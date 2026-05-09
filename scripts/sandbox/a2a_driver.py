@@ -21,6 +21,7 @@ This validates the full reply path that 2026-05-09 E2E-A could not finish.
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 import textwrap
 import uuid
@@ -34,7 +35,7 @@ PROMPT = (
     "in your response."
 )
 
-BOT_A_URL = "http://127.0.0.1:9800/"
+BOT_A_URL = os.environ.get("BOT_A_URL", "http://127.0.0.1:9800/")
 SENTINEL = "HELLO_FROM_BOT_B"
 
 
@@ -42,7 +43,7 @@ async def main() -> int:
     try:
         import httpx
         from a2a.client import A2ACardResolver, ClientConfig, ClientFactory
-        from a2a.types import Message, Part, Role, SendMessageRequest, TextPart
+        from a2a.types import Message, Part, Role, SendMessageRequest
     except ImportError as exc:
         print(f"FATAL: a2a-sdk + httpx required. Install in venv. {exc}",
               file=sys.stderr)
@@ -64,7 +65,7 @@ async def main() -> int:
         req = SendMessageRequest(
             message=Message(
                 role=Role.ROLE_USER,
-                parts=[Part(root=TextPart(text=PROMPT))],
+                parts=[Part(text=PROMPT)],
                 message_id=str(uuid.uuid4()),
             )
         )

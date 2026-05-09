@@ -15,6 +15,10 @@ platforms:
       peers:
         bot-a: "http://a2a-bot-a:8800/"
       agent_card:
+        # Bot-A fetches our card (target_url=http://a2a-bot-b:8801/) then
+        # uses card.supportedInterfaces[].url for the actual send. Set the
+        # advertised url to the service-name endpoint so peers can reach us.
+        url: "http://a2a-bot-b:8801/"
         name: "Bot-B"
         description: "Sandbox A2A bot — reply side (Docker)"
         discord_bot_user_id: "bot-b"

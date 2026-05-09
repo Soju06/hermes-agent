@@ -18,6 +18,13 @@ platforms:
         # Service-name resolution on the a2a-net bridge.
         bot-b: "http://a2a-bot-b:8801/"
       agent_card:
+        # Public URL advertised in our AgentCard. Peers fetch this card
+        # then send to card.supportedInterfaces[].url. Inside a2a-net
+        # we want service-name resolution so peer containers can reach
+        # us; from the host driver side, we pass BOT_A_URL=http://127.0.0.1:8800/
+        # via `docker exec -e` to bypass card-advertised URL entirely
+        # (resolver target_url overrides for the initial card fetch only).
+        url: "http://a2a-bot-a:8800/"
         name: "Bot-A"
         description: "Sandbox A2A bot — outbound side (Docker)"
         discord_bot_user_id: "bot-a"
