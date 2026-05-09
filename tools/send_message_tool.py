@@ -344,6 +344,14 @@ def _parse_target_ref(platform_name: str, target_ref: str):
         if target_ref.strip().isdigit():
             return f"group:{target_ref.strip()}", None, True
         return None, None, False
+    if platform_name == "a2a":
+        # A2A peer IDs are free-form: typically a discord_user_id (numeric)
+        # for production, an arbitrary string for sandbox tests. The
+        # resolution layer is `A2AAdapter._peers` (config: peers map) and
+        # the http(s):// URL fallback inside A2AAdapter.send(). We just
+        # have to mark target as explicit so the channel_directory
+        # lookup in _handle_send doesn't reject it.
+        return target_ref.strip(), None, True
     if platform_name in _PHONE_PLATFORMS:
         match = _E164_TARGET_RE.fullmatch(target_ref)
         if match:
@@ -427,6 +435,10 @@ async def _send_via_adapter(platform, pconfig, chat_id, chunk):
     """Send a message via a live gateway adapter (for plugin platforms).
 
     Falls back to error if no adapter is connected for this platform.
+    For A2A and any future request/response-shaped adapter, the peer's
+    reply text is surfaced as ``raw_response`` so the calling agent can
+    use the answer in its own turn (the whole point of A2A is sync
+    request/reply, not fire-and-forget).
     """
     try:
         from gateway.run import _gateway_runner_ref
@@ -437,7 +449,13 @@ async def _send_via_adapter(platform, pconfig, chat_id, chunk):
                 from gateway.platforms.base import SendResult
                 result = await adapter.send(chat_id=chat_id, content=chunk)
                 if result.success:
-                    return {"success": True, "message_id": result.message_id}
+                    out = {"success": True, "message_id": result.message_id}
+                    # Surface the peer's reply when the adapter captured one
+                    # (A2A's send() blocks until the peer's terminal Message
+                    # arrives — see gateway/platforms/a2a.py send()).
+                    if result.raw_response is not None:
+                        out["raw_response"] = result.raw_response
+                    return out
                 return {"error": f"Adapter send failed: {result.error}"}
     except Exception as e:
         return {"error": f"Plugin platform send failed: {e}"}
