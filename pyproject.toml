@@ -65,7 +65,12 @@ mcp = ["mcp>=1.2.0,<2"]
 homeassistant = ["aiohttp>=3.9.0,<4"]
 sms = ["aiohttp>=3.9.0,<4"]
 acp = ["agent-client-protocol>=0.9.0,<1.0"]
-a2a = ["a2a-sdk[http-server]>=1.0.0,<2.0.0"]
+a2a = [
+    "a2a-sdk[http-server]>=1.0.0,<2.0.0",
+    # a2a-sdk 1.0.2 calls FieldDescriptor.label, removed in protobuf 7.0+.
+    # Pin <7 until a2a-sdk uses is_required()/is_repeated().
+    "protobuf<7",
+]
 mistral = ["mistralai>=2.3.0,<3"]
 bedrock = ["boto3>=1.35.0,<2"]
 termux = [
