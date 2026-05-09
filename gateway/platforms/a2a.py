@@ -249,8 +249,95 @@ class A2AAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        logger.info("[A2A] send() — skeleton, not yet implemented (chat_id=%s)", chat_id)
-        return SendResult(success=False, error="not implemented")
+        """Send an A2A message to a peer and capture its terminal reply.
+
+        ``chat_id`` is interpreted as either:
+          - a discord_user_id (looked up in self._peers → agent_card_url), or
+          - a direct agent_card_url (must start with http:// or https://).
+
+        Returns a SendResult whose ``raw_response`` carries the peer's terminal
+        reply text (per the ADR-001 §3 non-streaming PoC). Failures set
+        ``retryable=True`` so the gateway's retry policy can decide whether to
+        re-attempt — A2A failures are typically transient (network, peer
+        restart), not permanent.
+        """
+        if not A2A_AVAILABLE:
+            return SendResult(success=False, error="a2a-sdk not available")
+
+        peer_url = self._peers.get(chat_id) or chat_id
+        if not (peer_url.startswith("http://") or peer_url.startswith("https://")):
+            return SendResult(success=False, error=f"unknown peer: {chat_id}")
+
+        try:
+            # Local imports keep the module importable when a2a-sdk is missing.
+            from a2a.client import A2ACardResolver, ClientConfig, ClientFactory
+            from a2a.types import (
+                Message as A2AMessage,
+                Part as A2APart,
+                Role,
+                SendMessageRequest,
+            )
+            import httpx
+            import uuid
+
+            message_id = str(uuid.uuid4())
+            ctx_id = (metadata or {}).get("context_id") or chat_id
+
+            async with httpx.AsyncClient(timeout=60.0) as http:
+                resolver = A2ACardResolver(http, peer_url)
+                peer_card = await resolver.get_agent_card()
+                client = ClientFactory(
+                    ClientConfig(httpx_client=http, streaming=False)
+                ).create(peer_card)
+
+                req = SendMessageRequest(
+                    message=A2AMessage(
+                        # Peer-to-peer: we ARE an agent talking to another agent.
+                        # ROLE_USER would also work (HermesA2AExecutor doesn't
+                        # branch on role), but ROLE_AGENT matches ADR-001's
+                        # peer-to-peer semantic.
+                        role=Role.ROLE_AGENT,
+                        parts=[A2APart(text=content)],
+                        message_id=message_id,
+                        context_id=str(ctx_id),
+                    )
+                )
+
+                reply_text: Optional[str] = None
+                # send_message ALWAYS returns AsyncIterator[StreamResponse]
+                # in a2a-sdk 1.0.2 — even with streaming=False. The streaming
+                # flag only controls whether interim events are emitted; the
+                # terminal {message,task} oneof always closes the iterator.
+                async for resp in client.send_message(req):
+                    # StreamResponse is a proto with oneof {task, message, ...}.
+                    if resp.HasField("message"):
+                        for p in resp.message.parts:
+                            if p.HasField("text"):
+                                reply_text = p.text
+                                break
+                        if reply_text is not None:
+                            break
+                    elif resp.HasField("task"):
+                        # Scan the task history for the agent's terminal reply.
+                        task = resp.task
+                        for m in task.history:
+                            if m.role == Role.ROLE_AGENT and m.parts:
+                                for p in m.parts:
+                                    if p.HasField("text"):
+                                        reply_text = p.text
+                                        break
+                            if reply_text is not None:
+                                break
+                        if reply_text is not None:
+                            break
+
+            return SendResult(
+                success=True, message_id=message_id, raw_response=reply_text
+            )
+
+        except Exception as e:
+            logger.error("[A2A] send failed: %s", e, exc_info=True)
+            return SendResult(success=False, error=str(e), retryable=True)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         return None  # A2A has no typing indicator
