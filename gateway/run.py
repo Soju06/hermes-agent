@@ -282,6 +282,42 @@ def _restart_notification_pending() -> bool:
     return (_hermes_home / ".restart_notify.json").exists()
 
 
+def _inject_a2a_dedup_into_discord(platforms: Dict[Any, Any]) -> None:
+    """Inject the A2A peers map into Discord's config.extra (ADR-001 §3).
+
+    The Discord adapter's inbound handler consults
+    ``config.extra["a2a_dedup_config"]`` to drop messages whose author is
+    a registered A2A peer (the peer also delivers them via A2A as a
+    normalized single-turn payload). This function copies the relevant
+    slice of the A2A platform config across before either adapter is
+    constructed, so the wiring is order-independent.
+
+    No-op when:
+      - A2A platform is missing or disabled
+      - Discord platform is missing or disabled
+      - The A2A peers map is empty (nothing to dedup against)
+
+    The injection is idempotent: re-running it overwrites the previous
+    snapshot, which matters for ``/reload``-style config refreshes.
+    """
+    # Local import keeps this module load-order-safe (Platform is defined
+    # in gateway.config which is also imported elsewhere in this file).
+    from gateway.config import Platform
+
+    a2a_cfg = platforms.get(Platform.A2A)
+    discord_cfg = platforms.get(Platform.DISCORD)
+    if not (a2a_cfg and getattr(a2a_cfg, "enabled", False)):
+        return
+    if not (discord_cfg and getattr(discord_cfg, "enabled", False)):
+        return
+
+    peers = (a2a_cfg.extra or {}).get("peers") or {}
+    if not peers:
+        return
+
+    discord_cfg.extra["a2a_dedup_config"] = {"peers": dict(peers)}
+
+
 # Mark this process as a gateway so cli.py's module-level load_cli_config()
 # knows not to clobber TERMINAL_CWD if lazily imported.
 os.environ["_HERMES_GATEWAY"] = "1"
@@ -3161,7 +3197,12 @@ class GatewayRunner:
         enabled_platform_count = 0
         startup_nonretryable_errors: list[str] = []
         startup_retryable_errors: list[str] = []
-        
+
+        # ADR-001 §3: copy A2A peers into Discord config.extra BEFORE
+        # constructing either adapter, so the wiring is independent of
+        # dict-iteration order in the loop below.
+        _inject_a2a_dedup_into_discord(self.config.platforms)
+
         # Initialize and connect each configured platform
         for platform, platform_config in self.config.platforms.items():
             if not platform_config.enabled:

@@ -566,6 +566,30 @@ class DiscordAdapter(BasePlatformAdapter):
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._slash_commands: bool = self.config.extra.get("slash_commands", True)
 
+    # ------------------------------------------------------------------
+    # A2A dedup (ADR-001 §3) — drop inbound Discord messages whose author
+    # is a registered A2A peer; the same message will arrive via the A2A
+    # adapter as a normalized, single-turn payload, so processing the
+    # Discord echo would double-deliver to the agent.
+    # ------------------------------------------------------------------
+    def _is_a2a_peer_echo(self, author_id: str | int) -> bool:
+        """Return True if this Discord author is a registered A2A peer.
+
+        The A2A peers map is injected into ``config.extra["a2a_dedup_config"]``
+        by the gateway runner *before* this adapter is connected (see
+        ``gateway/run.py`` ``_inject_a2a_dedup_into_discord``). The check is
+        intentionally pure and best-effort: any failure falls back to
+        "not a peer" so a malformed config can never silence Discord
+        delivery on its own.
+        """
+        try:
+            from gateway.platforms.a2a_registry import resolve_a2a_peer_url
+            cfg = self.config.extra.get("a2a_dedup_config")
+            return cfg is not None and resolve_a2a_peer_url(author_id, cfg) is not None
+        except Exception as e:  # pragma: no cover - defensive
+            logger.debug("[%s] A2A dedup check failed (non-fatal): %s", self.name, e)
+            return False
+
     async def connect(self) -> bool:
         """Connect to Discord and start receiving events."""
         if not DISCORD_AVAILABLE:
@@ -704,6 +728,19 @@ class DiscordAdapter(BasePlatformAdapter):
 
                 # Always ignore our own messages
                 if message.author == self._client.user:
+                    return
+
+                # A2A dedup (ADR-001 §3): if this author is a registered
+                # A2A peer, the peer is also delivering this message via
+                # A2A as a normalized single-turn payload. Drop the
+                # Discord echo to avoid double-processing. The peer map
+                # is injected into config.extra["a2a_dedup_config"] by
+                # the gateway runner; absent map → check is a no-op.
+                if adapter_self._is_a2a_peer_echo(str(message.author.id)):
+                    logger.info(
+                        "[%s] Dropping echo from A2A peer user_id=%s (will arrive via A2A)",
+                        adapter_self.name, message.author.id,
+                    )
                     return
 
                 # Ignore Discord system messages (thread renames, pins, member joins, etc.)
