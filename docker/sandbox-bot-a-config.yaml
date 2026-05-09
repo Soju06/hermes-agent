@@ -1,0 +1,29 @@
+# Sandbox Bot-A config (Docker)
+provider: anthropic
+model: claude-sonnet-4-20250514
+
+display:
+  platforms:
+    a2a:
+      streaming: false  # ADR-002 §required-config
+
+platforms:
+  a2a:
+    enabled: true
+    extra:
+      # Inside the container we listen on 0.0.0.0 so docker port-publish
+      # (127.0.0.1:9800 → container:8800) can reach us.
+      listen: "0.0.0.0:8800"
+      peers:
+        # Service-name resolution on the a2a-net bridge.
+        bot-b: "http://a2a-bot-b:8801/"
+      agent_card:
+        name: "Bot-A"
+        description: "Sandbox A2A bot — outbound side (Docker)"
+        discord_bot_user_id: "bot-a"
+
+memory:
+  provider: ""
+
+logging:
+  level: INFO

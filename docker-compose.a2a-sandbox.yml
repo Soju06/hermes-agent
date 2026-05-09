@@ -1,0 +1,78 @@
+# Sandbox A2A e2e — two isolated Hermes containers ping-ponging via A2A.
+#
+# Why Docker?
+#   `gateway run` calls refresh_systemd_unit_if_needed() on every boot
+#   (hermes_cli/gateway.py:2832), which silently rewrites the host's
+#   systemd-user unit using the gateway's own HERMES_HOME + venv. On a
+#   host that runs production nachoneko/mymel/craw via systemd, this
+#   corrupts the production unit.
+#
+#   Inside a container `which("systemctl")` returns None (no systemctl
+#   binary installed in the official Dockerfile), so
+#   supports_systemd_services() == False, the refresh is skipped, and
+#   the host's unit is mathematically untouchable from inside.
+#
+# Isolation guarantees:
+#   - No bind mount to ~/.hermes — sandbox state lives in named volumes
+#     bot-a-data, bot-b-data only.
+#   - No `network_mode: host` — sandbox uses its own bridge network
+#     a2a-net. Bot-A talks to Bot-B via service name, not host loopback.
+#   - Bot-A's inbound port is published to host 127.0.0.1:9800 ONLY
+#     so the driver script can hit it. No 0.0.0.0 exposure.
+#   - Containers talk to each other on a2a-net at service-name resolution
+#     (a2a-bot-a:8800, a2a-bot-b:8801).
+#
+# Usage:
+#   cd ~/projects/hermes-agent-a2a
+#   HERMES_UID=$(id -u) HERMES_GID=$(id -g) \
+#     docker compose -f docker-compose.a2a-sandbox.yml up -d --build
+#   # bot-A on http://127.0.0.1:9800/  (driver target)
+#   # logs:    docker compose -f docker-compose.a2a-sandbox.yml logs -f
+#   # cleanup: docker compose -f docker-compose.a2a-sandbox.yml down -v
+#
+services:
+  a2a-bot-a:
+    build: .
+    image: hermes-agent:a2a-sandbox
+    container_name: a2a-bot-a
+    restart: "no"
+    networks:
+      - a2a-net
+    ports:
+      - "127.0.0.1:9800:8800"  # host:container — driver reaches Bot-A here
+    volumes:
+      - bot-a-data:/opt/data
+      - ./docker/sandbox-bot-a-config.yaml:/opt/data/config.yaml:ro
+      - ./docker/sandbox-env:/opt/data/.env:ro
+    environment:
+      - HERMES_UID=${HERMES_UID:-10000}
+      - HERMES_GID=${HERMES_GID:-10000}
+      - GATEWAY_ALLOW_ALL_USERS=true
+    command: ["gateway", "run"]
+
+  a2a-bot-b:
+    image: hermes-agent:a2a-sandbox
+    container_name: a2a-bot-b
+    restart: "no"
+    networks:
+      - a2a-net
+    # No port publish — Bot-B is only reached by Bot-A inside the network.
+    volumes:
+      - bot-b-data:/opt/data
+      - ./docker/sandbox-bot-b-config.yaml:/opt/data/config.yaml:ro
+      - ./docker/sandbox-env:/opt/data/.env:ro
+    environment:
+      - HERMES_UID=${HERMES_UID:-10000}
+      - HERMES_GID=${HERMES_GID:-10000}
+      - GATEWAY_ALLOW_ALL_USERS=true
+    depends_on:
+      - a2a-bot-a
+    command: ["gateway", "run"]
+
+networks:
+  a2a-net:
+    driver: bridge
+
+volumes:
+  bot-a-data:
+  bot-b-data:

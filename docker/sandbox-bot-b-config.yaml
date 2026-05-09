@@ -1,0 +1,26 @@
+# Sandbox Bot-B config (Docker)
+provider: anthropic
+model: claude-sonnet-4-20250514
+
+display:
+  platforms:
+    a2a:
+      streaming: false  # ADR-002 §required-config
+
+platforms:
+  a2a:
+    enabled: true
+    extra:
+      listen: "0.0.0.0:8801"
+      peers:
+        bot-a: "http://a2a-bot-a:8800/"
+      agent_card:
+        name: "Bot-B"
+        description: "Sandbox A2A bot — reply side (Docker)"
+        discord_bot_user_id: "bot-b"
+
+memory:
+  provider: ""
+
+logging:
+  level: INFO
