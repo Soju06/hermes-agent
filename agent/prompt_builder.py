@@ -385,6 +385,16 @@ PLATFORM_HINTS = {
         "attachments, audio as file attachments. You can also include image URLs "
         "in markdown format ![alt](url) and they will be sent as attachments."
     ),
+    "a2a": (
+        "You are communicating with another AI agent over the A2A (Agent2Agent) protocol. "
+        "Messages are normalized: a single response per turn, no chunking, no streaming "
+        "edits, no inline tool-progress bubbles. The peer agent has its own tools, memory, "
+        "and goals — treat it as a capable autonomous interlocutor, not as a user to assist. "
+        "When uncertain about the peer's intent, ask explicitly; there is no human in the "
+        "loop to disambiguate. Tool calls are internal to your turn — the peer only sees "
+        "your final reply. The conversation may also be mirrored to a Discord channel for "
+        "human observers, but the A2A peer is the canonical addressee."
+    ),
     "slack": (
         "You are in a Slack workspace communicating with your user. "
         "You can send media files natively: include MEDIA:/absolute/path/to/file "
