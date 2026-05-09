@@ -262,6 +262,76 @@ class A2AAdapter(BasePlatformAdapter):
         return {"name": f"a2a:{chat_id}", "type": "a2a_peer", "chat_id": chat_id}
 
     # ------------------------------------------------------------------
+    # Message handler — capture-via-wrapping
+    # ------------------------------------------------------------------
+    def set_message_handler(self, handler):  # type: ignore[override]
+        """Wrap the gateway's message handler so we can intercept the agent's
+        final reply text and route it back to the A2A caller via the
+        per-message-id capture callback registry.
+
+        Why a wrapper instead of a base-class hook (Task 7 reality-check):
+        - Hermes' MessageHandler contract already says the handler may
+          return a string (final text), an EphemeralReply, or None
+          (already-delivered, e.g. streaming). See gateway/platforms/base.py
+          line 1115.
+        - For A2A, we deliver the reply through HermesA2AExecutor →
+          event_queue.enqueue_event(reply_msg) inside the executor. We do
+          NOT want base.py's _process_message_background to also call
+          self._send_with_retry (which would hit the SendResult(success=False,
+          error="not implemented") path and log a spurious failure).
+        - Returning None from the wrapped handler engages the existing
+          base-class contract: `if response: ... if text_content: ...
+          _send_with_retry()` is gated, so no outbound send fires for
+          A2A turns.
+        - Streaming is disabled per-platform via
+          `display.platforms.a2a.streaming: false` in user config (gateway/
+          run.py line ~13738), so no StreamConsumer.adapter.send hits this
+          adapter either.
+
+        Net effect: A2A inbound → handler → final string captured →
+        executor enqueues reply Message → caller sees the response. base.py
+        sees None and skips its own send path entirely.
+        """
+
+        async def _wrapped(event):
+            # Delegate to the gateway's real handler — runs the agent,
+            # returns the final string (or None when streaming already sent).
+            try:
+                result = await handler(event)
+            except Exception:
+                # Surface the failure to the A2A caller as a reply rather
+                # than letting the executor's wait_for time out at 120s.
+                cb = self._post_response_callbacks.get(event.message_id) if event.message_id else None
+                if cb is not None:
+                    try:
+                        await cb("[A2A error: handler raised an exception]")
+                    except Exception:  # pragma: no cover - defensive
+                        pass
+                raise
+
+            text, _ttl = self._unwrap_ephemeral(result)  # TTL is dropped — A2A doesn't need ephemeral TTLs
+
+            if text and event.message_id:
+                cb = self._post_response_callbacks.get(event.message_id)
+                if cb is not None:
+                    try:
+                        await cb(text)
+                    except Exception as e:
+                        logger.error(
+                            "[A2A] post-response capture callback failed: %s",
+                            e,
+                            exc_info=True,
+                        )
+
+            # Always return None so base.py's _process_message_background
+            # skips its own _send_with_retry (the `if text_content:` gate).
+            # The A2A executor has either captured the text (above) or
+            # the handler streamed/already-delivered (text was None).
+            return None
+
+        super().set_message_handler(_wrapped)
+
+    # ------------------------------------------------------------------
     # Agent Card construction
     # ------------------------------------------------------------------
     def _build_agent_card(self) -> "AgentCard":
