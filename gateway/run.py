@@ -4474,7 +4474,14 @@ class GatewayRunner:
             logger.debug("Platform registry lookup for '%s' failed: %s", platform.value, e)
         # Fall through to built-in adapters below
 
-        if platform == Platform.TELEGRAM:
+        if platform == Platform.A2A:
+            from gateway.platforms.a2a import A2AAdapter, check_a2a_requirements
+            if not check_a2a_requirements():
+                logger.warning("A2A: a2a-sdk not installed (pip install -e \".[a2a]\")")
+                return None
+            return A2AAdapter(config)
+
+        elif platform == Platform.TELEGRAM:
             from gateway.platforms.telegram import TelegramAdapter, check_telegram_requirements
             if not check_telegram_requirements():
                 logger.warning("Telegram: python-telegram-bot not installed")
@@ -4663,6 +4670,9 @@ class GatewayRunner:
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
             Platform.QQBOT: "QQ_ALLOWED_USERS",
             Platform.YUANBAO: "YUANBAO_ALLOWED_USERS",
+            # A2A authorizes by peer_id (not user_id); reusing the env-var map
+            # keeps the auth pipeline uniform — see plan/phase-1-poc.md Task 3.
+            Platform.A2A: "A2A_ALLOWED_PEERS",
         }
         platform_group_user_env_map = {
             Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_USERS",
@@ -4689,6 +4699,7 @@ class GatewayRunner:
             Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOW_ALL_USERS",
             Platform.QQBOT: "QQ_ALLOW_ALL_USERS",
             Platform.YUANBAO: "YUANBAO_ALLOW_ALL_USERS",
+            Platform.A2A: "A2A_ALLOW_ALL_PEERS",
         }
         # Bots admitted by {PLATFORM}_ALLOW_BOTS bypass the human allowlist (#4466).
         platform_allow_bots_map = {
@@ -4874,6 +4885,7 @@ class GatewayRunner:
                 Platform.WEIXIN:   "WEIXIN_ALLOWED_USERS",
                 Platform.BLUEBUBBLES: "BLUEBUBBLES_ALLOWED_USERS",
                 Platform.QQBOT:    "QQ_ALLOWED_USERS",
+                Platform.A2A:      "A2A_ALLOWED_PEERS",
             }
             platform_group_env_map = {
                 Platform.TELEGRAM: (
