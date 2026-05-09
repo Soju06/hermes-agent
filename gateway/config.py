@@ -108,6 +108,7 @@ class Platform(Enum):
     BLUEBUBBLES = "bluebubbles"
     QQBOT = "qqbot"
     YUANBAO = "yuanbao"
+    A2A = "a2a"
     @classmethod
     def _missing_(cls, value):
         """Accept unknown platform names only for known plugin adapters.
@@ -394,6 +395,9 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
         (cfg.extra.get("client_id") or os.getenv("DINGTALK_CLIENT_ID"))
         and (cfg.extra.get("client_secret") or os.getenv("DINGTALK_CLIENT_SECRET"))
     ),
+    # A2A: peer-to-peer agent protocol — sufficient if a listen address is
+    # configured (no token; auth is via static peer registry / agent cards).
+    Platform.A2A: lambda cfg: bool(cfg.extra.get("listen")),
 }
 
 
@@ -1645,6 +1649,18 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         yuanbao_group_allow_from = os.getenv("YUANBAO_GROUP_ALLOW_FROM")
         if yuanbao_group_allow_from:
             extra["group_allow_from"] = yuanbao_group_allow_from
+
+    # A2A — peer-to-peer agent protocol (ADR-001 / hermes-a2a)
+    # A2A_LISTEN: e.g. "127.0.0.1:8765" (host:port for the JSON-RPC endpoint).
+    # Other A2A config (peers, agent_card) lives in YAML under
+    # gateway.platforms.a2a.extra; only the listen address is exposed via env
+    # so a2a can be toggled on for a given Hermes instance via .env.
+    a2a_listen = os.getenv("A2A_LISTEN")
+    if a2a_listen:
+        if Platform.A2A not in config.platforms:
+            config.platforms[Platform.A2A] = PlatformConfig()
+        config.platforms[Platform.A2A].enabled = True
+        config.platforms[Platform.A2A].extra["listen"] = a2a_listen.strip()
 
     # Session settings
     idle_minutes = os.getenv("SESSION_IDLE_MINUTES")
