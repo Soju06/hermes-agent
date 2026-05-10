@@ -14,6 +14,7 @@ platforms:
       listen: "0.0.0.0:8800"
       peers:
         - "http://a2a-bot-b:8801/"
+      max_turns_per_conversation: 2
       agent_card:
         url: "http://a2a-bot-a:8800/"
         name: "A-bot"

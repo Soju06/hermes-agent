@@ -178,6 +178,15 @@ class A2AAdapter(BasePlatformAdapter):
             config.extra.get("min_dual_send_interval_seconds", 1.5)
         )
         self._last_mirror_at: Dict[str, float] = {}
+        # ADR-006 multi-turn termination. Per-(peer_id, context_id) counter
+        # capped at `max_turns_per_conversation` (default 5). When the cap is
+        # hit, the inbound is dropped: real handler is NOT invoked, mirror is
+        # NOT posted, but the A2A capture callback fires with a turn-limit
+        # notice so the caller doesn't hang for 60s.
+        self._turn_counters: Dict[tuple, int] = {}
+        self._max_turns_per_conversation: int = int(
+            config.extra.get("max_turns_per_conversation", 5)
+        )
         self._self_card: Optional[Dict[str, Any]] = config.extra.get("agent_card", None)
         self._server_task: Optional[asyncio.Task] = None
         self._app = None
@@ -494,6 +503,29 @@ class A2AAdapter(BasePlatformAdapter):
         return {"name": f"a2a:{chat_id}", "type": "a2a_peer", "chat_id": chat_id}
 
     # ------------------------------------------------------------------
+    # ADR-006 multi-turn termination
+    # ------------------------------------------------------------------
+    def _reset_turn_counters_for_chat(self, chat_id: str) -> int:
+        """Clear all turn counters whose context_id == chat_id.
+
+        Called by Discord adapter when a non-bot message lands in the mirror
+        channel — a human (re-)joining the conversation resets the cap so
+        multi-turn peer chats can resume.
+
+        Returns the number of (peer_id, chat_id) pairs cleared.
+        """
+        keys = [k for k in self._turn_counters if k[1] == chat_id]
+        for k in keys:
+            self._turn_counters.pop(k, None)
+        if keys:
+            logger.info(
+                "[A2A] reset %d turn counter(s) on chat %s",
+                len(keys),
+                chat_id,
+            )
+        return len(keys)
+
+    # ------------------------------------------------------------------
     # ADR-003 dual-send mirror
     # ------------------------------------------------------------------
     async def _mirror_to_discord(self, text: Optional[str]) -> None:
@@ -593,6 +625,50 @@ class A2AAdapter(BasePlatformAdapter):
         """
 
         async def _wrapped(event):
+            # ADR-006 turn-limit check — fast path, before handler/LLM call.
+            # Key on (peer_id, context_id) per ADR-006 §1. Fail-safe: if
+            # event.source is malformed, skip the check (don't break the
+            # reply path).
+            try:
+                src = getattr(event, "source", None)
+                peer_id = getattr(src, "user_id", None) if src else None
+                ctx_id = getattr(src, "chat_id", None) if src else None
+            except Exception:
+                peer_id = ctx_id = None
+
+            if peer_id and ctx_id:
+                key = (peer_id, ctx_id)
+                count = self._turn_counters.get(key, 0)
+                if count >= self._max_turns_per_conversation:
+                    logger.info(
+                        "[A2A] turn limit %d reached for peer=%s ctx=%s — dropping",
+                        self._max_turns_per_conversation,
+                        peer_id,
+                        ctx_id,
+                    )
+                    # A2A spec satisfaction: the caller is awaiting a reply
+                    # via the executor's wait_for(120s). Fire the capture
+                    # callback with a notice so they don't hang.
+                    msg_id = getattr(event, "message_id", None)
+                    if msg_id:
+                        cb = self._post_response_callbacks.get(msg_id)
+                        if cb is not None:
+                            try:
+                                await cb(
+                                    f"[A2A turn limit reached after "
+                                    f"{self._max_turns_per_conversation} turns]"
+                                )
+                            except Exception as e:
+                                logger.error(
+                                    "[A2A] turn-limit notice callback failed: %s",
+                                    e,
+                                )
+                    # Silent on Discord side (no mirror), no handler call,
+                    # no counter increment. Return None per base.py contract.
+                    return None
+                # Increment AFTER the gate so we don't double-count drops.
+                self._turn_counters[key] = count + 1
+
             # Delegate to the gateway's real handler — runs the agent,
             # returns the final string (or None when streaming already sent).
             try:

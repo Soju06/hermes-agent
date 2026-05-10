@@ -590,6 +590,53 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.debug("[%s] A2A dedup check failed (non-fatal): %s", self.name, e)
             return False
 
+    def _maybe_reset_a2a_turn_counters(self, message) -> None:
+        """ADR-006 reset hook — non-peer message in mirror channel resets A2A
+        turn counters.
+
+        Best-effort: any failure is silent (caller wraps with try/except).
+        Logic:
+          - Skip if message is from a bot (only humans / non-peer activity
+            should reset; peer-bot echoes were already filtered out by
+            _is_a2a_peer_echo before this is called).
+          - Locate the A2A adapter via the gateway runner registry.
+          - If this channel matches A2A's mirror_channel_id (Phase 2 single
+            static channel; Phase 3 will plumb dynamic mapping), reset
+            counters keyed by that chat. We use mirror_channel_id as the
+            chat key per ADR-006 §4 (Phase 2 approximation — A2A context_id
+            ↔ Discord channel_id mapping is Phase 3).
+        """
+        author = getattr(message, "author", None)
+        if author is None or getattr(author, "bot", False):
+            return  # only humans (or non-bot accounts) trigger reset
+        try:
+            from gateway.run import _gateway_runner_ref
+            from gateway.config import Platform
+        except Exception:
+            return
+        runner = _gateway_runner_ref()
+        if runner is None:
+            return
+        a2a_adapter = runner.adapters.get(Platform.A2A)
+        if a2a_adapter is None:
+            return
+        chan_id = str(getattr(getattr(message, "channel", None), "id", "") or "")
+        mirror_chan = getattr(a2a_adapter, "_mirror_channel_id", None)
+        if not chan_id or not mirror_chan or chan_id != str(mirror_chan):
+            return
+        # Phase 2 static-channel approximation: clear ALL counters when a
+        # human speaks in the mirror channel (single conversation context).
+        # Phase 3 dynamic mapping will use a per-context_id reset.
+        reset_fn = getattr(a2a_adapter, "_reset_turn_counters_for_chat", None)
+        if not callable(reset_fn):
+            return
+        # Reset across every chat_id present — the static mapping conflates
+        # them into one Discord channel. (Single .clear() would also work
+        # but the per-chat helper logs which chats got reset.)
+        chats = {k[1] for k in getattr(a2a_adapter, "_turn_counters", {})}
+        for ctx in chats:
+            reset_fn(ctx)
+
     async def connect(self) -> bool:
         """Connect to Discord and start receiving events."""
         if not DISCORD_AVAILABLE:
@@ -742,6 +789,19 @@ class DiscordAdapter(BasePlatformAdapter):
                         adapter_self.name, message.author.id,
                     )
                     return
+
+                # ADR-006 turn-counter reset: a non-peer message in the A2A
+                # mirror channel means a human (or non-peer bot) is joining
+                # the conversation. Reset all turn counters keyed by this
+                # chat so capped peer chats can resume. Best-effort: any
+                # failure is silent so it can never block Discord delivery.
+                try:
+                    adapter_self._maybe_reset_a2a_turn_counters(message)
+                except Exception as e:  # pragma: no cover - defensive
+                    logger.debug(
+                        "[%s] a2a turn-counter reset failed: %s",
+                        adapter_self.name, e,
+                    )
 
                 # Ignore Discord system messages (thread renames, pins, member joins, etc.)
                 # Allow both default and reply types — replies have a distinct MessageType.
