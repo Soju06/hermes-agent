@@ -4579,7 +4579,33 @@ class GatewayRunner:
             if not check_a2a_requirements():
                 logger.warning("A2A: a2a-sdk not installed (pip install -e \".[a2a]\")")
                 return None
-            return A2AAdapter(config)
+            adapter = A2AAdapter(config)
+            # ADR-003: wire `display.platforms.a2a.mirror_channel_id` into the
+            # adapter so dual-send can find its destination. The display path
+            # is the canonical home for this setting (alongside `streaming`),
+            # but the adapter also accepts `extra.mirror_channel_id` for
+            # sandbox/test convenience.
+            try:
+                _user_cfg = _load_gateway_config() or {}
+                display_cfg = (
+                    _user_cfg.get("display", {})
+                    .get("platforms", {})
+                    .get("a2a", {})
+                )
+                mirror_chan = display_cfg.get("mirror_channel_id")
+                if mirror_chan and not adapter._mirror_channel_id:
+                    adapter._mirror_channel_id = str(mirror_chan)
+                    logger.info(
+                        "[A2A] mirror channel wired from display config: %s",
+                        mirror_chan,
+                    )
+                # Also let display override min_dual_send_interval_seconds.
+                interval = display_cfg.get("min_dual_send_interval_seconds")
+                if interval is not None:
+                    adapter._min_mirror_interval_s = float(interval)
+            except Exception as e:
+                logger.debug("[A2A] mirror config wiring failed: %s", e)
+            return adapter
 
         elif platform == Platform.TELEGRAM:
             from gateway.platforms.telegram import TelegramAdapter, check_telegram_requirements

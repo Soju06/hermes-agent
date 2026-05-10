@@ -5,6 +5,7 @@ display:
   platforms:
     a2a:
       streaming: false
+      mirror_channel_id: "1502907302901055679"
 
 platforms:
   a2a:

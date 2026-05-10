@@ -166,6 +166,18 @@ class A2AAdapter(BasePlatformAdapter):
             )
         # Peers that failed to resolve at connect() time — retried on first send().
         self._unresolved_peer_urls: set[str] = set()
+        # ADR-003 dual-send mirror config. `mirror_channel_id` is wired from
+        # `display.platforms.a2a.mirror_channel_id` by gateway/run.py at adapter
+        # construction time (or here via extra for sandbox/test convenience).
+        # `min_dual_send_interval_seconds` (default 1.5s) bounds Discord burst
+        # rate to stay inside the 5 msg/5s per-channel limit.
+        self._mirror_channel_id: Optional[str] = config.extra.get(
+            "mirror_channel_id"
+        )
+        self._min_mirror_interval_s: float = float(
+            config.extra.get("min_dual_send_interval_seconds", 1.5)
+        )
+        self._last_mirror_at: Dict[str, float] = {}
         self._self_card: Optional[Dict[str, Any]] = config.extra.get("agent_card", None)
         self._server_task: Optional[asyncio.Task] = None
         self._app = None
@@ -482,6 +494,73 @@ class A2AAdapter(BasePlatformAdapter):
         return {"name": f"a2a:{chat_id}", "type": "a2a_peer", "chat_id": chat_id}
 
     # ------------------------------------------------------------------
+    # ADR-003 dual-send mirror
+    # ------------------------------------------------------------------
+    async def _mirror_to_discord(self, text: Optional[str]) -> None:
+        """Post the A2A reply text to the configured Discord mirror channel.
+
+        ADR-003: replier-side dual-send. The bot that GENERATED the reply
+        (i.e. the executor side, where `_wrapped` runs) posts a copy of the
+        reply text to the static `mirror_channel_id`, making A2A traffic
+        visible to humans in the Discord channel. The receiver bot sees the
+        mirror as a regular Discord message but drops it via ADR-001 §4
+        strict-dedup (it's authored by a registered A2A peer).
+
+        Best-effort:
+          - Silently no-op if `mirror_channel_id` is unset, text is empty,
+            no Discord adapter is registered, or send raises.
+          - Failures NEVER propagate — the A2A reply path must keep working.
+
+        Rate limit:
+          - Per-channel: `_last_mirror_at[chan]` enforces
+            `min_dual_send_interval_seconds` (default 1.5s) between consecutive
+            mirrors to the same channel. Stays comfortably under Discord's
+            5 msg / 5s per-channel limit even with bursty A2A turns.
+        """
+        if not self._mirror_channel_id or not text:
+            return
+        chan = self._mirror_channel_id
+
+        # Per-channel rate limit.
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        last = self._last_mirror_at.get(chan, 0.0)
+        delay = self._min_mirror_interval_s - (now - last)
+        if delay > 0:
+            await asyncio.sleep(delay)
+        # Record the attempt time NOW (post-sleep) so concurrent mirrors
+        # serialize correctly even under rapid bursts.
+        self._last_mirror_at[chan] = loop.time()
+
+        try:
+            # Local import: gateway.run isn't always importable from a2a.py
+            # at module-import time (load order via discovery), but it's
+            # always available by the time _wrapped runs (gateway is up).
+            from gateway import run as _gw_run
+
+            runner = _gw_run._gateway_runner_ref()
+            if runner is None:
+                logger.debug(
+                    "[A2A] no runner registered; mirror to %s skipped", chan
+                )
+                return
+            discord_adapter = runner.adapters.get(Platform.DISCORD)
+            if discord_adapter is None:
+                logger.debug(
+                    "[A2A] no discord adapter registered; mirror to %s skipped",
+                    chan,
+                )
+                return
+            await discord_adapter.send(chat_id=chan, content=text)
+            logger.debug(
+                "[A2A] mirrored reply to discord channel %s (%d chars)",
+                chan,
+                len(text),
+            )
+        except Exception as e:
+            logger.warning("[A2A] mirror to discord failed: %s", e)
+
+    # ------------------------------------------------------------------
     # Message handler — capture-via-wrapping
     # ------------------------------------------------------------------
     def set_message_handler(self, handler):  # type: ignore[override]
@@ -542,6 +621,12 @@ class A2AAdapter(BasePlatformAdapter):
                             e,
                             exc_info=True,
                         )
+
+            # ADR-003 dual-send mirror — best-effort, runs even when no
+            # capture callback is registered (so out-of-band agent traffic
+            # also surfaces in Discord). Failures are logged inside.
+            if text:
+                await self._mirror_to_discord(text)
 
             # Always return None so base.py's _process_message_background
             # skips its own _send_with_retry (the `if text_content:` gate).
