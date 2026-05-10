@@ -119,6 +119,11 @@ class HermesA2AExecutor:
         self._adapter._post_response_callbacks[message_id] = _capture
 
         try:
+            # ADR-007: mirror inbound peer message to Discord channel before
+            # dispatch so humans see both sides of the conversation. Best-
+            # effort, never blocks reply path.
+            await self._adapter._mirror_a2a_inbound_to_discord(peer_agent_id, text)
+
             await self._adapter.handle_message(event)
             reply_text = await asyncio.wait_for(reply_future, timeout=120.0)
         except asyncio.TimeoutError:
@@ -591,6 +596,53 @@ class A2AAdapter(BasePlatformAdapter):
             )
         except Exception as e:
             logger.warning("[A2A] mirror to discord failed: %s", e)
+
+    # ------------------------------------------------------------------
+    # ADR-007 inbound mirror — surface peer message text in Discord too
+    # ------------------------------------------------------------------
+    async def _mirror_a2a_inbound_to_discord(
+        self, peer_id: str, text: Optional[str]
+    ) -> None:
+        """Post the A2A INBOUND text to the configured Discord mirror channel.
+
+        ADR-007: while replier-side streaming mirror (status_adapter swap)
+        gives humans a live view of the *outgoing* reply, the inbound side
+        of the conversation is invisible without this — the channel reads
+        like a one-sided phone call. This method posts a single line per
+        inbound message:
+
+            📥 from {peer_id}: {text}
+
+        Best-effort: missing mirror_channel_id, empty text, missing Discord
+        adapter, or send failure all silently no-op so the inbound dispatch
+        path stays alive (ADR-003 Risk D semantic, preserved by ADR-007).
+        """
+        if not self._mirror_channel_id:
+            return
+        if not text or not text.strip():
+            return
+
+        try:
+            from gateway import run as _gw_run
+
+            runner = _gw_run._gateway_runner_ref()
+            if runner is None:
+                return
+            discord_adapter = runner.adapters.get(Platform.DISCORD)
+            if discord_adapter is None:
+                return
+            await discord_adapter.send(
+                chat_id=self._mirror_channel_id,
+                content=f"📥 from {peer_id}: {text}",
+            )
+            logger.debug(
+                "[A2A] inbound mirrored to discord channel %s (peer=%s, %d chars)",
+                self._mirror_channel_id,
+                peer_id,
+                len(text),
+            )
+        except Exception as e:
+            logger.warning("[A2A] inbound mirror to discord failed: %s", e)
 
     # ------------------------------------------------------------------
     # Message handler — capture-via-wrapping

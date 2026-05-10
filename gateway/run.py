@@ -353,6 +353,66 @@ def _wire_dedup_into_discord(
             pass
 
 
+def _resolve_a2a_mirror_swap(
+    source: Any,
+    runner_adapters: Dict[Any, Any],
+    fallback_adapter: Any,
+    fallback_chat_id: str,
+) -> tuple[Any, str, bool]:
+    """ADR-007: Decide whether to swap status target to Discord mirror channel.
+
+    Called from the inbound chokepoint when a message arrives. For A2A
+    inbound messages with a configured mirror_channel_id and a registered
+    Discord adapter, returns (discord_adapter, mirror_chan, True) so the
+    GatewayStreamConsumer + status/interim/bg_review callbacks all post to
+    the mirror channel. For everything else, returns the fallback unchanged.
+
+    Pure helper — no I/O, no side effects. Easy to unit-test without
+    standing up a full GatewayRunner.
+    """
+    from gateway.config import Platform
+
+    if getattr(source, "platform", None) != Platform.A2A:
+        return fallback_adapter, fallback_chat_id, False
+    a2a_adapter = runner_adapters.get(Platform.A2A)
+    if a2a_adapter is None:
+        return fallback_adapter, fallback_chat_id, False
+    mirror_chan = getattr(a2a_adapter, "_mirror_channel_id", None)
+    if not mirror_chan:
+        return fallback_adapter, fallback_chat_id, False
+    discord_adapter = runner_adapters.get(Platform.DISCORD)
+    if discord_adapter is None:
+        return fallback_adapter, fallback_chat_id, False
+    return discord_adapter, mirror_chan, True
+
+
+def _force_off_a2a_streaming_when_no_swap(
+    source: Any,
+    plat_streaming: Any,
+    swapped: bool,
+) -> Any:
+    """ADR-007 v2 Risk B Resolution: protect A2A JSONRPC reply path.
+
+    Without a successful Discord mirror swap, GatewayStreamConsumer would
+    post partial messages to the A2A adapter — which corrupts the JSONRPC
+    reply path (caller's reply_future resolves with a partial, message_id
+    mismatch, etc.). For A2A inbound + swap failed, force streaming OFF
+    regardless of the user's explicit ``display.platforms.a2a.streaming``
+    config or the global default.
+
+    For non-A2A platforms, returns ``plat_streaming`` unchanged so the
+    existing per-platform streaming gate logic in gateway/run.py applies
+    as before.
+
+    Pure helper — easy to unit-test.
+    """
+    from gateway.config import Platform
+
+    if getattr(source, "platform", None) == Platform.A2A and not swapped:
+        return False
+    return plat_streaming
+
+
 # Mark this process as a gateway so cli.py's module-level load_cli_config()
 # knows not to clobber TERMINAL_CWD if lazily imported.
 os.environ["_HERMES_GATEWAY"] = "1"
@@ -13754,6 +13814,24 @@ class GatewayRunner:
         # Bridge sync status_callback → async adapter.send for context pressure
         _status_adapter = self.adapters.get(source.platform)
         _status_chat_id = source.chat_id
+
+        # ADR-007: A2A inbound → swap status target to Discord mirror channel.
+        # When successful, GatewayStreamConsumer + status/interim/bg_review
+        # callbacks all post to the mirror channel for human visibility.
+        # When swap fails (no mirror_channel_id or no Discord adapter), the
+        # ADR-007 v2 force-off below disables streaming to protect the
+        # JSONRPC reply path. See _resolve_a2a_mirror_swap docstring.
+        _status_adapter, _status_chat_id, _a2a_mirror_swapped = _resolve_a2a_mirror_swap(
+            source=source,
+            runner_adapters=self.adapters,
+            fallback_adapter=_status_adapter,
+            fallback_chat_id=_status_chat_id,
+        )
+        if _a2a_mirror_swapped:
+            logger.debug(
+                "[A2A] status target swapped to Discord mirror channel %s",
+                _status_chat_id,
+            )
         if source.platform == Platform.FEISHU and source.thread_id and event_message_id:
             # Feishu topics only keep messages inside the topic when they are
             # sent via the reply API with reply_in_thread=true. Status/interim,
@@ -13863,6 +13941,15 @@ class GatewayRunner:
             # streaming config is enabled.
             _plat_streaming = resolve_display_setting(
                 user_config, platform_key, "streaming"
+            )
+            # ADR-007 v2 Risk B Resolution: A2A inbound + swap failed →
+            # force streaming OFF to protect the JSONRPC reply path. Without
+            # this, GatewayStreamConsumer would post partials to the A2A
+            # adapter and corrupt reply_future / message_id.
+            _plat_streaming = _force_off_a2a_streaming_when_no_swap(
+                source=source,
+                plat_streaming=_plat_streaming,
+                swapped=_a2a_mirror_swapped,
             )
             # None = no per-platform override → follow global config
             _streaming_enabled = (
