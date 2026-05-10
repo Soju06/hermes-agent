@@ -1,0 +1,90 @@
+# Sandbox A2A 3-bot mesh — Phase 3a (ADR-008 per-peer routing + ADR-010 Risk A).
+#
+# Extends docker-compose.a2a-sandbox.yml with Bot-C (test3 user) for
+# multi-peer scenario testing.
+#
+# Why 3 bots: ADR-008 per-peer mirror_channels routing requires multi-peer
+# scenario to verify (2-bot has only 1 peer per side). ADR-010 Risk A
+# (Discord rate-limit under concurrent streaming) requires 2 peers
+# simultaneously sending to a 3rd bot.
+#
+# Isolation: same as 2-bot — named volumes only, bridge network, no host
+# mount. Production nachoneko/mymel untouched.
+#
+# Usage:
+#   cd ~/projects/hermes-agent-a2a
+#   HERMES_UID=$(id -u) HERMES_GID=$(id -g) \
+#     docker compose -f docker-compose.a2a-sandbox-3bot.yml up -d --build
+#   # bot-A: 127.0.0.1:9800
+#   # bot-B: not host-published (internal-only, peer of A and C)
+#   # bot-C: 127.0.0.1:9802 (driver target for concurrent driver)
+#   # logs:    docker compose -f docker-compose.a2a-sandbox-3bot.yml logs -f
+#   # cleanup: docker compose -f docker-compose.a2a-sandbox-3bot.yml down
+#
+services:
+  a2a-bot-a:
+    build: .
+    image: hermes-agent:a2a-sandbox
+    container_name: a2a-bot-a
+    restart: "no"
+    networks:
+      - a2a-net
+    ports:
+      - "127.0.0.1:9800:8800"
+    volumes:
+      - bot-a-data:/opt/data
+      - ./docker/sandbox-bot-a-config.yaml:/opt/data/config.yaml:ro
+      - ./docker/sandbox-env-a:/opt/data/.env:ro
+    environment:
+      - HERMES_UID=${HERMES_UID:-10000}
+      - HERMES_GID=${HERMES_GID:-10000}
+      - GATEWAY_ALLOW_ALL_USERS=true
+    command: ["gateway", "run"]
+
+  a2a-bot-b:
+    image: hermes-agent:a2a-sandbox
+    container_name: a2a-bot-b
+    restart: "no"
+    networks:
+      - a2a-net
+    volumes:
+      - bot-b-data:/opt/data
+      - ./docker/sandbox-bot-b-config.yaml:/opt/data/config.yaml:ro
+      - ./docker/sandbox-env-b:/opt/data/.env:ro
+    environment:
+      - HERMES_UID=${HERMES_UID:-10000}
+      - HERMES_GID=${HERMES_GID:-10000}
+      - GATEWAY_ALLOW_ALL_USERS=true
+    depends_on:
+      - a2a-bot-a
+    command: ["gateway", "run"]
+
+  a2a-bot-c:
+    image: hermes-agent:a2a-sandbox
+    container_name: a2a-bot-c
+    restart: "no"
+    networks:
+      - a2a-net
+    ports:
+      - "127.0.0.1:9802:8802"
+    volumes:
+      - bot-c-data:/opt/data
+      - ./docker/sandbox-bot-c-config.yaml:/opt/data/config.yaml:ro
+      - ./docker/sandbox-env-c:/opt/data/.env:ro
+    environment:
+      - HERMES_UID=${HERMES_UID:-10000}
+      - HERMES_GID=${HERMES_GID:-10000}
+      - GATEWAY_ALLOW_ALL_USERS=true
+    depends_on:
+      - a2a-bot-a
+      - a2a-bot-b
+    command: ["gateway", "run"]
+
+networks:
+  a2a-net:
+    driver: bridge
+
+volumes:
+  bot-a-data:
+  bot-b-data:
+  bot-c-data:

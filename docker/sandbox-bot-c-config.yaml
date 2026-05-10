@@ -1,0 +1,40 @@
+provider: anthropic
+model: claude-sonnet-4-20250514
+
+display:
+  platforms:
+    a2a:
+      streaming: true
+      # ADR-008 (Phase 3a): per-peer mirror_channels.
+      # Bot-C가 어느 peer (A or B) 에 응답하든, peer별로 별도 channel.
+      # Bot-A peer (1502705819290963999) → mesh-ac channel
+      # Bot-B peer (1502705976233558126) → mesh-bc channel
+      # default → fallback channel (use existing 1502907302901055679 if needed)
+      mirror_channels:
+        "1502705819290963999": "1502907302901055679"
+        "1502705976233558126": "1502907302901055679"
+        default: "1502907302901055679"
+
+platforms:
+  a2a:
+    enabled: true
+    extra:
+      listen: "0.0.0.0:8802"
+      peers:
+        - "http://a2a-bot-a:8800/"
+        - "http://a2a-bot-b:8801/"
+      max_turns_per_conversation: 2
+      agent_card:
+        url: "http://a2a-bot-c:8802/"
+        name: "C-bot"
+        description: "Sandbox A2A+Discord bot — peer of A-bot and B-bot (Phase 3a)"
+        discord_bot_user_id: "1503019818062839958"
+
+  discord:
+    enabled: true
+
+memory:
+  provider: ""
+
+logging:
+  level: INFO

@@ -5,7 +5,13 @@ display:
   platforms:
     a2a:
       streaming: true
-      mirror_channel_id: "1502907302901055679"
+      # ADR-008 (Phase 3a): per-peer mirror_channels.
+      # Bot-A peer (1502705819290963999) → existing mesh-ab channel (Phase 2.5)
+      # Bot-C peer (1503019818062839958) → mesh-bc channel (Phase 3a new)
+      mirror_channels:
+        "1502705819290963999": "1502907302901055679"
+        "1503019818062839958": "1502907302901055679"
+        default: "1502907302901055679"
 
 platforms:
   a2a:
@@ -14,11 +20,12 @@ platforms:
       listen: "0.0.0.0:8801"
       peers:
         - "http://a2a-bot-a:8800/"
+        - "http://a2a-bot-c:8802/"
       max_turns_per_conversation: 2
       agent_card:
         url: "http://a2a-bot-b:8801/"
         name: "B-bot"
-        description: "Sandbox A2A+Discord bot — peer of A-bot"
+        description: "Sandbox A2A+Discord bot — peer of A-bot and C-bot (Phase 3a)"
         discord_bot_user_id: "1502705976233558126"
 
   discord:
