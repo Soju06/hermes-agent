@@ -559,8 +559,18 @@ class A2AAdapter(BasePlatformAdapter):
         Best-effort: missing mirror_channel_id, empty text, missing Discord
         adapter, or send failure all silently no-op so the inbound dispatch
         path stays alive (ADR-003 Risk D semantic, preserved by ADR-007).
+
+        ADR-008 (Phase 3a): lookup priority for the target channel mirrors the
+        swap helper's chain — `_mirror_channels[peer_id]` → `_mirror_channels["default"]`
+        → `_mirror_channel_id` → no-op. Without this the inbound mirror is
+        silently skipped whenever the config switches to per-peer routing.
         """
-        if not self._mirror_channel_id:
+        target_chan = (
+            self._mirror_channels.get(peer_id)
+            or self._mirror_channels.get("default")
+            or self._mirror_channel_id
+        )
+        if not target_chan:
             return
         if not text or not text.strip():
             return
@@ -575,12 +585,12 @@ class A2AAdapter(BasePlatformAdapter):
             if discord_adapter is None:
                 return
             await discord_adapter.send(
-                chat_id=self._mirror_channel_id,
+                chat_id=target_chan,
                 content=f"📥 from {peer_id}: {text}",
             )
             logger.debug(
                 "[A2A] inbound mirrored to discord channel %s (peer=%s, %d chars)",
-                self._mirror_channel_id,
+                target_chan,
                 peer_id,
                 len(text),
             )
