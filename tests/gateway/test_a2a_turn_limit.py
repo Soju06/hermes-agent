@@ -154,43 +154,6 @@ async def test_at_limit_drops_inbound_no_handler_call(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_drop_does_not_mirror_to_discord(monkeypatch):
-    """Limit-exceeded drops do NOT post to the Discord mirror channel."""
-    spy = _SpyDiscord()
-    _install_runner(monkeypatch, spy)
-    a = _make_adapter(
-        {
-            "max_turns_per_conversation": 2,
-            "mirror_channel_id": "chan-mirror",
-            # Crank rate-limit to ~0 so legitimate mirrors fire fast.
-            "min_dual_send_interval_seconds": 0.001,
-        }
-    )
-
-    async def real_handler(event):
-        return f"reply-{event.text}"
-
-    a.set_message_handler(real_handler)
-    wrapped = a._message_handler
-
-    async def cap_cb(text: str) -> None:
-        pass
-
-    for i in range(2):
-        a._post_response_callbacks[f"m{i}"] = cap_cb
-        await wrapped(_make_event(peer_id="P", context_id="C", message_id=f"m{i}"))
-
-    # Mirror called twice (legitimate replies).
-    assert len(spy.calls) == 2
-
-    # 3rd inbound: dropped; mirror count must not increase.
-    a._post_response_callbacks["m-drop"] = cap_cb
-    await wrapped(_make_event(peer_id="P", context_id="C", message_id="m-drop"))
-
-    assert len(spy.calls) == 2  # unchanged — drop was silent on Discord side
-
-
-@pytest.mark.asyncio
 async def test_counter_per_peer_chat_pair(monkeypatch):
     """(peer_id, context_id) pair is the cap key — different peer/chat is independent."""
     _install_runner(monkeypatch, _SpyDiscord())

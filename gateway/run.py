@@ -4659,10 +4659,10 @@ class GatewayRunner:
                         "[A2A] mirror channel wired from display config: %s",
                         mirror_chan,
                     )
-                # Also let display override min_dual_send_interval_seconds.
-                interval = display_cfg.get("min_dual_send_interval_seconds")
-                if interval is not None:
-                    adapter._min_mirror_interval_s = float(interval)
+                # ADR-007 v2: ADR-003's `min_dual_send_interval_seconds`
+                # rate-limit was removed alongside `_mirror_to_discord` —
+                # GatewayStreamConsumer's `edit_interval` (default 1.0s)
+                # paces edits per-message instead.
             except Exception as e:
                 logger.debug("[A2A] mirror config wiring failed: %s", e)
             return adapter
