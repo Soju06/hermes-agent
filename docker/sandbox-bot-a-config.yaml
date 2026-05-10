@@ -1,33 +1,29 @@
-# Sandbox Bot-A config (Docker)
 provider: anthropic
 model: claude-sonnet-4-20250514
 
 display:
   platforms:
     a2a:
-      streaming: false  # ADR-002 §required-config
+      streaming: false
 
 platforms:
   a2a:
     enabled: true
     extra:
-      # Inside the container we listen on 0.0.0.0 so docker port-publish
-      # (127.0.0.1:9800 → container:8800) can reach us.
       listen: "0.0.0.0:8800"
       peers:
-        # Service-name resolution on the a2a-net bridge.
-        bot-b: "http://a2a-bot-b:8801/"
+        - "http://a2a-bot-b:8801/"
       agent_card:
-        # Public URL advertised in our AgentCard. Peers fetch this card
-        # then send to card.supportedInterfaces[].url. Inside a2a-net
-        # we want service-name resolution so peer containers can reach
-        # us; from the host driver side, we pass BOT_A_URL=http://127.0.0.1:8800/
-        # via `docker exec -e` to bypass card-advertised URL entirely
-        # (resolver target_url overrides for the initial card fetch only).
         url: "http://a2a-bot-a:8800/"
-        name: "Bot-A"
-        description: "Sandbox A2A bot — outbound side (Docker)"
-        discord_bot_user_id: "bot-a"
+        name: "A-bot"
+        description: "Sandbox A2A+Discord bot — peer of B-bot"
+        discord_bot_user_id: "1502705819290963999"
+
+  discord:
+    enabled: true
+    extra:
+      free_response_channels:
+        - "1502907302901055679"
 
 memory:
   provider: ""

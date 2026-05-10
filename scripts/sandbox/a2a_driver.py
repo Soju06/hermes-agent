@@ -27,8 +27,9 @@ import textwrap
 import uuid
 
 PROMPT = (
-    "Hi Bot-A. Please send the following message to peer 'bot-b' via the "
-    "send_message tool with platform='a2a' and target='bot-b': "
+    "Hi Bot-A. Please send the following message to peer "
+    "'1502705976233558126' via the send_message tool with platform='a2a' and "
+    "target='1502705976233558126': "
     "'Bot-B, please reply with exactly: HELLO_FROM_BOT_B (a unique token "
     "we use to verify the reply path).' "
     "After you receive Bot-B's reply, quote it back to me verbatim "

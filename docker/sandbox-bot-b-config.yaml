@@ -1,11 +1,10 @@
-# Sandbox Bot-B config (Docker)
 provider: anthropic
 model: claude-sonnet-4-20250514
 
 display:
   platforms:
     a2a:
-      streaming: false  # ADR-002 §required-config
+      streaming: false
 
 platforms:
   a2a:
@@ -13,15 +12,15 @@ platforms:
     extra:
       listen: "0.0.0.0:8801"
       peers:
-        bot-a: "http://a2a-bot-a:8800/"
+        - "http://a2a-bot-a:8800/"
       agent_card:
-        # Bot-A fetches our card (target_url=http://a2a-bot-b:8801/) then
-        # uses card.supportedInterfaces[].url for the actual send. Set the
-        # advertised url to the service-name endpoint so peers can reach us.
         url: "http://a2a-bot-b:8801/"
-        name: "Bot-B"
-        description: "Sandbox A2A bot — reply side (Docker)"
-        discord_bot_user_id: "bot-b"
+        name: "B-bot"
+        description: "Sandbox A2A+Discord bot — peer of A-bot"
+        discord_bot_user_id: "1502705976233558126"
+
+  discord:
+    enabled: true
 
 memory:
   provider: ""

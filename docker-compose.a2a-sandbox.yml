@@ -43,7 +43,7 @@ services:
     volumes:
       - bot-a-data:/opt/data
       - ./docker/sandbox-bot-a-config.yaml:/opt/data/config.yaml:ro
-      - ./docker/sandbox-env:/opt/data/.env:ro
+      - ./docker/sandbox-env-a:/opt/data/.env:ro
     environment:
       - HERMES_UID=${HERMES_UID:-10000}
       - HERMES_GID=${HERMES_GID:-10000}
@@ -60,7 +60,7 @@ services:
     volumes:
       - bot-b-data:/opt/data
       - ./docker/sandbox-bot-b-config.yaml:/opt/data/config.yaml:ro
-      - ./docker/sandbox-env:/opt/data/.env:ro
+      - ./docker/sandbox-env-b:/opt/data/.env:ro
     environment:
       - HERMES_UID=${HERMES_UID:-10000}
       - HERMES_GID=${HERMES_GID:-10000}

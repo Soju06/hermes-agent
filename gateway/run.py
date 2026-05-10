@@ -312,10 +312,45 @@ def _inject_a2a_dedup_into_discord(platforms: Dict[Any, Any]) -> None:
         return
 
     peers = (a2a_cfg.extra or {}).get("peers") or {}
+    if isinstance(peers, list):
+        # ADR-004: list-form peers are resolved at connect() time (URL → AgentCard
+        # → bot_user_id), so we don't have the dedup map yet at config-load time.
+        # The A2AAdapter wires dedup post-resolve via _wire_dedup_into_discord()
+        # below. Skip this static injection path.
+        return
     if not peers:
         return
 
     discord_cfg.extra["a2a_dedup_config"] = {"peers": dict(peers)}
+
+
+def _wire_dedup_into_discord(
+    a2a_adapter: Any, discord_adapter: Optional[Any]
+) -> None:
+    """Late dedup wiring for ADR-004 list-form peers.
+
+    Called by GatewayRunner after A2AAdapter.connect() resolves well-known
+    peers. Updates the Discord adapter's dedup map in-place from the freshly
+    populated ``a2a_adapter._peers`` dict so ADR-001 §4 strict-dedup keeps
+    working with list-form peer config.
+    """
+    if discord_adapter is None:
+        return
+    peers = getattr(a2a_adapter, "_peers", None) or {}
+    if not peers:
+        return
+    cfg = getattr(discord_adapter, "config", None)
+    if cfg is None:
+        return
+    cfg.extra["a2a_dedup_config"] = {"peers": dict(peers)}
+    # Some Discord adapters cache the dedup map at connect time — re-poke it
+    # if a setter exists.
+    setter = getattr(discord_adapter, "set_a2a_dedup_peers", None)
+    if callable(setter):
+        try:
+            setter(dict(peers))
+        except Exception:
+            pass
 
 
 # Mark this process as a gateway so cli.py's module-level load_cli_config()
@@ -3243,6 +3278,30 @@ class GatewayRunner:
                 if success:
                     self.adapters[platform] = adapter
                     self._sync_voice_mode_state_to_adapter(adapter)
+                    # ADR-004: late dedup wiring for list-form A2A peers.
+                    # When A2A connects, its _peers dict was just populated by
+                    # _resolve_well_known_peers(); inject those into Discord's
+                    # dedup map so ADR-001 §4 keeps working.
+                    if platform == Platform.A2A:
+                        try:
+                            _wire_dedup_into_discord(
+                                adapter, self.adapters.get(Platform.DISCORD)
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                "[A2A] late dedup wiring failed: %s", e
+                            )
+                    elif platform == Platform.DISCORD:
+                        # Other order: Discord connected after A2A.
+                        try:
+                            a2a_adapter = self.adapters.get(Platform.A2A)
+                            if a2a_adapter is not None:
+                                _wire_dedup_into_discord(a2a_adapter, adapter)
+                        except Exception as e:
+                            logger.warning(
+                                "[A2A] late dedup wiring (discord-side) failed: %s",
+                                e,
+                            )
                     connected_count += 1
                     self._update_platform_runtime_status(
                         platform.value,

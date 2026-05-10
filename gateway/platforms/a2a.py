@@ -18,7 +18,7 @@ References:
 
 import asyncio
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -149,7 +149,23 @@ class A2AAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.A2A)
         self._listen_addr: str = config.extra.get("listen", "127.0.0.1:8765")
-        self._peers: Dict[str, str] = config.extra.get("peers", {})  # discord_id -> agent_card_url
+        # Tier-1.5 well-known peer list (ADR-004). Two config forms accepted:
+        #   peers: {"<discord_bot_user_id>": "<agent_card_url>", ...}  (dict)
+        #   peers: ["<agent_card_url>", ...]  (list — auto-resolve at connect)
+        # Mixing forms is rejected to avoid mode confusion.
+        peers_raw = config.extra.get("peers", {})
+        if isinstance(peers_raw, list):
+            self._peers_to_resolve: List[str] = list(peers_raw)
+            self._peers: Dict[str, str] = {}
+        elif isinstance(peers_raw, dict):
+            self._peers_to_resolve = []
+            self._peers = dict(peers_raw)
+        else:
+            raise ValueError(
+                f"a2a.peers must be list[url] or dict[id, url], got {type(peers_raw).__name__}"
+            )
+        # Peers that failed to resolve at connect() time — retried on first send().
+        self._unresolved_peer_urls: set[str] = set()
         self._self_card: Optional[Dict[str, Any]] = config.extra.get("agent_card", None)
         self._server_task: Optional[asyncio.Task] = None
         self._app = None
@@ -216,11 +232,114 @@ class A2AAdapter(BasePlatformAdapter):
 
             logger.info("[A2A] server listening on %s", self._listen_addr)
             self._mark_connected()
+            # ADR-004: resolve list-form peers via AgentCard fetch.
+            # Awaited inline so that connect() doesn't return success before peer
+            # resolution gets a fair shot — but resolution failures are NEVER
+            # treated as connect failures (the local server is up and ready
+            # regardless of remote peer availability).
+            if self._peers_to_resolve:
+                try:
+                    await self._resolve_well_known_peers()
+                except Exception as e:
+                    logger.warning(
+                        "[A2A] well-known peer resolution raised; ignored: %s", e
+                    )
             return True
         except Exception as e:
             logger.error("[A2A] connect failed: %s", e, exc_info=True)
             self._set_fatal_error("connect-failed", str(e), retryable=True)
             return False
+
+    async def _resolve_well_known_peers(self) -> None:
+        """Resolve list-form peers via AgentCard fetch (ADR-004).
+
+        For each URL in ``self._peers_to_resolve``, GET
+        ``<url>/.well-known/agent-card.json``, parse, find the
+        ``discord-identity`` extension, and register the peer keyed by
+        ``bot_user_id``.
+
+        Chicken-egg defense: backoff schedule [1.0s, 3.0s, 7.0s] (~11s budget)
+        per peer. Any peer that still fails is queued in
+        ``self._unresolved_peer_urls`` for lazy retry on first ``send()``.
+
+        Failure semantics:
+          - Network/HTTP errors → retry with backoff
+          - Card has no ``discord-identity`` extension → permanent skip
+          - Card has extension but no ``bot_user_id`` → permanent skip
+          - All retries exhausted → queue for lazy retry
+        """
+        import httpx
+
+        backoffs = [1.0, 3.0, 7.0]
+        for url in self._peers_to_resolve:
+            base = url.rstrip("/")
+            card_url = f"{base}/.well-known/agent-card.json"
+            resolved = False
+            for attempt, delay in enumerate(backoffs):
+                try:
+                    async with httpx.AsyncClient(timeout=5.0) as cli:
+                        r = await cli.get(card_url)
+                        r.raise_for_status()
+                        card = r.json()
+                    extensions = (card.get("capabilities", {}) or {}).get(
+                        "extensions", []
+                    ) or []
+                    ext = next(
+                        (
+                            e
+                            for e in extensions
+                            if str(e.get("uri", "")).endswith("/discord-identity/v1")
+                        ),
+                        None,
+                    )
+                    if not ext:
+                        logger.warning(
+                            "[A2A] peer %s has no discord-identity extension; skipping",
+                            url,
+                        )
+                        # Permanent skip — don't retry, don't queue for lazy retry.
+                        resolved = True  # treat as "handled, move on"
+                        break
+                    bot_id = (ext.get("params") or {}).get("bot_user_id")
+                    if not bot_id:
+                        logger.warning(
+                            "[A2A] peer %s discord-identity has no bot_user_id; skipping",
+                            url,
+                        )
+                        resolved = True
+                        break
+                    self._peers[str(bot_id)] = url
+                    self._unresolved_peer_urls.discard(url)
+                    logger.info(
+                        "[A2A] resolved peer %s → bot_user_id=%s (attempt %d)",
+                        url,
+                        bot_id,
+                        attempt + 1,
+                    )
+                    resolved = True
+                    break
+                except Exception as e:
+                    if attempt < len(backoffs) - 1:
+                        logger.debug(
+                            "[A2A] resolve %s failed (attempt %d/%d): %s; retrying in %.1fs",
+                            url,
+                            attempt + 1,
+                            len(backoffs),
+                            e,
+                            delay,
+                        )
+                        await asyncio.sleep(delay)
+                    else:
+                        logger.warning(
+                            "[A2A] failed to resolve peer %s after %d attempts: %s",
+                            url,
+                            len(backoffs),
+                            e,
+                        )
+            if not resolved:
+                # Queue for lazy retry — send() will try once more if it can't
+                # find the peer in self._peers.
+                self._unresolved_peer_urls.add(url)
 
     async def disconnect(self) -> None:
         logger.info("[A2A] disconnect()")
@@ -264,7 +383,21 @@ class A2AAdapter(BasePlatformAdapter):
         if not A2A_AVAILABLE:
             return SendResult(success=False, error="a2a-sdk not available")
 
-        peer_url = self._peers.get(chat_id) or chat_id
+        peer_url = self._peers.get(chat_id)
+        if peer_url is None and self._unresolved_peer_urls:
+            # ADR-004 lazy retry — peer may have come up after connect().
+            logger.info(
+                "[A2A] peer %s not in registry; retrying well-known resolve",
+                chat_id,
+            )
+            try:
+                await self._resolve_well_known_peers()
+            except Exception as e:
+                logger.warning("[A2A] lazy resolve raised; ignored: %s", e)
+            peer_url = self._peers.get(chat_id)
+        if peer_url is None:
+            # Fall back to treating chat_id as a direct URL (legacy path).
+            peer_url = chat_id
         if not (peer_url.startswith("http://") or peer_url.startswith("https://")):
             return SendResult(success=False, error=f"unknown peer: {chat_id}")
 

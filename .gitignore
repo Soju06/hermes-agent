@@ -73,3 +73,5 @@ models-dev-upstream/
 
 # Sandbox A2A e2e (per-test secrets, do not commit)
 docker/sandbox-env
+docker/sandbox-env-a
+docker/sandbox-env-b
