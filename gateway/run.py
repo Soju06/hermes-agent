@@ -377,7 +377,18 @@ def _resolve_a2a_mirror_swap(
     a2a_adapter = runner_adapters.get(Platform.A2A)
     if a2a_adapter is None:
         return fallback_adapter, fallback_chat_id, False
-    mirror_chan = getattr(a2a_adapter, "_mirror_channel_id", None)
+    # ADR-008 (Phase 3a): per-peer mirror routing. Lookup priority:
+    #   1. _mirror_channels[source.user_id]   — peer match
+    #   2. _mirror_channels["default"]        — default fallback
+    #   3. _mirror_channel_id                 — Phase 2.5 backwards-compat
+    #   4. None → swap=False → force-off
+    peer_id = getattr(source, "user_id", None) or ""
+    mirror_channels = getattr(a2a_adapter, "_mirror_channels", {}) or {}
+    mirror_chan = (
+        mirror_channels.get(peer_id)
+        or mirror_channels.get("default")
+        or getattr(a2a_adapter, "_mirror_channel_id", None)
+    )
     if not mirror_chan:
         return fallback_adapter, fallback_chat_id, False
     discord_adapter = runner_adapters.get(Platform.DISCORD)
@@ -4658,6 +4669,19 @@ class GatewayRunner:
                     logger.info(
                         "[A2A] mirror channel wired from display config: %s",
                         mirror_chan,
+                    )
+                # ADR-008 (Phase 3a): wire per-peer `mirror_channels` dict.
+                # Schema: { "<peer_user_id>": "<channel_id>", "default": "<chan>" }.
+                # Lookup priority handled in `_resolve_a2a_mirror_swap`. Coexists
+                # with `mirror_channel_id` (legacy, used as 3rd-tier fallback).
+                mirror_channels_cfg = display_cfg.get("mirror_channels") or {}
+                if mirror_channels_cfg and not adapter._mirror_channels:
+                    adapter._mirror_channels = {
+                        str(k): str(v) for k, v in mirror_channels_cfg.items()
+                    }
+                    logger.info(
+                        "[A2A] mirror channels wired from display config: %d peer mapping(s)",
+                        len(adapter._mirror_channels),
                     )
                 # ADR-007 v2: ADR-003's `min_dual_send_interval_seconds`
                 # rate-limit was removed alongside `_mirror_to_discord` —

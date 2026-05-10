@@ -181,6 +181,18 @@ class A2AAdapter(BasePlatformAdapter):
         self._mirror_channel_id: Optional[str] = config.extra.get(
             "mirror_channel_id"
         )
+        # ADR-008 (Phase 3a): per-peer mirror routing. Optional dict of
+        # peer_user_id → channel_id. Lookup priority in
+        # `_resolve_a2a_mirror_swap` (gateway/run.py):
+        #   1. _mirror_channels[peer_user_id]    — peer match
+        #   2. _mirror_channels["default"]       — default fallback
+        #   3. _mirror_channel_id                — Phase 2.5 backwards-compat
+        #   4. None → swap=False → force-off
+        # Wired from `display.platforms.a2a.mirror_channels` by gateway/run.py
+        # (or here via extra for sandbox/test convenience).
+        self._mirror_channels: Dict[str, str] = dict(
+            config.extra.get("mirror_channels") or {}
+        )
         # ADR-006 multi-turn termination. Per-(peer_id, context_id) counter
         # capped at `max_turns_per_conversation` (default 5). When the cap is
         # hit, the inbound is dropped: real handler is NOT invoked, mirror is
