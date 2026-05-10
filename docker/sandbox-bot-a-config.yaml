@@ -4,7 +4,7 @@ model: claude-sonnet-4-20250514
 display:
   platforms:
     a2a:
-      streaming: false
+      streaming: true
       mirror_channel_id: "1502907302901055679"
 
 platforms:

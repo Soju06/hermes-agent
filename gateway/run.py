@@ -13828,7 +13828,7 @@ class GatewayRunner:
             fallback_chat_id=_status_chat_id,
         )
         if _a2a_mirror_swapped:
-            logger.debug(
+            logger.info(
                 "[A2A] status target swapped to Discord mirror channel %s",
                 _status_chat_id,
             )
@@ -13958,6 +13958,14 @@ class GatewayRunner:
                 else bool(_plat_streaming)
             )
             _want_stream_deltas = _streaming_enabled
+            # ADR-007 v2 debug: log final streaming decision for A2A inbound
+            if source.platform == Platform.A2A:
+                logger.info(
+                    "[A2A] streaming decision: enabled=%s, swapped=%s, plat_streaming=%s",
+                    _streaming_enabled,
+                    _a2a_mirror_swapped,
+                    _plat_streaming,
+                )
             _want_interim_messages = interim_assistant_messages_enabled
             _want_interim_consumer = _want_interim_messages
             if _want_stream_deltas or _want_interim_consumer:
@@ -13998,10 +14006,10 @@ class GatewayRunner:
                             fresh_final_after_seconds=_fresh_final_secs,
                         )
                         _stream_consumer = GatewayStreamConsumer(
-                            adapter=_adapter,
-                            chat_id=source.chat_id,
+                            adapter=(_status_adapter if _a2a_mirror_swapped else _adapter),
+                            chat_id=(_status_chat_id if _a2a_mirror_swapped else source.chat_id),
                             config=_consumer_cfg,
-                            metadata=_status_thread_metadata,
+                            metadata=(None if _a2a_mirror_swapped else _status_thread_metadata),
                             on_new_message=(
                                 (lambda: progress_queue.put(("__reset__",)))
                                 if progress_queue is not None
@@ -15228,13 +15236,24 @@ class GatewayRunner:
             # sent the final text via the adapter (non-streaming path).
             _previewed = bool(response.get("response_previewed"))
             if not _is_empty_sentinel and (_streamed or _previewed):
-                logger.info(
-                    "Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s).",
-                    session_key or "?",
-                    _streamed,
-                    _previewed,
-                )
-                response["already_sent"] = True
+                # ADR-007 v2: when stream went to Discord mirror (not back to
+                # the A2A source peer), do NOT suppress the source send —
+                # the peer hasn't received anything yet.  Suppressing here
+                # would cause the A2A peer to time out (no Message reply).
+                if _a2a_mirror_swapped:
+                    logger.info(
+                        "[A2A] mirror streamed=%s previewed=%s — NOT suppressing source send (peer still needs reply).",
+                        _streamed,
+                        _previewed,
+                    )
+                else:
+                    logger.info(
+                        "Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s).",
+                        session_key or "?",
+                        _streamed,
+                        _previewed,
+                    )
+                    response["already_sent"] = True
 
         # Schedule deletion of tracked temporary progress bubbles after the
         # final response lands. Failed runs skip this so bubbles remain as
