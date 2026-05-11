@@ -119,10 +119,14 @@ class HermesA2AExecutor:
         self._adapter._post_response_callbacks[message_id] = _capture
 
         try:
-            # ADR-007: mirror inbound peer message to Discord channel before
-            # dispatch so humans see both sides of the conversation. Best-
-            # effort, never blocks reply path.
-            await self._adapter._mirror_a2a_inbound_to_discord(peer_agent_id, text)
+            # ADR-011 v2.1 §8a / Phase 4 Task 37: route inbound side-effect
+            # through the dispatch shim. Picks ADR-011 channel_broadcast
+            # transcript-append path OR ADR-007 v3 mirror path OR disabled
+            # no-op based on adapter._inbound_handler — mutually exclusive.
+            # Best-effort, never blocks reply path.
+            await self._adapter._dispatch_a2a_inbound(
+                message=incoming, peer_agent_id=peer_agent_id, text=text
+            )
 
             await self._adapter.handle_message(event)
             reply_text = await asyncio.wait_for(reply_future, timeout=120.0)
@@ -237,6 +241,57 @@ class A2AAdapter(BasePlatformAdapter):
         self._self_bot_user_id: Optional[str] = (
             str(_self_bot) if _self_bot is not None else None
         )
+        # ADR-011 v2.1 §3 / Phase 4 Task 37: per-channel transcript ring buffer.
+        # Inbound A2A messages arriving via the channel_broadcast handler are
+        # appended here so a later reply-policy check (Task 38) can read the
+        # last N entries as context for the LLM trigger. defaultdict(deque)
+        # auto-creates a maxlen=100 deque per surface channel id — bounded so
+        # a noisy peer channel can't grow memory unbounded.
+        from collections import defaultdict, deque
+        self._channel_transcripts: Dict[str, "deque[Dict[str, Any]]"] = (
+            defaultdict(lambda: deque(maxlen=100))
+        )
+        # ADR-011 v2.1 §8a / Phase 4 Task 37: inbound handler resolution.
+        # Modes:
+        #   "channel_broadcast" — ADR-011 path: transcript append + immediate ack
+        #   "mirror"            — ADR-007 v3 path: stream chunks to Discord mirror
+        #   "disabled"          — neither side-effect (handle_message still runs
+        #                         in the executor for compatibility with the
+        #                         pre-Phase-3a roundtrip tests)
+        # Resolution priority:
+        #   1. Explicit `inbound_handler` config wins (operator decision)
+        #   2. Auto: `channel_peers` set     → "channel_broadcast"
+        #   3. Auto: `mirror_channels` set   → "mirror"
+        #   4. Auto: neither                 → "disabled"
+        # Mixed config (BOTH channel_peers AND mirror_channels) WITHOUT explicit
+        # `inbound_handler` → fatal at __init__. Operator must commit to one
+        # path. Explicit setting overrides the fatal — useful for gradual
+        # migration where the operator wants both data structures loaded but
+        # has picked the active path.
+        _explicit_handler = config.extra.get("inbound_handler")
+        _has_channel_peers = bool(self._channel_peers)
+        _has_mirror_channels = bool(self._mirror_channels)
+        if _explicit_handler:
+            if _explicit_handler not in ("channel_broadcast", "mirror", "disabled"):
+                raise ValueError(
+                    f"[A2A] invalid inbound_handler={_explicit_handler!r}; "
+                    "must be one of 'channel_broadcast' / 'mirror' / 'disabled'"
+                )
+            self._inbound_handler: str = _explicit_handler
+        elif _has_channel_peers and _has_mirror_channels:
+            raise ValueError(
+                "[A2A] mixed config: BOTH `channel_peers` (ADR-011) and "
+                "`mirror_channels` (ADR-007 v3) are set, but no explicit "
+                "`inbound_handler` config was provided. Pick one path "
+                "explicitly: `inbound_handler: channel_broadcast` or "
+                "`inbound_handler: mirror` (or `disabled` to opt out)."
+            )
+        elif _has_channel_peers:
+            self._inbound_handler = "channel_broadcast"
+        elif _has_mirror_channels:
+            self._inbound_handler = "mirror"
+        else:
+            self._inbound_handler = "disabled"
         self._server_task: Optional[asyncio.Task] = None
         self._app = None
         # Per-message-id reply-capture callbacks. Task 7 hoists this onto
@@ -436,6 +491,140 @@ class A2AAdapter(BasePlatformAdapter):
         self._server_task = None
         self._app = None
         self._mark_disconnected()
+
+    # ------------------------------------------------------------------
+    # ADR-011 v2.1 §3 §8a / Phase 4 Task 37: Inbound handler split + transcript
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _decode_inbound_metadata(message) -> Dict[str, str]:
+        """Pull ``hermes.*`` keys out of an inbound ``Message.metadata``
+        protobuf Struct into a plain dict. Missing keys yield empty strings —
+        the inbound handler treats "" as "unset".
+
+        Defensive: also accepts a raw dict (test convenience) and a None
+        metadata field (legacy peer that didn't set it).
+        """
+        if message is None:
+            return {}
+        meta = getattr(message, "metadata", None)
+        if meta is None:
+            return {}
+        out: Dict[str, str] = {}
+        # Real protobuf Struct: .fields is a map of name → Value
+        fields = getattr(meta, "fields", None)
+        if fields is not None:
+            try:
+                for k in fields:
+                    v = fields[k]
+                    if v.HasField("string_value"):
+                        out[k] = v.string_value
+                    elif v.HasField("number_value"):
+                        out[k] = str(v.number_value)
+                    elif v.HasField("bool_value"):
+                        out[k] = "true" if v.bool_value else "false"
+                    else:
+                        out[k] = ""
+                return out
+            except Exception:
+                pass
+        # Fallback: dict-like (test fixture or future SDK change)
+        if isinstance(meta, dict):
+            return {str(k): str(v) for k, v in meta.items()}
+        return {}
+
+    async def _handle_a2a_inbound_channel_broadcast(
+        self, message, peer_agent_id: str
+    ) -> None:
+        """ADR-011 channel_broadcast inbound handler.
+
+        Appends a TranscriptEntry to ``_channel_transcripts[channel_id]`` and
+        returns immediately. Does NOT trigger the LLM — that's Task 38's
+        ``reply_policy``. Does NOT mirror to Discord — that's the legacy
+        ADR-007 v3 ``_mirror_a2a_inbound_to_discord`` path, which is mutually
+        exclusive with this one (handler split per ``_inbound_handler``).
+
+        Entry shape (TranscriptEntry):
+            {
+                "sender_bot_user_id": str,    # from hermes.sender_bot_user_id
+                "text":               str,    # parts[0].text
+                "timestamp":          float,  # time.time()
+                "message_id":         str,    # A2A Message.message_id
+                "surface_message_id": str,    # from hermes.surface_message_id
+                "surface_channel_id": str,    # from hermes.surface_channel_id
+            }
+        """
+        import time
+
+        meta = self._decode_inbound_metadata(message)
+        channel_id = meta.get("hermes.surface_channel_id") or ""
+        if not channel_id:
+            # No surface channel id → can't bucket this transcript. Drop with
+            # a debug log; a malformed legacy peer would land here.
+            logger.debug(
+                "[A2A] channel_broadcast inbound from %s has no "
+                "hermes.surface_channel_id metadata; transcript drop",
+                peer_agent_id,
+            )
+            return
+
+        # Extract the text from parts[0] (Task 36 wire spec: single text part).
+        text = ""
+        try:
+            for p in message.parts:
+                if p.HasField("text"):
+                    text = p.text
+                    break
+        except Exception:
+            pass
+
+        entry: Dict[str, Any] = {
+            "sender_bot_user_id": meta.get("hermes.sender_bot_user_id", "")
+            or peer_agent_id,
+            "text": text,
+            "timestamp": time.time(),
+            "message_id": getattr(message, "message_id", "") or "",
+            "surface_message_id": meta.get("hermes.surface_message_id", ""),
+            "surface_channel_id": channel_id,
+        }
+        self._channel_transcripts[channel_id].append(entry)
+
+    async def _dispatch_a2a_inbound(
+        self, message, peer_agent_id: str, text: str
+    ) -> None:
+        """Executor-side shim — routes A2A inbound to the configured handler.
+
+        Called by ``HermesA2AExecutor.execute`` BEFORE the LLM dispatch loop
+        runs. Picks one of:
+          - ``_inbound_handler == "channel_broadcast"``:
+              call ``_handle_a2a_inbound_channel_broadcast`` (ADR-011 path).
+              Mirror skipped.
+          - ``_inbound_handler == "mirror"``:
+              call ``_mirror_a2a_inbound_to_discord`` (ADR-007 v3 path).
+              Transcript skipped.
+          - ``_inbound_handler == "disabled"``:
+              no-op. Executor still continues to ``handle_message`` for the
+              roundtrip path (pre-Phase-3a compatibility).
+
+        Failures inside the handler are logged but never propagate — a broken
+        handler must not block the inbound ack.
+        """
+        try:
+            if self._inbound_handler == "channel_broadcast":
+                await self._handle_a2a_inbound_channel_broadcast(
+                    message=message, peer_agent_id=peer_agent_id
+                )
+            elif self._inbound_handler == "mirror":
+                await self._mirror_a2a_inbound_to_discord(peer_agent_id, text)
+            else:
+                # "disabled" — no side-effect
+                pass
+        except Exception as e:
+            logger.warning(
+                "[A2A] inbound handler %r raised for peer %s (swallowed): %s",
+                self._inbound_handler,
+                peer_agent_id,
+                e,
+            )
 
     # ------------------------------------------------------------------
     # ADR-011 v2.1 / Phase 4 Task 35: Dual-delivery outbound broadcast
