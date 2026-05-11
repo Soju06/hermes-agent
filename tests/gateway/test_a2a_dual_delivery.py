@@ -32,6 +32,48 @@ def _make_config(**extra: Any) -> PlatformConfig:
     )
 
 
+def _ext_card():
+    """Build a minimal AgentCard advertising channel-broadcast/v1 ext.
+
+    After ADR-012 / Task 40, the broadcast path requires every peer's card
+    in `_peer_cards` to carry the ext or the Tier 1 sender-side guard skips
+    it. These dual-delivery tests focus on the broadcast routing/dispatch
+    logic, NOT on the ext gate, so we pre-seed every peer's card with the
+    ext to keep them from being skipped by Task 40 logic.
+    """
+    from a2a.types import (
+        AgentCard,
+        AgentCapabilities,
+        AgentExtension,
+        AgentInterface,
+        AgentSkill,
+    )
+    from google.protobuf import struct_pb2
+
+    caps = AgentCapabilities(streaming=False)
+    p = struct_pb2.Struct()
+    p.update({"version": 1, "fire_and_forget": True})
+    caps.extensions.append(
+        AgentExtension(
+            uri="https://hermes.nous/extensions/channel-broadcast/v1",
+            description="ADR-012 ext",
+            required=False,
+            params=p,
+        )
+    )
+    return AgentCard(
+        name="peer", description="peer", version="0.1.0",
+        capabilities=caps,
+        skills=[AgentSkill(
+            id="chat", name="chat", description="chat",
+            tags=["chat"], input_modes=["text/plain"], output_modes=["text/plain"],
+        )],
+        default_input_modes=["text/plain"],
+        default_output_modes=["text/plain"],
+        supported_interfaces=[AgentInterface(url="http://peer/", protocol_binding="JSONRPC")],
+    )
+
+
 def _make_adapter_with_peers(
     *,
     self_bot_user_id: str = "bot_self",
@@ -39,7 +81,13 @@ def _make_adapter_with_peers(
     peers: dict = None,
     peer_cards: dict = None,
 ) -> A2AAdapter:
-    """Adapter with `_self_bot_user_id`, `_channel_peers`, `_peers`, `_peer_cards` pre-loaded."""
+    """Adapter with `_self_bot_user_id`, `_channel_peers`, `_peers`, `_peer_cards` pre-loaded.
+
+    If `peer_cards` is None, auto-seed every peer in `peers` with an ext-having
+    card so the Task 40 Tier 1 sender-side guard doesn't skip them. Tests that
+    want to exercise the ext-gate explicitly should pass `peer_cards={}` (empty)
+    or a partial map.
+    """
     config = _make_config(
         listen="127.0.0.1:9999",
         discord_bot_user_id=self_bot_user_id,
@@ -47,8 +95,10 @@ def _make_adapter_with_peers(
         peers=peers or {},
     )
     adapter = A2AAdapter(config)
-    if peer_cards:
-        adapter._peer_cards.update(peer_cards)
+    if peer_cards is None:
+        # Default — every peer in `peers` gets an ext-having card
+        peer_cards = {pid: _ext_card() for pid in (peers or {})}
+    adapter._peer_cards.update(peer_cards)
     if peers:
         adapter._peers.update(peers)
     return adapter

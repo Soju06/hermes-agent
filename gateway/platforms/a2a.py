@@ -338,6 +338,36 @@ class A2AAdapter(BasePlatformAdapter):
         # now < timestamp + cooldown_after_silent_decision (except mentions).
         self._consecutive_self_replies: Dict[str, int] = {}
         self._last_silent_decision: Dict[str, float] = {}
+        # ADR-011 v2.1 §10a / ADR-012 / Phase 4 Task 40: mixed deployment guard.
+        # `_legacy_inbound` controls how channel_broadcast handler treats
+        # inbound payloads MISSING `hermes.sender_bot_user_id` metadata (the
+        # tell-tale of a legacy ADR-007/008 caller speaking the wire):
+        #   "reject" (default)      — ack-only, transcript drop, no LLM trigger
+        #   "accept_as_user"        — route through legacy user-role handler
+        #                             (`handle_message`); transcript NOT appended
+        #                             (caller is treated as a user, not a peer).
+        #                             ⚠ loop risk: legacy bot's reply could come
+        #                             back as another A2A inbound — Tier 3 guard
+        #                             (Task 38 max_consecutive + Task 39 dedup)
+        #                             provides the final safety net.
+        #   "accept_as_peer"        — transcript appended with sender inferred
+        #                             from `peer_agent_id` (executor extracts
+        #                             from caller AgentCard during resolve).
+        # ADR-011 §10a "기본 reject" — Soju spec.
+        _legacy_inbound = config.extra.get("legacy_inbound", "reject")
+        if _legacy_inbound not in ("reject", "accept_as_user", "accept_as_peer"):
+            raise ValueError(
+                f"[A2A] invalid legacy_inbound={_legacy_inbound!r}; must be "
+                "one of 'reject' / 'accept_as_user' / 'accept_as_peer'"
+            )
+        self._legacy_inbound: str = _legacy_inbound
+        # ADR-012 §params.supported_surfaces: which human-surface platforms
+        # this bot bridges. Phase 4 default = ["discord"] (Telegram bridge
+        # lands in Phase 5+). Operator-overridable via config.extra for
+        # forward-compat — extension params advertise this so peers can
+        # filter by surface support.
+        _surfaces = config.extra.get("supported_surfaces") or ["discord"]
+        self._supported_surfaces: List[str] = [str(s) for s in _surfaces]
         self._server_task: Optional[asyncio.Task] = None
         self._app = None
         # Per-message-id reply-capture callbacks. Task 7 hoists this onto
@@ -540,7 +570,31 @@ class A2AAdapter(BasePlatformAdapter):
 
     # ------------------------------------------------------------------
     # ADR-011 v2.1 §3 §8a / Phase 4 Task 37: Inbound handler split + transcript
+    # ADR-011 v2.1 §10a / ADR-012 / Phase 4 Task 40: mixed deployment guard
     # ------------------------------------------------------------------
+    @staticmethod
+    def _has_channel_broadcast_ext(card) -> bool:
+        """Return True if ``card`` advertises the ADR-012
+        ``hermes-channel-broadcast/v1`` capability extension.
+
+        Used by Tier 1 sender-side guard in ``_broadcast_to_channel_peers``
+        to skip legacy peers that don't speak the dual-delivery wire.
+
+        Defensive: accepts None and any object lacking
+        ``capabilities.extensions`` (returns False).
+        """
+        if card is None:
+            return False
+        caps = getattr(card, "capabilities", None)
+        if caps is None:
+            return False
+        exts = getattr(caps, "extensions", None) or []
+        for ext in exts:
+            uri = str(getattr(ext, "uri", "") or "")
+            if uri.endswith("/channel-broadcast/v1"):
+                return True
+        return False
+
     @staticmethod
     def _decode_inbound_metadata(message) -> Dict[str, str]:
         """Pull ``hermes.*`` keys out of an inbound ``Message.metadata``
@@ -804,6 +858,47 @@ class A2AAdapter(BasePlatformAdapter):
             )
             return
 
+        # ADR-011 §10a / Phase 4 Task 40 — Tier 2 receiver-side guard.
+        # If sender_id is missing, the caller is a legacy bot (no ADR-011 wire
+        # metadata). Route per `_legacy_inbound` config:
+        #   "reject"          — silent drop (default), no transcript
+        #   "accept_as_user"  — transcript drop, executor will route the
+        #                       message through the legacy user-role
+        #                       handler (handle_message) via the Tier 2-aware
+        #                       executor wiring (Task 35b.4 scope; for now
+        #                       the handler just drops here and the executor
+        #                       falls through to handle_message naturally).
+        #   "accept_as_peer"  — transcript appended with sender inferred from
+        #                       peer_agent_id (executor extracts it from the
+        #                       caller AgentCard during resolve).
+        if not sender:
+            if self._legacy_inbound == "reject":
+                logger.debug(
+                    "[A2A] channel_broadcast inbound from legacy peer %s; "
+                    "legacy_inbound=reject — dropping",
+                    peer_agent_id,
+                )
+                return
+            if self._legacy_inbound == "accept_as_user":
+                logger.debug(
+                    "[A2A] channel_broadcast inbound from legacy peer %s; "
+                    "legacy_inbound=accept_as_user — transcript drop, "
+                    "executor will route to legacy user-role handler",
+                    peer_agent_id,
+                )
+                return
+            # accept_as_peer — fall through. The sender used for the
+            # transcript entry is the peer_agent_id passed in by the executor
+            # (extracted from the caller's AgentCard discord-identity
+            # extension during resolve).
+            logger.debug(
+                "[A2A] channel_broadcast inbound from legacy peer %s; "
+                "legacy_inbound=accept_as_peer — inferring sender from "
+                "peer_agent_id",
+                peer_agent_id,
+            )
+            sender = peer_agent_id
+
         # (2) Message-id dedup — same A2A Message.message_id within TTL.
         a2a_msg_id = getattr(message, "message_id", "") or ""
         if a2a_msg_id and a2a_msg_id in self._recently_seen:
@@ -1027,6 +1122,20 @@ class A2AAdapter(BasePlatformAdapter):
                 logger.debug(
                     "[A2A] broadcast: peer %s not in _peers; skipping (Phase 4 "
                     "scope — no lazy resolve)",
+                    peer_id,
+                )
+                continue
+            # ADR-011 §10a / ADR-012 / Phase 4 Task 40 — Tier 1 sender-side
+            # guard: skip peers that don't advertise the channel-broadcast/v1
+            # capability. Legacy bots without the ext would receive the
+            # broadcast and process it via ADR-007 v3 user-role handler,
+            # potentially looping. Requires `_peer_cards[peer_id]` to be
+            # populated (Task 34 wires this in _resolve_well_known_peers).
+            peer_card = self._peer_cards.get(peer_id)
+            if not self._has_channel_broadcast_ext(peer_card):
+                logger.debug(
+                    "[A2A] broadcast: peer %s lacks channel-broadcast/v1 "
+                    "extension (legacy or unresolved); Tier 1 skip",
                     peer_id,
                 )
                 continue
@@ -1472,13 +1581,15 @@ class A2AAdapter(BasePlatformAdapter):
 
         capabilities = AgentCapabilities(streaming=False)
 
+        # struct_pb2 used by both discord-identity (line below) and
+        # channel-broadcast/v1 (ADR-012) extension param packing.
+        from google.protobuf import struct_pb2
+
         # Discord identity → AgentExtension on capabilities.
         # Peer adapters use this to resolve the sender's Discord bot user_id
         # for the strict-dedup path (Discord echo from registered peer → drop).
         discord_bot_id = cfg.get("discord_bot_user_id")
         if discord_bot_id:
-            from google.protobuf import struct_pb2
-
             params = struct_pb2.Struct()
             params.update(
                 {
@@ -1492,6 +1603,35 @@ class A2AAdapter(BasePlatformAdapter):
                     description="Discord bot identity for A2A↔Discord dedup",
                     required=False,
                     params=params,
+                )
+            )
+
+        # ADR-012 / Phase 4 Task 40: channel-broadcast/v1 capability marker.
+        # Only ADR-011-enabled bots advertise this — sender-side Tier 1 guard
+        # uses it to skip legacy peers (ADR-011 §10a R2 defense).
+        # URI namespace: `hermes.nous/extensions/...` (matches discord-identity).
+        # Paper (ADR-012 v1) wrote `hermes-a2a.dev/...`; code uses `hermes.nous/...`
+        # for consistency with the Phase 1 namespace decision. ADR-011 v2.3
+        # paper amend records this mapping.
+        if self._inbound_handler == "channel_broadcast":
+            cb_params = struct_pb2.Struct()
+            cb_params.update(
+                {
+                    "version": 1,
+                    "supported_surfaces": list(self._supported_surfaces),
+                    "fire_and_forget": True,
+                }
+            )
+            capabilities.extensions.append(
+                AgentExtension(
+                    uri="https://hermes.nous/extensions/channel-broadcast/v1",
+                    description=(
+                        "Hermes channel-broadcast capability marker (ADR-012). "
+                        "ADR-011-enabled bots advertise this to participate in "
+                        "dual-delivery (human surface + A2A wire). Absence = legacy bot."
+                    ),
+                    required=False,
+                    params=cb_params,
                 )
             )
 
