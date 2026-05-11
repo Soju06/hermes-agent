@@ -225,6 +225,18 @@ class A2AAdapter(BasePlatformAdapter):
             config.extra.get("max_turns_per_conversation", 5)
         )
         self._self_card: Optional[Dict[str, Any]] = config.extra.get("agent_card", None)
+        # ADR-011 v2.1 (Phase 4 Task 35): self bot_user_id, mirrored here from
+        # `discord_bot_user_id` for the channel-broadcast self-skip path.
+        # `_broadcast_to_channel_peers` excludes this id from broadcast targets
+        # to prevent the bot from emitting an A2A copy of its own reply back
+        # to itself (which would loop into the inbound handler). Default None
+        # — when unset, broadcast still runs but the self-skip is a no-op
+        # (callers should always configure `discord_bot_user_id` when using
+        # channel_peers).
+        _self_bot = config.extra.get("discord_bot_user_id")
+        self._self_bot_user_id: Optional[str] = (
+            str(_self_bot) if _self_bot is not None else None
+        )
         self._server_task: Optional[asyncio.Task] = None
         self._app = None
         # Per-message-id reply-capture callbacks. Task 7 hoists this onto
@@ -424,6 +436,163 @@ class A2AAdapter(BasePlatformAdapter):
         self._server_task = None
         self._app = None
         self._mark_disconnected()
+
+    # ------------------------------------------------------------------
+    # ADR-011 v2.1 / Phase 4 Task 35: Dual-delivery outbound broadcast
+    # ------------------------------------------------------------------
+    async def _broadcast_to_channel_peers(
+        self,
+        channel_id: str,
+        content: str,
+        surface_message_id: str,
+        surface_platform: str,
+        context_id: str,
+    ) -> None:
+        """Fire-and-forget broadcast the bot's reply to all channel peers.
+
+        Iterates ``self._channel_peers[channel_id]`` (the bot user_ids subscribed
+        to this surface channel via static config — mechanism (a) in
+        ADR-011 §2). For each peer that is NOT ourselves, schedules a
+        fire-and-forget ``_send_fire_and_forget`` task and returns immediately
+        without awaiting peer replies.
+
+        Scope notes (Phase 4):
+        - Caller side guard for ``hermes-channel-broadcast/v1`` extension lands
+          in Task 40 (R2 Tier 1). Phase 4 broadcasts to every peer in the
+          channel regardless of capability; the extension check is added in
+          Task 40 once `_has_channel_broadcast_ext` exists.
+        - Peers not in ``self._peers`` (i.e. not resolved at startup) are
+          skipped silently with a debug log — same lazy-retry semantics as
+          ``send()`` will catch them on a future broadcast.
+        - Self-skip uses ``self._self_bot_user_id``. If unset (None), no
+          skip happens — operators using ``channel_peers`` must configure
+          ``discord_bot_user_id`` or risk self-echo loops (handled defensively
+          in Task 39 anyway).
+        - Failures inside ``_send_fire_and_forget`` are logged but never
+          propagate — a broken peer must not break the sender's reply flow.
+
+        This method itself returns within a few ms once the peer tasks are
+        scheduled — fire-and-forget semantics are preserved end-to-end.
+        """
+        peer_ids = self._channel_peers.get(str(channel_id))
+        if not peer_ids:
+            return
+
+        metadata = {
+            "hermes.sender_bot_user_id": self._self_bot_user_id,
+            "hermes.surface_channel_id": str(channel_id),
+            "hermes.surface_message_id": str(surface_message_id),
+            "hermes.surface_platform": surface_platform,
+            "hermes.context_id": str(context_id),
+        }
+
+        for peer_id in peer_ids:
+            peer_id = str(peer_id)
+            if (
+                self._self_bot_user_id is not None
+                and peer_id == self._self_bot_user_id
+            ):
+                # ADR-011 §6: never broadcast to self — would self-echo.
+                continue
+            peer_url = self._peers.get(peer_id)
+            if peer_url is None:
+                logger.debug(
+                    "[A2A] broadcast: peer %s not in _peers; skipping (Phase 4 "
+                    "scope — no lazy resolve)",
+                    peer_id,
+                )
+                continue
+            # Fire-and-forget — schedule the task and move on. The broadcast
+            # method itself returns within ms regardless of peer latency.
+            asyncio.create_task(
+                self._send_fire_and_forget(
+                    peer_id=peer_id,
+                    peer_url=peer_url,
+                    content=content,
+                    metadata=metadata,
+                )
+            )
+
+    async def _send_fire_and_forget(
+        self,
+        peer_id: str,
+        peer_url: str,
+        content: str,
+        metadata: Dict[str, Any],
+    ) -> None:
+        """Send a single broadcast message to one peer with fire-and-forget
+        semantics (a2a-sdk 1.0.2 `SendMessageConfiguration.return_immediately=True`).
+
+        - Server-side: ``default_request_handler_v2.py`` breaks on the first
+          event when ``return_immediately`` is set, so the peer agent's reply
+          path runs in background and never blocks this caller's network round
+          trip.
+        - Client-side: we still consume the AsyncIterator but it closes
+          immediately after the task acknowledgement, so the call returns in
+          well under a second even when the peer is slow.
+        - Exceptions are swallowed and logged — broadcast must not propagate
+          peer failures to the sender's reply flow.
+        """
+        if not A2A_AVAILABLE:
+            logger.warning(
+                "[A2A] broadcast skipped: a2a-sdk not available (peer=%s)", peer_id
+            )
+            return
+
+        try:
+            from a2a.client import A2ACardResolver, ClientConfig, ClientFactory
+            from a2a.types import (
+                Message as A2AMessage,
+                Part as A2APart,
+                Role,
+                SendMessageConfiguration,
+                SendMessageRequest,
+            )
+            from google.protobuf import struct_pb2
+            import httpx
+            import uuid
+
+            message_id = str(uuid.uuid4())
+            ctx_id = str(metadata.get("hermes.context_id") or peer_id)
+
+            # Pack metadata into a protobuf Struct (A2A Message.metadata field).
+            meta_struct = struct_pb2.Struct()
+            # struct_pb2.Struct.update only accepts simple types; coerce None → ""
+            meta_struct.update(
+                {k: (v if v is not None else "") for k, v in metadata.items()}
+            )
+
+            async with httpx.AsyncClient(timeout=10.0) as http:
+                resolver = A2ACardResolver(http, peer_url)
+                peer_card = await resolver.get_agent_card()
+                client = ClientFactory(
+                    ClientConfig(httpx_client=http, streaming=False)
+                ).create(peer_card)
+
+                req = SendMessageRequest(
+                    message=A2AMessage(
+                        role=Role.ROLE_AGENT,
+                        parts=[A2APart(text=content)],
+                        message_id=message_id,
+                        context_id=ctx_id,
+                        metadata=meta_struct,
+                    ),
+                    configuration=SendMessageConfiguration(
+                        return_immediately=True,
+                    ),
+                )
+
+                # Consume the iterator; with return_immediately=True the server
+                # closes the stream after the first ack event.
+                async for _resp in client.send_message(req):
+                    break
+
+        except Exception as e:
+            logger.warning(
+                "[A2A] broadcast to %s failed (fire-and-forget, swallowed): %s",
+                peer_id,
+                e,
+            )
 
     async def send(
         self,
