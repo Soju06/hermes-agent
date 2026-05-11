@@ -308,6 +308,36 @@ class A2AAdapter(BasePlatformAdapter):
         self._loop_prevention_ttl_seconds: int = int(
             config.extra.get("loop_prevention_ttl_seconds", 300)
         )
+        # ADR-011 v2.1 §6 / Phase 4 Task 38: reply trigger policy.
+        # Default mode='autonomous' per Soju Q3 directive. mention_only and
+        # hybrid available via config. cost guards (max_consecutive_self_replies +
+        # cooldown_after_silent_decision) apply to autonomous + hybrid; mention_only
+        # ignores them because direct address always overrides.
+        _raw_policy = dict(config.extra.get("reply_policy") or {})
+        _mode = _raw_policy.get("mode", "autonomous")
+        if _mode not in ("autonomous", "mention_only", "hybrid"):
+            raise ValueError(
+                f"[A2A] invalid reply_policy.mode={_mode!r}; must be one of "
+                "'autonomous' / 'mention_only' / 'hybrid'"
+            )
+        self._reply_policy: Dict[str, Any] = {
+            "mode": _mode,
+            "max_consecutive_self_replies": int(
+                _raw_policy.get("max_consecutive_self_replies", 3)
+            ),
+            "cooldown_after_silent_decision": int(
+                _raw_policy.get("cooldown_after_silent_decision", 30)
+            ),
+            "channel_hints": list(_raw_policy.get("channel_hints") or []),
+        }
+        # Per-channel counters/timestamps for the cost guards.
+        # `_consecutive_self_replies[channel_id]` increments on mark_self_reply,
+        # resets on mark_other_inbound or any user message.
+        # `_last_silent_decision[channel_id]` is the timestamp of the last
+        # silent-decision marker; should_trigger_reply skips while
+        # now < timestamp + cooldown_after_silent_decision (except mentions).
+        self._consecutive_self_replies: Dict[str, int] = {}
+        self._last_silent_decision: Dict[str, float] = {}
         self._server_task: Optional[asyncio.Task] = None
         self._app = None
         # Per-message-id reply-capture callbacks. Task 7 hoists this onto
@@ -580,6 +610,150 @@ class A2AAdapter(BasePlatformAdapter):
             return
         self._recently_seen_surface[str(surface_message_id)] = time.time()
 
+    # ------------------------------------------------------------------
+    # ADR-011 v2.1 §6 / Phase 4 Task 38: Reply trigger policy
+    # ------------------------------------------------------------------
+    def should_trigger_reply(
+        self,
+        channel_id: str,
+        *,
+        user_message: str,
+        mentioned_user_ids: Optional[set] = None,
+        is_user_message: bool = True,
+    ) -> bool:
+        """Decide whether to dispatch an LLM reply for this channel event.
+
+        Decision tree per ADR-011 §6 Q3:
+
+          mention_only:
+            - is_user_message AND self._self_bot_user_id ∈ mentioned_user_ids
+              → True
+            - else → False
+            - Cost guards do NOT apply — direct address always overrides.
+
+          autonomous (default):
+            - Cost guard A: consecutive self-replies cap. If
+              `_consecutive_self_replies[channel_id]` ≥ max, return False
+              UNLESS the caller is explicitly mentioned (mentions always win).
+            - Cost guard B: cooldown after silent decision. If
+              `now < _last_silent_decision[channel_id] + cooldown`, return
+              False UNLESS the caller is explicitly mentioned.
+            - Otherwise → True (every event becomes a reply candidate).
+
+          hybrid:
+            - Mention → True (same as mention_only).
+            - Channel-hint regex match against user_message → True.
+              Regex compiled lazily; invalid pattern logged + skipped.
+            - is_user_message=False (peer A2A broadcast) without hint match
+              → False. hybrid is mention-or-explicit-hint, not autonomous.
+
+        `mentioned_user_ids` is a set of string user-ids extracted by the
+        platform adapter (Discord/Telegram) BEFORE calling this. Empty set
+        or None == nobody mentioned.
+        """
+        mode = self._reply_policy["mode"]
+        mentions = mentioned_user_ids or set()
+        is_self_mentioned = bool(
+            self._self_bot_user_id and self._self_bot_user_id in mentions
+        )
+
+        if mode == "mention_only":
+            # Direct address only. Peer broadcasts never trigger here.
+            return bool(is_user_message and is_self_mentioned)
+
+        # autonomous + hybrid share the cost guards (with mention bypass)
+        if not is_self_mentioned:
+            # Consecutive self-replies cap
+            cap = int(self._reply_policy["max_consecutive_self_replies"])
+            if self._consecutive_self_replies.get(str(channel_id), 0) >= cap:
+                return False
+            # Cooldown window
+            cooldown = int(self._reply_policy["cooldown_after_silent_decision"])
+            last_silent = self._last_silent_decision.get(str(channel_id))
+            if last_silent is not None and time.time() < last_silent + cooldown:
+                return False
+
+        if mode == "autonomous":
+            return True
+
+        # hybrid:
+        if is_self_mentioned:
+            return True
+        for pat in self._reply_policy["channel_hints"]:
+            try:
+                import re
+
+                if re.search(pat, user_message or ""):
+                    return True
+            except Exception as e:
+                logger.warning(
+                    "[A2A] reply_policy hint regex %r failed; skipping: %s",
+                    pat,
+                    e,
+                )
+        return False
+
+    def mark_self_reply(self, channel_id: str) -> None:
+        """Increment the consecutive-self-replies counter for this channel.
+
+        Task 35b wiring will call this whenever THIS bot emits a reply that
+        broadcasts to channel_peers (the chain begins immediately after the
+        reply lands on Discord/Telegram, before the next inbound).
+        """
+        cid = str(channel_id)
+        self._consecutive_self_replies[cid] = (
+            self._consecutive_self_replies.get(cid, 0) + 1
+        )
+
+    def mark_other_inbound(self, channel_id: str) -> None:
+        """Reset the consecutive counter for this channel.
+
+        Called whenever a DIFFERENT sender (other bot, user) lands a message
+        in the channel — the chain of self-replies is broken so the cap
+        starts fresh. Channel-broadcast handler (Task 37) and any
+        user-message hook from gateway/run.py (Task 35b) call this.
+        """
+        self._consecutive_self_replies[str(channel_id)] = 0
+
+    def mark_silent_decision(self, channel_id: str) -> None:
+        """Start the cooldown window for this channel.
+
+        Called by Task 35b's reply hook when the LLM evaluates the channel
+        and decides not to reply ('silent'). For `cooldown_after_silent_decision`
+        seconds afterwards, should_trigger_reply will return False for
+        non-mention triggers — gives the channel a breather before the bot
+        re-evaluates.
+        """
+        self._last_silent_decision[str(channel_id)] = time.time()
+
+    def build_transcript_context(
+        self, channel_id: str, max_entries: int = 20
+    ) -> List[Dict[str, Any]]:
+        """Return the last `max_entries` TranscriptEntry rows for this channel,
+        augmented with an `is_self` flag derived from self._self_bot_user_id.
+
+        Task 35b's gateway wiring will call this when it decides to dispatch
+        an LLM reply (after `should_trigger_reply` returns True). The wiring
+        is free to render the entries into the conversation_history slot it
+        prefers — typically an assistant-role message for `is_self`, otherwise
+        a system-or-user message labelled by `sender_bot_user_id`. This
+        helper just returns the data; the splice site decides the layout.
+        """
+        deq = self._channel_transcripts.get(str(channel_id))
+        if not deq:
+            return []
+        # Take last N (deque slicing isn't supported; convert + tail)
+        recent = list(deq)[-int(max_entries):]
+        out: List[Dict[str, Any]] = []
+        for entry in recent:
+            row = dict(entry)
+            row["is_self"] = bool(
+                self._self_bot_user_id
+                and entry.get("sender_bot_user_id") == self._self_bot_user_id
+            )
+            out.append(row)
+        return out
+
     async def _handle_a2a_inbound_channel_broadcast(
         self, message, peer_agent_id: str
     ) -> None:
@@ -680,6 +854,10 @@ class A2AAdapter(BasePlatformAdapter):
             self._recently_seen[a2a_msg_id] = now
         if surface_id:
             self._recently_seen_surface[surface_id] = now
+        # ADR-011 §6 / Task 38: a non-self inbound breaks the consecutive
+        # self-reply chain. The self-echo path already returned above, so
+        # any inbound that lands here is by definition NOT us.
+        self.mark_other_inbound(channel_id)
 
     async def _dispatch_a2a_inbound(
         self, message, peer_agent_id: str, text: str
