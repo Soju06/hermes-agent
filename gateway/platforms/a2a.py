@@ -440,6 +440,74 @@ class A2AAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
     # ADR-011 v2.1 / Phase 4 Task 35: Dual-delivery outbound broadcast
     # ------------------------------------------------------------------
+    def _build_broadcast_payload(
+        self,
+        text: str,
+        surface_channel_id: str,
+        surface_message_id: str,
+        surface_platform: str,
+        context_id: str,
+    ):
+        """Construct the A2A ``Message`` for a channel-broadcast wire send.
+
+        Follows ADR-011 v2.1 §3 (Q1 directive: text + minimal ``hermes.*``
+        metadata):
+
+            role     = ROLE_AGENT       (peer-to-peer, ADR-001)
+            parts    = [text part]
+            metadata = Struct{
+                "hermes.sender_bot_user_id": self._self_bot_user_id,
+                "hermes.surface_channel_id": surface_channel_id,
+                "hermes.surface_message_id": surface_message_id,
+                "hermes.surface_platform":   surface_platform,
+                "hermes.context_id":         context_id,
+            }
+            message_id = fresh uuid4
+            context_id = mirrored
+
+        Plan §Task 36 §3 chunking convention: when a reply was streamed in N
+        chunks on the human surface, the *caller* passes the LAST chunk's
+        surface message id here. This helper just propagates whatever it's
+        given — it doesn't track chunks itself.
+
+        Spec-vs-SDK drift note: ADR-011 v2.1 §3 paper writes ``role="assistant"``
+        as a conceptual dict-style spec. a2a-sdk 1.0.2's protobuf ``Role`` enum
+        only has ``ROLE_USER`` and ``ROLE_AGENT`` — no "assistant" value. Since
+        ADR-001 frames this as peer-to-peer agent communication, ``ROLE_AGENT``
+        is the correct mapping. ADR-011 v2.2 minor amend should record this
+        mapping so future readers don't trip on it.
+        """
+        from a2a.types import (
+            Message as A2AMessage,
+            Part as A2APart,
+            Role,
+        )
+        from google.protobuf import struct_pb2
+        import uuid
+
+        # Pack hermes.* metadata into a protobuf Struct. struct_pb2.Struct
+        # rejects None (NULL must be set explicitly), so we coerce None to ""
+        # — channel-broadcast metadata fields are all conceptually strings
+        # and "" carries the "unset" signal downstream.
+        meta_struct = struct_pb2.Struct()
+        meta_struct.update(
+            {
+                "hermes.sender_bot_user_id": self._self_bot_user_id or "",
+                "hermes.surface_channel_id": str(surface_channel_id),
+                "hermes.surface_message_id": str(surface_message_id),
+                "hermes.surface_platform": str(surface_platform),
+                "hermes.context_id": str(context_id),
+            }
+        )
+
+        return A2AMessage(
+            role=Role.ROLE_AGENT,
+            parts=[A2APart(text=text)],
+            message_id=str(uuid.uuid4()),
+            context_id=str(context_id),
+            metadata=meta_struct,
+        )
+
     async def _broadcast_to_channel_peers(
         self,
         channel_id: str,
@@ -542,24 +610,23 @@ class A2AAdapter(BasePlatformAdapter):
         try:
             from a2a.client import A2ACardResolver, ClientConfig, ClientFactory
             from a2a.types import (
-                Message as A2AMessage,
-                Part as A2APart,
-                Role,
                 SendMessageConfiguration,
                 SendMessageRequest,
             )
-            from google.protobuf import struct_pb2
             import httpx
-            import uuid
 
-            message_id = str(uuid.uuid4())
-            ctx_id = str(metadata.get("hermes.context_id") or peer_id)
-
-            # Pack metadata into a protobuf Struct (A2A Message.metadata field).
-            meta_struct = struct_pb2.Struct()
-            # struct_pb2.Struct.update only accepts simple types; coerce None → ""
-            meta_struct.update(
-                {k: (v if v is not None else "") for k, v in metadata.items()}
+            # Reconstruct the broadcast payload via the Task 36 helper so the
+            # wire format stays in one place (DRY + spec-locked). Caller fed us
+            # the flat `metadata` dict; unpack it back into the helper's named
+            # kwargs. The helper re-builds the protobuf Struct from scratch —
+            # we don't reuse the dict directly because the SDK Message field
+            # wants a Struct, not a Python dict.
+            payload = self._build_broadcast_payload(
+                text=content,
+                surface_channel_id=metadata.get("hermes.surface_channel_id", ""),
+                surface_message_id=metadata.get("hermes.surface_message_id", ""),
+                surface_platform=metadata.get("hermes.surface_platform", ""),
+                context_id=metadata.get("hermes.context_id") or peer_id,
             )
 
             async with httpx.AsyncClient(timeout=10.0) as http:
@@ -570,13 +637,7 @@ class A2AAdapter(BasePlatformAdapter):
                 ).create(peer_card)
 
                 req = SendMessageRequest(
-                    message=A2AMessage(
-                        role=Role.ROLE_AGENT,
-                        parts=[A2APart(text=content)],
-                        message_id=message_id,
-                        context_id=ctx_id,
-                        metadata=meta_struct,
-                    ),
+                    message=payload,
                     configuration=SendMessageConfiguration(
                         return_immediately=True,
                     ),
