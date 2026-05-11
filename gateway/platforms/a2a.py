@@ -193,6 +193,28 @@ class A2AAdapter(BasePlatformAdapter):
         self._mirror_channels: Dict[str, str] = dict(
             config.extra.get("mirror_channels") or {}
         )
+        # ADR-011 v2.1 (Phase 4 Task 34): channel-bound peer group for
+        # channel-broadcast A2A wire. Maps surface channel id (Discord
+        # channel / Telegram chat) → list of bot_user_ids participating in
+        # that channel via A2A. When a bot replies in a given channel,
+        # Task 35's `_broadcast_to_channel_peers` iterates these IDs
+        # (excluding self) and fires a fire-and-forget broadcast to each
+        # peer that advertises the `hermes-channel-broadcast/v1` extension
+        # (ADR-012). Phase 4 scope = static config only (mechanism (a)
+        # in ADR-011 §2); Phase 5+ adds Activity-scan / slash-command /
+        # channel-join hooks (b/c/d). Optional — empty default means
+        # channel-broadcast is disabled for this adapter.
+        self._channel_peers: Dict[str, List[str]] = {
+            str(channel_id): [str(b) for b in bot_ids]
+            for channel_id, bot_ids in (config.extra.get("channel_peers") or {}).items()
+        }
+        # ADR-012 (Phase 4 Task 34): cache of resolved peer AgentCards keyed
+        # by bot_user_id. Populated by `_resolve_well_known_peers` (ADR-004)
+        # after a successful fetch. Used by Task 40 to verify peer capability
+        # via the `hermes-channel-broadcast/v1` extension before broadcasting
+        # (R2 Tier 1 sender-side guard). Empty default — entries appear as
+        # peers resolve at connect() time or lazily via send().
+        self._peer_cards: Dict[str, Dict[str, Any]] = {}
         # ADR-006 multi-turn termination. Per-(peer_id, context_id) counter
         # capped at `max_turns_per_conversation` (default 5). When the cap is
         # hit, the inbound is dropped: real handler is NOT invoked, mirror is
@@ -345,6 +367,12 @@ class A2AAdapter(BasePlatformAdapter):
                         resolved = True
                         break
                     self._peers[str(bot_id)] = url
+                    # ADR-012 (Phase 4 Task 34): cache the fetched card so
+                    # Task 40 can verify the `hermes-channel-broadcast/v1`
+                    # extension before broadcasting (R2 Tier 1 sender-side
+                    # guard). Keyed by the same bot_user_id used in _peers
+                    # so lookup mirrors the existing peer dedup key shape.
+                    self._peer_cards[str(bot_id)] = card
                     self._unresolved_peer_urls.discard(url)
                     logger.info(
                         "[A2A] resolved peer %s → bot_user_id=%s (attempt %d)",
