@@ -397,6 +397,157 @@ def _resolve_a2a_mirror_swap(
     return discord_adapter, mirror_chan, True
 
 
+# ============================================================================
+# ADR-011 v2.1 / Phase 4 Task 35b: gateway/run.py wiring helpers
+# ============================================================================
+def _wire_a2a_display_config(adapter: Any, display_cfg: Dict[str, Any]) -> None:
+    """Task 35b.1 — wire ADR-011 keys from display.platforms.a2a config into
+    the adapter AFTER its __init__ has run.
+
+    Pre-init wiring would be cleaner (so __init__ can resolve `_inbound_handler`
+    from `channel_peers` at construction time), but adapter creation in the
+    GatewayRunner factory happens before display config is read in this code
+    path (see line ~4653 — A2AAdapter(config) is built from PlatformConfig).
+    So we patch the fields post-init and **re-run the inbound_handler
+    auto-resolution** so the final state matches what `__init__` would have
+    decided had channel_peers been in `config.extra`.
+
+    Keys honoured (all optional):
+      - channel_peers: Dict[channel_id, List[bot_user_id]]
+      - inbound_handler: "channel_broadcast" | "mirror" | "disabled"
+      - reply_policy: dict mirroring _reply_policy schema
+      - loop_prevention_ttl_seconds: int
+
+    Production safety: empty / missing display_cfg → all fields preserved.
+    nachoneko/mymel use mirror_channels (Phase 3a) so their _inbound_handler
+    is already 'mirror' from __init__; this function MUST NOT downgrade it.
+    The auto-resolution branch below explicitly preserves any non-disabled
+    handler unless the caller passes channel_peers or inbound_handler.
+    """
+    if not isinstance(display_cfg, dict):
+        return
+
+    channel_peers_cfg = display_cfg.get("channel_peers")
+    if channel_peers_cfg:
+        adapter._channel_peers = {
+            str(k): [str(v) for v in (vs or [])]
+            for k, vs in channel_peers_cfg.items()
+        }
+
+    reply_policy_cfg = display_cfg.get("reply_policy")
+    if reply_policy_cfg:
+        # Validate mode against the same allowlist __init__ uses
+        _mode = reply_policy_cfg.get("mode")
+        if _mode is not None and _mode not in (
+            "autonomous",
+            "mention_only",
+            "hybrid",
+        ):
+            raise ValueError(
+                f"[A2A] invalid reply_policy.mode={_mode!r} in display config; "
+                "must be one of 'autonomous' / 'mention_only' / 'hybrid'"
+            )
+        # Update in place — preserve fields not overridden
+        if _mode is not None:
+            adapter._reply_policy["mode"] = _mode
+        if "max_consecutive_self_replies" in reply_policy_cfg:
+            adapter._reply_policy["max_consecutive_self_replies"] = int(
+                reply_policy_cfg["max_consecutive_self_replies"]
+            )
+        if "cooldown_after_silent_decision" in reply_policy_cfg:
+            adapter._reply_policy["cooldown_after_silent_decision"] = int(
+                reply_policy_cfg["cooldown_after_silent_decision"]
+            )
+        if "channel_hints" in reply_policy_cfg:
+            adapter._reply_policy["channel_hints"] = list(
+                reply_policy_cfg["channel_hints"] or []
+            )
+
+    ttl_cfg = display_cfg.get("loop_prevention_ttl_seconds")
+    if ttl_cfg is not None:
+        adapter._loop_prevention_ttl_seconds = int(ttl_cfg)
+
+    # Inbound handler resolution AFTER channel_peers wire — same logic as
+    # A2AAdapter.__init__ but applied post-init. Explicit setting wins; auto
+    # resolution only fires when no explicit setting was provided.
+    explicit_handler = display_cfg.get("inbound_handler")
+    if explicit_handler:
+        if explicit_handler not in ("channel_broadcast", "mirror", "disabled"):
+            raise ValueError(
+                f"[A2A] invalid inbound_handler={explicit_handler!r} in "
+                "display config; must be one of 'channel_broadcast' / "
+                "'mirror' / 'disabled'"
+            )
+        adapter._inbound_handler = explicit_handler
+    elif adapter._inbound_handler == "disabled":
+        # Only auto-resolve if the adapter is currently disabled — never
+        # downgrade an existing 'mirror' or 'channel_broadcast' resolution
+        # (preserves nachoneko/mymel mirror mode without explicit config).
+        if adapter._channel_peers:
+            adapter._inbound_handler = "channel_broadcast"
+        elif adapter._mirror_channels:
+            adapter._inbound_handler = "mirror"
+
+
+async def _maybe_broadcast_a2a_reply(
+    adapter: Any,
+    *,
+    source: Any,
+    reply_text: str,
+    surface_message_id: str,
+) -> None:
+    """Task 35b.2 — outbound broadcast hook.
+
+    Called from the reply path after a Discord/Telegram message has been
+    successfully sent. Fires `_broadcast_to_channel_peers` (fire-and-forget,
+    via asyncio.create_task) + `_mark_surface_outbound` (Task 39 dedup) +
+    `mark_self_reply` (Task 38 consecutive counter).
+
+    Gates (all must pass; otherwise no-op):
+      1. adapter is not None
+      2. adapter._inbound_handler == 'channel_broadcast'
+      3. source.platform.value in ('discord', 'telegram')
+      4. str(source.chat_id) in adapter._channel_peers
+
+    Production safety: nachoneko/mymel use 'mirror' mode → gate 2 fails →
+    no-op. Operators must explicitly set channel_peers + inbound_handler
+    (or auto via channel_peers presence) to opt into the broadcast path.
+    """
+    if adapter is None:
+        return
+    inbound = getattr(adapter, "_inbound_handler", None)
+    if inbound != "channel_broadcast":
+        return
+    platform = getattr(source, "platform", None)
+    platform_value = getattr(platform, "value", None)
+    if platform_value not in ("discord", "telegram"):
+        return
+    chat_id = str(getattr(source, "chat_id", "") or "")
+    peers = getattr(adapter, "_channel_peers", {}) or {}
+    if chat_id not in peers:
+        return
+
+    # All gates passed — fire the broadcast machinery.
+    # 1. Surface dedup (Task 39): self-mark BEFORE the wire echo could land.
+    adapter._mark_surface_outbound(surface_message_id)
+    # 2. Self-reply consecutive counter (Task 38).
+    adapter.mark_self_reply(chat_id)
+    # 3. Fire-and-forget broadcast (Task 35). asyncio.create_task so this
+    #    hook returns immediately — broadcast can't block the reply path.
+    context_id = (
+        getattr(source, "session_id", None) or chat_id
+    )
+    asyncio.create_task(
+        adapter._broadcast_to_channel_peers(
+            channel_id=chat_id,
+            content=reply_text,
+            surface_message_id=surface_message_id,
+            surface_platform=platform_value,
+            context_id=str(context_id),
+        )
+    )
+
+
 def _force_off_a2a_streaming_when_no_swap(
     source: Any,
     plat_streaming: Any,
@@ -4683,6 +4834,25 @@ class GatewayRunner:
                         "[A2A] mirror channels wired from display config: %d peer mapping(s)",
                         len(adapter._mirror_channels),
                     )
+                # ADR-011 v2.1 / Phase 4 Task 35b.1: wire ADR-011 channel-broadcast
+                # keys from display config (channel_peers, inbound_handler,
+                # reply_policy, loop_prevention_ttl_seconds). Helper preserves
+                # production safety (empty config = no-op, never downgrades
+                # nachoneko/mymel's `mirror` resolution).
+                try:
+                    _wire_a2a_display_config(adapter, display_cfg)
+                    if adapter._channel_peers or adapter._inbound_handler == "channel_broadcast":
+                        logger.info(
+                            "[A2A] ADR-011 channel-broadcast wired: %d channel(s), "
+                            "inbound_handler=%r, reply_policy.mode=%r",
+                            len(adapter._channel_peers),
+                            adapter._inbound_handler,
+                            adapter._reply_policy["mode"],
+                        )
+                except ValueError as ve:
+                    # Invalid config — fail loud so operator fixes it
+                    logger.error("[A2A] ADR-011 config wiring fatal: %s", ve)
+                    raise
                 # ADR-007 v2: ADR-003's `min_dual_send_interval_seconds`
                 # rate-limit was removed alongside `_mirror_to_discord` —
                 # GatewayStreamConsumer's `edit_interval` (default 1.0s)
