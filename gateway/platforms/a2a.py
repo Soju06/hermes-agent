@@ -17,6 +17,7 @@ References:
 """
 
 import asyncio
+import time
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -292,6 +293,21 @@ class A2AAdapter(BasePlatformAdapter):
             self._inbound_handler = "mirror"
         else:
             self._inbound_handler = "disabled"
+        # ADR-011 v2.1 §9 / Phase 4 Task 39: Loop / echo prevention caches.
+        # Both are message-id → timestamp dicts with lazy on-access expiry.
+        # - `_recently_seen` keys = A2A Message.message_id
+        # - `_recently_seen_surface` keys = hermes.surface_message_id metadata
+        #   (also populated by `_mark_surface_outbound` from the Discord reply
+        #    hook in Task 35b — bot's own surface messages register themselves
+        #    so an A2A wire echo of the same surface id is dedup'd as if it
+        #    were a self-echo)
+        # TTL default 300s (5 min) per plan §Task 39 + ADR-011 §9. Tunable
+        # via `loop_prevention_ttl_seconds` extra for tests.
+        self._recently_seen: Dict[str, float] = {}
+        self._recently_seen_surface: Dict[str, float] = {}
+        self._loop_prevention_ttl_seconds: int = int(
+            config.extra.get("loop_prevention_ttl_seconds", 300)
+        )
         self._server_task: Optional[asyncio.Task] = None
         self._app = None
         # Per-message-id reply-capture callbacks. Task 7 hoists this onto
@@ -532,6 +548,38 @@ class A2AAdapter(BasePlatformAdapter):
             return {str(k): str(v) for k, v in meta.items()}
         return {}
 
+    def _prune_expired_seen(self, now: float) -> None:
+        """ADR-011 §9 Task 39: lazy on-access TTL eviction.
+
+        Called from the channel_broadcast inbound handler before each dedup
+        check so cache size stays bounded without a background sweeper. O(N)
+        in cache size per call — fine for the expected scale (sub-100 entries
+        per ~5min window per channel). If load profile changes this can be
+        amortized via a periodic sweep, but the simplest thing works.
+        """
+        ttl = self._loop_prevention_ttl_seconds
+        cutoff = now - ttl
+        # Snapshot keys before mutating to avoid RuntimeError mid-iteration
+        for k in [k for k, ts in self._recently_seen.items() if ts < cutoff]:
+            self._recently_seen.pop(k, None)
+        for k in [k for k, ts in self._recently_seen_surface.items() if ts < cutoff]:
+            self._recently_seen_surface.pop(k, None)
+
+    def _mark_surface_outbound(self, surface_message_id: str) -> None:
+        """Task 39 helper for Task 35b wiring.
+
+        Discord/Telegram reply hook calls this when THIS bot sends a surface
+        message so the same id is already in ``_recently_seen_surface`` by
+        the time an A2A wire echo (carrying the same ``hermes.surface_message_id``)
+        could arrive. Without this, the bot's own message would re-enter via
+        the channel_broadcast handler and trigger a self-conversation loop
+        through the dedup path (which only catches *seen-before* ids, not
+        *just-sent* ones).
+        """
+        if not surface_message_id:
+            return
+        self._recently_seen_surface[str(surface_message_id)] = time.time()
+
     async def _handle_a2a_inbound_channel_broadcast(
         self, message, peer_agent_id: str
     ) -> None:
@@ -553,8 +601,6 @@ class A2AAdapter(BasePlatformAdapter):
                 "surface_channel_id": str,    # from hermes.surface_channel_id
             }
         """
-        import time
-
         meta = self._decode_inbound_metadata(message)
         channel_id = meta.get("hermes.surface_channel_id") or ""
         if not channel_id:
@@ -563,6 +609,46 @@ class A2AAdapter(BasePlatformAdapter):
             logger.debug(
                 "[A2A] channel_broadcast inbound from %s has no "
                 "hermes.surface_channel_id metadata; transcript drop",
+                peer_agent_id,
+            )
+            return
+
+        # ADR-011 v2.1 §9 Task 39 — loop / echo prevention 3-check.
+        # Lazy TTL expiry first so a 5-min-old dedup entry doesn't keep blocking
+        # legitimate resends.
+        now = time.time()
+        self._prune_expired_seen(now)
+
+        # (1) Self-echo skip — sender == self never lands in own transcript.
+        # We don't even bother caching this — repeated self-echoes are cheap to
+        # re-check and caching them would pollute the dedup map.
+        sender = meta.get("hermes.sender_bot_user_id", "")
+        if sender and self._self_bot_user_id and sender == self._self_bot_user_id:
+            logger.debug(
+                "[A2A] channel_broadcast inbound self-echo skip (peer=%s)",
+                peer_agent_id,
+            )
+            return
+
+        # (2) Message-id dedup — same A2A Message.message_id within TTL.
+        a2a_msg_id = getattr(message, "message_id", "") or ""
+        if a2a_msg_id and a2a_msg_id in self._recently_seen:
+            logger.debug(
+                "[A2A] channel_broadcast inbound dedup skip msg_id=%s (peer=%s)",
+                a2a_msg_id,
+                peer_agent_id,
+            )
+            return
+
+        # (3) Surface dedup — same hermes.surface_message_id within TTL.
+        # Also catches Task 35b: when this bot sent the surface message, the
+        # Discord reply hook called _mark_surface_outbound first, so the same
+        # surface id arriving via A2A wire is dropped here.
+        surface_id = meta.get("hermes.surface_message_id", "")
+        if surface_id and surface_id in self._recently_seen_surface:
+            logger.debug(
+                "[A2A] channel_broadcast inbound dedup skip surface_id=%s (peer=%s)",
+                surface_id,
                 peer_agent_id,
             )
             return
@@ -587,6 +673,13 @@ class A2AAdapter(BasePlatformAdapter):
             "surface_channel_id": channel_id,
         }
         self._channel_transcripts[channel_id].append(entry)
+        # Record dedup keys AFTER the append so a future inbound with the same
+        # ids hits the dedup gate above. `now` was captured at the top of the
+        # handler so the timestamp lines up with `_prune_expired_seen`'s view.
+        if a2a_msg_id:
+            self._recently_seen[a2a_msg_id] = now
+        if surface_id:
+            self._recently_seen_surface[surface_id] = now
 
     async def _dispatch_a2a_inbound(
         self, message, peer_agent_id: str, text: str
