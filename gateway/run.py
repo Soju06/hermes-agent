@@ -6560,6 +6560,63 @@ class GatewayRunner:
             source.chat_id or "unknown", _msg_preview,
         )
 
+        # ── ADR-011 v2.1 §6 / Phase 4 Task 35b.4: user-message reply gate ──
+        # When a Discord/Telegram user posts in a channel that is configured
+        # for A2A channel-broadcast, run the reply trigger policy BEFORE
+        # spending tokens.  Skipping the LLM dispatch on silent-decision keeps
+        # mention_only / hybrid bots quiet in shared channels — they only
+        # respond when explicitly addressed (or when the autonomous cost
+        # guards permit).
+        #
+        # Gates short-circuit when:
+        #   - No A2A adapter (production-safe default)
+        #   - A2A adapter not in channel_broadcast mode (mirror/disabled)
+        #   - Source platform isn't discord/telegram
+        #   - Source channel isn't in adapter._channel_peers
+        # Any failure inside the gate is swallowed — never block a normal
+        # user-message dispatch on broken A2A wiring.
+        try:
+            _a2a_adapter_gate = self.adapters.get(Platform.A2A)
+            _source_plat_value = source.platform.value if source.platform else ""
+            if (
+                _a2a_adapter_gate is not None
+                and getattr(_a2a_adapter_gate, "_inbound_handler", None) == "channel_broadcast"
+                and _source_plat_value in ("discord", "telegram")
+                and str(source.chat_id) in (getattr(_a2a_adapter_gate, "_channel_peers", {}) or {})
+                and (event.text or "")
+            ):
+                # Extract platform-native mentions from the user's text so the
+                # gate's mention bypass fires when this bot is directly
+                # addressed.  _extract_mentions handles both Discord
+                # (<@id>/<@!id>) and Telegram (@username).
+                _user_mentions = _a2a_adapter_gate._extract_mentions(
+                    event.text, surface_platform=_source_plat_value
+                )
+                _should_reply = _a2a_adapter_gate.should_trigger_reply(
+                    str(source.chat_id),
+                    user_message=event.text or "",
+                    mentioned_user_ids=_user_mentions,
+                    is_user_message=True,
+                )
+                if not _should_reply:
+                    _a2a_adapter_gate.mark_silent_decision(str(source.chat_id))
+                    logger.info(
+                        "[A2A] user-message silent decision (channel=%s platform=%s) — "
+                        "skipping LLM dispatch (reply_policy=%s)",
+                        source.chat_id, _source_plat_value,
+                        _a2a_adapter_gate._reply_policy.get("mode", "?"),
+                    )
+                    return None
+                # ADR-011 §6: a user message breaks the consecutive self-
+                # reply chain (the next reply isn't "self after self") so
+                # reset the counter here, after deciding to dispatch.
+                _a2a_adapter_gate.mark_other_inbound(str(source.chat_id))
+        except Exception as _gate_err:
+            logger.debug(
+                "[A2A] user-message trigger gate error (non-fatal): %s",
+                _gate_err,
+            )
+
         # Get or create session
         session_entry = self.session_store.get_or_create_session(source)
         session_key = session_entry.session_key

@@ -129,8 +129,33 @@ class HermesA2AExecutor:
                 message=incoming, peer_agent_id=peer_agent_id, text=text
             )
 
-            await self._adapter.handle_message(event)
-            reply_text = await asyncio.wait_for(reply_future, timeout=120.0)
+            # ADR-011 v2.1 §6 / Phase 4 Task 35b.3: reply-trigger gate.
+            # When channel_broadcast mode populated a trigger decision for
+            # this inbound, honor it: trigger=False → silent reply (empty
+            # text), trigger=True → call handle_message and capture the
+            # LLM reply as usual. For all other modes (mirror, disabled,
+            # legacy inbound without sender_id), the decision is None and
+            # we keep the legacy behavior of always calling handle_message
+            # (Phase 1-3 compatibility).
+            _trigger_decision = self._adapter._consume_inbound_trigger_decision(
+                message_id
+            )
+            if _trigger_decision is not None and not _trigger_decision["should_trigger"]:
+                # Silent decision — do NOT invoke handle_message. The peer
+                # still gets a reply on the wire (empty content) so its
+                # SendMessage request settles cleanly; cooldown is already
+                # set by the handler. The peer's transcript will show this
+                # bot as silent for the next `cooldown_after_silent_decision`
+                # seconds, after which the gate re-evaluates.
+                logger.info(
+                    "[A2A] inbound silent decision (peer=%s channel=%s) — "
+                    "transcript appended, no LLM dispatch",
+                    peer_agent_id, _trigger_decision.get("channel_id", "?"),
+                )
+                reply_text = ""
+            else:
+                await self._adapter.handle_message(event)
+                reply_text = await asyncio.wait_for(reply_future, timeout=120.0)
         except asyncio.TimeoutError:
             reply_text = "[A2A timeout: peer agent did not respond within 120s]"
         except Exception as exc:  # pragma: no cover - defensive
@@ -308,6 +333,15 @@ class A2AAdapter(BasePlatformAdapter):
         self._loop_prevention_ttl_seconds: int = int(
             config.extra.get("loop_prevention_ttl_seconds", 300)
         )
+        # ADR-011 v2.1 §6 / Phase 4 Task 35b.3: cached should_trigger_reply
+        # decisions for A2A inbounds. Populated by
+        # ``_handle_a2a_inbound_channel_broadcast`` (after the transcript
+        # append + mention parse) and consumed by ``HermesA2AExecutor.execute``
+        # to decide whether to call ``handle_message`` for this inbound.
+        # Empty entries are popped on consume; pruning is not strictly needed
+        # because the cache lifetime matches the inbound's executor run, but
+        # we cap reads to defensive Optional return.
+        self._inbound_trigger_decisions: Dict[str, Dict[str, Any]] = {}
         # ADR-011 v2.1 §6 / Phase 4 Task 38: reply trigger policy.
         # Default mode='autonomous' per Soju Q3 directive. mention_only and
         # hybrid available via config. cost guards (max_consecutive_self_replies +
@@ -594,6 +628,55 @@ class A2AAdapter(BasePlatformAdapter):
             if uri.endswith("/channel-broadcast/v1"):
                 return True
         return False
+
+    @staticmethod
+    def _extract_mentions(text: str, surface_platform: str = "discord") -> set:
+        """Extract platform-native mention user_ids from a free-form text.
+
+        ADR-011 v2.1 §6 Q3 / Phase 4 Task 35b.4 — when a peer A2A broadcast
+        delivers a reply that ALREADY went through Discord/Telegram, the wire
+        text is the post-render surface text and still contains the mention
+        syntax for the receiving platform.  The trigger gate reads
+        ``mentioned_user_ids`` to decide whether the receiving bot is being
+        directly addressed.
+
+        Surfaces:
+
+          - ``discord`` (default, Phase 4 scope):
+              ``<@123>`` and ``<@!123>`` (legacy nickname form). Extracts the
+              numeric user id.
+          - ``telegram``:
+              ``@username`` (entity-rendered text). Extracts the bare username
+              without the ``@``.  Note that Telegram numeric user-id mentions
+              render as plain ``@username`` text entities — the wire path does
+              not preserve the numeric id, so this returns usernames only.
+
+        Empty / non-string text → empty set.  Unknown surface → empty set
+        (caller's None-friendly).
+
+        Returns a set of string ids/usernames so the trigger gate's
+        ``self._self_bot_user_id in mentions`` check works directly.
+        """
+        if not text or not isinstance(text, str):
+            return set()
+        import re
+
+        if surface_platform == "discord":
+            # Discord renders user mentions as <@USER_ID> or <@!USER_ID>.
+            # The trigger gate compares against `self._self_bot_user_id`
+            # which is the numeric Discord user id (string).
+            return set(re.findall(r"<@!?(\d+)>", text))
+        if surface_platform == "telegram":
+            # Telegram renders @username text mentions; the username has no
+            # numeric resolution on the wire side. Trigger gates configured
+            # against numeric user ids cannot use this — operators must
+            # configure `_self_bot_user_id` to the bot's @username (without
+            # the @) for the equality to match.
+            #
+            # Username syntax: alphanumeric + underscore, 5-32 chars per
+            # Telegram spec. Match `@<username>` with conservative bounds.
+            return set(re.findall(r"@([A-Za-z0-9_]{1,32})", text))
+        return set()
 
     @staticmethod
     def _decode_inbound_metadata(message) -> Dict[str, str]:
@@ -953,6 +1036,62 @@ class A2AAdapter(BasePlatformAdapter):
         # self-reply chain. The self-echo path already returned above, so
         # any inbound that lands here is by definition NOT us.
         self.mark_other_inbound(channel_id)
+
+        # ADR-011 v2.1 §6 / Phase 4 Task 35b.3: reply-trigger gate.
+        # After the transcript is updated, decide whether THIS bot should
+        # dispatch an LLM reply to the peer broadcast that just arrived.
+        # Read mentions from the wire text using the peer's surface_platform
+        # so a Discord-rendered ``<@self>`` lights up the mention path.
+        #
+        # Result is stashed on the adapter keyed by A2A inbound message_id
+        # so the executor can read it without changing the handler's
+        # signature.  The executor pops the entry right before deciding
+        # whether to call ``handle_message`` for this inbound.
+        try:
+            surface_plat = meta.get("hermes.surface_platform", "") or "discord"
+            mentions = self._extract_mentions(text, surface_platform=surface_plat)
+            _trigger = self.should_trigger_reply(
+                channel_id,
+                user_message=text,
+                mentioned_user_ids=mentions,
+                is_user_message=False,
+            )
+            # Cache the trigger decision keyed by the A2A wire message_id so
+            # the executor (which has the same message_id in hand) can read
+            # it via _consume_inbound_trigger_decision.  TTL = inbound's own
+            # lifetime — we pop in the executor before reply enqueue.
+            wire_mid = getattr(message, "message_id", "") or ""
+            if wire_mid:
+                self._inbound_trigger_decisions[wire_mid] = {
+                    "should_trigger": bool(_trigger),
+                    "channel_id": channel_id,
+                    "mentions": mentions,
+                    "surface_platform": surface_plat,
+                    "ts": time.time(),
+                }
+            if not _trigger:
+                # ADR-011 §6 silent decision: record so cooldown applies and
+                # an immediate follow-up broadcast doesn't keep firing the
+                # gate.  Mentions bypass cooldown so direct address still
+                # wakes us up.
+                self.mark_silent_decision(channel_id)
+        except Exception as _trigger_err:
+            logger.debug(
+                "[A2A] should_trigger_reply on inbound failed (peer=%s): %s",
+                peer_agent_id, _trigger_err,
+            )
+
+    def _consume_inbound_trigger_decision(self, message_id: str) -> Optional[Dict[str, Any]]:
+        """Pop the cached trigger decision for an inbound A2A message.
+
+        Executor calls this after ``_dispatch_a2a_inbound`` to decide whether
+        to invoke ``handle_message`` for this inbound.  Returns ``None`` when
+        the message_id has no cached decision (legacy peer, mirror mode,
+        disabled handler, or the decision cache was already consumed).
+        """
+        if not message_id:
+            return None
+        return self._inbound_trigger_decisions.pop(message_id, None)
 
     async def _dispatch_a2a_inbound(
         self, message, peer_agent_id: str, text: str
