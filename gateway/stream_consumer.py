@@ -692,6 +692,17 @@ class GatewayStreamConsumer:
         self._final_response_sent = True
         self._last_sent_text = chunks[-1]
         self._fallback_prefix = ""
+        # ADR-011 Task 35b.2.b: record final outbound delivery for broadcast.
+        if last_message_id:
+            try:
+                _rec = getattr(self.adapter, "_record_outbound_delivery", None)
+                if callable(_rec):
+                    _rec(self.chat_id, last_message_id)
+            except Exception:
+                logger.debug(
+                    "stream_consumer fallback outbound delivery tracking failed",
+                    exc_info=True,
+                )
 
     def _is_flood_error(self, result) -> bool:
         """Check if a SendResult failure is due to flood control / rate limiting."""
@@ -934,6 +945,23 @@ class GatewayStreamConsumer:
                         self._last_sent_text = text
                         # Successful edit — reset flood strike counter
                         self._flood_strikes = 0
+                        # ADR-011 Task 35b.2.b: record outbound delivery on
+                        # finalize so post-delivery callbacks (A2A broadcast,
+                        # future cross-cutting hooks) can read the surface
+                        # message_id without rebuilding it.  Recorded only on
+                        # finalize=True to keep mid-stream edits out of the
+                        # ``last outbound`` slot.  Best-effort — never fail
+                        # the send path.
+                        if finalize:
+                            try:
+                                _rec = getattr(self.adapter, "_record_outbound_delivery", None)
+                                if callable(_rec):
+                                    _rec(self.chat_id, self._message_id)
+                            except Exception:
+                                logger.debug(
+                                    "stream_consumer outbound delivery tracking failed",
+                                    exc_info=True,
+                                )
                         return True
                     else:
                         # Edit failed.  If this looks like flood control / rate

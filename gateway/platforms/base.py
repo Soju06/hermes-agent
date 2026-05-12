@@ -15,6 +15,7 @@ import re
 import socket as _socket
 import subprocess
 import sys
+import time
 import uuid
 from abc import ABC, abstractmethod
 from urllib.parse import urlsplit
@@ -1264,6 +1265,70 @@ class BasePlatformAdapter(ABC):
         # Chats where typing indicator is paused (e.g. during approval waits).
         # _keep_typing skips send_typing when the chat_id is in this set.
         self._typing_paused: set = set()
+        # Per-chat last outbound delivery metadata.  Generic mechanism — populated
+        # by ``_process_message_background`` after ``_send_with_retry`` succeeds AND
+        # by ``GatewayStreamConsumer`` after final stream send/edit succeeds.  Reads
+        # are platform-agnostic (any post-delivery callback that needs the surface
+        # message_id can pull from here).  Currently consumed by the A2A
+        # channel-broadcast hook (ADR-011 Task 35b.2.b) — generic so future
+        # cross-cutting features (Feishu mirror, webhook outbound, etc.) can reuse.
+        #
+        # Entry shape: ``{"message_id": str, "message_ids": list[str], "ts": float}``
+        # where ``message_id`` is the LAST chunk for chunked sends (Task 36 §3
+        # convention), and ``message_ids`` carries every chunk for callers that
+        # need the full set.  Streaming overwrites with the final message_id once
+        # the stream consumer settles.
+        self._last_outbound_per_chat: Dict[str, Dict[str, Any]] = {}
+
+    def _record_outbound_delivery(
+        self,
+        chat_id: Any,
+        message_id: Any,
+        *,
+        message_ids: Optional[List[str]] = None,
+    ) -> None:
+        """Record a successful outbound delivery for post-delivery hook readout.
+
+        Cheap and idempotent.  Both the non-streaming send path
+        (``_process_message_background``) and the streaming finalize path
+        (``GatewayStreamConsumer``) call this with the message_id Discord /
+        Telegram / etc. assigned to the delivered message.
+
+        Generic mechanism — no A2A-specific code lives here.  Consumers read
+        via ``get_last_outbound_delivery`` from a post-delivery callback.
+        """
+        if not chat_id or not message_id:
+            return
+        try:
+            chat_key = str(chat_id)
+            mid = str(message_id)
+            mids = [str(m) for m in (message_ids or []) if m]
+            if not mids:
+                mids = [mid]
+            self._last_outbound_per_chat[chat_key] = {
+                "message_id": mid,
+                "message_ids": mids,
+                "ts": time.time(),
+            }
+        except Exception:
+            # Outbound tracking must never break the send path.
+            logger.debug("_record_outbound_delivery failed", exc_info=True)
+
+    def get_last_outbound_delivery(
+        self,
+        chat_id: Any,
+    ) -> Optional[Dict[str, Any]]:
+        """Read the last recorded outbound delivery for ``chat_id``.
+
+        Returns ``None`` if no delivery has been recorded for this chat.
+        Callers should treat the returned dict as read-only.
+        """
+        if not chat_id:
+            return None
+        try:
+            return self._last_outbound_per_chat.get(str(chat_id))
+        except Exception:
+            return None
 
     @property
     def has_fatal_error(self) -> bool:
@@ -2923,6 +2988,37 @@ class BasePlatformAdapter(ABC):
                         metadata=_thread_metadata,
                     )
                     _record_delivery(result)
+                    # Generic outbound-delivery tracking (ADR-011 Task 35b.2.b).
+                    # Surface the message_id (LAST chunk for multi-chunk sends,
+                    # per Task 36 §3) so post-delivery callbacks can read the
+                    # surface metadata without rebuilding it.  Platform-agnostic;
+                    # A2A consumes via run.py + a2a.py, but any future cross-
+                    # cutting outbound hook can do the same.
+                    if result and getattr(result, "success", False):
+                        try:
+                            _ids = None
+                            _raw = getattr(result, "raw_response", None) or {}
+                            if isinstance(_raw, dict):
+                                _maybe_ids = _raw.get("message_ids")
+                                if isinstance(_maybe_ids, list) and _maybe_ids:
+                                    _ids = _maybe_ids
+                            # LAST-chunk convention (Task 36 §3): when an adapter
+                            # delivers multiple chunks, use the final chunk's id
+                            # as the surface_message_id for broadcast.  result
+                            # .message_id may already be the first chunk; prefer
+                            # _ids[-1] when available, fall back to message_id.
+                            _last_id = (_ids[-1] if _ids else None) or result.message_id
+                            self._record_outbound_delivery(
+                                event.source.chat_id,
+                                _last_id,
+                                message_ids=_ids,
+                            )
+                        except Exception:
+                            logger.debug(
+                                "[%s] outbound delivery tracking failed",
+                                self.name,
+                                exc_info=True,
+                            )
 
                     # Schedule auto-deletion of system-notice replies.
                     # Detached so the handler returns immediately; errors

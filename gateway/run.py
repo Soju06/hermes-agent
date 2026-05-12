@@ -7456,6 +7456,99 @@ class GatewayRunner:
             if self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
                 await self._send_voice_reply(event, response)
 
+            # ── ADR-011 Task 35b.2.b: A2A channel-broadcast hook ────────────
+            # When the source surface is Discord/Telegram AND the configured A2A
+            # adapter has ``channel_broadcast`` enabled for this channel, fire
+            # ``_maybe_broadcast_a2a_reply`` after the surface delivery settles.
+            # Registered as a post-delivery callback so it runs AFTER base.py's
+            # send (non-streaming) OR after stream_consumer's finalize
+            # (streaming) — both paths populate
+            # ``adapter._last_outbound_per_chat[chat_id]`` so we can read the
+            # surface message_id without rebuilding it.
+            #
+            # Registered ONCE here so both ``return response`` (non-streaming)
+            # and ``return None`` (streaming, already_sent=True) paths are
+            # covered.  The gates inside ``_maybe_broadcast_a2a_reply`` are
+            # idempotent — duplicate registration would be cheap, but the
+            # base.py callback slot is a single shot per session_key+generation
+            # so the registration must happen before either return.
+            #
+            # Gates short-circuit when the A2A adapter is in mirror mode
+            # (production nachoneko/mymel) or no peers are configured.
+            try:
+                _a2a_adapter = self.adapters.get(Platform.A2A)
+                _source_platform_value = (
+                    source.platform.value if source.platform else ""
+                )
+                if (
+                    _a2a_adapter is not None
+                    and getattr(_a2a_adapter, "_inbound_handler", None) == "channel_broadcast"
+                    and _source_platform_value in ("discord", "telegram")
+                    and str(source.chat_id) in (getattr(_a2a_adapter, "_channel_peers", {}) or {})
+                    and response  # only broadcast non-empty replies
+                    and session_key
+                ):
+                    _src_adapter = self.adapters.get(source.platform)
+                    if (
+                        _src_adapter is not None
+                        and hasattr(_src_adapter, "register_post_delivery_callback")
+                    ):
+                        _a2a_snapshot = _a2a_adapter
+                        _source_snapshot = source
+                        _reply_snapshot = response
+                        _loop_snapshot = asyncio.get_running_loop()
+
+                        def _fire_a2a_broadcast() -> None:
+                            try:
+                                _last = _src_adapter.get_last_outbound_delivery(
+                                    _source_snapshot.chat_id
+                                )
+                                if not _last:
+                                    logger.debug(
+                                        "[A2A] broadcast skipped — no surface "
+                                        "message_id recorded for chat=%s",
+                                        _source_snapshot.chat_id,
+                                    )
+                                    return
+                                _surface_mid = _last.get("message_id")
+                                if not _surface_mid:
+                                    return
+
+                                async def _run() -> None:
+                                    await _maybe_broadcast_a2a_reply(
+                                        _a2a_snapshot,
+                                        source=_source_snapshot,
+                                        reply_text=_reply_snapshot,
+                                        surface_message_id=str(_surface_mid),
+                                    )
+
+                                asyncio.run_coroutine_threadsafe(_run(), _loop_snapshot)
+                            except Exception as _bcast_err:
+                                logger.debug(
+                                    "[A2A] broadcast post-delivery hook failed: %s",
+                                    _bcast_err,
+                                )
+
+                        try:
+                            _src_adapter.register_post_delivery_callback(
+                                session_key,
+                                _fire_a2a_broadcast,
+                                generation=run_generation,
+                            )
+                            logger.debug(
+                                "[A2A] broadcast callback registered for session=%s "
+                                "chat=%s platform=%s",
+                                session_key, source.chat_id, _source_platform_value,
+                            )
+                        except Exception as _reg_err:
+                            logger.debug(
+                                "[A2A] broadcast callback registration failed: %s",
+                                _reg_err,
+                            )
+            except Exception as _a2a_hook_err:
+                # Never let A2A broadcast wiring break normal message flow.
+                logger.debug("[A2A] broadcast wiring error: %s", _a2a_hook_err)
+
             # If streaming already delivered the response, extract and
             # deliver any MEDIA: files before returning None.  Streaming
             # sends raw text chunks that include MEDIA: tags — the normal
@@ -7486,6 +7579,13 @@ class GatewayRunner:
                     except Exception as _e:
                         logger.debug("trailing footer send failed: %s", _e)
                 return None
+
+            # ── ADR-011 Task 35b.2.b: broadcast registration moved earlier ──
+            # The A2A channel-broadcast post-delivery callback is registered
+            # higher up (right after voice-reply gating) so BOTH this
+            # ``return response`` path AND the streaming ``return None`` path
+            # are covered with a single registration site.  Search this file
+            # for "A2A channel-broadcast hook" for the registration.
 
             return response
             
