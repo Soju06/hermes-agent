@@ -1,0 +1,101 @@
+# Sandbox A2A 3-bot mesh — Phase 4 (ADR-011 v2.1 channel_broadcast).
+#
+# Inherits the same 3-bot topology as docker-compose.a2a-sandbox-3bot.yml but
+# uses the ADR-011 config flavor (channel_peers + inbound_handler:
+# channel_broadcast + reply_policy.autonomous) instead of Phase 3a's
+# mirror_channels.
+#
+# Isolation:
+#   - Container names suffixed `-adr011` so they don't collide with the
+#     Phase 3a sandbox stack (if running) or production.
+#   - Bridge network `a2a-net-adr011`.
+#   - Named volumes `bot-{a,b,c}-data-adr011`.
+#   - Host ports 9810/9812 (vs 9800/9802 in Phase 3a) to allow parallel run.
+#   - Image reuse: same `hermes-agent:a2a-sandbox` image as Phase 3a (no
+#     code change between flavors — config-only difference).
+#   - Network aliases let peer configs keep using `a2a-bot-a` / `a2a-bot-b` /
+#     `a2a-bot-c` hostnames (matches agent_card.url advertised in configs).
+#
+# Usage:
+#   cd ~/projects/hermes-agent-a2a
+#   HERMES_UID=$(id -u) HERMES_GID=$(id -g) \
+#     docker compose -f docker-compose.a2a-sandbox-adr011.yml up -d --build
+#   # bot-A: 127.0.0.1:9810 (driver target)
+#   # bot-B: not host-published (internal-only peer)
+#   # bot-C: 127.0.0.1:9812
+#   # logs:    docker compose -f docker-compose.a2a-sandbox-adr011.yml logs -f
+#   # cleanup: docker compose -f docker-compose.a2a-sandbox-adr011.yml down
+
+services:
+  a2a-bot-a-adr011:
+    build: .
+    image: hermes-agent:a2a-sandbox
+    container_name: a2a-bot-a-adr011
+    restart: "no"
+    networks:
+      a2a-net-adr011:
+        aliases:
+          - a2a-bot-a
+    ports:
+      - "127.0.0.1:9810:8800"
+    volumes:
+      - bot-a-data-adr011:/opt/data
+      - ./docker/sandbox-bot-a-config-adr011.yaml:/opt/data/config.yaml:ro
+      - ./docker/sandbox-env-a:/opt/data/.env:ro
+    environment:
+      - HERMES_UID=${HERMES_UID:-10000}
+      - HERMES_GID=${HERMES_GID:-10000}
+      - GATEWAY_ALLOW_ALL_USERS=true
+    command: ["gateway", "run"]
+
+  a2a-bot-b-adr011:
+    image: hermes-agent:a2a-sandbox
+    container_name: a2a-bot-b-adr011
+    restart: "no"
+    networks:
+      a2a-net-adr011:
+        aliases:
+          - a2a-bot-b
+    volumes:
+      - bot-b-data-adr011:/opt/data
+      - ./docker/sandbox-bot-b-config-adr011.yaml:/opt/data/config.yaml:ro
+      - ./docker/sandbox-env-b:/opt/data/.env:ro
+    environment:
+      - HERMES_UID=${HERMES_UID:-10000}
+      - HERMES_GID=${HERMES_GID:-10000}
+      - GATEWAY_ALLOW_ALL_USERS=true
+    depends_on:
+      - a2a-bot-a-adr011
+    command: ["gateway", "run"]
+
+  a2a-bot-c-adr011:
+    image: hermes-agent:a2a-sandbox
+    container_name: a2a-bot-c-adr011
+    restart: "no"
+    networks:
+      a2a-net-adr011:
+        aliases:
+          - a2a-bot-c
+    ports:
+      - "127.0.0.1:9812:8802"
+    volumes:
+      - bot-c-data-adr011:/opt/data
+      - ./docker/sandbox-bot-c-config-adr011.yaml:/opt/data/config.yaml:ro
+      - ./docker/sandbox-env-c:/opt/data/.env:ro
+    environment:
+      - HERMES_UID=${HERMES_UID:-10000}
+      - HERMES_GID=${HERMES_GID:-10000}
+      - GATEWAY_ALLOW_ALL_USERS=true
+    depends_on:
+      - a2a-bot-a-adr011
+      - a2a-bot-b-adr011
+    command: ["gateway", "run"]
+
+networks:
+  a2a-net-adr011:
+    driver: bridge
+
+volumes:
+  bot-a-data-adr011:
+  bot-b-data-adr011:
+  bot-c-data-adr011:

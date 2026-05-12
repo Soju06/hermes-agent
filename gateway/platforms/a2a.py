@@ -614,11 +614,32 @@ class A2AAdapter(BasePlatformAdapter):
         Used by Tier 1 sender-side guard in ``_broadcast_to_channel_peers``
         to skip legacy peers that don't speak the dual-delivery wire.
 
-        Defensive: accepts None and any object lacking
-        ``capabilities.extensions`` (returns False).
+        Defensive: accepts None, dict (from ``_resolve_well_known_peers``
+        which caches the raw JSON), and protobuf AgentCard objects.
+        Returns False for anything lacking ``capabilities.extensions``.
+
+        Phase 4 Task 41 amend (2026-05-12): originally `getattr`-only
+        implementation silently failed on dict-shaped peer cards because
+        `dict.capabilities` is None — so every peer was Tier-1 skipped
+        and the broadcast was a silent no-op in the live sandbox. The
+        ADR-008 `_resolve_well_known_peers` path caches dicts; the
+        adapter's own self-card path uses protobuf. Both must work.
         """
         if card is None:
             return False
+        # Dict shape (cached via _resolve_well_known_peers)
+        if isinstance(card, dict):
+            caps = card.get("capabilities") or {}
+            exts = caps.get("extensions") or []
+            for ext in exts:
+                if isinstance(ext, dict):
+                    uri = str(ext.get("uri") or "")
+                else:
+                    uri = str(getattr(ext, "uri", "") or "")
+                if uri.endswith("/channel-broadcast/v1"):
+                    return True
+            return False
+        # Protobuf / object shape
         caps = getattr(card, "capabilities", None)
         if caps is None:
             return False

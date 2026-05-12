@@ -154,6 +154,47 @@ def test_has_channel_broadcast_ext_negative():
     assert adapter._has_channel_broadcast_ext(card) is False
 
 
+def test_has_channel_broadcast_ext_dict_shape_positive():
+    """Phase 4 Task 41 amend: ``_resolve_well_known_peers`` caches the raw
+    JSON dict (not a protobuf AgentCard). Tier-1 ext-check must accept dict
+    shape too, otherwise every well-known-resolved peer is silently
+    skipped and the broadcast is a no-op.
+    """
+    adapter = _make_adapter()
+    card_dict = {
+        "name": "Peer",
+        "capabilities": {
+            "extensions": [
+                {"uri": "https://hermes.nous/extensions/discord-identity/v1"},
+                {"uri": "https://hermes.nous/extensions/channel-broadcast/v1",
+                 "params": {"version": 1}},
+            ],
+        },
+    }
+    assert adapter._has_channel_broadcast_ext(card_dict) is True
+
+
+def test_has_channel_broadcast_ext_dict_shape_negative():
+    adapter = _make_adapter()
+    card_dict = {
+        "name": "LegacyPeer",
+        "capabilities": {
+            "extensions": [
+                {"uri": "https://hermes.nous/extensions/discord-identity/v1"},
+            ],
+        },
+    }
+    assert adapter._has_channel_broadcast_ext(card_dict) is False
+
+
+def test_has_channel_broadcast_ext_dict_no_capabilities():
+    """Empty / minimal dict — must not raise."""
+    adapter = _make_adapter()
+    assert adapter._has_channel_broadcast_ext({}) is False
+    assert adapter._has_channel_broadcast_ext({"name": "x"}) is False
+    assert adapter._has_channel_broadcast_ext({"capabilities": None}) is False
+
+
 def test_has_channel_broadcast_ext_handles_none_card():
     adapter = _make_adapter()
     assert adapter._has_channel_broadcast_ext(None) is False

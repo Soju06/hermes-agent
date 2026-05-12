@@ -1,0 +1,42 @@
+provider: anthropic
+model: claude-sonnet-4-20250514
+
+# ADR-011 v2.1 channel-broadcast sandbox config (Phase 4 Task 41).
+# See sandbox-bot-a-config-adr011.yaml for full mode explanation.
+
+platforms:
+  a2a:
+    enabled: true
+    extra:
+      listen: "0.0.0.0:8802"
+      peers:
+        - "http://a2a-bot-a:8800/"
+        - "http://a2a-bot-b:8801/"
+      max_turns_per_conversation: 5
+      discord_bot_user_id: "1503019818062839958"
+      agent_card:
+        url: "http://a2a-bot-c:8802/"
+        name: "C-bot"
+        description: "Sandbox ADR-011 channel_broadcast — peer of A-bot and B-bot"
+        discord_bot_user_id: "1503019818062839958"
+      channel_peers:
+        "1502907302901055679":         # Discord mesh-abc channel
+          - "1502705819290963999"      # Bot-A
+          - "1502705976233558126"      # Bot-B
+      inbound_handler: "channel_broadcast"
+      reply_policy:
+        mode: "autonomous"
+        max_consecutive_self_replies: 3
+        cooldown_after_silent_decision: 30
+
+  discord:
+    enabled: true
+    extra:
+      free_response_channels:
+        - "1502907302901055679"
+
+memory:
+  provider: ""
+
+logging:
+  level: INFO

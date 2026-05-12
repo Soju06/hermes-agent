@@ -7537,11 +7537,24 @@ class GatewayRunner:
                 _source_platform_value = (
                     source.platform.value if source.platform else ""
                 )
+                # Thread support (Phase 4 amend 2026-05-12): Discord auto-creates
+                # threads on @mention via `DISCORD_AUTO_THREAD` (default true), so
+                # `source.chat_id` will frequently be a thread ID, not the parent
+                # channel. ADR-011 channel_peers config keys are parent channels
+                # only (operator-supplied, never thread IDs). Resolve the effective
+                # channel key as: thread? → parent_chat_id (populated by Discord
+                # adapter when channel is type=11/12), else source.chat_id directly.
+                _effective_channel_id = (
+                    str(source.parent_chat_id)
+                    if getattr(source, "parent_chat_id", None)
+                    else str(source.chat_id)
+                )
+                _channel_peers = (getattr(_a2a_adapter, "_channel_peers", {}) or {})
                 if (
                     _a2a_adapter is not None
                     and getattr(_a2a_adapter, "_inbound_handler", None) == "channel_broadcast"
                     and _source_platform_value in ("discord", "telegram")
-                    and str(source.chat_id) in (getattr(_a2a_adapter, "_channel_peers", {}) or {})
+                    and _effective_channel_id in _channel_peers
                     and response  # only broadcast non-empty replies
                     and session_key
                 ):
@@ -7553,10 +7566,13 @@ class GatewayRunner:
                         _a2a_snapshot = _a2a_adapter
                         _source_snapshot = source
                         _reply_snapshot = response
+                        _effective_chan_snapshot = _effective_channel_id
                         _loop_snapshot = asyncio.get_running_loop()
 
                         def _fire_a2a_broadcast() -> None:
                             try:
+                                # Read outbound tracker by the SURFACE chat_id
+                                # (where Discord posted — the thread, not parent).
                                 _last = _src_adapter.get_last_outbound_delivery(
                                     _source_snapshot.chat_id
                                 )
@@ -7571,10 +7587,26 @@ class GatewayRunner:
                                 if not _surface_mid:
                                     return
 
+                                # Override source.chat_id to the effective channel
+                                # for the broadcast payload (peers receive the
+                                # parent channel id, not the thread id, because
+                                # `channel_peers` is keyed by parent channel and
+                                # the cross-bot dedup logic also reasons in terms
+                                # of parent channels).
+                                import dataclasses
+                                _broadcast_source = (
+                                    dataclasses.replace(
+                                        _source_snapshot,
+                                        chat_id=_effective_chan_snapshot,
+                                    )
+                                    if dataclasses.is_dataclass(_source_snapshot)
+                                    else _source_snapshot
+                                )
+
                                 async def _run() -> None:
                                     await _maybe_broadcast_a2a_reply(
                                         _a2a_snapshot,
-                                        source=_source_snapshot,
+                                        source=_broadcast_source,
                                         reply_text=_reply_snapshot,
                                         surface_message_id=str(_surface_mid),
                                     )
@@ -7592,10 +7624,11 @@ class GatewayRunner:
                                 _fire_a2a_broadcast,
                                 generation=run_generation,
                             )
-                            logger.debug(
-                                "[A2A] broadcast callback registered for session=%s "
-                                "chat=%s platform=%s",
-                                session_key, source.chat_id, _source_platform_value,
+                            logger.info(
+                                "[A2A] broadcast callback registered "
+                                "(session=%s surface_chat=%s effective_chan=%s platform=%s)",
+                                session_key, source.chat_id,
+                                _effective_channel_id, _source_platform_value,
                             )
                         except Exception as _reg_err:
                             logger.debug(

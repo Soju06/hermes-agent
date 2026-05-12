@@ -1,0 +1,59 @@
+provider: anthropic
+model: claude-sonnet-4-20250514
+
+# ADR-011 v2.1 channel-broadcast sandbox config (Phase 4 Task 41).
+# Migrated from Phase 3a `mirror_channels` (ADR-008) → `channel_peers` +
+# `inbound_handler: channel_broadcast`.
+#
+# In this mode:
+#   - Bot replies stream directly to Discord (sender bot is a channel member)
+#   - Bot replies ALSO broadcast as A2A wire to peers in the same channel
+#     (fire-and-forget, ADR-011 §6)
+#   - A2A inbound arrives → transcript append + reply trigger decision
+#     (reply_policy.autonomous default → Bot may reply to peer broadcast)
+#   - No mirror_channels (would conflict with channel_broadcast at __init__)
+#
+# Reply policy:
+#   mode: autonomous            — every transcript event evaluates trigger
+#   max_consecutive_self_replies: 3   — caps runaway cascade (Bot A → B → A → B)
+#   cooldown_after_silent_decision: 30s — backs off on no-reply decisions
+
+platforms:
+  a2a:
+    enabled: true
+    extra:
+      listen: "0.0.0.0:8800"
+      peers:
+        - "http://a2a-bot-b:8801/"
+        - "http://a2a-bot-c:8802/"
+      max_turns_per_conversation: 5
+      # ADR-011 self-bot identity used by _broadcast_to_channel_peers for
+      # self-skip + ADR-012 ext params. Must be at top-level extra.
+      discord_bot_user_id: "1502705819290963999"
+      agent_card:
+        url: "http://a2a-bot-a:8800/"
+        name: "A-bot"
+        description: "Sandbox ADR-011 channel_broadcast — peer of B-bot and C-bot"
+        discord_bot_user_id: "1502705819290963999"
+      # ADR-011 v2.1 Phase 4 Task 34: channel-bound peer group
+      channel_peers:
+        "1502907302901055679":         # Discord mesh-abc channel
+          - "1502705976233558126"      # Bot-B
+          - "1503019818062839958"      # Bot-C
+      inbound_handler: "channel_broadcast"
+      reply_policy:
+        mode: "autonomous"
+        max_consecutive_self_replies: 3
+        cooldown_after_silent_decision: 30
+
+  discord:
+    enabled: true
+    extra:
+      free_response_channels:
+        - "1502907302901055679"
+
+memory:
+  provider: ""
+
+logging:
+  level: INFO
