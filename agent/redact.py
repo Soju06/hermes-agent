@@ -66,6 +66,16 @@ _SENSITIVE_BODY_KEYS = frozenset({
 # downgrade — see `_log_redaction_status()` in gateway/run.py and cli.py.
 _REDACT_ENABLED = os.getenv("HERMES_REDACT_SECRETS", "true").lower() in {"1", "true", "yes", "on"}
 
+# Personal-identifier redaction (E.164 phones, Discord snowflake mentions)
+# is a SEPARATE category from credential redaction. For personal-assistant
+# deployments (single-tenant, self-hosted), the user's own phone and
+# Discord IDs are first-class data the LLM needs to see and reason about,
+# not credentials to hide. Default OFF — credentials (A category) stay
+# masked, PII (B category) passes through. Enable for shared / multi-user
+# deployments via `security.redact_pii: true` in config.yaml or
+# `HERMES_REDACT_PII=true` in ~/.hermes/.env.
+_REDACT_PII_ENABLED = os.getenv("HERMES_REDACT_PII", "false").lower() in ("1", "true", "yes", "on")
+
 # Known API key prefixes -- match the prefix + contiguous token chars
 _PREFIX_PATTERNS = [
     r"sk-[A-Za-z0-9_-]{10,}",           # OpenAI / OpenRouter / Anthropic (sk-ant-*)
@@ -401,12 +411,12 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
     if "&" in text and "=" in text:
         text = _redact_form_body(text)
 
-    # Discord user/role mentions (<@snowflake_id>)
-    if "<@" in text:
+    # Discord user/role mentions (<@snowflake_id>) — PII category, gated.
+    if _REDACT_PII_ENABLED and "<@" in text:
         text = _DISCORD_MENTION_RE.sub(lambda m: f"<@{'!' if '!' in m.group(0) else ''}***>", text)
 
-    # E.164 phone numbers (Signal, WhatsApp)
-    if "+" in text:
+    # E.164 phone numbers (Signal, WhatsApp) — PII category, gated.
+    if _REDACT_PII_ENABLED and "+" in text:
         def _redact_phone(m):
             phone = m.group(1)
             if len(phone) <= 8:

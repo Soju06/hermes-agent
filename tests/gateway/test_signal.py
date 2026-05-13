@@ -324,6 +324,10 @@ class TestSignalPhoneRedaction:
         # See skill: xdist-cross-test-pollution Pattern 5.
         monkeypatch.delenv("HERMES_REDACT_SECRETS", raising=False)
         monkeypatch.setattr("agent.redact._REDACT_ENABLED", True)
+        # Phone redaction is PII category (default off for single-tenant
+        # personal-assistant deployments) — explicitly enable for these tests.
+        monkeypatch.setenv("HERMES_REDACT_PII", "true")
+        monkeypatch.setattr("agent.redact._REDACT_PII_ENABLED", True)
 
     def test_us_number(self):
         from agent.redact import redact_sensitive_text
