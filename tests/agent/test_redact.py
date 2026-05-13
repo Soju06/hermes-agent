@@ -345,6 +345,16 @@ class TestJWTTokens:
 class TestDiscordMentions:
     """Discord snowflake IDs in <@ID> or <@!ID> format."""
 
+    @pytest.fixture(autouse=True)
+    def _enable_pii(self, monkeypatch):
+        """Discord mention redaction is PII category — gated, opt-in.
+
+        Tests in this class need it on; default is off (single-tenant
+        personal-assistant deployments treat snowflakes as first-class data).
+        """
+        monkeypatch.setenv("HERMES_REDACT_PII", "true")
+        monkeypatch.setattr("agent.redact._REDACT_PII_ENABLED", True)
+
     def test_normal_mention(self):
         result = redact_sensitive_text("Hello <@222589316709220353>")
         assert "222589316709220353" not in result
