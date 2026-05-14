@@ -1,0 +1,319 @@
+#!/usr/bin/env python3
+"""hermes-patches — manifest-driven fork patch stack manager.
+
+Subcommands:
+  status         Show each patch's state vs base & upstream PR.
+  rebuild        Reset soju/production to base + octopus-merge all patches.
+  sync <ref>     Fetch upstream, bump base to <ref>, rebase all patches, drop merged.
+  add <name>     Scaffold a new soju/patches/<name> branch off current base.
+  validate       Verify manifest matches git reality (CI-friendly, exit non-zero on drift).
+
+The manifest lives at <repo>/PATCHES.md (YAML-in-markdown — patches are listed
+as numbered sections with metadata in `- **key:** value` lines).
+
+Run from a checkout that has `upstream` and `origin` remotes:
+  upstream → NousResearch/hermes-agent
+  origin   → Soju06/hermes-agent (fork)
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+REPO = Path(__file__).resolve().parent.parent
+MANIFEST = REPO / "PATCHES.md"
+PRODUCTION_BRANCH = "soju/production"
+PATCH_PREFIX = "soju/patches/"
+
+
+def git(*args: str, check: bool = True, capture: bool = True) -> str:
+    res = subprocess.run(
+        ["git", "-C", str(REPO), *args],
+        check=check,
+        capture_output=capture,
+        text=True,
+    )
+    return res.stdout.strip() if capture else ""
+
+
+@dataclass
+class Patch:
+    name: str
+    branch: str
+    origin: str
+    upstream_pr: Optional[int]
+    state: str
+    rationale: str
+    commits: list[str] = field(default_factory=list)
+    touches: list[str] = field(default_factory=list)
+
+
+@dataclass
+class Manifest:
+    base_commit: str
+    base_ref: str
+    patches: list[Patch]
+
+
+def parse_manifest() -> Manifest:
+    text = MANIFEST.read_text()
+    base_commit_m = re.search(r"base_commit:\s*(\S+)", text)
+    base_ref_m = re.search(r"base_ref:\s*(\S+)", text)
+    if not base_commit_m or not base_ref_m:
+        sys.exit("PATCHES.md is missing base_commit or base_ref")
+
+    patches: list[Patch] = []
+    # Sections start with "### N. <name>" and end at the next "### " or "## ".
+    for section in re.finditer(
+        r"^###\s+\d+\.\s+(?P<name>\S+)\n(?P<body>.*?)(?=^### |^## |\Z)",
+        text,
+        re.MULTILINE | re.DOTALL,
+    ):
+        name = section.group("name").strip()
+        body = section.group("body")
+
+        def field_(key: str, default: str = "") -> str:
+            m = re.search(rf"-\s+\*\*{re.escape(key)}:\*\*\s+(.+?)(?=\n|$)", body)
+            return m.group(1).strip() if m else default
+
+        branch = field_("branch").strip("`")
+        origin = field_("origin").strip("`")
+        upstream_pr_raw = field_("upstream_pr")
+        upstream_pr = None
+        m = re.search(r"\b(\d+)\b", upstream_pr_raw)
+        if m:
+            upstream_pr = int(m.group(1))
+        state = field_("state").strip("`")
+        rationale = field_("rationale")
+
+        # Pull commit SHAs from "commit:" or "commits (cherry-picked from PR):" blocks
+        commits = re.findall(r"`([0-9a-f]{7,40})\b", body)
+        touches_line = field_("touches")
+        touches = [t.strip(" `") for t in re.split(r"[,]", touches_line) if t.strip()]
+
+        patches.append(
+            Patch(
+                name=name,
+                branch=branch,
+                origin=origin,
+                upstream_pr=upstream_pr,
+                state=state,
+                rationale=rationale,
+                commits=commits,
+                touches=touches,
+            )
+        )
+
+    return Manifest(
+        base_commit=base_commit_m.group(1),
+        base_ref=base_ref_m.group(1),
+        patches=patches,
+    )
+
+
+def cmd_status(_args: argparse.Namespace) -> int:
+    m = parse_manifest()
+    print(f"BASE: {m.base_ref} @ {m.base_commit[:12]}")
+    print(f"      upstream/main HEAD = {git('rev-parse', 'upstream/main')[:12]}")
+    print()
+    print(f"{'PATCH':40} {'STATE':18} {'BRANCH OK':10} {'IN BASE':9} {'NOTES'}")
+    print("-" * 100)
+    drift = False
+    for p in m.patches:
+        # Does the branch exist locally?
+        branch_ok = "yes"
+        try:
+            git("rev-parse", "--verify", p.branch, check=True)
+        except subprocess.CalledProcessError:
+            branch_ok = "MISSING"
+            drift = True
+
+        # Is the patch already in base (via git patch-id)?
+        in_base = "?"
+        if branch_ok == "yes" and p.commits:
+            try:
+                first = p.commits[0]
+                # cherry-mode: is this patch reachable from base_commit (by patch-id)?
+                # `git cherry base topic` lists commits NOT yet in base. If empty → all merged.
+                cherry = git("cherry", m.base_commit, p.branch).split("\n")
+                cherry = [c for c in cherry if c.strip()]
+                if not cherry:
+                    in_base = "YES"
+                elif all(c.startswith("-") for c in cherry):  # all matched by patch-id
+                    in_base = "yes(pid)"
+                else:
+                    pending = sum(1 for c in cherry if c.startswith("+"))
+                    in_base = f"no({pending})"
+            except subprocess.CalledProcessError:
+                in_base = "?"
+
+        notes = []
+        if p.state == "pending-upstream" and p.upstream_pr:
+            notes.append(f"PR#{p.upstream_pr}")
+        if in_base == "YES" and p.state != "merged-upstream":
+            notes.append("DROPPABLE — mark merged-upstream and remove")
+            drift = True
+        if in_base.startswith("no(") and p.state == "merged-upstream":
+            notes.append("CLAIMED MERGED BUT NOT IN BASE")
+            drift = True
+
+        print(
+            f"{p.name:40} {p.state:18} {branch_ok:10} {in_base:9} {'; '.join(notes)}"
+        )
+
+    print()
+    print("DRIFT" if drift else "OK")
+    return 1 if drift else 0
+
+
+def cmd_rebuild(_args: argparse.Namespace) -> int:
+    m = parse_manifest()
+    print(f"Rebuilding {PRODUCTION_BRANCH} on {m.base_ref} @ {m.base_commit[:12]}")
+
+    active = [p for p in m.patches if p.state in ("local-only", "pending-upstream", "vendored")]
+    if not active:
+        print("No active patches; production = base.")
+        git("branch", "-f", PRODUCTION_BRANCH, m.base_commit)
+        return 0
+
+    # Reset production to base.
+    git("checkout", "--quiet", "--detach", m.base_commit)
+    git("branch", "-f", PRODUCTION_BRANCH, m.base_commit)
+    git("checkout", "--quiet", PRODUCTION_BRANCH)
+
+    # Try octopus first.
+    branches = [p.branch for p in active]
+    try:
+        git(
+            "merge",
+            "--no-ff",
+            "-m",
+            f"merge: assemble production stack [auto, {len(active)} patches]",
+            *branches,
+            check=True,
+        )
+        print(f"Octopus merge OK: {', '.join(branches)}")
+        return 0
+    except subprocess.CalledProcessError as exc:
+        print("Octopus failed; falling back to sequential merge.")
+        git("merge", "--abort", check=False)
+        git("reset", "--hard", m.base_commit)
+
+    # Sequential fallback (apply order = manifest order).
+    for p in active:
+        try:
+            git(
+                "merge",
+                "--no-ff",
+                "-m",
+                f"merge: apply patch {p.name}",
+                p.branch,
+                check=True,
+            )
+            print(f"  applied: {p.name}")
+        except subprocess.CalledProcessError:
+            print(f"  CONFLICT: {p.name} — resolve in topic branch '{p.branch}' and retry.")
+            return 2
+    return 0
+
+
+def cmd_sync(args: argparse.Namespace) -> int:
+    new_ref = args.ref
+    git("fetch", "--quiet", "upstream")
+    new_commit = git("rev-parse", new_ref)
+    print(f"Sync target: {new_ref} @ {new_commit[:12]}")
+
+    m = parse_manifest()
+    print(f"Current base: {m.base_ref} @ {m.base_commit[:12]}")
+    if new_commit == m.base_commit:
+        print("Already at target.")
+        return 0
+
+    # For each active patch, attempt rebase onto new_commit.
+    for p in m.patches:
+        if p.state == "merged-upstream":
+            continue
+        print(f"Rebasing {p.branch} → {new_ref}")
+        # Check if already in new base by patch-id.
+        cherry = [c for c in git("cherry", new_commit, p.branch).split("\n") if c.strip()]
+        if not cherry or all(c.startswith("-") for c in cherry):
+            print(f"  → {p.name} appears merged upstream. Mark state: merged-upstream in PATCHES.md.")
+            continue
+        git("checkout", "--quiet", p.branch)
+        try:
+            git("rebase", new_commit, check=True)
+            print(f"  → rebased clean.")
+        except subprocess.CalledProcessError:
+            print(f"  → CONFLICT. Resolve, then `git rebase --continue` and re-run sync.")
+            return 2
+
+    # Bump base in manifest (manual step — print the sed/edit hint).
+    print()
+    print(f"Now edit PATCHES.md:")
+    print(f"  base_commit: {new_commit}")
+    print(f"  pinned_at:   <today>")
+    print(f"Then run: bin/hermes-patches rebuild")
+    return 0
+
+
+def cmd_add(args: argparse.Namespace) -> int:
+    name = args.name
+    branch = f"{PATCH_PREFIX}{name}"
+    m = parse_manifest()
+    git("checkout", "-b", branch, m.base_commit)
+    print(f"Created branch {branch} off base {m.base_commit[:12]}")
+    print()
+    print("Next steps:")
+    print(f"  1. Make commits with trailer:")
+    print(f"       Origin: {args.origin}")
+    print(f"       Upstream-PR: {args.upstream_pr or 'none'}")
+    print(f"       Patch-State: {args.state}")
+    print(f"  2. Append a new entry to PATCHES.md (use existing entries as template).")
+    print(f"  3. Run: bin/hermes-patches rebuild")
+    return 0
+
+
+def cmd_validate(_args: argparse.Namespace) -> int:
+    m = parse_manifest()
+    failed = False
+    for p in m.patches:
+        try:
+            git("rev-parse", "--verify", p.branch, check=True)
+        except subprocess.CalledProcessError:
+            print(f"FAIL: branch {p.branch} declared in PATCHES.md does not exist")
+            failed = True
+    print("validate:", "FAIL" if failed else "OK")
+    return 1 if failed else 0
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(prog="hermes-patches")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("status").set_defaults(func=cmd_status)
+    sub.add_parser("rebuild").set_defaults(func=cmd_rebuild)
+    sub.add_parser("validate").set_defaults(func=cmd_validate)
+
+    sync = sub.add_parser("sync")
+    sync.add_argument("ref", help="upstream ref to sync to (e.g. upstream/main, v2026.5.7)")
+    sync.set_defaults(func=cmd_sync)
+
+    add = sub.add_parser("add")
+    add.add_argument("name")
+    add.add_argument("--origin", default="local-author")
+    add.add_argument("--upstream-pr", type=int, default=None)
+    add.add_argument("--state", default="local-only", choices=["local-only", "pending-upstream", "vendored"])
+    add.set_defaults(func=cmd_add)
+
+    args = p.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

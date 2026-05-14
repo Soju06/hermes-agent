@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# hermes-venv-rebuild — idempotent editable install of the live hermes-agent tree.
+#
+# Use after switching git branches in ~/.hermes/hermes-agent/, after a sync, or
+# any time the live venv might be out of sync with the working tree.
+#
+# DOES NOT restart any gateway. That's a separate, conscious step.
+
+set -euo pipefail
+
+LIVE_TREE="${LIVE_TREE:-$HOME/.hermes/hermes-agent}"
+VENV="$LIVE_TREE/venv"
+
+if [[ ! -d "$LIVE_TREE" ]]; then
+    echo "FATAL: live tree not found at $LIVE_TREE" >&2
+    exit 1
+fi
+
+cd "$LIVE_TREE"
+
+CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+CURRENT_COMMIT=$(git rev-parse --short HEAD)
+echo "Live tree branch: $CURRENT_BRANCH @ $CURRENT_COMMIT"
+
+if [[ ! -d "$VENV" ]]; then
+    echo "venv missing — creating fresh..."
+    uv venv "$VENV"
+fi
+
+source "$VENV/bin/activate"
+
+echo "Reinstalling editable hermes_agent..."
+# `--reinstall` so the .pth file is rewritten if the live tree path changed.
+uv pip install --quiet --reinstall -e ".[dev]"
+
+# Sanity: confirm the .pth points where we expect.
+PTH_FILE=$(find "$VENV/lib" -name '__editable__.hermes_agent-*.pth' | head -1)
+if [[ -z "$PTH_FILE" ]]; then
+    echo "WARN: editable .pth not found — install may have failed" >&2
+    exit 2
+fi
+echo "Editable .pth: $PTH_FILE"
+echo "  → $(cat "$PTH_FILE")"
+
+# Quick import smoke
+python -c "import run_agent, gateway.run, tools.delegate_tool; print('import OK')"
+
+echo
+echo "Done. Restart gateways manually with:"
+echo "  hermes --profile nachoneko gateway --replace"
+echo "  hermes --profile mymel     gateway --replace"
