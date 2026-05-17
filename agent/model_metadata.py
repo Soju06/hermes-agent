@@ -1248,7 +1248,8 @@ def get_model_context_length(
     """Get the context length for a model.
 
     Resolution order:
-    0. Explicit config override (model.context_length or custom_providers per-model)
+    0. Provider/model-specific custom override (``providers[].models.<id>.context_length``)
+    0b. Global explicit config override (``model.context_length``)
     1. Persistent cache (previously discovered via probing)
     1b. AWS Bedrock static table (must precede custom-endpoint probe)
     2. Active endpoint metadata (/models for explicit custom endpoints)
@@ -1260,14 +1261,10 @@ def get_model_context_length(
     8. Thin hardcoded defaults (broad family patterns)
     9. Default fallback (256K)
     """
-    # 0. Explicit config override — user knows best
-    if config_context_length is not None and isinstance(config_context_length, int) and config_context_length > 0:
-        return config_context_length
-
-    # 0b. custom_providers per-model override — check before any probe.
-    # This closes the gap where /model switch and display paths used to fall
-    # back to 128K despite the user having a per-model context_length set.
-    # See #15779.
+    # 0. custom_providers per-model override — the most specific user config wins.
+    # A top-level model.context_length often describes the default provider only;
+    # when switching providers, do not let that global value leak across and
+    # override providers.<name>.models.<model>.context_length. See #15779.
     if custom_providers and base_url and model:
         try:
             from hermes_cli.config import get_custom_provider_context_length
@@ -1279,7 +1276,12 @@ def get_model_context_length(
             if cp_ctx:
                 return cp_ctx
         except Exception:
-            pass  # fall through to probing
+            pass  # fall through to global config / probing
+
+    # 0b. Explicit global config override — applies when no provider/model-specific
+    # override exists for the active endpoint.
+    if config_context_length is not None and isinstance(config_context_length, int) and config_context_length > 0:
+        return config_context_length
 
     # Normalise provider-prefixed model names (e.g. "local:model-name" →
     # "model-name") so cache lookups and server queries use the bare ID that

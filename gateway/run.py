@@ -6382,6 +6382,7 @@ class GatewayRunner:
             _hyg_provider = None
             _hyg_base_url = None
             _hyg_api_key = None
+            _hyg_custom_providers = None
             _hyg_data = {}
             try:
                 _hyg_data = _load_gateway_config()
@@ -6433,10 +6434,9 @@ class GatewayRunner:
                 except Exception:
                     pass
 
-                # Check custom_providers per-model context_length
-                # (same fallback as run_agent.py lines 1171-1189).
+                # Check custom_providers per-model context_length.
                 # Must run after runtime resolution so _hyg_base_url is set.
-                if _hyg_config_context_length is None and _hyg_base_url:
+                if _hyg_base_url:
                     try:
                         try:
                             from hermes_cli.config import get_compatible_custom_providers as _gw_gcp
@@ -6445,19 +6445,20 @@ class GatewayRunner:
                             _hyg_custom_providers = _hyg_data.get("custom_providers")
                             if not isinstance(_hyg_custom_providers, list):
                                 _hyg_custom_providers = []
-                        for _cp in _hyg_custom_providers:
-                            if not isinstance(_cp, dict):
-                                continue
-                            _cp_url = (_cp.get("base_url") or "").rstrip("/")
-                            if _cp_url and _cp_url == _hyg_base_url.rstrip("/"):
-                                _cp_models = _cp.get("models", {})
-                                if isinstance(_cp_models, dict):
-                                    _cp_model_cfg = _cp_models.get(_hyg_model, {})
-                                    if isinstance(_cp_model_cfg, dict):
-                                        _cp_ctx = _cp_model_cfg.get("context_length")
-                                        if _cp_ctx is not None:
-                                            _hyg_config_context_length = int(_cp_ctx)
-                                break
+                        if _hyg_config_context_length is None:
+                            for _cp in _hyg_custom_providers:
+                                if not isinstance(_cp, dict):
+                                    continue
+                                _cp_url = (_cp.get("base_url") or "").rstrip("/")
+                                if _cp_url and _cp_url == _hyg_base_url.rstrip("/"):
+                                    _cp_models = _cp.get("models", {})
+                                    if isinstance(_cp_models, dict):
+                                        _cp_model_cfg = _cp_models.get(_hyg_model, {})
+                                        if isinstance(_cp_model_cfg, dict):
+                                            _cp_ctx = _cp_model_cfg.get("context_length")
+                                            if _cp_ctx is not None:
+                                                _hyg_config_context_length = int(_cp_ctx)
+                                    break
                     except (TypeError, ValueError):
                         pass
             except Exception:
@@ -6470,6 +6471,7 @@ class GatewayRunner:
                     api_key=_hyg_api_key or "",
                     config_context_length=_hyg_config_context_length,
                     provider=_hyg_provider or "",
+                    custom_providers=_hyg_custom_providers,
                 )
                 _compress_token_threshold = int(
                     _hyg_context_length * _hyg_threshold_pct

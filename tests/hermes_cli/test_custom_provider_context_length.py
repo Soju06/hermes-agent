@@ -183,27 +183,30 @@ class TestGetModelContextLengthHonorsOverride:
                 p.stop()
         assert ctx == 1_050_000
 
-    def test_explicit_config_context_length_still_wins(self):
-        """Top-level model.context_length (step 0) outranks custom_providers (step 0b).
+    def test_provider_model_override_wins_over_global_config_context_length(self):
+        """Provider/model-specific context_length outranks global model.context_length.
 
-        Users who set both should see the top-level value — that's the
-        documented precedence and matches the long-standing step-0 behavior.
+        The global value belongs to the configured default runtime.  When the
+        user switches to a provider that declares ``models.<id>.context_length``,
+        that more specific provider/model value must win; otherwise Claude's
+        1M top-level setting leaks into codex-nekos gpt-5.5 and the agent
+        compresses far too late.
         """
         from agent.model_metadata import get_model_context_length
         custom = [
             {
                 "base_url": "https://example.invalid/v1",
-                "models": {"m": {"context_length": 1_050_000}},
+                "models": {"m": {"context_length": 400_000}},
             }
         ]
         ctx = get_model_context_length(
             "m",
             base_url="https://example.invalid/v1",
             provider="custom",
-            config_context_length=500_000,  # explicit top-level wins
+            config_context_length=1_000_000,
             custom_providers=custom,
         )
-        assert ctx == 500_000
+        assert ctx == 400_000
 
     def test_no_override_falls_through_to_default(self):
         """With custom_providers=None and all probes disabled, resolver

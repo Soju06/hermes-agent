@@ -20,6 +20,33 @@ def compressor():
         return c
 
 
+class TestProviderSpecificContextLength:
+    def test_custom_provider_context_length_can_override_global_config(self):
+        """Compressor startup must receive provider-specific overrides.
+
+        A live /model switch or provider config can supply both a global
+        ``model.context_length`` and a more specific provider/model override.
+        The compressor must pass the custom-provider table through to the
+        central resolver so the specific value wins.
+        """
+        custom = [
+            {
+                "base_url": "https://example.invalid/v1",
+                "models": {"gpt-5.5": {"context_length": 400_000}},
+            }
+        ]
+        c = ContextCompressor(
+            model="gpt-5.5",
+            base_url="https://example.invalid/v1",
+            provider="custom",
+            config_context_length=1_000_000,
+            custom_providers=custom,
+            quiet_mode=True,
+        )
+        assert c.context_length == 400_000
+        assert c.threshold_tokens == 200_000
+
+
 class TestShouldCompress:
     def test_below_threshold(self, compressor):
         compressor.last_prompt_tokens = 50000

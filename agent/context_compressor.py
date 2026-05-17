@@ -388,6 +388,7 @@ class ContextCompressor(ContextEngine):
         base_url: str = "",
         api_key: str = "",
         config_context_length: int | None = None,
+        custom_providers: list | None = None,
         provider: str = "",
         api_mode: str = "",
     ):
@@ -406,6 +407,7 @@ class ContextCompressor(ContextEngine):
             model, base_url=base_url, api_key=api_key,
             config_context_length=config_context_length,
             provider=provider,
+            custom_providers=custom_providers,
         )
         # Floor: never compress below MINIMUM_CONTEXT_LENGTH tokens even if
         # the percentage would suggest a lower value.  This prevents premature
