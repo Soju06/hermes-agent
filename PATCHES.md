@@ -32,18 +32,6 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **commit:** `5eb14655c feat(redact): gate PII redaction behind HERMES_REDACT_PII (default off)`
 - **touches:** `agent/redact.py`, `tests/conftest.py`, `tests/gateway/test_signal.py`
 
-### 2. delegate-per-task-model
-- **branch:** `soju/patches/delegate-per-task-model`
-- **origin:** `upstream-pr:23769`
-- **upstream_pr:** https://github.com/NousResearch/hermes-agent/pull/23769
-- **state:** `pending-upstream`
-- **rationale:** Adds `model` parameter to `delegate_task` so subagents can be routed per-call to a different provider/model (e.g. cheap GPT for mechanical fan-out while parent runs on Opus). Required for ADR-002 (per-task model routing).
-- **commits (cherry-picked from PR):**
-  - `5c0d3a928 fix(delegation): accept per-call model override on delegate_task`
-  - `1ccbefe1d fix(delegation): drive runtime resolution by per-task target_model`
-- **touches:** `tools/delegate_tool.py`, `tests/tools/test_delegate.py`
-- **drop_when:** PR #23769 is merged into `upstream/main` — `bin/hermes-patches sync` will detect this via `git patch-id` match and skip cherry-pick automatically.
-
 ## State Vocabulary
 
 | state | meaning | when |
@@ -69,8 +57,7 @@ Patch-State: local-only | pending-upstream | vendored
 main                                  ← mirror of upstream/main, fast-forward only
 soju/fork-policy                    ← management branch with manifest + scripts (not applied)
 soju/patches/redact-pii-optout       ← runtime topic, rebased on base_commit
-soju/patches/delegate-per-task-model  ← runtime topic, rebased on base_commit
-soju/production                       ← rebuilt: base_commit + octopus-merge runtime topics only
+soju/production                       ← rebuilt: base_commit + runtime patches only
                                          NEVER hand-edit. Always run `bin/hermes-patches rebuild` from `soju/fork-policy`.
 ```
 
