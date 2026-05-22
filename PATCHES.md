@@ -13,9 +13,9 @@ Every runtime patch must live in a `soju/patches/<name>` topic branch and be lis
 ```
 upstream: NousResearch/hermes-agent
 base_ref: upstream/main
-base_commit: 6122a79aab45041d8b7c8d775f95be3ac6ce579f
-base_tag:   none (post-v2026.5.7 main)
-pinned_at:  2026-05-14
+base_commit: f6f25b9449dbf05e1aa59759e2c1faa0d46e681b
+base_tag:   none (post-v2026.5.16 main)
+pinned_at:  2026-05-22
 ```
 
 Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must rebase all `soju/patches/*` topics on top of the new base and verify the production stack rebuilds clean.
@@ -29,7 +29,7 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **upstream_pr:** _(none — personal preference)_
 - **state:** `local-only`
 - **rationale:** Nachoneko/Mymel hosts disable PII redaction by default; gate behind `HERMES_REDACT_PII=1`. Required so memory/Graphiti ingest sees raw user text.
-- **commit:** `5eb14655c feat(redact): gate PII redaction behind HERMES_REDACT_PII (default off)`
+- **commit:** `73840e050 feat(redact): gate PII redaction behind HERMES_REDACT_PII (default off)`
 - **touches:** `agent/redact.py`, `tests/conftest.py`, `tests/gateway/test_signal.py`
 
 ## State Vocabulary
