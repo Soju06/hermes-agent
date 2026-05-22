@@ -1,10 +1,12 @@
 # Hermes Agent Fork — Patch Manifest
 
-Source of truth for every modification this fork carries on top of upstream `NousResearch/hermes-agent`.
+Source of truth for every **runtime** modification this fork carries on top of upstream `NousResearch/hermes-agent`.
+
+Management files (`PATCHES.md`, `DECISIONS.md`, `bin/hermes-patches`, `bin/hermes-venv-rebuild`) live on the separate `soju/fork-policy` branch/worktree only. They are intentionally **not** applied to `soju/production`.
 
 Never edit history of `main` (mirrors upstream).
 Never commit directly to `soju/production` (rebuilt by `bin/hermes-patches rebuild`).
-Every patch must live in a `soju/patches/<name>` topic branch and be listed below.
+Every runtime patch must live in a `soju/patches/<name>` topic branch and be listed below.
 
 ## Pinned Base
 
@@ -20,16 +22,8 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 
 ## Patches (apply order = list order)
 
-### 1. fork-policy
-- **branch:** `soju/patches/fork-policy`
-- **origin:** `local-author`
-- **upstream_pr:** none
-- **state:** `local-only`
-- **rationale:** Adds this manifest + DECISIONS.md ADR-001 + `bin/hermes-patches` + `bin/hermes-venv-rebuild` to the fork. The patch system is meta — it patches itself in. Drop only if abandoning the policy.
-- **commit:** `7880f1302 chore(fork): add ADR-001 + PATCHES.md + bin/hermes-patches`
-- **touches:** `DECISIONS.md`, `PATCHES.md`, `bin/hermes-patches`, `bin/hermes-venv-rebuild`
 
-### 2. redact-pii-optout
+### 1. redact-pii-optout
 - **branch:** `soju/patches/redact-pii-optout`
 - **origin:** `local-author` (Soju)
 - **upstream_pr:** _(none — personal preference)_
@@ -38,7 +32,7 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **commit:** `5eb14655c feat(redact): gate PII redaction behind HERMES_REDACT_PII (default off)`
 - **touches:** `agent/redact.py`, `tests/conftest.py`, `tests/gateway/test_signal.py`
 
-### 3. delegate-per-task-model
+### 2. delegate-per-task-model
 - **branch:** `soju/patches/delegate-per-task-model`
 - **origin:** `upstream-pr:23769`
 - **upstream_pr:** https://github.com/NousResearch/hermes-agent/pull/23769
@@ -73,10 +67,11 @@ Patch-State: local-only | pending-upstream | vendored
 
 ```
 main                                  ← mirror of upstream/main, fast-forward only
-soju/patches/redact-pii-optout       ← single-purpose topic, rebased on base_commit
-soju/patches/delegate-per-task-model  ← single-purpose topic, rebased on base_commit
-soju/production                       ← rebuilt: base_commit + octopus-merge all topics
-                                         NEVER hand-edit. Always run `bin/hermes-patches rebuild`.
+soju/fork-policy                    ← management branch with manifest + scripts (not applied)
+soju/patches/redact-pii-optout       ← runtime topic, rebased on base_commit
+soju/patches/delegate-per-task-model  ← runtime topic, rebased on base_commit
+soju/production                       ← rebuilt: base_commit + octopus-merge runtime topics only
+                                         NEVER hand-edit. Always run `bin/hermes-patches rebuild` from `soju/fork-policy`.
 ```
 
 ## Operating Procedures
