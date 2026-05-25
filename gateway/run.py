@@ -16330,6 +16330,29 @@ class GatewayRunner:
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides") or {}
 
+            def _runtime_update_callback(*, scope: str, model_override=None, reasoning_config=None) -> None:
+                """Persist agent-requested session runtime switches in gateway state.
+
+                The live AIAgent is already updated by the core runtime tool; this
+                callback only mirrors session-scoped changes into the gateway's
+                per-session override maps so future agent creations inherit them.
+                Global changes are intentionally unsupported by model_switch.
+                """
+                if scope != "session" or not session_key:
+                    return
+                if model_override:
+                    self._session_model_overrides[session_key] = {
+                        "model": model_override.get("model", ""),
+                        "provider": model_override.get("provider", ""),
+                        "api_key": model_override.get("api_key", ""),
+                        "base_url": model_override.get("base_url", ""),
+                        "api_mode": model_override.get("api_mode", ""),
+                    }
+                if reasoning_config is not None:
+                    self._set_session_reasoning_override(session_key, reasoning_config)
+
+            agent.runtime_update_callback = _runtime_update_callback
+
             _bg_review_release = threading.Event()
             _bg_review_pending: list[str] = []
             _bg_review_pending_lock = threading.Lock()
