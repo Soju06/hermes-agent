@@ -32,6 +32,24 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **commit:** `cc7c08c89 feat(redact): gate PII redaction behind HERMES_REDACT_PII (default off)`
 - **touches:** `agent/redact.py`, `tests/conftest.py`, `tests/gateway/test_signal.py`
 
+### 2. runtime-control-core
+- **branch:** `soju/patches/runtime-control-core`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — dogfood runtime control)_
+- **state:** `local-only`
+- **rationale:** Expose core-owned, agent-callable `model_status` / `model_switch` tools so the live agent can inspect and change current turn/session model and reasoning state without plugin private-internal hacks.
+- **commit:** `d2931bd94 feat(runtime): add agent-callable model control`
+- **touches:** `agent/runtime_control.py`, `tools/runtime_control_tool.py`, `agent/conversation_loop.py`, `agent/agent_runtime_helpers.py`, `agent/tool_executor.py`, `gateway/run.py`, `model_tools.py`, `toolsets.py`, `tests/run_agent/test_runtime_control.py`
+
+### 3. runtime-control-config-sot-guard
+- **branch:** `soju/patches/runtime-control-config-sot-guard`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — dogfood safety guard)_
+- **state:** `local-only`
+- **rationale:** Prevent agent-facing `model_switch` from free-form provider/model guesses by constraining model targets to the existing Hermes config provider/model declarations as the source of truth.
+- **commit:** `041f0279f fix(runtime): constrain agent model switches to config targets`
+- **touches:** `agent/runtime_control.py`, `tests/run_agent/test_runtime_control.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
