@@ -23,12 +23,38 @@ class _CapturingAgent:
     """Fake agent that records init kwargs for assertions."""
 
     last_init = None
+    last_instance = None
 
     def __init__(self, *args, **kwargs):
         type(self).last_init = dict(kwargs)
+        type(self).last_instance = self
         self.tools = []
+        self.runtime_update_callback = None
 
     def run_conversation(self, user_message: str, conversation_history=None, task_id=None):
+        return {
+            "final_response": "ok",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class _RuntimeSwitchingAgent(_CapturingAgent):
+    """Fake agent that exercises the gateway runtime_update_callback seam."""
+
+    def run_conversation(self, user_message: str, conversation_history=None, task_id=None):
+        assert callable(self.runtime_update_callback)
+        self.runtime_update_callback(
+            scope="session",
+            model_override={
+                "model": "session-model",
+                "provider": "session-provider",
+                "api_key": "***",
+                "base_url": "https://runtime.example/v1",
+                "api_mode": "codex_responses",
+            },
+            reasoning_config={"enabled": True, "effort": "low"},
+        )
         return {
             "final_response": "ok",
             "messages": [],
@@ -124,6 +150,51 @@ def test_run_agent_prefers_session_override_over_global_runtime(monkeypatch):
     assert _CapturingAgent.last_init["base_url"] == "https://chatgpt.com/backend-api/codex"
     assert _CapturingAgent.last_init["api_key"] == "***"
     assert _CapturingAgent.last_init["reasoning_config"] == {"enabled": True, "effort": "high"}
+
+
+def test_runtime_update_callback_persists_session_overrides(monkeypatch):
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda *args, **kwargs: {"model": "base-model", "provider": "base-provider"},
+    )
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = _RuntimeSwitchingAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    runner = _make_runner()
+    source = SessionSource(
+        platform=Platform.LOCAL,
+        chat_id="cli",
+        chat_name="CLI",
+        chat_type="dm",
+        user_id="user-1",
+    )
+    session_key = "agent:main:local:dm"
+
+    result = asyncio.run(
+        runner._run_agent(
+            message="switch runtime",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id="session-1",
+            session_key=session_key,
+        )
+    )
+
+    assert result["final_response"] == "ok"
+    assert runner._session_model_overrides[session_key] == {
+        "model": "session-model",
+        "provider": "session-provider",
+        "api_key": "***",
+        "base_url": "https://runtime.example/v1",
+        "api_mode": "codex_responses",
+    }
+    assert runner._session_reasoning_overrides[session_key] == {"enabled": True, "effort": "low"}
 
 
 @pytest.mark.asyncio

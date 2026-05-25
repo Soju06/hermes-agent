@@ -1506,7 +1506,20 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     if block_message is not None:
         return json.dumps({"error": block_message}, ensure_ascii=False)
 
-    if function_name == "todo":
+    if function_name == "model_status":
+        from agent.runtime_control import model_status as _model_status
+        return _model_status(agent)
+    elif function_name == "model_switch":
+        from agent.runtime_control import model_switch as _model_switch
+        return _model_switch(
+            agent,
+            model=function_args.get("model"),
+            provider=function_args.get("provider"),
+            reasoning_effort=function_args.get("reasoning_effort"),
+            scope=function_args.get("scope", "turn"),
+            reason=function_args.get("reason"),
+        )
+    elif function_name == "todo":
         from tools.todo_tool import todo_tool as _todo_tool
         return _todo_tool(
             todos=function_args.get("todos"),

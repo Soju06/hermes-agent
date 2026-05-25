@@ -46,8 +46,8 @@ _HERMES_CORE_TOOLS = [
     "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
     # Text-to-speech
     "text_to_speech",
-    # Planning & memory
-    "todo", "memory",
+    # Planning, memory, and model/runtime introspection
+    "todo", "memory", "model_status", "model_switch",
     # Session history search
     "session_search",
     # Clarifying questions
@@ -206,6 +206,12 @@ TOOLSETS = {
         "includes": []
     },
     
+    "runtime": {
+        "description": "Inspect and switch the current model/provider/reasoning for turn or session scope",
+        "tools": ["model_status", "model_switch"],
+        "includes": []
+    },
+
     "session_search": {
         "description": "Search and recall past conversations with summarization",
         "tools": ["session_search"],
