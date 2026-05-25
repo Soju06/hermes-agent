@@ -132,15 +132,127 @@ def test_model_switch_session_scope_persists_reasoning_callback():
     ]
 
 
-def test_model_switch_model_uses_model_switch_and_agent_switch_model():
+def _configured_provider_models_config():
+    return {
+        "providers": {
+            "codex-nekos": {
+                "default_model": "gpt-5.5",
+                "models": {
+                    "gpt-5.5": {"context_length": 272000},
+                    "gpt-5.4": {"context_length": 400000},
+                },
+            },
+            "claude-nekos": {
+                "default_model": "claude-opus-4-6",
+                "models": {
+                    "claude-opus-4-6": {"context_length": 200000},
+                    "shared-model": {"context_length": 100000},
+                },
+            },
+            "other-nekos": {
+                "default_model": "other-default",
+                "models": ["shared-model", {"name": "other-default"}],
+            },
+        }
+    }
+
+
+def test_model_switch_rejects_agent_free_form_provider_model_before_fuzzy_resolution():
     agent = DummyAgent()
 
-    with patch("agent.runtime_control.resolve_model_switch", return_value=_switch_result()) as resolve:
+    with patch("hermes_cli.config.load_config", return_value=_configured_provider_models_config()), patch(
+        "agent.runtime_control.resolve_model_switch",
+        return_value=_switch_result("o3", "openrouter"),
+    ) as resolve:
         changed = json.loads(
             model_switch(
                 agent,
-                model="new-model",
-                provider="new-provider",
+                model="o3",
+                provider="openrouter",
+                scope="session",
+                reason="test free-form rejection",
+            )
+        )
+
+    assert changed["success"] is False
+    assert "config" in changed["error"].lower()
+    resolve.assert_not_called()
+    assert agent.switch_calls == []
+
+
+def test_model_switch_resolves_model_only_when_configured_unique_provider():
+    agent = DummyAgent()
+
+    with patch("hermes_cli.config.load_config", return_value=_configured_provider_models_config()), patch(
+        "agent.runtime_control.resolve_model_switch",
+        return_value=_switch_result("gpt-5.5", "codex-nekos"),
+    ) as resolve:
+        changed = json.loads(model_switch(agent, model="gpt-5.5", scope="session"))
+
+    assert changed["success"] is True
+    resolve.assert_called_once()
+    assert resolve.call_args.kwargs["raw_input"] == "gpt-5.5"
+    assert resolve.call_args.kwargs["explicit_provider"] == "codex-nekos"
+    assert agent.switch_calls == [
+        ("gpt-5.5", "codex-nekos", "secret-new", "https://new.example/v1", "codex_responses")
+    ]
+
+
+def test_model_switch_rejects_model_only_when_configured_ambiguous():
+    agent = DummyAgent()
+
+    with patch("hermes_cli.config.load_config", return_value=_configured_provider_models_config()), patch(
+        "agent.runtime_control.resolve_model_switch",
+        return_value=_switch_result("shared-model", "claude-nekos"),
+    ) as resolve:
+        changed = json.loads(model_switch(agent, model="shared-model", scope="session"))
+
+    assert changed["success"] is False
+    assert "ambiguous" in changed["error"].lower()
+    resolve.assert_not_called()
+    assert agent.switch_calls == []
+
+
+def test_model_switch_provider_only_uses_configured_default_model():
+    agent = DummyAgent()
+
+    with patch("hermes_cli.config.load_config", return_value=_configured_provider_models_config()), patch(
+        "agent.runtime_control.resolve_model_switch",
+        return_value=_switch_result("gpt-5.5", "codex-nekos"),
+    ) as resolve:
+        changed = json.loads(model_switch(agent, provider="codex-nekos", scope="session"))
+
+    assert changed["success"] is True
+    resolve.assert_called_once()
+    assert resolve.call_args.kwargs["raw_input"] == "gpt-5.5"
+    assert resolve.call_args.kwargs["explicit_provider"] == "codex-nekos"
+
+
+def test_model_switch_fails_closed_if_shared_resolver_changes_configured_target():
+    agent = DummyAgent()
+
+    with patch("hermes_cli.config.load_config", return_value=_configured_provider_models_config()), patch(
+        "agent.runtime_control.resolve_model_switch",
+        return_value=_switch_result("o3", "openrouter"),
+    ):
+        changed = json.loads(model_switch(agent, model="gpt-5.5", provider="codex-nekos", scope="session"))
+
+    assert changed["success"] is False
+    assert "resolved outside" in changed["error"].lower()
+    assert agent.switch_calls == []
+
+
+def test_model_switch_model_uses_model_switch_and_agent_switch_model():
+    agent = DummyAgent()
+
+    with patch("hermes_cli.config.load_config", return_value=_configured_provider_models_config()), patch(
+        "agent.runtime_control.resolve_model_switch", return_value=_switch_result("gpt-5.5", "codex-nekos")
+    ) as resolve:
+        changed = json.loads(
+            model_switch(
+                agent,
+                model="gpt-5.5",
+                provider="codex-nekos",
                 reasoning_effort="low",
                 scope="session",
                 reason="test",
@@ -149,10 +261,10 @@ def test_model_switch_model_uses_model_switch_and_agent_switch_model():
 
     resolve.assert_called_once()
     assert agent.switch_calls == [
-        ("new-model", "new-provider", "secret-new", "https://new.example/v1", "codex_responses")
+        ("gpt-5.5", "codex-nekos", "secret-new", "https://new.example/v1", "codex_responses")
     ]
-    assert agent.model == "new-model"
-    assert agent.provider == "new-provider"
+    assert agent.model == "gpt-5.5"
+    assert agent.provider == "codex-nekos"
     assert agent.reasoning_config == {"enabled": True, "effort": "low"}
     assert changed["success"] is True
     assert "secret-new" not in json.dumps(changed)
@@ -160,8 +272,8 @@ def test_model_switch_model_uses_model_switch_and_agent_switch_model():
         {
             "scope": "session",
             "model_override": {
-                "model": "new-model",
-                "provider": "new-provider",
+                "model": "gpt-5.5",
+                "provider": "codex-nekos",
                 "api_key": "secret-new",
                 "base_url": "https://new.example/v1",
                 "api_mode": "codex_responses",
@@ -189,14 +301,18 @@ def test_session_switch_after_turn_switch_updates_pending_restore_snapshot():
 def test_session_model_switch_after_turn_switch_updates_pending_restore_snapshot():
     agent = DummyAgent()
 
-    with patch("agent.runtime_control.resolve_model_switch", return_value=_switch_result("turn-model", "turn-provider")):
-        model_switch(agent, model="turn-model", provider="turn-provider", scope="turn")
-    with patch("agent.runtime_control.resolve_model_switch", return_value=_switch_result("session-model", "session-provider")):
-        model_switch(agent, model="session-model", provider="session-provider", scope="session")
+    with patch("hermes_cli.config.load_config", return_value=_configured_provider_models_config()), patch(
+        "agent.runtime_control.resolve_model_switch", return_value=_switch_result("gpt-5.4", "codex-nekos")
+    ):
+        model_switch(agent, model="gpt-5.4", provider="codex-nekos", scope="turn")
+    with patch("hermes_cli.config.load_config", return_value=_configured_provider_models_config()), patch(
+        "agent.runtime_control.resolve_model_switch", return_value=_switch_result("gpt-5.5", "codex-nekos")
+    ):
+        model_switch(agent, model="gpt-5.5", provider="codex-nekos", scope="session")
     restore_pending_turn_runtime(agent)
 
-    assert agent.model == "session-model"
-    assert agent.provider == "session-provider"
+    assert agent.model == "gpt-5.5"
+    assert agent.provider == "codex-nekos"
     assert agent._fallback_chain == []
     assert agent._fallback_index == 99
 
@@ -222,8 +338,10 @@ def test_turn_scoped_model_restore_preserves_fallback_state():
     original_chain = list(agent._fallback_chain)
     original_model = agent._fallback_model
 
-    with patch("agent.runtime_control.resolve_model_switch", return_value=_switch_result()):
-        model_switch(agent, model="new-model", provider="new-provider", scope="turn")
+    with patch("hermes_cli.config.load_config", return_value=_configured_provider_models_config()), patch(
+        "agent.runtime_control.resolve_model_switch", return_value=_switch_result("gpt-5.4", "codex-nekos")
+    ):
+        model_switch(agent, model="gpt-5.4", provider="codex-nekos", scope="turn")
 
     assert agent._fallback_chain == []  # switch_model mutated it
     restore_pending_turn_runtime(agent)

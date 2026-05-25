@@ -174,6 +174,213 @@ def restore_pending_turn_runtime(agent: Any) -> bool:
             pass
 
 
+def _configured_model_names(entry: Any) -> set[str]:
+    """Extract declared model IDs from a provider/custom-provider config entry."""
+    models: set[str] = set()
+    if not isinstance(entry, dict):
+        return models
+
+    for key in ("default_model", "model"):
+        value = entry.get(key)
+        if isinstance(value, str) and value.strip():
+            models.add(value.strip())
+
+    raw_models = entry.get("models")
+    if isinstance(raw_models, dict):
+        models.update(str(model).strip() for model in raw_models if str(model).strip())
+    elif isinstance(raw_models, list):
+        for item in raw_models:
+            if isinstance(item, str) and item.strip():
+                models.add(item.strip())
+            elif isinstance(item, dict):
+                for key in ("id", "name", "model"):
+                    value = item.get(key)
+                    if isinstance(value, str) and value.strip():
+                        models.add(value.strip())
+                        break
+    return models
+
+
+def _configured_model_targets(cfg: Any) -> Dict[str, set[str]]:
+    """Return provider -> configured model IDs using config.yaml as the SoT."""
+    targets: Dict[str, set[str]] = {}
+    if not isinstance(cfg, dict):
+        return targets
+
+    providers = cfg.get("providers") or {}
+    if isinstance(providers, dict):
+        for provider, entry in providers.items():
+            if not isinstance(provider, str) or not provider.strip():
+                continue
+            models = _configured_model_names(entry)
+            if models:
+                targets[provider.strip()] = models
+
+    custom_providers = cfg.get("custom_providers") or []
+    if isinstance(custom_providers, list):
+        for entry in custom_providers:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name")
+            if not isinstance(name, str) or not name.strip():
+                continue
+            slug = "custom:" + name.strip().lower().replace(" ", "-")
+            models = _configured_model_names(entry)
+            if models:
+                targets[slug] = models
+
+    model_cfg = cfg.get("model") or {}
+    if isinstance(model_cfg, dict):
+        provider = model_cfg.get("provider")
+        model = model_cfg.get("default") or model_cfg.get("model")
+        if isinstance(provider, str) and provider.strip() and isinstance(model, str) and model.strip():
+            targets.setdefault(provider.strip(), set()).add(model.strip())
+
+    return targets
+
+
+def _match_configured_value(value: str, candidates: set[str] | Dict[str, set[str]]) -> str | None:
+    if value in candidates:
+        return value
+    lowered = value.lower()
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.lower() == lowered:
+            return candidate
+    return None
+
+
+def _configured_default_model(cfg: Any, provider: str) -> str | None:
+    if not isinstance(cfg, dict) or not provider:
+        return None
+    providers = cfg.get("providers") or {}
+    if isinstance(providers, dict):
+        entry = providers.get(provider)
+        if isinstance(entry, dict):
+            value = entry.get("default_model") or entry.get("model")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    custom_providers = cfg.get("custom_providers") or []
+    if isinstance(custom_providers, list) and provider.startswith("custom:"):
+        for entry in custom_providers:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name")
+            if not isinstance(name, str) or not name.strip():
+                continue
+            slug = "custom:" + name.strip().lower().replace(" ", "-")
+            if slug == provider:
+                value = entry.get("default_model") or entry.get("model")
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+    model_cfg = cfg.get("model") or {}
+    if isinstance(model_cfg, dict) and model_cfg.get("provider") == provider:
+        value = model_cfg.get("default") or model_cfg.get("model")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _format_configured_targets(targets: Dict[str, set[str]], *, limit: int = 8) -> Dict[str, list[str]]:
+    formatted: Dict[str, list[str]] = {}
+    for provider in sorted(targets)[:limit]:
+        formatted[provider] = sorted(targets[provider])[:limit]
+    return formatted
+
+
+def resolve_agent_model_target_strict(
+    *,
+    requested_provider: str,
+    requested_model: str,
+    current_provider: str,
+    current_model: str,
+) -> tuple[bool, str, str, Dict[str, Any] | None]:
+    """Resolve agent-callable model switches only through configured targets.
+
+    Human ``/model`` commands intentionally support fuzzy catalog discovery.  The
+    agent-facing tool must not invent provider/model names, so this function uses
+    config.yaml provider declarations as the source of truth before the shared
+    resolver is allowed to run.
+    """
+    from hermes_cli.config import load_config
+
+    cfg = load_config()
+    targets = _configured_model_targets(cfg)
+    requested_provider = requested_provider.strip()
+    requested_model = requested_model.strip()
+    current_provider = current_provider.strip()
+    current_model = current_model.strip()
+
+    def error(message: str, **extra: Any) -> tuple[bool, str, str, Dict[str, Any]]:
+        payload: Dict[str, Any] = {
+            "success": False,
+            "error": message,
+            "configured_targets": _format_configured_targets(targets),
+        }
+        payload.update(extra)
+        return False, "", "", payload
+
+    if not targets:
+        return error(
+            "No configured provider/model targets found in config.yaml. Agent model_switch may only select models declared in config.yaml.",
+        )
+
+    provider = ""
+    if requested_provider:
+        provider_match = _match_configured_value(requested_provider, targets)
+        if provider_match is None:
+            return error(
+                "Provider is not configured. Agent model_switch may only select providers declared in config.yaml.",
+                requested={"provider": requested_provider, "model": requested_model},
+            )
+        provider = provider_match
+
+    if provider and not requested_model:
+        default_model = _configured_default_model(cfg, provider)
+        model_match = _match_configured_value(default_model or "", targets[provider]) if default_model else None
+        if model_match is None:
+            model_match = _match_configured_value(current_model, targets[provider]) if current_provider == provider else None
+        if model_match is None:
+            model_match = sorted(targets[provider])[0]
+        return True, provider, model_match, None
+
+    if provider and requested_model:
+        model_match = _match_configured_value(requested_model, targets[provider])
+        if model_match is None:
+            return error(
+                "Model is not configured for provider. Agent model_switch may only select models declared in config.yaml.",
+                requested={"provider": provider, "model": requested_model},
+            )
+        return True, provider, model_match, None
+
+    if requested_model:
+        current_provider_match = _match_configured_value(current_provider, targets)
+        if current_provider_match is not None:
+            model_match = _match_configured_value(requested_model, targets[current_provider_match])
+            if model_match is not None:
+                return True, current_provider_match, model_match, None
+
+        matches: list[tuple[str, str]] = []
+        for candidate_provider, models in targets.items():
+            model_match = _match_configured_value(requested_model, models)
+            if model_match is not None:
+                matches.append((candidate_provider, model_match))
+        if not matches:
+            return error(
+                "Model is not configured. Agent model_switch may only select models declared in config.yaml.",
+                requested={"provider": requested_provider, "model": requested_model},
+            )
+        providers = sorted({match_provider for match_provider, _ in matches})
+        if len(providers) > 1:
+            return error(
+                "Ambiguous configured model; specify provider.",
+                requested={"provider": requested_provider, "model": requested_model},
+                matching_providers=providers,
+            )
+        return True, matches[0][0], matches[0][1], None
+
+    return error("No model/provider target requested.")
+
+
 def resolve_model_switch(
     *,
     raw_input: str,
@@ -279,16 +486,29 @@ def model_switch(
     persistence_error = None
 
     if requested_model or requested_provider:
+        current_provider = str(getattr(agent, "provider", "") or "")
+        current_model = str(getattr(agent, "model", "") or "")
+        ok, strict_provider, strict_model, strict_error = resolve_agent_model_target_strict(
+            requested_provider=requested_provider,
+            requested_model=requested_model,
+            current_provider=current_provider,
+            current_model=current_model,
+        )
+        if not ok:
+            if scope == "turn":
+                restore_pending_turn_runtime(agent)
+            return json.dumps(strict_error, ensure_ascii=False)
+
         current_api_key = getattr(agent, "api_key", "")
         if not isinstance(current_api_key, str):
             current_api_key = ""
         result = resolve_model_switch(
-            raw_input=requested_model,
-            current_provider=str(getattr(agent, "provider", "") or ""),
-            current_model=str(getattr(agent, "model", "") or ""),
+            raw_input=strict_model,
+            current_provider=current_provider,
+            current_model=current_model,
             current_base_url=str(getattr(agent, "base_url", "") or ""),
             current_api_key=current_api_key,
-            explicit_provider=requested_provider,
+            explicit_provider=strict_provider,
         )
         if not getattr(result, "success", False):
             # If the model part failed for a turn-scoped call that captured a
@@ -300,6 +520,22 @@ def model_switch(
                 {
                     "success": False,
                     "error": getattr(result, "error_message", "Model switch failed") or "Model switch failed",
+                },
+                ensure_ascii=False,
+            )
+        if getattr(result, "target_provider", "") != strict_provider or getattr(result, "new_model", "") != strict_model:
+            if scope == "turn":
+                restore_pending_turn_runtime(agent)
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": "Shared model resolver resolved outside configured agent target; refusing to apply free-form/fuzzy model switch.",
+                    "requested": {"provider": requested_provider, "model": requested_model},
+                    "expected": {"provider": strict_provider, "model": strict_model},
+                    "resolved": {
+                        "provider": getattr(result, "target_provider", ""),
+                        "model": getattr(result, "new_model", ""),
+                    },
                 },
                 ensure_ascii=False,
             )
