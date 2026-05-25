@@ -50,6 +50,15 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **commit:** `041f0279f fix(runtime): constrain agent model switches to config targets`
 - **touches:** `agent/runtime_control.py`, `tests/run_agent/test_runtime_control.py`
 
+### 4. runtime-control-session-only
+- **branch:** `soju/patches/runtime-control-session-only`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — dogfood session-only enforcement)_
+- **state:** `local-only`
+- **rationale:** Force all `model_switch` calls to session scope. Turn scope caused silent model reversion when the LLM omitted the `scope` parameter (29% of calls). Remove `scope` from tool schema so the LLM cannot send it; backend ignores any scope input and always uses session. Fixes half-patch incident where schema was updated but backend was not.
+- **commit:** `7236595f6 fix(runtime): force model_switch to session scope, remove turn scope`
+- **touches:** `agent/runtime_control.py`, `tools/runtime_control_tool.py`, `tests/run_agent/test_runtime_control.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -75,6 +84,9 @@ Patch-State: local-only | pending-upstream | vendored
 main                                  ← mirror of upstream/main, fast-forward only
 soju/fork-policy                    ← management branch with manifest + scripts (not applied)
 soju/patches/redact-pii-optout       ← runtime topic, rebased on base_commit
+soju/patches/runtime-control-core    ← runtime topic
+soju/patches/runtime-control-config-sot-guard ← runtime topic
+soju/patches/runtime-control-session-only     ← runtime topic
 soju/production                       ← rebuilt: base_commit + runtime patches only
                                          NEVER hand-edit. Always run `bin/hermes-patches rebuild` from `soju/fork-policy`.
 ```
