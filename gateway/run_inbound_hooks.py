@@ -76,9 +76,12 @@ class GatewayInboundHooksMixin:
     ) -> Optional[MessageEvent]:
         """Run the ``pre_gateway_dispatch`` plugin hook; None = drop, else the (maybe rewritten) event.
         Results: ``{"action": "skip"}`` → drop; ``{"action": "rewrite", "text"}`` → replace ``event.text``;
-        ``allow``/None → normal dispatch. On the messaging path it runs BEFORE auth so plugins can handle
-        unauthorized senders; on the producer path (webhook/relay, ``admit_producer``) it runs AFTER the
-        delivery's authorization, which preparing its payload performs, so it never sees a refused sender.
+        ``{"action": "prepend", "text"}`` → prepend text (accumulates); ``{"action": "runtime_override", ...}``
+        → staged on the event and applied by ``_hm_apply_runtime_override_directives`` only after auth and
+        the emergency-stop gate; ``allow``/None → normal dispatch. On the messaging path it runs BEFORE
+        auth so plugins can handle unauthorized senders; on the producer path (webhook/relay,
+        ``admit_producer``) it runs AFTER the delivery's authorization, which preparing its payload
+        performs, so it never sees a refused sender.
 
         Once per inbound message, at ingress (here, or ``admit_producer`` for webhook/relay), never
         while an admitted row EXECUTES: a messaging turn already passed it before its commit, and a
@@ -97,6 +100,8 @@ class GatewayInboundHooksMixin:
             logger.warning("pre_gateway_dispatch invocation failed: %s", _hook_exc)
             _hook_results = []
 
+        _runtime_override_directives: list[dict] = []
+        _hook_prepends: list[str] = []
         for _result in _hook_results:
             if not isinstance(_result, dict):
                 continue
@@ -108,6 +113,14 @@ class GatewayInboundHooksMixin:
                     source.chat_id or "unknown",
                 )
                 return None
+            if _action == "runtime_override":
+                _runtime_override_directives.append(_result)
+                continue
+            if _action == "prepend":
+                _prepend_text = _result.get("text")
+                if isinstance(_prepend_text, str) and _prepend_text.strip():
+                    _hook_prepends.append(_prepend_text.strip())
+                continue
             if _action == "rewrite":
                 _new_text = _result.get("text")
                 if isinstance(_new_text, str):
@@ -126,7 +139,30 @@ class GatewayInboundHooksMixin:
                 break
             if _action == "allow":
                 break
+
+        if _hook_prepends:
+            from gateway.session_ingress_context import carry_callback
+            _combined = "\n\n".join(_hook_prepends)
+            _original = event.text or ""
+            prepended = dataclasses.replace(
+                event, text=f"{_combined}\n\n{_original}" if _original else _combined,
+            )
+            carry_callback(event, prepended)
+            event = prepended
+        if _runtime_override_directives:
+            # Trusted plugins may pick a session route before the first LLM call; the directives ride
+            # the event (same pattern as ``_bot_loop_admitted``) so they can only be applied after auth.
+            event._hermes_runtime_override_directives = _runtime_override_directives
         return event
+
+    def _hm_apply_runtime_override_directives(self, event: MessageEvent, source: SessionSource) -> None:
+        """Apply ``runtime_override`` directives staged by ``_hm_pre_gateway_dispatch_hook``. Called only
+        after auth and after the emergency-stop gate decided this event may proceed."""
+        directives = getattr(event, "_hermes_runtime_override_directives", None)
+        if not directives:
+            return
+        for _directive in directives:
+            self._apply_gateway_runtime_override(_directive, source)
 
     def _hm_quick_commands(self) -> dict:
         """User-defined ``quick_commands`` mapping from config (empty dict when unset/malformed)."""

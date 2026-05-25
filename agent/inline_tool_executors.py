@@ -297,8 +297,30 @@ def _setup_mcp_shim(agent, args: dict, ctx: InlineToolContext) -> Any:
     }, ctx)
 
 
+def _model_status(agent, args: dict, ctx: InlineToolContext) -> Any:
+    from agent.runtime_control import model_status
+
+    return model_status(agent)
+
+
+def _model_switch(agent, args: dict, ctx: InlineToolContext) -> Any:
+    from agent.runtime_control import model_switch
+
+    return model_switch(
+        agent,
+        model=args.get("model"),
+        provider=args.get("provider"),
+        reasoning_effort=args.get("reasoning_effort"),
+        scope=args.get("scope", "session"),
+        reason=args.get("reason"),
+    )
+
+
 # Order is the historical if/elif order of ``execute_tool_calls_sequential``.
 _RAW_INLINE_TOOL_EXECUTORS: dict[str, InlineToolExecutor] = {
+    # Core-owned runtime introspection/switching (agent/runtime_control.py): needs live agent state.
+    "model_status": _model_status,
+    "model_switch": _model_switch,
     "todo_list": _tool(
         "tools.todo_tool", "todo_tool", ("todos", "todos"), ("merge", "merge", False),
         store=lambda agent, ctx: agent._todo_store,

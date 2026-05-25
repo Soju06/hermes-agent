@@ -526,6 +526,38 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         agent.request_overrides = overrides
         agent._gateway_turn_request_overrides = turn_overrides
 
+    def _make_runtime_update_callback(self):
+        """Sync callback for ``agent.runtime_update_callback`` (agent/runtime_control.py): mirror a
+        session-scoped model/reasoning switch into the session override state and persist the
+        secret-free identifiers on the SessionEntry."""
+        ctx = self._ctx
+        runner = self._runner
+
+        def _runtime_update_callback(*, scope: str, model_override=None, reasoning_config=None) -> None:
+            if scope != "session" or not ctx.session_key:
+                return
+            if model_override:
+                runner._session_state(ctx.session_key).conversation.model_override = {
+                    "model": model_override.get("model", ""),
+                    "provider": model_override.get("provider", ""),
+                    "api_key": model_override.get("api_key", ""),
+                    "base_url": model_override.get("base_url", ""),
+                    "api_mode": model_override.get("api_mode", ""),
+                }
+            if reasoning_config is not None:
+                runner._session_state(ctx.session_key).conversation.reasoning_override = dict(reasoning_config)
+            if model_override or reasoning_config is not None:
+                runner._persist_session_runtime_override(
+                    ctx.session_key,
+                    model=(model_override or {}).get("model"),
+                    provider=(model_override or {}).get("provider"),
+                    reasoning_config=reasoning_config,
+                    include_model=bool(model_override),
+                    include_reasoning=reasoning_config is not None,
+                )
+
+        return _runtime_update_callback
+
     def _wire_turn_agent_callbacks(self, agent, turn_route, reasoning_config,
                                    stream_delta_cb, interim_assistant_cb, want_interim_messages):
         """Per-message state (callbacks, reasoning, voice route) — never baked into the cached agent."""
@@ -571,6 +603,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         # auxiliary.voice_chat route (a voice note, or an admission committed as a voice turn) and
         # this turn's must-deliver notes; a managed worker arms its agent through the same helper.
         arm_surface_turn(agent, runner._consume_pending_turn_sidecar_notes(ctx.session_key), voice_turn=ctx.voice_turn)
+        # Session-scoped runtime switches (agent model_switch) mirror into the session override state
+        # and the durable SessionEntry runtime fields so the route survives cache eviction/restart.
+        agent.runtime_update_callback = self._make_runtime_update_callback()
         agent.background_review_callback, bg_release = self._make_bg_review_callbacks()
         # Register the release hook on the adapter so base.py's finally block fires it after the
         # main response is delivered.
