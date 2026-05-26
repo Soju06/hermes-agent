@@ -38,8 +38,8 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **upstream_pr:** _(none — dogfood runtime control)_
 - **state:** `local-only`
 - **rationale:** Agent-callable `model_status` / `model_switch` tools. Session-only scope (turn scope removed — LLMs omitted scope ~29%, causing silent reversion). Model targets constrained to config-declared providers/models. Gateway session callback for override persistence.
-- **commit:** `3e7dae028 feat(runtime): agent-callable model_switch / model_status (session-only)`
-- **touches:** `agent/runtime_control.py`, `tools/runtime_control_tool.py`, `agent/conversation_loop.py`, `agent/agent_runtime_helpers.py`, `agent/tool_executor.py`, `gateway/run.py`, `model_tools.py`, `toolsets.py`, `tests/run_agent/test_runtime_control.py`
+- **commit:** `ecb98d137 feat(runtime): agent-callable model_switch / model_status (session-only)`
+- **touches:** `agent/runtime_control.py`, `tools/runtime_control_tool.py`, `agent/conversation_loop.py`, `agent/agent_runtime_helpers.py`, `agent/tool_executor.py`, `gateway/run.py`, `hermes_cli/plugins.py`, `model_tools.py`, `toolsets.py`, `tests/hermes_cli/test_plugins.py`, `tests/run_agent/test_runtime_control.py`
 
 ## State Vocabulary
 
