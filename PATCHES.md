@@ -37,9 +37,9 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **origin:** `local-author`
 - **upstream_pr:** _(none — dogfood runtime control)_
 - **state:** `local-only`
-- **rationale:** Agent-callable `model_status` / `model_switch` tools. Session-only scope (turn scope removed — LLMs omitted scope ~29%, causing silent reversion). Model targets constrained to config-declared providers/models. Gateway session callback for override persistence.
-- **commit:** `ecb98d137 feat(runtime): agent-callable model_switch / model_status (session-only)`
-- **touches:** `agent/runtime_control.py`, `tools/runtime_control_tool.py`, `agent/conversation_loop.py`, `agent/agent_runtime_helpers.py`, `agent/tool_executor.py`, `gateway/run.py`, `hermes_cli/plugins.py`, `model_tools.py`, `toolsets.py`, `tests/hermes_cli/test_plugins.py`, `tests/run_agent/test_runtime_control.py`
+- **rationale:** Agent-callable `model_status` / `model_switch` tools. Session-only scope (turn scope removed — LLMs omitted scope ~29%, causing silent reversion). Model targets constrained to config-declared providers/models. Gateway session callback plus durable SessionEntry runtime fields so session-scoped model/reasoning overrides survive gateway restart without storing secrets.
+- **commit:** `f051bbf5e feat(runtime): agent-callable model_switch / model_status (session-only)`
+- **touches:** `agent/runtime_control.py`, `tools/runtime_control_tool.py`, `agent/conversation_loop.py`, `agent/agent_runtime_helpers.py`, `agent/tool_executor.py`, `gateway/run.py`, `gateway/session.py`, `hermes_cli/plugins.py`, `model_tools.py`, `toolsets.py`, `tests/hermes_cli/test_plugins.py`, `tests/run_agent/test_runtime_control.py`
 
 ## State Vocabulary
 
@@ -66,7 +66,7 @@ Patch-State: local-only | pending-upstream | vendored
 main                                  ← mirror of upstream/main, fast-forward only
 soju/fork-policy                    ← management branch with manifest + scripts (not applied)
 soju/patches/redact-pii-optout       ← runtime topic, rebased on base_commit
-soju/patches/runtime-control          ← runtime topic (squashed: core + config-sot-guard + session-only)
+soju/patches/runtime-control          ← runtime topic (squashed: core + config-sot-guard + session-only + SessionEntry persistence)
 soju/production                       ← rebuilt: base_commit + runtime patches only
                                          NEVER hand-edit. Always run `bin/hermes-patches rebuild` from `soju/fork-policy`.
 ```
