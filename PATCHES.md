@@ -13,9 +13,9 @@ Every runtime patch must live in a `soju/patches/<name>` topic branch and be lis
 ```
 upstream: NousResearch/hermes-agent
 base_ref: upstream/main
-base_commit: 372e9a18cd0e446a979e6fb06d40dc4d65d4070a
+base_commit: 0bc616ecf9f16f48b7a3ec87497614b90e83254e
 base_tag:   none (post-v2026.5.16 main)
-pinned_at:  2026-05-22
+pinned_at:  2026-06-01
 ```
 
 Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must rebase all `soju/patches/*` topics on top of the new base and verify the production stack rebuilds clean.
@@ -28,8 +28,8 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **origin:** `local-author` (Soju)
 - **upstream_pr:** _(none — personal preference)_
 - **state:** `local-only`
-- **rationale:** Nachoneko/Mymel hosts disable PII redaction by default; gate behind `HERMES_REDACT_PII=1`. Required so memory/Graphiti ingest sees raw user text.
-- **commit:** `cc7c08c89 feat(redact): gate PII redaction behind HERMES_REDACT_PII (default off)`
+- **rationale:** Nachoneko/Mymel hosts disable PII redaction by default; gate E.164 phone-number redaction behind `HERMES_REDACT_PII=1` while keeping credential redaction on. Required so memory/Graphiti ingest sees raw user text. Discord mention snowflakes intentionally follow upstream policy and pass through unchanged because they are functional mention syntax, not secrets.
+- **commit:** `a39922592 feat(redact): gate PII redaction behind HERMES_REDACT_PII (default off)`
 - **touches:** `agent/redact.py`, `tests/conftest.py`, `tests/gateway/test_signal.py`
 
 ### 2. runtime-control
@@ -38,8 +38,8 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **upstream_pr:** _(none — dogfood runtime control)_
 - **state:** `local-only`
 - **rationale:** Agent-callable `model_status` / `model_switch` tools. Session-only scope (turn scope removed — LLMs omitted scope ~29%, causing silent reversion). Model targets constrained to config-declared providers/models. Gateway session callback plus durable SessionEntry runtime fields so session-scoped model/reasoning overrides survive gateway restart without storing secrets. Trusted pre-dispatch plugin runtime overrides can select the session route after auth but before the first LLM call.
-- **commit:** `22bdf15db feat(runtime): agent-callable model_switch / model_status (session-only)`
-- **touches:** `agent/runtime_control.py`, `tools/runtime_control_tool.py`, `agent/conversation_loop.py`, `agent/agent_runtime_helpers.py`, `agent/tool_executor.py`, `gateway/run.py`, `gateway/session.py`, `hermes_cli/plugins.py`, `model_tools.py`, `toolsets.py`, `tests/gateway/test_pre_gateway_dispatch.py`, `tests/hermes_cli/test_plugins.py`, `tests/run_agent/test_runtime_control.py`
+- **commit:** `48292918d feat(runtime): agent-callable model_switch / model_status (session-only)`
+- **touches:** `agent/agent_init.py`, `agent/agent_runtime_helpers.py`, `agent/conversation_loop.py`, `agent/runtime_control.py`, `agent/tool_dispatch_helpers.py`, `agent/tool_executor.py`, `gateway/run.py`, `gateway/session.py`, `hermes_cli/plugins.py`, `model_tools.py`, `toolsets.py`, `tools/runtime_control_tool.py`, `tests/gateway/test_pre_gateway_dispatch.py`, `tests/gateway/test_session.py`, `tests/gateway/test_session_model_override_routing.py`, `tests/hermes_cli/test_plugins.py`, `tests/run_agent/test_run_agent.py`, `tests/run_agent/test_runtime_control.py`, `tests/test_model_tools.py`
 
 ## State Vocabulary
 
