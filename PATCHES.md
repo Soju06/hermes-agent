@@ -41,6 +41,15 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **commit:** `48292918d feat(runtime): agent-callable model_switch / model_status (session-only)`
 - **touches:** `agent/agent_init.py`, `agent/agent_runtime_helpers.py`, `agent/conversation_loop.py`, `agent/runtime_control.py`, `agent/tool_dispatch_helpers.py`, `agent/tool_executor.py`, `gateway/run.py`, `gateway/session.py`, `hermes_cli/plugins.py`, `model_tools.py`, `toolsets.py`, `tools/runtime_control_tool.py`, `tests/gateway/test_pre_gateway_dispatch.py`, `tests/gateway/test_session.py`, `tests/gateway/test_session_model_override_routing.py`, `tests/hermes_cli/test_plugins.py`, `tests/run_agent/test_run_agent.py`, `tests/run_agent/test_runtime_control.py`, `tests/test_model_tools.py`
 
+### 3. memory-write-reason-gate
+- **branch:** `soju/patches/memory-write-reason-gate`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — dogfood memory hygiene)_
+- **state:** `local-only`
+- **rationale:** Memory `add`/`replace` tool calls require an explicit suitability reason explaining why USER/MEMORY is the right store rather than a skill, Graphiti, or session history. The reason is a guardrail only and is not persisted with the entry.
+- **commit:** `c818c4456 feat(memory): require write reason for memory updates`
+- **touches:** `agent/agent_runtime_helpers.py`, `agent/tool_executor.py`, `tools/memory_tool.py`, `tests/tools/test_memory_tool.py`, `tests/tools/test_memory_tool_schema.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -67,6 +76,7 @@ main                                  ← mirror of upstream/main, fast-forward 
 soju/fork-policy                    ← management branch with manifest + scripts (not applied)
 soju/patches/redact-pii-optout       ← runtime topic, rebased on base_commit
 soju/patches/runtime-control          ← runtime topic (squashed: core + config-sot-guard + session-only + SessionEntry persistence)
+soju/patches/memory-write-reason-gate ← runtime topic, memory add/replace suitability reason guardrail
 soju/production                       ← rebuilt: base_commit + runtime patches only
                                          NEVER hand-edit. Always run `bin/hermes-patches rebuild` from `soju/fork-policy`.
 ```
