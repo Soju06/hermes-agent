@@ -149,6 +149,7 @@ def _memory(agent, args: dict, ctx: InlineToolContext) -> Any:
         (
             ("action", "action"), ("target", "target"), ("content", "content"),
             ("old_text", "old_text"), ("new_text", "new_text"), ("operations", "operations"),
+            ("reason", "reason", ""),
         ),
         store=agent._memory_store,
     )

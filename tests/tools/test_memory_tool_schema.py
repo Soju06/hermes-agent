@@ -18,7 +18,9 @@ backends reject.
 """
 
 import json
+from types import SimpleNamespace
 
+from agent import agent_runtime_helpers, inline_tool_executors
 from tools.memory_tool import MEMORY_SCHEMA, MemoryStore
 from tools.registry import registry
 
@@ -117,3 +119,59 @@ def test_background_review_one_item_remove_of_the_last_entry_is_staged_not_appli
         reset_current_write_origin(token)
     assert result["staged"] is True
     assert store.user_entries == ["Name: Alice"]
+
+
+def test_memory_invoke_tool_forwards_reason_to_runtime_handler(tmp_path, monkeypatch):
+    """Agent-level memory dispatch must pass the schema's reason argument through.
+
+    This catches half-patches where the tool schema/backend accepts ``reason``
+    but agent intercept paths still call ``memory_tool()`` without forwarding it.
+    """
+    monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+    store = MemoryStore(memory_char_limit=1000, user_char_limit=1000)
+    store.load_from_disk()
+    agent = SimpleNamespace(
+        _memory_store=store,
+        _memory_manager=None,
+        session_id="test-session",
+    )
+
+    result = json.loads(
+        agent_runtime_helpers.invoke_tool(
+            agent,
+            "memory",
+            {
+                "action": "add",
+                "target": "memory",
+                "content": "Runtime dispatch reason smoke",
+                "reason": "This is a global environment invariant for dispatch regression testing.",
+            },
+            effective_task_id="test-task",
+            pre_tool_block_checked=True,
+        )
+    )
+
+    assert result["success"] is True
+    assert "Runtime dispatch reason smoke" in store.memory_entries
+
+
+def test_memory_intercept_paths_forward_reason_argument(tmp_path, monkeypatch):
+    # Both invoke_tool (concurrent path) and execute_tool_calls_sequential dispatch
+    # "memory" through the shared INLINE_TOOL_EXECUTORS table, so the single
+    # executor is the one seam that must forward ``reason``.
+    monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+    store = MemoryStore(memory_char_limit=1000, user_char_limit=1000)
+    store.load_from_disk()
+    agent = SimpleNamespace(_memory_store=store, _memory_manager=None)
+    ctx = inline_tool_executors.InlineToolContext(effective_task_id="test-task", tool_call_id="call-1")
+    execute = inline_tool_executors.INLINE_TOOL_EXECUTORS["memory"]
+    args = {"action": "add", "target": "memory", "content": "Inline executor reason seam"}
+
+    denied = json.loads(execute(agent, dict(args), ctx))
+    assert denied["success"] is False
+    assert "reason is required" in denied["error"]
+
+    allowed = json.loads(execute(
+        agent, {**args, "reason": "This is a global environment invariant for dispatch regression testing."}, ctx))
+    assert allowed["success"] is True
+    assert store.memory_entries == ["Inline executor reason seam"]
