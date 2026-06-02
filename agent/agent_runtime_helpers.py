@@ -2289,6 +2289,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 content=next_args.get("content"),
                 old_text=next_args.get("old_text"),
                 operations=operations,
+                reason=next_args.get("reason", ""),
                 store=agent._memory_store,
             )
             # Mirror successful built-in memory writes to external providers.
