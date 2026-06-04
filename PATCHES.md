@@ -56,7 +56,7 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **upstream_pr:** _(none — Discord/gateway dogfood UX)_
 - **state:** `local-only`
 - **rationale:** Gateway progress bubbles should show todo item statuses after the todo tool completes, not only a count like `planning N task(s)`. Also flush throttled progress edits when the final queued event has no following tool event.
-- **commit:** `887a32680 feat(gateway): show todo progress details`
+- **commit:** `670274b3b feat(gateway): show todo progress details`
 - **touches:** `agent/display.py`, `gateway/run.py`, `tests/agent/test_display.py`, `tests/gateway/test_run_progress_topics.py`
 
 ## State Vocabulary
