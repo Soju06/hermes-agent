@@ -68,6 +68,16 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **commit:** `10fdf4a43 feat(discord): render markdown tables as codeblocks`
 - **touches:** `plugins/platforms/discord/adapter.py`, `tests/gateway/test_discord_send.py`
 
+
+### 6. delegate-per-task-model
+- **branch:** `soju/patches/delegate-per-task-model`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — dogfood subagent routing)_
+- **state:** `local-only`
+- **rationale:** `delegate_task` should support per-call and per-task model/provider overrides so the parent can route lightweight research or analysis children to a different configured provider (e.g. `grok-tokenmaxxing/grok-4.3`) without changing `delegation.model/provider` globally for every subagent.
+- **commit:** `fd485d122 feat(delegate): restore per-call model provider override`
+- **touches:** `gateway/run.py`, `run_agent.py`, `tools/delegate_tool.py`, `tests/gateway/test_run_progress_topics.py`, `tests/tools/test_delegate.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -97,6 +107,7 @@ soju/patches/runtime-control          ← runtime topic (squashed: core + config
 soju/patches/memory-write-reason-gate ← runtime topic, memory add/replace suitability reason guardrail
 soju/patches/todo-progress-display    ← runtime topic, gateway todo progress status rendering
 soju/patches/discord-table-codeblocks  ← runtime topic, Discord markdown tables as fenced ASCII codeblocks
+soju/patches/delegate-per-task-model   ← runtime topic, per-call/per-task subagent model/provider routing
 soju/production                       ← rebuilt: base_commit + runtime patches only
                                          NEVER hand-edit. Always run `bin/hermes-patches rebuild` from `soju/fork-policy`.
 ```
