@@ -59,6 +59,15 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **commit:** `670274b3b feat(gateway): show todo progress details`
 - **touches:** `agent/display.py`, `gateway/run.py`, `tests/agent/test_display.py`, `tests/gateway/test_run_progress_topics.py`
 
+### 5. discord-table-codeblocks
+- **branch:** `soju/patches/discord-table-codeblocks`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — Discord/gateway dogfood UX)_
+- **state:** `local-only`
+- **rationale:** Discord does not render GitHub-flavored markdown pipe tables. Convert detected outbound pipe tables to fenced box-drawing ASCII tables so table responses remain readable, while preserving existing fenced code blocks, CJK wide-character alignment, and long-table chunk codeblock boundaries.
+- **commit:** `10fdf4a43 feat(discord): render markdown tables as codeblocks`
+- **touches:** `plugins/platforms/discord/adapter.py`, `tests/gateway/test_discord_send.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -87,6 +96,7 @@ soju/patches/redact-pii-optout       ← runtime topic, rebased on base_commit
 soju/patches/runtime-control          ← runtime topic (squashed: core + config-sot-guard + session-only + SessionEntry persistence)
 soju/patches/memory-write-reason-gate ← runtime topic, memory add/replace suitability reason guardrail
 soju/patches/todo-progress-display    ← runtime topic, gateway todo progress status rendering
+soju/patches/discord-table-codeblocks  ← runtime topic, Discord markdown tables as fenced ASCII codeblocks
 soju/production                       ← rebuilt: base_commit + runtime patches only
                                          NEVER hand-edit. Always run `bin/hermes-patches rebuild` from `soju/fork-policy`.
 ```
