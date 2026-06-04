@@ -221,8 +221,11 @@ class GatewayTurnProgressMixin:
             ctx.log_queue.put(f"{ts}  {tool_name}:{preview_str}".rstrip())
         if not ctx.progress_queue or not ctx._run_still_current():
             return
-        if event_type == "tool.completed" and not ctx.long_tool_hint_fired[0]:
-            self._progress_onboarding_hint(kwargs)
+        if event_type == "tool.completed":
+            if not ctx.long_tool_hint_fired[0]:
+                self._progress_onboarding_hint(kwargs)
+            if not kwargs.get("is_error"):
+                self._progress_todo_result(tool_name, kwargs)
             return
         # "_thinking" is assistant scratch text between tool calls, never ordinary tool progress:
         # only relayed when the platform explicitly opted into thinking_progress.
@@ -310,6 +313,26 @@ class GatewayTurnProgressMixin:
                     mark_seen(_hermes_home / "config.yaml", TOOL_PROGRESS_FLAG)
         except Exception as err:
             logger.debug("tool-progress onboarding hint failed: %s", err)
+
+    def _progress_todo_result(self, tool_name, kwargs: dict) -> None:
+        """Render a completed todo result (task statuses) into the progress bubble, replacing the
+        "📋 planning N task(s)" line its tool.started event queued, so editable platforms show the
+        tasks instead of only item counts."""
+        from tools.todo_tool import is_todo_tool_name
+        if not is_todo_tool_name(tool_name):
+            return
+        try:
+            from agent.display import format_todo_result_for_progress, get_tool_emoji, get_tool_verb
+            todo_progress = format_todo_result_for_progress(kwargs.get("result") or "")
+            if todo_progress:
+                # Same emoji/verb resolution as _progress_build_message so the prefix matches the
+                # queued tool.started line whichever emoji the registry/skin resolved.
+                emoji = get_tool_emoji(tool_name, default="⚙️")
+                verb = get_tool_verb(tool_name)
+                prefix = f"{emoji} {verb}" if verb else f"{emoji} {tool_name}"
+                self._ctx.progress_queue.put(("__replace_last_matching__", prefix, todo_progress))
+        except Exception:
+            logger.debug("todo progress formatting failed", exc_info=True)
 
     @staticmethod
     def _preview_cap() -> int:
@@ -831,8 +854,25 @@ class GatewayTurnProgressMixin:
                 return base_msg
             st.progress_lines[-1] = _append_progress_repeat_count(base_msg, count + 1)
             return st.progress_lines[-1]
-        st.progress_lines.append(raw)
-        return raw
+        if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__replace_last_matching__":
+            # Swap the newest line starting with ``prefix`` (e.g. the todo tool's "📋 planning ..."
+            # line) for ``replacement``; append when no such line is in the current bubble.
+            _, prefix, replacement = raw
+            msg = str(replacement)
+            replace_idx = next(
+                (idx for idx in range(len(st.progress_lines) - 1, -1, -1)
+                 if str(st.progress_lines[idx]).startswith(str(prefix))),
+                None,
+            )
+            if replace_idx is None:
+                st.progress_lines.append(msg)
+            else:
+                st.progress_lines[replace_idx] = msg
+            self._ctx.last_progress_msg[0], self._ctx.repeat_count[0] = msg, 0
+            return msg
+        msg = str(raw)
+        st.progress_lines.append(msg)
+        return msg
 
     async def _flush_progress_edit(self, st) -> None:
         if st.can_edit and st.progress_lines and st.progress_msg_id and not _in_flood_window(st):
@@ -973,12 +1013,12 @@ class GatewayTurnProgressMixin:
                 msg = self._progress_absorb(st, raw)
                 if not await self._roll_progress_overflow_if_needed(st):
                     # Throttle edits: batch rapid tool updates into fewer API calls (grammY pattern:
-                    # proactively rate-limit rather than react to 429s). Loop back to drain further
-                    # queued messages before sending a single batched edit.
+                    # proactively rate-limit rather than react to 429s). Wait out the interval, then
+                    # deliver — even when this is the final queued event, so accumulated lines are
+                    # not stranded until a later tool event (or cancel) arrives.
                     remaining = EDIT_INTERVAL - (time.monotonic() - last_edit_ts)
                     if remaining > 0:
                         await asyncio.sleep(remaining)
-                        continue
                     if not ctx._run_still_current():
                         return
                     if not await self._progress_send_or_edit(st, msg):
