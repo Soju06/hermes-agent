@@ -50,6 +50,15 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **commit:** `c818c4456 feat(memory): require write reason for memory updates`
 - **touches:** `agent/agent_runtime_helpers.py`, `agent/tool_executor.py`, `tools/memory_tool.py`, `tests/tools/test_memory_tool.py`, `tests/tools/test_memory_tool_schema.py`
 
+### 4. todo-progress-display
+- **branch:** `soju/patches/todo-progress-display`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — Discord/gateway dogfood UX)_
+- **state:** `local-only`
+- **rationale:** Gateway progress bubbles should show todo item statuses after the todo tool completes, not only a count like `planning N task(s)`. Also flush throttled progress edits when the final queued event has no following tool event.
+- **commit:** `887a32680 feat(gateway): show todo progress details`
+- **touches:** `agent/display.py`, `gateway/run.py`, `tests/agent/test_display.py`, `tests/gateway/test_run_progress_topics.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -77,6 +86,7 @@ soju/fork-policy                    ← management branch with manifest + script
 soju/patches/redact-pii-optout       ← runtime topic, rebased on base_commit
 soju/patches/runtime-control          ← runtime topic (squashed: core + config-sot-guard + session-only + SessionEntry persistence)
 soju/patches/memory-write-reason-gate ← runtime topic, memory add/replace suitability reason guardrail
+soju/patches/todo-progress-display    ← runtime topic, gateway todo progress status rendering
 soju/production                       ← rebuilt: base_commit + runtime patches only
                                          NEVER hand-edit. Always run `bin/hermes-patches rebuild` from `soju/fork-policy`.
 ```
