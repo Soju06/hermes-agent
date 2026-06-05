@@ -464,11 +464,37 @@ _MEMORY_ROUTING_BLOCK = (
     "out — a wrong fact misleads every future session.\n\n"
 )
 
+_MEMORY_WRITE_CONTRACT = (
+    "Memory write contract (hard gate): USER.md and MEMORY.md are always-injected scarce context, "
+    "so most conversation facts must NOT be written there.\n"
+    "Only call memory(add|replace) when the fact is useful across unrelated session types "
+    "(ordinary chat, research, writing, and development) or is a global agent/environment/routing "
+    "invariant. Stable-but-scoped project, infra, host, repo, PR, service, workflow, and task-state "
+    "facts belong to Graphiti/session history, or to a skill only if they are reusable procedures "
+    "or pitfalls.\n"
+    "If you call memory(add|replace), the `reason` argument MUST be a JSON object string with "
+    "`declared_scope` and `declared_category`, plus concrete `evidence`, `why_always_injected`, "
+    "`why_not_skill`, and `why_not_graphiti`. For target='user', include `applies_to` covering at "
+    "least three of: ordinary_chat, research, writing, development.\n"
+    "If the candidate does not satisfy that contract, do not attempt memory; say 'Nothing to "
+    "save.' for memory and move on.\n\n"
+)
+
+_SKILL_REVIEW_CALIBRATION = (
+    "Skill review calibration: be selective, not eager. Update skills only when there is a real "
+    "reusable learning signal: a user correction to approach or style, a non-trivial proven "
+    "technique/workaround/debugging path, or a loaded skill that was wrong, missing a step, or "
+    "outdated. Most ordinary turns, one-off tasks, status checks, and transient errors should "
+    "result in 'Nothing to save.' Do not create work just to satisfy the review.\n\n"
+)
+
 _MEMORY_REVIEW_PROMPT = (
     "Review the conversation above and consider saving to memory if appropriate.\n\n"
-    "Memory has " + _MEMORY_ROUTING_BLOCK +
-    "If something stands out, save it once, in the right store, using the memory tool with the "
-    "matching target. If nothing is worth saving, just say 'Nothing to save.' and stop."
+    + _MEMORY_WRITE_CONTRACT +
+    "For a candidate that passes the contract, memory has " + _MEMORY_ROUTING_BLOCK +
+    "If a candidate satisfies the memory write contract, save it once, in the right store, using "
+    "the memory tool with the matching target and the required structured JSON reason. If nothing "
+    "satisfies the contract, just say 'Nothing to save.' and stop."
 )
 
 # Shared shape contract for anything written into a skill. The failure mode this prevents is the
@@ -530,14 +556,14 @@ _DO_NOT_CAPTURE_BLOCK = (
 )
 
 _SKILL_REVIEW_PROMPT = (
-    "Review the conversation above and update the skill library. Be ACTIVE — most sessions produce "
-    "at least one skill update, even if small. A pass that does nothing is a missed learning "
-    "opportunity, not a neutral outcome.\n\n"
+    "Review the conversation above and update the skill library only when the conversation "
+    "contains a real reusable learning signal.\n\n"
+    + _SKILL_REVIEW_CALIBRATION +
     "Target shape of the library: CLASS-LEVEL skills, each with a SKILL.md of always-on rules and a "
     "small `references/` set of topical depth. Not a flat list of narrow one-session skills, and "
     "not an umbrella hoarding a references/ file per session. This shapes HOW you update, not "
     "WHETHER you update.\n\n" + _LESSON_LAYER_BLOCK +
-    "Signals to look for (any one of these warrants action):\n"
+    "Signals to look for (these may warrant action when concrete and reusable):\n"
     "  • User corrected your style, tone, format, legibility, or verbosity. Frustration signals "
     "like 'stop doing X', 'this is too verbose', 'don't format like this', 'why are you "
     "explaining', 'just give me the answer', 'you always do Y and I hate it', or an explicit "
@@ -549,8 +575,8 @@ _SKILL_REVIEW_PROMPT = (
     "that a future session would benefit from. Capture it.\n"
     "  • A skill that got loaded or consulted this session turned out to be wrong, missing a step, "
     "or outdated. Patch it NOW.\n\n"
-    "Preference order — prefer the earliest action that fits, but do pick one when a signal above "
-    "fired:\n"
+    "Preference order — if a concrete reusable signal exists, prefer the earliest action that "
+    "fits:\n"
     "  1. UPDATE A CURRENTLY-LOADED SKILL. Look back through the conversation for skills the user "
     "loaded via /skill-name or you read via skill_view. If any of them covers the territory of the "
     "new learning, PATCH that one first (re-load it with skill_view during this review — see "
@@ -597,21 +623,24 @@ _SKILL_REVIEW_PROMPT = (
     "If you notice two existing skills that overlap, note it in your reply — the background "
     "curator handles consolidation at scale. Never delete a skill here.\n\n"
     "Do NOT capture" + _DO_NOT_CAPTURE_BLOCK +
-    "'Nothing to save.' is a real option but should NOT be the default. If the session ran "
-    "smoothly with no corrections and produced no new technique, just say 'Nothing to save.' and "
-    "stop. Otherwise, act."
+    "'Nothing to save.' is the correct answer when the session has no concrete reusable "
+    "correction, technique, or skill defect. If the session ran smoothly with no corrections and "
+    "produced no new reusable technique, say 'Nothing to save.' and stop. Otherwise, act only on "
+    "the concrete signal."
 )
 
 _COMBINED_REVIEW_PROMPT = (
-    "Review the conversation above and update two things:\n\n"
-    "**Memory**: " + _MEMORY_ROUTING_BLOCK +
-    "**Skills**: how to do this class of task. Be ACTIVE — most sessions produce at least one "
-    "skill update. A pass that does nothing is a missed learning opportunity, not a neutral "
-    "outcome.\n\n"
+    "Review the conversation above and update two dimensions only when each has a real durable "
+    "signal:\n\n"
+    "**Memory**: who the user is or global agent/runtime invariants.\n"
+    + _MEMORY_WRITE_CONTRACT +
+    "For a candidate that passes the contract, memory has " + _MEMORY_ROUTING_BLOCK +
+    "**Skills**: how to do a class of task for this user.\n"
+    + _SKILL_REVIEW_CALIBRATION +
     "Target shape of the skill library: CLASS-LEVEL skills with a SKILL.md of always-on rules and a "
     "small `references/` set of topical depth — not narrow one-session skills, and not an umbrella "
     "hoarding a references/ file per session.\n\n" + _LESSON_LAYER_BLOCK +
-    "Signals that warrant a skill update (any one is enough):\n"
+    "Signals that may warrant a skill update when concrete and reusable:\n"
     "  • User corrected your style, tone, format, legibility, verbosity, or approach. Frustration "
     "is a FIRST-CLASS skill signal, not just a memory signal. 'stop doing X', 'don't format like "
     "this', 'I hate when you Y' — embed the lesson in the skill that governs that task so the next "
@@ -650,8 +679,9 @@ _COMBINED_REVIEW_PROMPT = (
     "If you notice overlapping existing skills, mention it — the background curator handles "
     "consolidation. Never delete a skill here.\n\n"
     "Do NOT capture as skills" + _DO_NOT_CAPTURE_BLOCK +
-    "Act on whichever of the two dimensions has real signal. If genuinely nothing stands out on "
-    "either, say 'Nothing to save.' and stop — but don't reach for that conclusion as a default."
+    "Act on whichever dimension has a real concrete signal. If genuinely nothing stands out on "
+    "either, say 'Nothing to save.' and stop. Do not create memory or skill updates for weak, "
+    "scoped, or one-off signals."
 )
 
 
