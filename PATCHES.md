@@ -78,6 +78,15 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **commit:** `fd485d122 feat(delegate): restore per-call model provider override`
 - **touches:** `gateway/run.py`, `run_agent.py`, `tools/delegate_tool.py`, `tests/gateway/test_run_progress_topics.py`, `tests/tools/test_delegate.py`
 
+### 7. background-review-guardrails
+- **branch:** `soju/patches/background-review-guardrails`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — dogfood self-improvement guardrail)_
+- **state:** `local-only`
+- **rationale:** Background self-improvement review must be a calibrated participant in the memory/skill governance model instead of aggressively writing after most sessions. Memory review prompts now carry the structured always-injected memory rationale contract, and skill review prompts default to "Nothing to save" unless a concrete reusable signal exists.
+- **commit:** `81083e1c8 fix: calibrate background self-improvement review`
+- **touches:** `agent/background_review.py`, `tests/run_agent/test_review_prompt_class_first.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -108,6 +117,7 @@ soju/patches/memory-write-reason-gate ← runtime topic, memory add/replace suit
 soju/patches/todo-progress-display    ← runtime topic, gateway todo progress status rendering
 soju/patches/discord-table-codeblocks  ← runtime topic, Discord markdown tables as fenced ASCII codeblocks
 soju/patches/delegate-per-task-model   ← runtime topic, per-call/per-task subagent model/provider routing
+soju/patches/background-review-guardrails ← runtime topic, calibrated self-improvement review guardrails
 soju/production                       ← rebuilt: base_commit + runtime patches only
                                          NEVER hand-edit. Always run `bin/hermes-patches rebuild` from `soju/fork-policy`.
 ```
