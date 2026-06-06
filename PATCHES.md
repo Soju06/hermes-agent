@@ -23,16 +23,7 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 ## Patches (apply order = list order)
 
 
-### 1. redact-pii-optout
-- **branch:** `soju/patches/redact-pii-optout`
-- **origin:** `local-author` (Soju)
-- **upstream_pr:** _(none — personal preference)_
-- **state:** `local-only`
-- **rationale:** Nachoneko/Mymel hosts disable PII redaction by default; gate E.164 phone-number redaction behind `HERMES_REDACT_PII=1` while keeping credential redaction on. Required so memory/Graphiti ingest sees raw user text. Discord mention snowflakes intentionally follow upstream policy and pass through unchanged because they are functional mention syntax, not secrets.
-- **commit:** `a39922592 feat(redact): gate PII redaction behind HERMES_REDACT_PII (default off)`
-- **touches:** `agent/redact.py`, `tests/conftest.py`, `tests/gateway/test_signal.py`
-
-### 2. runtime-control
+### 1. runtime-control
 - **branch:** `soju/patches/runtime-control`
 - **origin:** `local-author`
 - **upstream_pr:** _(none — dogfood runtime control)_
@@ -41,7 +32,7 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **commit:** `b3e842047 feat(runtime): agent-callable model_switch / model_status (session-only)`
 - **touches:** `agent/agent_init.py`, `agent/agent_runtime_helpers.py`, `agent/conversation_loop.py`, `agent/runtime_control.py`, `agent/tool_dispatch_helpers.py`, `agent/tool_executor.py`, `gateway/run.py`, `gateway/session.py`, `hermes_cli/plugins.py`, `model_tools.py`, `toolsets.py`, `tools/runtime_control_tool.py`, `tests/gateway/test_pre_gateway_dispatch.py`, `tests/gateway/test_session.py`, `tests/gateway/test_session_model_override_routing.py`, `tests/hermes_cli/test_plugins.py`, `tests/run_agent/test_pre_tool_session_id.py`, `tests/run_agent/test_run_agent.py`, `tests/run_agent/test_runtime_control.py`, `tests/test_model_tools.py`
 
-### 3. memory-write-reason-gate
+### 2. memory-write-reason-gate
 - **branch:** `soju/patches/memory-write-reason-gate`
 - **origin:** `local-author`
 - **upstream_pr:** _(none — dogfood memory hygiene)_
@@ -50,7 +41,7 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **commit:** `c818c4456 feat(memory): require write reason for memory updates`
 - **touches:** `agent/agent_runtime_helpers.py`, `agent/tool_executor.py`, `tools/memory_tool.py`, `tests/tools/test_memory_tool.py`, `tests/tools/test_memory_tool_schema.py`
 
-### 4. todo-progress-display
+### 3. todo-progress-display
 - **branch:** `soju/patches/todo-progress-display`
 - **origin:** `local-author`
 - **upstream_pr:** _(none — Discord/gateway dogfood UX)_
@@ -59,7 +50,7 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **commit:** `670274b3b feat(gateway): show todo progress details`
 - **touches:** `agent/display.py`, `gateway/run.py`, `tests/agent/test_display.py`, `tests/gateway/test_run_progress_topics.py`
 
-### 5. discord-table-codeblocks
+### 4. discord-table-codeblocks
 - **branch:** `soju/patches/discord-table-codeblocks`
 - **origin:** `local-author`
 - **upstream_pr:** _(none — Discord/gateway dogfood UX)_
@@ -69,22 +60,22 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **touches:** `plugins/platforms/discord/adapter.py`, `tests/gateway/test_discord_send.py`
 
 
-### 6. delegate-per-task-model
+### 5. delegate-per-task-model
 - **branch:** `soju/patches/delegate-per-task-model`
 - **origin:** `local-author`
 - **upstream_pr:** _(none — dogfood subagent routing)_
 - **state:** `local-only`
 - **rationale:** `delegate_task` should support per-call and per-task model/provider overrides so the parent can route lightweight research or analysis children to a different configured provider (e.g. `grok-tokenmaxxing/grok-4.3`) without changing `delegation.model/provider` globally for every subagent.
-- **commit:** `fd485d122 feat(delegate): restore per-call model provider override`
+- **commit:** `8b0eb824b feat(delegate): restore per-call model provider override`
 - **touches:** `gateway/run.py`, `run_agent.py`, `tools/delegate_tool.py`, `tests/gateway/test_run_progress_topics.py`, `tests/tools/test_delegate.py`
 
-### 7. background-review-guardrails
+### 6. background-review-guardrails
 - **branch:** `soju/patches/background-review-guardrails`
 - **origin:** `local-author`
 - **upstream_pr:** _(none — dogfood self-improvement guardrail)_
 - **state:** `local-only`
 - **rationale:** Background self-improvement review must be a calibrated participant in the memory/skill governance model instead of aggressively writing after most sessions. Memory review prompts now carry the structured always-injected memory rationale contract, and skill review prompts default to "Nothing to save" unless a concrete reusable signal exists.
-- **commit:** `81083e1c8 fix: calibrate background self-improvement review`
+- **commit:** `4f4527126 fix: calibrate background self-improvement review`
 - **touches:** `agent/background_review.py`, `tests/run_agent/test_review_prompt_class_first.py`
 
 ## State Vocabulary
@@ -111,7 +102,6 @@ Patch-State: local-only | pending-upstream | vendored
 ```
 main                                  ← mirror of upstream/main, fast-forward only
 soju/fork-policy                    ← management branch with manifest + scripts (not applied)
-soju/patches/redact-pii-optout       ← runtime topic, rebased on base_commit
 soju/patches/runtime-control          ← runtime topic (squashed: core + config-sot-guard + session-only + SessionEntry persistence)
 soju/patches/memory-write-reason-gate ← runtime topic, memory add/replace suitability reason guardrail
 soju/patches/todo-progress-display    ← runtime topic, gateway todo progress status rendering
