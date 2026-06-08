@@ -66,7 +66,7 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **upstream_pr:** _(none — dogfood subagent routing)_
 - **state:** `local-only`
 - **rationale:** `delegate_task` should support per-call and per-task model/provider overrides so the parent can route lightweight research or analysis children to a different configured provider (e.g. `grok-tokenmaxxing/grok-4.3`) without changing `delegation.model/provider` globally for every subagent.
-- **commit:** `8b0eb824b feat(delegate): restore per-call model provider override`
+- **commit:** `ccec568ae feat(delegate): restore per-call model provider override`
 - **touches:** `gateway/run.py`, `run_agent.py`, `tools/delegate_tool.py`, `tests/gateway/test_run_progress_topics.py`, `tests/tools/test_delegate.py`
 
 ### 6. background-review-guardrails
