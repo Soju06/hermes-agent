@@ -32,6 +32,7 @@ from agent.context_compressor_summary import accepts_keyword_argument
 from agent.context_engine import CompactionProgressText, automatic_compaction_status_message, sanitize_memory_context
 from agent.conversation_compression_codex import _compress_context_via_codex_app_server
 from agent.conversation_compression_deadline import resolve_context_compression_timeouts
+from agent.conversation_compression_runtime_state import publish_runtime_state_after_split
 from agent.conversation_compression_scaffolding import _SYNTHETIC_USER_FLAGS, _message_text, is_user_role_scaffolding
 from agent.conversation_compression_telemetry import (
     _emit_aborted_attempt_telemetry, _emit_blocked_attempt_telemetry, _emit_bypassed_attempt_telemetry,
@@ -3340,6 +3341,9 @@ def _finish_compaction_boundary(
                 _labels_store.sessions.clear_activity_labels(_old_sid)
             elif callable(_clear_labels := getattr(type(_labels_db), "clear_session_activity_labels", None)):
                 _clear_labels(_labels_db, _old_sid)
+
+    # Republish runtime state for the rotated session before later gates observe the new id.
+    publish_runtime_state_after_split(agent, _old_sid)
 
     # Plugin engines use boundary_reason="compression" to keep lineage/checkpoint
     # state. Fires in BOTH modes: in-place passes the same id, the boundary is real.
