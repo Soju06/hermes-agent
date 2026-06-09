@@ -78,6 +78,15 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **commit:** `4f4527126 fix: calibrate background self-improvement review`
 - **touches:** `agent/background_review.py`, `tests/run_agent/test_review_prompt_class_first.py`
 
+### 7. runtime-state-session-split
+- **branch:** `soju/patches/runtime-state-session-split`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — dogfood runtime gate correctness)_
+- **state:** `local-only`
+- **rationale:** Runtime hard gates must see the active session's actual model/provider after context compression rotates the session id. Compression split now republishes runtime state for the new session with the old session as task/parent scope, and tool hook prechecks consistently forward session_id/tool_call_id so plugins do not fall back to stale cross-session runtime state.
+- **commit:** `39b5cfc42 fix: keep runtime state scoped across compression splits`
+- **touches:** `agent/agent_runtime_helpers.py`, `agent/conversation_compression.py`, `agent/conversation_loop.py`, `agent/tool_executor.py`, `tests/agent/test_runtime_state_session_split.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -108,6 +117,7 @@ soju/patches/todo-progress-display    ← runtime topic, gateway todo progress s
 soju/patches/discord-table-codeblocks  ← runtime topic, Discord markdown tables as fenced ASCII codeblocks
 soju/patches/delegate-per-task-model   ← runtime topic, per-call/per-task subagent model/provider routing
 soju/patches/background-review-guardrails ← runtime topic, calibrated self-improvement review guardrails
+soju/patches/runtime-state-session-split ← runtime topic, scoped runtime state across compression splits
 soju/production                       ← rebuilt: base_commit + runtime patches only
                                          NEVER hand-edit. Always run `bin/hermes-patches rebuild` from `soju/fork-policy`.
 ```
