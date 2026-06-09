@@ -83,9 +83,9 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **origin:** `local-author`
 - **upstream_pr:** _(none — dogfood runtime gate correctness)_
 - **state:** `local-only`
-- **rationale:** Runtime hard gates must see the active session's actual model/provider after context compression rotates the session id. Compression split now republishes runtime state for the new session with the old session as task/parent scope, and tool hook prechecks consistently forward session_id/tool_call_id so plugins do not fall back to stale cross-session runtime state.
-- **commit:** `39b5cfc42 fix: keep runtime state scoped across compression splits`
-- **touches:** `agent/agent_runtime_helpers.py`, `agent/conversation_compression.py`, `agent/conversation_loop.py`, `agent/tool_executor.py`, `tests/agent/test_runtime_state_session_split.py`
+- **rationale:** Runtime hard gates must see the active session's actual model/provider after context compression rotates the session id. Compression split now republishes runtime state for the new session with the old session as task/parent scope, and pre-LLM hook payloads carry task_id so plugins can associate the active runtime with both the rotated session and its parent task scope instead of falling back to stale cross-session runtime state.
+- **commit:** `ae58fc6c5 fix: keep runtime state scoped across compression splits`
+- **touches:** `agent/conversation_compression.py`, `agent/conversation_loop.py`, `tests/agent/test_runtime_state_session_split.py`
 
 ## State Vocabulary
 
