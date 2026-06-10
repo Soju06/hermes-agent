@@ -105,6 +105,15 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **commit:** `7248c37e2 fix(lsp): reap idle language-server clients`
 - **touches:** `agent/lsp/manager.py`, `tests/agent/lsp/test_service.py`, `website/docs/user-guide/features/lsp.md`
 
+### 10. aux-runtime-context
+- **branch:** `soju/patches/aux-runtime-context`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — dogfood auxiliary runtime isolation)_
+- **state:** `local-only`
+- **rationale:** Auxiliary task routing must not use process-global main-runtime state in a concurrent gateway. Store the live provider/model/base_url/api_key/api_mode in thread-local state so one Discord thread's `codex-nekos/gpt-5.5` override cannot leak into another thread's `vision_analyze`, title generation, compression, or other auxiliary calls.
+- **commit:** `7074fdb29 fix(auxiliary): isolate runtime routing per thread`
+- **touches:** `agent/auxiliary_client.py`, `tests/agent/test_set_runtime_main_custom_provider.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -138,6 +147,7 @@ soju/patches/background-review-guardrails ← runtime topic, calibrated self-imp
 soju/patches/runtime-state-session-split ← runtime topic, scoped runtime state across compression splits
 soju/patches/runtime-route-awareness   ← runtime topic, CurrentRuntime + DesiredRoute prompt block
 soju/patches/lsp-idle-reaper        ← runtime topic, pending upstream PR #36892 LSP idle reaper
+soju/patches/aux-runtime-context    ← runtime topic, thread-local auxiliary runtime routing state
 soju/production                       ← rebuilt: base_commit + runtime patches only
                                          NEVER hand-edit. Always run `bin/hermes-patches rebuild` from `soju/fork-policy`.
 ```
