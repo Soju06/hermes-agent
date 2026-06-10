@@ -87,7 +87,16 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **commit:** `80bfe6d5a fix: keep runtime state scoped across compression splits`
 - **touches:** `agent/conversation_compression.py`, `agent/conversation_loop.py`, `tests/agent/test_runtime_state_session_split.py`
 
-### 8. lsp-idle-reaper
+### 8. runtime-route-awareness
+- **branch:** `soju/patches/runtime-route-awareness`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — dogfood runtime routing correctness)_
+- **state:** `local-only`
+- **rationale:** Inject an API-call-time Runtime/Route State block so the agent sees live CurrentRuntime plus current-turn DesiredRoute without calling `model_status`. Trusted pre-dispatch `runtime_override` metadata is normalized into one-shot route state for the routed gateway turn, preserving stale-route protection while leaving post-tool rerouting and NEED_CONTEXT scout mode for later phases.
+- **commit:** `66e95e99c feat(runtime): inject runtime route awareness prompt`
+- **touches:** `agent/chat_completion_helpers.py`, `agent/conversation_loop.py`, `agent/system_prompt.py`, `docs/runtime-route-awareness.md`, `gateway/run.py`, `tests/agent/test_runtime_route_prompt.py`, `tests/gateway/test_pre_gateway_dispatch.py`
+
+### 9. lsp-idle-reaper
 - **branch:** `soju/patches/lsp-idle-reaper`
 - **origin:** `upstream-pr:36892`
 - **upstream_pr:** `36892`
@@ -127,6 +136,7 @@ soju/patches/discord-table-codeblocks  ← runtime topic, Discord markdown table
 soju/patches/delegate-per-task-model   ← runtime topic, per-call/per-task subagent model/provider routing
 soju/patches/background-review-guardrails ← runtime topic, calibrated self-improvement review guardrails
 soju/patches/runtime-state-session-split ← runtime topic, scoped runtime state across compression splits
+soju/patches/runtime-route-awareness   ← runtime topic, CurrentRuntime + DesiredRoute prompt block
 soju/patches/lsp-idle-reaper        ← runtime topic, pending upstream PR #36892 LSP idle reaper
 soju/production                       ← rebuilt: base_commit + runtime patches only
                                          NEVER hand-edit. Always run `bin/hermes-patches rebuild` from `soju/fork-policy`.
