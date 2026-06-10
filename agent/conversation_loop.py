@@ -844,14 +844,14 @@ def run_conversation(
         # This is intentional — system prompt modifications break the prompt
         # cache prefix.  The system prompt is reserved for Hermes internals.
         #
-        # Hermes invariant: the system prompt is built ONCE per session
-        # (cached on ``_cached_system_prompt``) and replayed verbatim on
-        # every turn.  We send it as a single content string so the
-        # bytes are byte-stable across turns and upstream prompt caches
-        # stay warm.
-        effective_system = active_system_prompt or ""
-        if agent.ephemeral_system_prompt:
-            effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
+        # Hermes invariant: the cached system prompt is built ONCE per session
+        # (cached on ``_cached_system_prompt``) and reused as a byte-stable
+        # prefix.  API-call-time runtime/route awareness is appended after that
+        # prefix by compose_effective_system_prompt() so the model sees live
+        # runtime truth without rebuilding the cached prompt.
+        from agent.system_prompt import compose_effective_system_prompt
+
+        effective_system = compose_effective_system_prompt(agent, active_system_prompt or "")
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
 
