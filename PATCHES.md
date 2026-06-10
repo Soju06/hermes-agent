@@ -87,6 +87,15 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **commit:** `80bfe6d5a fix: keep runtime state scoped across compression splits`
 - **touches:** `agent/conversation_compression.py`, `agent/conversation_loop.py`, `tests/agent/test_runtime_state_session_split.py`
 
+### 8. lsp-idle-reaper
+- **branch:** `soju/patches/lsp-idle-reaper`
+- **origin:** `upstream-pr:36892`
+- **upstream_pr:** `36892`
+- **state:** `pending-upstream`
+- **rationale:** Reap idle LSP clients after `lsp.idle_timeout` so long-running gateways do not keep TypeScript/pyright/gopls/rust-analyzer subprocesses alive for the full process lifetime. `idle_timeout <= 0` disables reaping; stale clients respawn on the next relevant file operation.
+- **commit:** `7248c37e2 fix(lsp): reap idle language-server clients`
+- **touches:** `agent/lsp/manager.py`, `tests/agent/lsp/test_service.py`, `website/docs/user-guide/features/lsp.md`
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -118,6 +127,7 @@ soju/patches/discord-table-codeblocks  ← runtime topic, Discord markdown table
 soju/patches/delegate-per-task-model   ← runtime topic, per-call/per-task subagent model/provider routing
 soju/patches/background-review-guardrails ← runtime topic, calibrated self-improvement review guardrails
 soju/patches/runtime-state-session-split ← runtime topic, scoped runtime state across compression splits
+soju/patches/lsp-idle-reaper        ← runtime topic, pending upstream PR #36892 LSP idle reaper
 soju/production                       ← rebuilt: base_commit + runtime patches only
                                          NEVER hand-edit. Always run `bin/hermes-patches rebuild` from `soju/fork-policy`.
 ```
