@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -40,6 +41,11 @@ def git(*args: str, check: bool = True, capture: bool = True) -> str:
         text=True,
     )
     return res.stdout.strip() if capture else ""
+
+
+def run(cmd: list[str], *, cwd: Path, check: bool = True) -> subprocess.CompletedProcess[str]:
+    print("$", " ".join(cmd))
+    return subprocess.run(cmd, cwd=str(cwd), check=check, text=True)
 
 
 @dataclass
@@ -292,6 +298,97 @@ def cmd_validate(_args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
+POST_UPDATE_HEALTH_TESTS = [
+    "tests/agent/lsp/test_service.py",
+    "tests/run_agent/test_runtime_control.py",
+    "tests/test_model_tools.py",
+    "tests/gateway/test_session.py",
+    "tests/gateway/test_session_model_override_routing.py",
+    "tests/gateway/test_pre_gateway_dispatch.py",
+    "tests/hermes_cli/test_plugins.py",
+    "tests/run_agent/test_run_agent.py",
+    "tests/agent/test_redact.py",
+    "tests/gateway/test_signal.py",
+    "tests/agent/test_runtime_state_session_split.py",
+    "tests/agent/test_display_todo_progress.py",
+    "tests/agent/test_display.py",
+    "tests/tools/test_memory_tool_schema.py",
+    "tests/tools/test_memory_tool.py",
+    "tests/tools/test_todo_tool.py",
+]
+
+
+def _python_for(repo: Path) -> str:
+    for rel in ("venv/bin/python", ".venv/bin/python"):
+        candidate = repo / rel
+        if candidate.exists() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    fallback = Path.home() / ".hermes/hermes-agent/venv/bin/python"
+    if fallback.exists() and os.access(fallback, os.X_OK):
+        return str(fallback)
+    return sys.executable
+
+
+def _git_at(repo: Path, *args: str, check: bool = True) -> str:
+    res = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=check,
+        capture_output=True,
+        text=True,
+    )
+    return res.stdout.strip()
+
+
+def cmd_post_update_health(args: argparse.Namespace) -> int:
+    """Hard gate before claiming a fork update is semantically integrated."""
+    repo = Path(args.repo).expanduser().resolve()
+    m = parse_manifest()
+    active = [p for p in m.patches if p.state in ("local-only", "pending-upstream", "vendored")]
+    failed = False
+
+    print(f"post-update-health repo={repo}")
+    print(f"manifest base={m.base_ref} @ {m.base_commit[:12]} active_patches={len(active)}")
+
+    if not repo.exists():
+        print(f"FAIL: repo path does not exist: {repo}")
+        return 2
+
+    status = _git_at(repo, "status", "--short", "--branch")
+    print(status)
+    log_subject = _git_at(repo, "log", "-1", "--format=%s")
+    print(f"HEAD subject: {log_subject}")
+    expected_subject = f"merge: assemble production stack [auto, {len(active)} patches]"
+    if log_subject != expected_subject:
+        print(f"FAIL: HEAD subject does not match manifest active patch count: {expected_subject}")
+        failed = True
+
+    try:
+        live_vs_fork = _git_at(repo, "rev-list", "--left-right", "--count", "HEAD...fork/soju/production")
+        print(f"HEAD...fork/soju/production: {live_vs_fork}")
+        if live_vs_fork != "0\t0":
+            print("FAIL: repo HEAD differs from fork/soju/production")
+            failed = True
+    except subprocess.CalledProcessError:
+        print("WARN: could not compare against fork/soju/production")
+
+    if args.skip_tests:
+        print("SKIP: semantic pytest suite not run (--skip-tests)")
+    else:
+        py = _python_for(repo)
+        cmd = [py, "-m", "pytest", "-q", "-o", "addopts=", *POST_UPDATE_HEALTH_TESTS]
+        try:
+            run(cmd, cwd=repo, check=True)
+        except subprocess.CalledProcessError as exc:
+            print(f"FAIL: semantic pytest suite failed with exit code {exc.returncode}")
+            failed = True
+
+    if failed:
+        print("semantic integration: INCOMPLETE")
+        return 1
+    print("semantic integration: OK")
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(prog="hermes-patches")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -299,6 +396,11 @@ def main() -> int:
     sub.add_parser("status").set_defaults(func=cmd_status)
     sub.add_parser("rebuild").set_defaults(func=cmd_rebuild)
     sub.add_parser("validate").set_defaults(func=cmd_validate)
+
+    health = sub.add_parser("post-update-health")
+    health.add_argument("--repo", default=str(Path.home() / ".hermes/hermes-agent"), help="production/live repo to verify")
+    health.add_argument("--skip-tests", action="store_true", help="only check stack identity; do not run semantic pytest suite")
+    health.set_defaults(func=cmd_post_update_health)
 
     sync = sub.add_parser("sync")
     sync.add_argument("ref", help="upstream ref to sync to (e.g. upstream/main, v2026.5.7)")
