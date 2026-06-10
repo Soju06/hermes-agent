@@ -114,6 +114,15 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **commit:** `7074fdb29 fix(auxiliary): isolate runtime routing per thread`
 - **touches:** `agent/auxiliary_client.py`, `tests/agent/test_set_runtime_main_custom_provider.py`
 
+### 11. gateway-max-iterations-config-authority
+- **branch:** `soju/patches/gateway-max-iterations-config-authority`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — dogfood gateway budget config correctness)_
+- **state:** `local-only`
+- **rationale:** Gateway agent turns must resolve `max_iterations` from config.yaml `agent.max_turns` as the source of truth before falling back to `HERMES_MAX_ITERATIONS`. A stale `.env` value such as `HERMES_MAX_ITERATIONS=90` must not override `agent.max_turns: 300` or cause intermittent `Iteration budget exhausted (90/90)` in concurrent Discord sessions.
+- **commit:** `c4fd8d9f0 fix(gateway): keep max iterations config authoritative`
+- **touches:** `gateway/run.py`, `tests/gateway/test_runtime_env_reload_config_authority.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -148,6 +157,7 @@ soju/patches/runtime-state-session-split ← runtime topic, scoped runtime state
 soju/patches/runtime-route-awareness   ← runtime topic, CurrentRuntime + DesiredRoute prompt block
 soju/patches/lsp-idle-reaper        ← runtime topic, pending upstream PR #36892 LSP idle reaper
 soju/patches/aux-runtime-context    ← runtime topic, thread-local auxiliary runtime routing state
+soju/patches/gateway-max-iterations-config-authority ← runtime topic, config.yaml max_turns beats stale .env HERMES_MAX_ITERATIONS
 soju/production                       ← rebuilt: base_commit + runtime patches only
                                          NEVER hand-edit. Always run `bin/hermes-patches rebuild` from `soju/fork-policy`.
 ```
