@@ -606,6 +606,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         _surface = getattr(runner, "_daybreak_surface", None)  # read by Daybreak delegation routes
         agent.daybreak_surface = callable(_surface) and _surface(ctx.source) is True
         self._merge_turn_request_overrides(agent, turn_route)
+        # One-shot desired-route intent (pre_gateway_dispatch runtime_override) for the
+        # Runtime/Route State block composed at API time (agent/system_prompt.py).
+        agent._runtime_route_state = runner._consume_pending_runtime_route_state(ctx.session_key)
         from gateway.session_surface import arm_surface_turn
         # auxiliary.voice_chat route (a voice note, or an admission committed as a voice turn) and
         # this turn's must-deliver notes; a managed worker arms its agent through the same helper.

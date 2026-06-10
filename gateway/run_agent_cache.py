@@ -277,6 +277,49 @@ class GatewayAgentCacheMixin:
         except Exception:
             logger.debug("Failed to clear session runtime override", exc_info=True)
 
+    def _build_pending_runtime_route_state(
+        self,
+        directive: dict,
+        *,
+        target_model: str = "",
+        target_provider: str = "",
+        target_reasoning_effort: str = "",
+        reason: str = "",
+    ) -> dict:
+        label = (
+            directive.get("label") or directive.get("route_label")
+            or directive.get("policy_label") or directive.get("policy")
+            or "RUNTIME_OVERRIDE"
+        )
+        return {
+            "label": str(label),
+            "target_provider": str(target_provider or directive.get("provider") or "").strip(),
+            "target_model": str(target_model or directive.get("model") or directive.get("raw_input") or "").strip(),
+            "target_reasoning_effort": str(
+                target_reasoning_effort or directive.get("reasoning_effort") or ""
+            ).strip().lower(),
+            "source": str(directive.get("source") or "pre_gateway_dispatch").strip(),
+            "strictness": str(directive.get("strictness") or "auto_reconsiderable").strip(),
+            "confidence": directive.get("confidence", "unknown"),
+            "reason": str(reason or directive.get("reason") or "pre-dispatch routing").strip(),
+        }
+
+    def _set_pending_runtime_route_state(self, session_key: str, route_state: dict) -> None:
+        if not session_key or not isinstance(route_state, dict):
+            return
+        states = getattr(self, "_pending_runtime_route_states", None)
+        if not isinstance(states, dict):
+            states = {}
+            self._pending_runtime_route_states = states
+        states[session_key] = route_state
+
+    def _consume_pending_runtime_route_state(self, session_key: str) -> dict | None:
+        states = getattr(self, "_pending_runtime_route_states", None)
+        if not session_key or not isinstance(states, dict):
+            return None
+        state = states.pop(session_key, None)
+        return state if isinstance(state, dict) else None
+
     def _apply_gateway_runtime_override(self, directive: dict, source: SessionSource) -> bool:
         """Apply one trusted ``pre_gateway_dispatch`` ``runtime_override`` directive to the session
         route (model/provider via ``hermes_cli.model_switch.switch_model``, reasoning via the session
@@ -350,6 +393,16 @@ class GatewayAgentCacheMixin:
                     self._pending_model_notes = {}
                     pending = self._pending_model_notes
                 reason = str(directive.get("reason") or "pre-dispatch routing").strip()
+                self._set_pending_runtime_route_state(
+                    session_key,
+                    self._build_pending_runtime_route_state(
+                        directive,
+                        target_model=result.new_model,
+                        target_provider=result.target_provider,
+                        target_reasoning_effort=reasoning_effort,
+                        reason=reason,
+                    ),
+                )
                 pending[session_key] = (
                     "[Note: runtime route selected before this turn: "
                     f"{current_model or 'default'} -> {result.new_model} via "
@@ -368,6 +421,13 @@ class GatewayAgentCacheMixin:
                     logger.warning("Ignoring unknown reasoning_effort=%r", reasoning_effort)
                 else:
                     self._set_session_reasoning_override(session_key, parsed)
+                    if not (model_input or explicit_provider):
+                        self._set_pending_runtime_route_state(
+                            session_key,
+                            self._build_pending_runtime_route_state(
+                                directive, target_reasoning_effort=reasoning_effort,
+                            ),
+                        )
                     changed = True
             except Exception as exc:
                 logger.warning("Reasoning runtime override failed: %s", exc)

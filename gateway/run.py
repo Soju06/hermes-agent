@@ -2243,6 +2243,9 @@ _AGENT_PENDING_SENTINEL = object()
 # eviction path (_evict_cached_agent) with resource cleanup; boundaries call it explicitly.
 _CONVERSATION_SCOPED_STATE: tuple = (
     "_session_model_overrides",
+    # One-shot desired-route intent from pre_gateway_dispatch runtime routers;
+    # stale route intent must not survive a conversation reset.
+    "_pending_runtime_route_states",
     "_pending_model_notes",
     # Stall-watchdog "already notified" latch; cleared on /new so a fresh conversation can warn again.
     # See #72016.

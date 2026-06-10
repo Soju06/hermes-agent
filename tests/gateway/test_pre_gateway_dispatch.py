@@ -59,6 +59,7 @@ def _make_runner(platform: Platform):
     runner.session_store = MagicMock()
     runner._running_agents = {}
     runner._session_model_overrides = {}
+    runner._pending_runtime_route_states = {}
     return runner, adapter
 
 
@@ -159,11 +160,11 @@ async def test_hook_runtime_override_applies_after_auth_before_agent(monkeypatch
         )
 
     captured = {}
-
     async def _capture(event, source, _quick_key, _run_generation):
         session_key = runner._session_key_for_source(source)  # noqa: SLF001
         captured["model_override"] = runner._session_model_overrides.get(session_key)  # noqa: SLF001
         captured["reasoning_override"] = _reasoning_override(runner, session_key)
+        captured["route_state"] = runner._pending_runtime_route_states.get(session_key)  # noqa: SLF001
         return "ok"
 
     monkeypatch.setattr("hermes_cli.plugins.ainvoke_hook", _fake_hook)
@@ -185,6 +186,27 @@ async def test_hook_runtime_override_applies_after_auth_before_agent(monkeypatch
         "api_mode": "codex_responses",
     }
     assert captured["reasoning_override"] == {"enabled": True, "effort": "high"}
+    assert captured["route_state"] == {
+        "label": "RUNTIME_OVERRIDE",
+        "target_provider": "codex-nekos",
+        "target_model": "gpt-5.5",
+        "target_reasoning_effort": "high",
+        "source": "pre_gateway_dispatch",
+        "strictness": "auto_reconsiderable",
+        "confidence": "unknown",
+        "reason": "codex-lb PR review",
+    }
+
+
+def test_pending_runtime_route_state_is_consumed_once():
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    session_key = "whatsapp:chat:user"
+    state = {"label": "SYSTEM_DEV", "target_model": "gpt-5.5"}
+
+    runner._set_pending_runtime_route_state(session_key, state)  # noqa: SLF001
+
+    assert runner._consume_pending_runtime_route_state(session_key) == state  # noqa: SLF001
+    assert runner._consume_pending_runtime_route_state(session_key) is None  # noqa: SLF001
 
 
 @pytest.mark.asyncio
