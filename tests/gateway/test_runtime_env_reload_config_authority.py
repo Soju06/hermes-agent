@@ -66,3 +66,23 @@ def test_current_max_iterations_reloads_before_reading(monkeypatch) -> None:
     )
 
     assert gateway_run._current_max_iterations() == 200
+
+
+def test_resolve_gateway_max_iterations_prefers_config_after_runtime_env_reload(
+    tmp_path: Path, monkeypatch
+) -> None:
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        yaml.safe_dump({"agent": {"max_turns": 300}}),
+        encoding="utf-8",
+    )
+    (hermes_home / ".env").write_text("HERMES_MAX_ITERATIONS=90\n", encoding="utf-8")
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+    monkeypatch.setenv("HERMES_MAX_ITERATIONS", "90")
+
+    max_iterations = gateway_run._resolve_gateway_max_iterations(reload_runtime_env=True)
+
+    assert max_iterations == 300
+    assert os.environ["HERMES_MAX_ITERATIONS"] == "300"
