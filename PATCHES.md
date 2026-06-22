@@ -123,6 +123,15 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **commit:** `c4fd8d9f0 fix(gateway): keep max iterations config authoritative`
 - **touches:** `gateway/run.py`, `tests/gateway/test_runtime_env_reload_config_authority.py`
 
+### 12. strict-chat-reasoning-details
+- **branch:** `soju/patches/strict-chat-reasoning-details`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — dogfood strict OpenAI-compatible provider replay fix)_
+- **state:** `local-only`
+- **rationale:** Strict OpenAI-compatible Chat Completions providers such as GLM Vooy reject non-standard assistant message replay fields (`reasoning`, `reasoning_details`) with `Extra inputs are not permitted`. Preserve those fields in session history for provider continuity, but strip them from the outbound chat_completions wire payload so mixed-provider Discord sessions do not get stuck in repeat HTTP 400 retries.
+- **commit:** `edd51272c fix(chat): strip reasoning replay fields for strict chat completions`
+- **touches:** `agent/transports/chat_completions.py`, `tests/run_agent/test_strict_api_validation.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -158,6 +167,7 @@ soju/patches/runtime-route-awareness   ← runtime topic, CurrentRuntime + Desir
 soju/patches/lsp-idle-reaper        ← runtime topic, pending upstream PR #36892 LSP idle reaper
 soju/patches/aux-runtime-context    ← runtime topic, thread-local auxiliary runtime routing state
 soju/patches/gateway-max-iterations-config-authority ← runtime topic, config.yaml max_turns beats stale .env HERMES_MAX_ITERATIONS
+soju/patches/strict-chat-reasoning-details ← runtime topic, strip provider replay fields from strict chat_completions wire payloads
 soju/production                       ← rebuilt: base_commit + runtime patches only
                                          NEVER hand-edit. Always run `bin/hermes-patches rebuild` from `soju/fork-policy`.
 ```
