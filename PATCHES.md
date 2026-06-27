@@ -13,9 +13,9 @@ Every runtime patch must live in a `soju/patches/<name>` topic branch and be lis
 ```
 upstream: NousResearch/hermes-agent
 base_ref: upstream/main
-base_commit: 3c231eb3979ab9c57d5cd6d02f1d577a3b718b43
+base_commit: fbf748b2824703f11a55bcf4b5ba7a5909c00865
 base_tag:   v2026.6.5
-pinned_at:  2026-06-10
+pinned_at:  2026-06-27
 ```
 
 Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must rebase all `soju/patches/*` topics on top of the new base and verify the production stack rebuilds clean.
@@ -129,7 +129,7 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **upstream_pr:** _(none — dogfood strict OpenAI-compatible provider replay fix)_
 - **state:** `local-only`
 - **rationale:** Strict OpenAI-compatible Chat Completions providers such as GLM Vooy reject non-standard assistant message replay fields (`reasoning`, `reasoning_details`) with `Extra inputs are not permitted`. Preserve those fields in session history for provider continuity, but strip them from the outbound chat_completions wire payload so mixed-provider Discord sessions do not get stuck in repeat HTTP 400 retries.
-- **commit:** `edd51272c fix(chat): strip reasoning replay fields for strict chat completions`
+- **commit:** `0f52df9b4 fix(chat): strip reasoning replay fields for strict chat completions`
 - **touches:** `agent/transports/chat_completions.py`, `tests/run_agent/test_strict_api_validation.py`
 
 ## State Vocabulary
