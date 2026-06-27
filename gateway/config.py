@@ -431,15 +431,18 @@ class HomeChannel:
     chat_id: str
     name: str  # Human-readable name for display
     thread_id: Optional[str] = None
+    auto_thread: Optional[bool] = None
     
     def to_dict(self) -> Dict[str, Any]:
-        result = {
+        result: Dict[str, Any] = {
             "platform": self.platform.value,
             "chat_id": self.chat_id,
             "name": self.name,
         }
         if self.thread_id:
             result["thread_id"] = self.thread_id
+        if self.auto_thread is not None:
+            result["auto_thread"] = self.auto_thread
         return result
     
     @classmethod
@@ -449,6 +452,11 @@ class HomeChannel:
             chat_id=str(data["chat_id"]),
             name=data.get("name", "Home"),
             thread_id=str(data["thread_id"]) if data.get("thread_id") else None,
+            auto_thread=(
+                _coerce_bool(data.get("auto_thread"), True)
+                if data.get("auto_thread") is not None
+                else None
+            ),
         )
 
 
@@ -1386,6 +1394,38 @@ def load_gateway_config() -> GatewayConfig:
 
             _merge_platform_map(gateway_platforms)
             _merge_platform_map(yaml_cfg.get("platforms"))
+            # Back-compat: legacy /sethome and older configs stored home
+            # channels as top-level *_HOME_CHANNEL keys in config.yaml. Newer
+            # GatewayConfig.from_dict() only reads platforms.<name>.home_channel,
+            # so bridge legacy keys into the platform map before dataclass load.
+            for _plat, _env_prefix in (
+                (Platform.TELEGRAM, "TELEGRAM"),
+                (Platform.DISCORD, "DISCORD"),
+                (Platform.SLACK, "SLACK"),
+            ):
+                _home_key = f"{_env_prefix}_HOME_CHANNEL"
+                _home_val = yaml_cfg.get(_home_key)
+                if not _home_val:
+                    continue
+                _plat_data = platforms_data.setdefault(_plat.value, {})
+                if not isinstance(_plat_data, dict):
+                    _plat_data = {}
+                    platforms_data[_plat.value] = _plat_data
+                _home_data = {
+                    "platform": _plat.value,
+                    "chat_id": str(_home_val),
+                    "name": str(yaml_cfg.get(f"{_home_key}_NAME") or "Home"),
+                }
+                _thread_val = yaml_cfg.get(f"{_home_key}_THREAD_ID")
+                if _thread_val:
+                    _home_data["thread_id"] = str(_thread_val)
+                _auto_thread_key = f"{_home_key}_AUTO_THREAD"
+                if _plat == Platform.DISCORD and _auto_thread_key in yaml_cfg:
+                    _home_data["auto_thread"] = _coerce_bool(
+                        yaml_cfg.get(_auto_thread_key),
+                        True,
+                    )
+                _plat_data.setdefault("home_channel", _home_data)
             if platforms_data:
                 gw_data["platforms"] = platforms_data
             # Iterate built-in platforms plus any registered plugin platforms
@@ -1760,6 +1800,11 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             chat_id=discord_home,
             name=getenv("DISCORD_HOME_CHANNEL_NAME", "Home"),
             thread_id=getenv("DISCORD_HOME_CHANNEL_THREAD_ID") or None,
+            auto_thread=(
+                _coerce_bool(getenv("DISCORD_HOME_CHANNEL_AUTO_THREAD"), True)
+                if getenv("DISCORD_HOME_CHANNEL_AUTO_THREAD") is not None
+                else None
+            ),
         )
     
     # Reply threading mode for Discord (off/first/all)
