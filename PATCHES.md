@@ -132,6 +132,24 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **commit:** `0f52df9b4 fix(chat): strip reasoning replay fields for strict chat completions`
 - **touches:** `agent/transports/chat_completions.py`, `tests/run_agent/test_strict_api_validation.py`
 
+### 13. discord-home-autothread-fix
+- **branch:** `soju/patches/discord-home-autothread-fix`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — Discord home-channel dogfood routing fix)_
+- **state:** `local-only`
+- **rationale:** Discord home-channel messages should still auto-create thread conversations when channel controls disable broad channel auto-threading. Restore the home-channel path while keeping explicit channel-control disable behavior available for non-home channels.
+- **commit:** `511beeed5 fix(discord): restore home channel auto-threading`
+- **touches:** `gateway/config.py`, `plugins/platforms/discord/adapter.py`, `tests/gateway/test_discord_channel_controls.py`
+
+### 14. slash-command-mixin-shadow
+- **branch:** `soju/patches/slash-command-mixin-shadow`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — dogfood gateway slash-command refactor safety)_
+- **state:** `local-only`
+- **rationale:** Extracted gateway slash-command handlers must resolve through `GatewaySlashCommandsMixin`. Stale same-named methods left directly on `GatewayRunner` shadow the mixin through Python MRO; that broke Discord `/model` after `parse_model_flags` started returning the `--session` flag. Remove the stale handlers and add an MRO regression test for the extracted slash-command handler class.
+- **commit:** `21d7c49a0 fix(gateway): unshadow slash command mixin handlers`
+- **touches:** `gateway/run.py`, `tests/gateway/test_slash_commands_mixin.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -168,6 +186,8 @@ soju/patches/lsp-idle-reaper        ← runtime topic, pending upstream PR #3689
 soju/patches/aux-runtime-context    ← runtime topic, thread-local auxiliary runtime routing state
 soju/patches/gateway-max-iterations-config-authority ← runtime topic, config.yaml max_turns beats stale .env HERMES_MAX_ITERATIONS
 soju/patches/strict-chat-reasoning-details ← runtime topic, strip provider replay fields from strict chat_completions wire payloads
+soju/patches/discord-home-autothread-fix ← runtime topic, restore Discord home-channel auto-thread creation
+soju/patches/slash-command-mixin-shadow ← runtime topic, remove stale GatewayRunner slash-command handlers shadowing extracted mixin implementations
 soju/production                       ← rebuilt: base_commit + runtime patches only
                                          NEVER hand-edit. Always run `bin/hermes-patches rebuild` from `soju/fork-policy`.
 ```
