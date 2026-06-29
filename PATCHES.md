@@ -147,7 +147,7 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **upstream_pr:** _(none — dogfood gateway slash-command refactor safety)_
 - **state:** `local-only`
 - **rationale:** Extracted gateway slash-command handlers must resolve through `GatewaySlashCommandsMixin`. Stale same-named methods left directly on `GatewayRunner` shadow the mixin through Python MRO; that broke Discord `/model` after `parse_model_flags` started returning the `--session` flag. Remove the stale handlers and add an MRO regression test for the extracted slash-command handler class.
-- **commit:** `21d7c49a0 fix(gateway): unshadow slash command mixin handlers`
+- **commit:** `d2d006be6 fix(gateway): unshadow slash command mixin handlers`
 - **touches:** `gateway/run.py`, `tests/gateway/test_slash_commands_mixin.py`
 
 ## State Vocabulary
