@@ -13,9 +13,9 @@ Every runtime patch must live in a `soju/patches/<name>` topic branch and be lis
 ```
 upstream: NousResearch/hermes-agent
 base_ref: upstream/main
-base_commit: fbf748b2824703f11a55bcf4b5ba7a5909c00865
+base_commit: 1fcf6e58b6205a55bcb143f8914597c076f5d78a
 base_tag:   v2026.6.5
-pinned_at:  2026-06-27
+pinned_at:  2026-07-06
 ```
 
 Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must rebase all `soju/patches/*` topics on top of the new base and verify the production stack rebuilds clean.
@@ -29,7 +29,9 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **upstream_pr:** _(none — dogfood runtime control)_
 - **state:** `local-only`
 - **rationale:** Agent-callable `model_status` / `model_switch` tools. Session-only scope (turn scope removed — LLMs omitted scope ~29%, causing silent reversion). Model targets constrained to config-declared providers/models. Gateway session callback plus durable SessionEntry runtime fields so session-scoped model/reasoning overrides survive gateway restart without storing secrets. Trusted pre-dispatch plugin runtime overrides can select the session route after auth but before the first LLM call. Plugin `prepend` directives accumulate text before the original event message.
-- **commit:** `e6b6d1bfc fix(runtime): align runtime tool dispatch ownership`
+- **commits:**
+  - `63563ea84 feat(runtime): agent-callable model_switch / model_status (session-only)`
+  - `2dd8d9f8d fix(runtime): align runtime tool dispatch ownership`
 - **touches:** `agent/agent_init.py`, `agent/agent_runtime_helpers.py`, `agent/conversation_loop.py`, `agent/runtime_control.py`, `agent/tool_dispatch_helpers.py`, `agent/tool_executor.py`, `gateway/run.py`, `gateway/session.py`, `hermes_cli/plugins.py`, `model_tools.py`, `toolsets.py`, `tools/runtime_control_tool.py`, `tests/gateway/test_pre_gateway_dispatch.py`, `tests/gateway/test_session.py`, `tests/gateway/test_session_model_override_routing.py`, `tests/hermes_cli/test_plugins.py`, `tests/run_agent/test_pre_tool_session_id.py`, `tests/run_agent/test_run_agent.py`, `tests/run_agent/test_runtime_control.py`, `tests/test_model_tools.py`
 
 ### 2. memory-write-reason-gate
@@ -38,7 +40,7 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **upstream_pr:** _(none — dogfood memory hygiene)_
 - **state:** `local-only`
 - **rationale:** Memory `add`/`replace` tool calls require an explicit suitability reason explaining why USER/MEMORY is the right store rather than a skill, Graphiti, or session history. The reason is a guardrail only and is not persisted with the entry.
-- **commit:** `43606ea5d feat(memory): require write reason for memory updates`
+- **commit:** `b2a4dd204 feat(memory): require write reason for memory updates`
 - **touches:** `agent/agent_runtime_helpers.py`, `agent/tool_executor.py`, `tools/memory_tool.py`, `tests/tools/test_memory_tool.py`, `tests/tools/test_memory_tool_schema.py`
 
 ### 3. todo-progress-display
@@ -47,7 +49,7 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **upstream_pr:** _(none — Discord/gateway dogfood UX)_
 - **state:** `local-only`
 - **rationale:** Gateway progress bubbles should show todo item statuses after the todo tool completes, not only a count like `planning N task(s)`. Also flush throttled progress edits when the final queued event has no following tool event.
-- **commit:** `a54ff9e5c feat(gateway): show todo progress details`
+- **commit:** `ed092d784 feat(gateway): show todo progress details`
 - **touches:** `agent/display.py`, `gateway/run.py`, `tests/agent/test_display.py`, `tests/gateway/test_run_progress_topics.py`
 
 ### 4. discord-table-codeblocks
@@ -56,7 +58,7 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **upstream_pr:** _(none — Discord/gateway dogfood UX)_
 - **state:** `local-only`
 - **rationale:** Discord does not render GitHub-flavored markdown pipe tables. Convert detected outbound pipe tables to fenced box-drawing ASCII tables so table responses remain readable, while preserving existing fenced code blocks, CJK wide-character alignment, and long-table chunk codeblock boundaries.
-- **commit:** `1ef82004c feat(discord): render markdown tables as codeblocks`
+- **commit:** `c8d9acd56 feat(discord): render markdown tables as codeblocks`
 - **touches:** `plugins/platforms/discord/adapter.py`, `tests/gateway/test_discord_send.py`
 
 
@@ -66,7 +68,7 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **upstream_pr:** _(none — dogfood subagent routing)_
 - **state:** `local-only`
 - **rationale:** `delegate_task` should support per-call and per-task model/provider overrides so the parent can route lightweight research or analysis children to a different configured provider (e.g. `grok-tokenmaxxing/grok-4.3`) without changing `delegation.model/provider` globally for every subagent.
-- **commit:** `0c9ebbe38 feat(delegate): restore per-call model provider override`
+- **commit:** `814b209b9 feat(delegate): restore per-call model provider override`
 - **touches:** `gateway/run.py`, `run_agent.py`, `tools/delegate_tool.py`, `tests/gateway/test_run_progress_topics.py`, `tests/tools/test_delegate.py`
 
 ### 6. background-review-guardrails
@@ -75,7 +77,7 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **upstream_pr:** _(none — dogfood self-improvement guardrail)_
 - **state:** `local-only`
 - **rationale:** Background self-improvement review must be a calibrated participant in the memory/skill governance model instead of aggressively writing after most sessions. Memory review prompts now carry the structured always-injected memory rationale contract, and skill review prompts default to "Nothing to save" unless a concrete reusable signal exists.
-- **commit:** `f1f2579bb fix: calibrate background self-improvement review`
+- **commit:** `775e76fbf fix: calibrate background self-improvement review`
 - **touches:** `agent/background_review.py`, `tests/run_agent/test_review_prompt_class_first.py`
 
 ### 7. runtime-state-session-split
@@ -84,7 +86,7 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **upstream_pr:** _(none — dogfood runtime gate correctness)_
 - **state:** `local-only`
 - **rationale:** Runtime hard gates must see the active session's actual model/provider after context compression rotates the session id. Compression split now republishes runtime state for the new session with the old session as task/parent scope, and pre-LLM hook payloads carry task_id so plugins can associate the active runtime with both the rotated session and its parent task scope instead of falling back to stale cross-session runtime state.
-- **commit:** `80bfe6d5a fix: keep runtime state scoped across compression splits`
+- **commit:** `5f378ba4a fix: keep runtime state scoped across compression splits`
 - **touches:** `agent/conversation_compression.py`, `agent/conversation_loop.py`, `tests/agent/test_runtime_state_session_split.py`
 
 ### 8. runtime-route-awareness
@@ -93,7 +95,9 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **upstream_pr:** _(none — dogfood runtime routing correctness)_
 - **state:** `local-only`
 - **rationale:** Inject an API-call-time Runtime/Route State block so the agent sees live CurrentRuntime plus current-turn DesiredRoute without calling `model_status`. Trusted pre-dispatch `runtime_override` metadata is normalized into one-shot route state for the routed gateway turn, preserving stale-route protection while leaving post-tool rerouting and NEED_CONTEXT scout mode for later phases.
-- **commit:** `66e95e99c feat(runtime): inject runtime route awareness prompt`
+- **commits:**
+  - `4bfeb6f1c feat(runtime): agent-callable model_switch / model_status (session-only)`
+  - `ed5c350fd feat(runtime): inject runtime route awareness prompt`
 - **touches:** `agent/chat_completion_helpers.py`, `agent/conversation_loop.py`, `agent/system_prompt.py`, `docs/runtime-route-awareness.md`, `gateway/run.py`, `tests/agent/test_runtime_route_prompt.py`, `tests/gateway/test_pre_gateway_dispatch.py`
 
 ### 9. lsp-idle-reaper
@@ -102,7 +106,7 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **upstream_pr:** `36892`
 - **state:** `pending-upstream`
 - **rationale:** Reap idle LSP clients after `lsp.idle_timeout` so long-running gateways do not keep TypeScript/pyright/gopls/rust-analyzer subprocesses alive for the full process lifetime. `idle_timeout <= 0` disables reaping; stale clients respawn on the next relevant file operation.
-- **commit:** `7248c37e2 fix(lsp): reap idle language-server clients`
+- **commit:** `db88f0ceb fix(lsp): reap idle language-server clients`
 - **touches:** `agent/lsp/manager.py`, `tests/agent/lsp/test_service.py`, `website/docs/user-guide/features/lsp.md`
 
 ### 10. aux-runtime-context
@@ -111,7 +115,7 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **upstream_pr:** _(none — dogfood auxiliary runtime isolation)_
 - **state:** `local-only`
 - **rationale:** Auxiliary task routing must not use process-global main-runtime state in a concurrent gateway. Store the live provider/model/base_url/api_key/api_mode in thread-local state so one Discord thread's `codex-nekos/gpt-5.5` override cannot leak into another thread's `vision_analyze`, title generation, compression, or other auxiliary calls.
-- **commit:** `7074fdb29 fix(auxiliary): isolate runtime routing per thread`
+- **commit:** `c83ced8ef fix(auxiliary): isolate runtime routing per thread`
 - **touches:** `agent/auxiliary_client.py`, `tests/agent/test_set_runtime_main_custom_provider.py`
 
 ### 11. gateway-max-iterations-config-authority
@@ -120,7 +124,7 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **upstream_pr:** _(none — dogfood gateway budget config correctness)_
 - **state:** `local-only`
 - **rationale:** Gateway agent turns must resolve `max_iterations` from config.yaml `agent.max_turns` as the source of truth before falling back to `HERMES_MAX_ITERATIONS`. A stale `.env` value such as `HERMES_MAX_ITERATIONS=90` must not override `agent.max_turns: 300` or cause intermittent `Iteration budget exhausted (90/90)` in concurrent Discord sessions.
-- **commit:** `c4fd8d9f0 fix(gateway): keep max iterations config authoritative`
+- **commit:** `156c50e79 fix(gateway): keep max iterations config authoritative`
 - **touches:** `gateway/run.py`, `tests/gateway/test_runtime_env_reload_config_authority.py`
 
 ### 12. strict-chat-reasoning-details
@@ -129,7 +133,7 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **upstream_pr:** _(none — dogfood strict OpenAI-compatible provider replay fix)_
 - **state:** `local-only`
 - **rationale:** Strict OpenAI-compatible Chat Completions providers such as GLM Vooy reject non-standard assistant message replay fields (`reasoning`, `reasoning_details`) with `Extra inputs are not permitted`. Preserve those fields in session history for provider continuity, but strip them from the outbound chat_completions wire payload so mixed-provider Discord sessions do not get stuck in repeat HTTP 400 retries.
-- **commit:** `0f52df9b4 fix(chat): strip reasoning replay fields for strict chat completions`
+- **commit:** `684ad1eda fix(chat): strip reasoning replay fields for strict chat completions`
 - **touches:** `agent/transports/chat_completions.py`, `tests/run_agent/test_strict_api_validation.py`
 
 ### 13. discord-home-autothread-fix
@@ -138,7 +142,7 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **upstream_pr:** _(none — Discord home-channel dogfood routing fix)_
 - **state:** `local-only`
 - **rationale:** Discord home-channel messages should still auto-create thread conversations when channel controls disable broad channel auto-threading. Restore the home-channel path while keeping explicit channel-control disable behavior available for non-home channels.
-- **commit:** `511beeed5 fix(discord): restore home channel auto-threading`
+- **commit:** `8a610a67e fix(discord): restore home channel auto-threading`
 - **touches:** `gateway/config.py`, `plugins/platforms/discord/adapter.py`, `tests/gateway/test_discord_channel_controls.py`
 
 ### 14. slash-command-mixin-shadow
@@ -147,7 +151,7 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **upstream_pr:** _(none — dogfood gateway slash-command refactor safety)_
 - **state:** `local-only`
 - **rationale:** Extracted gateway slash-command handlers must resolve through `GatewaySlashCommandsMixin`. Stale same-named methods left directly on `GatewayRunner` shadow the mixin through Python MRO; that broke Discord `/model` after `parse_model_flags` started returning the `--session` flag. Remove the stale handlers and add an MRO regression test for the extracted slash-command handler class.
-- **commit:** `d2d006be6 fix(gateway): unshadow slash command mixin handlers`
+- **commit:** `7e6dcc103 fix(gateway): unshadow slash command mixin handlers`
 - **touches:** `gateway/run.py`, `tests/gateway/test_slash_commands_mixin.py`
 
 ## State Vocabulary
