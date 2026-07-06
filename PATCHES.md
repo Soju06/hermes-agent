@@ -95,9 +95,7 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **upstream_pr:** _(none — dogfood runtime routing correctness)_
 - **state:** `local-only`
 - **rationale:** Inject an API-call-time Runtime/Route State block so the agent sees live CurrentRuntime plus current-turn DesiredRoute without calling `model_status`. Trusted pre-dispatch `runtime_override` metadata is normalized into one-shot route state for the routed gateway turn, preserving stale-route protection while leaving post-tool rerouting and NEED_CONTEXT scout mode for later phases.
-- **commits:**
-  - `4bfeb6f1c feat(runtime): agent-callable model_switch / model_status (session-only)`
-  - `ed5c350fd feat(runtime): inject runtime route awareness prompt`
+- **commit:** `1e23a68d0 feat(runtime): inject runtime route awareness prompt` (stacked on `soju/patches/runtime-control`; branch contains runtime-control commits plus this one)
 - **touches:** `agent/chat_completion_helpers.py`, `agent/conversation_loop.py`, `agent/system_prompt.py`, `docs/runtime-route-awareness.md`, `gateway/run.py`, `tests/agent/test_runtime_route_prompt.py`, `tests/gateway/test_pre_gateway_dispatch.py`
 
 ### 9. lsp-idle-reaper
