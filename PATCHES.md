@@ -49,7 +49,7 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **upstream_pr:** _(none — Discord/gateway dogfood UX)_
 - **state:** `local-only`
 - **rationale:** Gateway progress bubbles should show todo item statuses after the todo tool completes, not only a count like `planning N task(s)`. Also flush throttled progress edits when the final queued event has no following tool event.
-- **commit:** `ed092d784 feat(gateway): show todo progress details`
+- **commit:** `a9cee4f9f feat(gateway): show todo progress details`
 - **touches:** `agent/display.py`, `gateway/run.py`, `tests/agent/test_display.py`, `tests/gateway/test_run_progress_topics.py`
 
 ### 4. discord-table-codeblocks
@@ -68,7 +68,7 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **upstream_pr:** _(none — dogfood subagent routing)_
 - **state:** `local-only`
 - **rationale:** `delegate_task` should support per-call and per-task model/provider overrides so the parent can route lightweight research or analysis children to a different configured provider (e.g. `grok-tokenmaxxing/grok-4.3`) without changing `delegation.model/provider` globally for every subagent.
-- **commit:** `814b209b9 feat(delegate): restore per-call model provider override`
+- **commit:** `4fbe9de44 feat(delegate): restore per-call model provider override`
 - **touches:** `gateway/run.py`, `run_agent.py`, `tools/delegate_tool.py`, `tests/gateway/test_run_progress_topics.py`, `tests/tools/test_delegate.py`
 
 ### 6. background-review-guardrails
