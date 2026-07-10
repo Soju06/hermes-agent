@@ -331,7 +331,8 @@ class GatewayConfigLoadersMixin:
         self, *, source: Optional[SessionSource] = None, session_key: Optional[str] = None,
         model: str = "",
     ) -> dict | None:
-        """Session ``/reasoning --session`` > per-model ``agent.reasoning_overrides`` > global.
+        """Session ``/reasoning --session`` > persisted ``SessionEntry.runtime_reasoning_effort``
+        (rehydrated after a gateway restart) > per-model ``agent.reasoning_overrides`` > global.
 
         ``model`` must be the session's *effective* model (session ``/model`` override included);
         empty uses ``model.default``.

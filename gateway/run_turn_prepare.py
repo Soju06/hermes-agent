@@ -71,6 +71,20 @@ def _resolve_policy_agent_runtime(runner, policy, *, fallback=True, record_notic
     return model, _runtime_agent_kwargs(runtime)
 
 
+def _persisted_runtime_bundle(override: dict) -> dict:
+    """Runtime kwargs of a rehydrated runtime route (``_rehydrate_persisted_runtime_route``): exactly
+    what its one provider resolution produced, so nothing is layered from the configured default."""
+    bundle_runtime = {
+        k: override.get(k) for k in ("api_key", "base_url", "provider", "api_mode", "credential_pool")
+    }
+    bundle_runtime["command"] = override.get("command")
+    bundle_runtime["args"] = list(override.get("args") or [])
+    for k in ("requested_provider", "max_tokens", "request_overrides", "capabilities"):
+        if override.get(k) is not None and override.get(k) != {}:
+            bundle_runtime[k] = override.get(k)
+    return bundle_runtime
+
+
 def _recover_or_remember_model(runner, skey, model):
     """Last step of ``_resolve_session_agent_runtime``: remember a good model, recover an empty one."""
     # Final safety net: an empty model (transient config-cache miss) makes every API call 400 and
@@ -225,6 +239,15 @@ class GatewayTurnPrepareMixin:
         if override:
             override_model = override.get("model", model)
             override_runtime = _session_override_snapshot(override)
+            if override.get("_runtime_bundle_complete") is True:
+                # Rehydrated runtime route: one atomic provider-resolution bundle (endpoint, mode,
+                # credentials, command, args, pool) — never mixed with the configured default.
+                bundle_runtime = _persisted_runtime_bundle(override)
+                logger.debug(
+                    "Persisted runtime bundle (fast): session=%s config_model=%s -> override_model=%s provider=%s",
+                    skey or "", model, override_model, bundle_runtime.get("provider"),
+                )
+                return override_model, bundle_runtime
             if override_runtime.get("api_key") and not managed_oauth:
                 if override_runtime.get("credential_pool") is None:
                     override_runtime["credential_pool"] = _credential_pool_for_provider(override.get("provider"))
