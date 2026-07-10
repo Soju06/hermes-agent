@@ -1904,14 +1904,24 @@ def _resolve_runtime_agent_kwargs() -> dict:
     }
 
 
-def _resolve_runtime_agent_kwargs_for_provider(provider: str) -> dict:
+def _resolve_runtime_agent_kwargs_for_provider(
+    provider: str,
+    *,
+    target_model: Optional[str] = None,
+) -> dict:
     """Resolve runtime credentials for a specific provider (e.g. from channel override)."""
     from hermes_cli.runtime_provider import (
         resolve_runtime_provider,
         format_runtime_provider_error,
     )
     try:
-        runtime = resolve_runtime_provider(requested=provider)
+        if target_model is None:
+            runtime = resolve_runtime_provider(requested=provider)
+        else:
+            runtime = resolve_runtime_provider(
+                requested=provider,
+                target_model=target_model,
+            )
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
     return {
@@ -3772,6 +3782,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "max_tokens": override.get("max_tokens"),
                 "credential_pool": override.get("credential_pool"),
             }
+            if override.get("_runtime_bundle_complete") is True:
+                if override_runtime["max_tokens"] is None:
+                    override_runtime.pop("max_tokens")
+                override_runtime["command"] = override.get("command")
+                override_runtime["args"] = list(override.get("args") or [])
+                logger.debug(
+                    "Persisted runtime bundle (fast): session=%s config_model=%s "
+                    "-> override_model=%s provider=%s",
+                    resolved_session_key or "",
+                    model,
+                    override_model,
+                    override_runtime.get("provider"),
+                )
+                return override_model, override_runtime
             if override_runtime.get("api_key"):
                 if override_runtime.get("credential_pool") is None:
                     override_runtime["credential_pool"] = _credential_pool_for_provider(
@@ -4836,7 +4860,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: Optional[SessionSource] = None,
         session_key: Optional[str] = None,
     ) -> dict | None:
-        """Resolve reasoning effort for a session, honoring session overrides."""
+        """Resolve reasoning effort for a session, honoring session overrides.
+
+        Priority: in-memory session override → persisted
+        ``SessionEntry.runtime_reasoning_effort`` (rehydrated after a gateway
+        restart) → global config.
+        """
         resolved_session_key = session_key
         if not resolved_session_key and source is not None:
             try:
@@ -4847,6 +4876,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         overrides = getattr(self, "_session_reasoning_overrides", {}) or {}
         if resolved_session_key and resolved_session_key in overrides:
             return overrides[resolved_session_key]
+        if resolved_session_key:
+            entry = self._get_session_entry(resolved_session_key)
+            persisted_effort = getattr(entry, "runtime_reasoning_effort", None) if entry else None
+            if isinstance(persisted_effort, str) and persisted_effort.strip():
+                from hermes_constants import parse_reasoning_effort
+
+                parsed = parse_reasoning_effort(persisted_effort)
+                if parsed is not None:
+                    self._set_session_reasoning_override(resolved_session_key, parsed)
+                    logger.info(
+                        "Rehydrated persisted reasoning override for session=%s: %s",
+                        resolved_session_key,
+                        persisted_effort,
+                    )
+                    return dict(parsed)
         return self._load_reasoning_config()
 
     def _set_session_reasoning_override(
@@ -15958,36 +16002,89 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             persisted = store.get_model_override(session_key)
         except Exception:
             logger.debug("Failed to read persisted session model override", exc_info=True)
+            persisted = None
+        if persisted:
+            override: Dict[str, Any] = {
+                "model": persisted.get("model"),
+                "provider": persisted.get("provider"),
+                "base_url": persisted.get("base_url"),
+            }
+            provider = persisted.get("provider")
+            if provider:
+                try:
+                    runtime = _resolve_runtime_agent_kwargs_for_provider(provider)
+                    override["api_key"] = runtime.get("api_key")
+                    override["api_mode"] = runtime.get("api_mode")
+                    override["credential_pool"] = runtime.get("credential_pool")
+                    if not override.get("base_url"):
+                        override["base_url"] = runtime.get("base_url")
+                except Exception:
+                    logger.debug(
+                        "Credential re-resolution failed for persisted override "
+                        "(provider=%s); using credential-less override",
+                        provider,
+                        exc_info=True,
+                    )
+            self._session_model_overrides[session_key] = override
+            logger.info(
+                "Rehydrated persisted /model override for session=%s: "
+                "model=%s provider=%s",
+                session_key,
+                override.get("model"),
+                provider or "",
+            )
             return
-        if not persisted:
+
+        entry = self._get_session_entry(session_key)
+        runtime_model = getattr(entry, "runtime_model", None) if entry else None
+        runtime_provider = getattr(entry, "runtime_provider", None) if entry else None
+        if not isinstance(runtime_model, str) or not runtime_model.strip():
             return
-        override: Dict[str, Any] = {
-            "model": persisted.get("model"),
-            "provider": persisted.get("provider"),
-            "base_url": persisted.get("base_url"),
+        if not isinstance(runtime_provider, str) or not runtime_provider.strip():
+            return
+        runtime_model = runtime_model.strip()
+        runtime_provider = runtime_provider.strip()
+        try:
+            runtime = _resolve_runtime_agent_kwargs_for_provider(
+                runtime_provider,
+                target_model=runtime_model,
+            )
+        except Exception:
+            logger.warning(
+                "Persisted runtime override for session=%s "
+                "(model=%s provider=%s) could not be resolved; using defaults",
+                session_key,
+                runtime_model,
+                runtime_provider,
+                exc_info=True,
+            )
+            return
+        resolved_provider = runtime.get("provider")
+        if not isinstance(resolved_provider, str) or not resolved_provider.strip():
+            logger.warning(
+                "Persisted runtime override for session=%s resolved without "
+                "a provider identity; using defaults",
+                session_key,
+            )
+            return
+        override = {
+            "model": runtime_model,
+            "provider": resolved_provider.strip(),
+            "api_key": runtime.get("api_key"),
+            "base_url": runtime.get("base_url"),
+            "api_mode": runtime.get("api_mode"),
+            "command": runtime.get("command"),
+            "args": list(runtime.get("args") or []),
+            "credential_pool": runtime.get("credential_pool"),
+            "_runtime_bundle_complete": True,
         }
-        provider = persisted.get("provider")
-        if provider:
-            try:
-                runtime = _resolve_runtime_agent_kwargs_for_provider(provider)
-                override["api_key"] = runtime.get("api_key")
-                override["api_mode"] = runtime.get("api_mode")
-                override["credential_pool"] = runtime.get("credential_pool")
-                if not override.get("base_url"):
-                    override["base_url"] = runtime.get("base_url")
-            except Exception:
-                logger.debug(
-                    "Credential re-resolution failed for persisted override "
-                    "(provider=%s); using credential-less override",
-                    provider,
-                    exc_info=True,
-                )
         self._session_model_overrides[session_key] = override
         logger.info(
-            "Rehydrated persisted /model override for session=%s: model=%s provider=%s",
+            "Rehydrated persisted runtime override for session=%s: "
+            "model=%s provider=%s",
             session_key,
-            override.get("model"),
-            provider or "",
+            runtime_model,
+            resolved_provider,
         )
 
     def _get_session_model_override(self, session_key: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -16000,18 +16097,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         override = getattr(self, "_session_model_overrides", {}).get(session_key)
         if override:
             return dict(override)
-        entry = self._get_session_entry(session_key)
-        if entry is None:
-            return None
-        runtime_model = getattr(entry, "runtime_model", None)
-        runtime_provider = getattr(entry, "runtime_provider", None)
-        if runtime_model is not None and not isinstance(runtime_model, str):
-            runtime_model = None
-        if runtime_provider is not None and not isinstance(runtime_provider, str):
-            runtime_provider = None
-        if not runtime_model and not runtime_provider:
-            return None
-        return {"model": runtime_model or "", "provider": runtime_provider or ""}
+        return None
 
     def _persist_session_runtime_override(
         self,
