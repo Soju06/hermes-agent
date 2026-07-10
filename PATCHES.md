@@ -152,6 +152,15 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **commit:** `7e6dcc103 fix(gateway): unshadow slash command mixin handlers`
 - **touches:** `gateway/run.py`, `tests/gateway/test_slash_commands_mixin.py`
 
+### 15. runtime-override-rehydrate-credentials
+- **branch:** `soju/patches/runtime-override-rehydrate-credentials`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — dogfood runtime-control follow-up fix)_
+- **state:** `local-only`
+- **rationale:** Persisted `SessionEntry.runtime_model`/`runtime_provider` overrides (written by `model_switch` and pre-dispatch runtime routing) were rehydrated after gateway restart as labels-only dicts with no `base_url`/`api_key`/`api_mode`. `_apply_session_model_override` then merged those labels onto the config-default provider's runtime kwargs, sending provider A's model to provider B's endpoint (upstream 404 surfaced as "model provider failed after retries"). Fold the runtime_* fallback into `_rehydrate_session_model_override` so both persisted stores re-resolve credentials and endpoint from the persisted provider; drop the override entirely when the provider can't be resolved; rehydrate persisted `runtime_reasoning_effort` after restart. Regression tests assert an override can never pair a model/provider with another provider's base_url.
+- **commit:** `db7a83b1e fix(gateway): re-resolve provider endpoint for persisted runtime overrides`
+- **touches:** `gateway/run.py`, `tests/gateway/test_session_model_override_routing.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -189,6 +198,7 @@ soju/patches/aux-runtime-context    ← runtime topic, thread-local auxiliary ru
 soju/patches/gateway-max-iterations-config-authority ← runtime topic, config.yaml max_turns beats stale .env HERMES_MAX_ITERATIONS
 soju/patches/strict-chat-reasoning-details ← runtime topic, strip provider replay fields from strict chat_completions wire payloads
 soju/patches/discord-home-autothread-fix ← runtime topic, restore Discord home-channel auto-thread creation
+soju/patches/runtime-override-rehydrate-credentials ← runtime topic, coherent provider endpoint re-resolution for persisted session runtime overrides
 soju/patches/slash-command-mixin-shadow ← runtime topic, remove stale GatewayRunner slash-command handlers shadowing extracted mixin implementations
 soju/production                       ← rebuilt: base_commit + runtime patches only
                                          NEVER hand-edit. Always run `bin/hermes-patches rebuild` from `soju/fork-policy`.
