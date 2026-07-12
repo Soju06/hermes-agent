@@ -1968,8 +1968,15 @@ class GatewayStartupMixin:
             # this caller owns finish() (idempotent) for the bound trace.
             try:
                 _handoff_trace = turn_trace.get_bound(synthetic_event)
+                if _handoff_trace is None:
+                    # Pre-dispatch hooks may have replaced the runner's event
+                    # copy; the shared SessionSource still carries the binding.
+                    _handoff_trace = turn_trace.get_bound(
+                        getattr(synthetic_event, "source", None)
+                    )
                 if _handoff_trace is not None:
                     _handoff_trace.finish(status="ok")
+                    turn_trace.bind(getattr(synthetic_event, "source", None), None)
             except Exception:
                 pass
         if not response_text:

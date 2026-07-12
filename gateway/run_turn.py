@@ -209,6 +209,13 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         )
         if _trace is not None:
             turn_trace.bind(event, _trace)
+            # The pre-dispatch hook loop may swap `event` for a copy
+            # (dataclasses.replace on prepend/rewrite directives), but the
+            # adapter's finish site still holds the ORIGINAL event.  The
+            # SessionSource object survives the replace, so bind it as the
+            # durable carrier; adapters resolve event-then-source and clear
+            # both after finish.
+            turn_trace.bind(source, _trace)
             try:
                 _dbnc_ts = getattr(event, "_hermes_debounce_enqueue_ts", None)
                 if _dbnc_ts:

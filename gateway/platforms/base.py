@@ -3466,8 +3466,11 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         """
         try:
             _t = _turn_trace_mod.get_bound(event) if _turn_trace_mod is not None else None
+            if _t is None and _turn_trace_mod is not None:
+                _t = _turn_trace_mod.get_bound(getattr(event, "source", None))
             if _t is not None:
                 _t.finish(status="ok")
+                _turn_trace_mod.bind(getattr(event, "source", None), None)
         except Exception:
             pass
 
@@ -4375,15 +4378,30 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         typing_task = self._start_typing_refresh(event, interrupt_event, _typing_metadata)
         generation = None
 
+        def _resolve_turn_trace():
+            # The runner binds the trace to the event AND to event.source: the
+            # pre-dispatch hook loop may have swapped the runner's event for a
+            # dataclasses.replace copy (prepend/rewrite directives), in which
+            # case only the shared SessionSource still carries the binding.
+            if _turn_trace_mod is None:
+                return None
+            _t = _turn_trace_mod.get_bound(event)
+            if _t is None:
+                _t = _turn_trace_mod.get_bound(getattr(event, "source", None))
+            return _t
+
         def _finish_turn_trace(status: str) -> None:
             # Gateway owns the turn-trace lifecycle: the runner begin()s it at
             # message ingress and binds it to this event; delivery timing and
             # the (idempotent, first-status-wins) finish() happen here so the
-            # trace covers the full ingress → delivery interval.
+            # trace covers the full ingress → delivery interval.  Clear the
+            # source binding afterwards — SessionSource can outlive the event,
+            # and a stale trace must not leak into a later turn.
             try:
-                _t = _turn_trace_mod.get_bound(event) if _turn_trace_mod is not None else None
+                _t = _resolve_turn_trace()
                 if _t is not None:
                     _t.finish(status=status)
+                    _turn_trace_mod.bind(getattr(event, "source", None), None)
             except Exception:
                 pass
 
@@ -4393,8 +4411,7 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
             event._turn_marker_handoff = self.gateway_runner is not None  # it can release the marker
             response = await self._message_handler(event)
             generation = getattr(interrupt_event, "_hermes_run_generation", None)
-            if _turn_trace_mod is not None:
-                _turn_trace = _turn_trace_mod.get_bound(event)
+            _turn_trace = _resolve_turn_trace()
             # A muted diagnostic wake ran for the session; its reply is not presented. The
             # policy read binds the routed profile; delivery itself stays in the launch scope.
             with self._media_delivery_scope(event.source):
@@ -4461,6 +4478,8 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
                         delivered=delivery_succeeded,
                     )
                 _turn_trace.finish(status="ok")
+                if _turn_trace_mod is not None:
+                    _turn_trace_mod.bind(getattr(event, "source", None), None)
 
             await self._release_turn_marker(event)
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
