@@ -153,6 +153,15 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **commit:** `31e65b358 fix(gateway): re-resolve persisted runtime override bundle` (stacked on `soju/patches/runtime-control`; branch contains runtime-control commits plus this one)
 - **touches:** `gateway/run.py`, `gateway/session.py`, `tests/gateway/test_runtime_override_restart_rehydration.py`, `tests/gateway/test_runtime_override_state_db_restart.py`, `tests/gateway/test_runtime_override_store_precedence.py`, `tests/gateway/test_session_model_override_routing.py`
 
+### 15. turn-waterfall-tracing
+- **branch:** `soju/patches/turn-waterfall-tracing`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — perf instrumentation for local bottleneck hunt)_
+- **state:** `local-only`
+- **rationale:** Per-turn waterfall tracing to attribute end-to-end turn latency (observed ~30% slower than a minimal agent on the same LLM). New `agent/turn_trace.py` collects wall-clock spans across the whole turn lifecycle — gateway ingest/session-resolve/transcript-load/agent-setup, prologue children (system-prompt restore, early persist, compression preflight, pre-LLM hook, memory prefetch), per-iteration context assembly/request setup/`llm.call` (TTFT + failed attempts) /accounting, tool batches incl. the inter-tool delay sleep, verify gates, finalize children, gateway persist, transport delivery — and emits one JSONL record per turn to `~/.hermes/logs/turn_traces.jsonl`. `agent/turn_trace_render.py` renders terminal/HTML waterfalls and cross-turn p50/p95 summaries with a model-time vs hermes-overhead split. Gated by `HERMES_TURN_TRACE=1` (default off = no-op); tracing failures can never break a turn.
+- **commit:** `50b72568b feat(telemetry): per-turn waterfall tracing spans`
+- **touches:** `agent/turn_trace.py` _(new)_, `agent/turn_trace_render.py` _(new)_, `tests/agent/test_turn_trace.py` _(new)_, `agent/chat_completion_helpers.py`, `agent/conversation_loop.py`, `agent/tool_executor.py`, `agent/turn_context.py`, `agent/turn_finalizer.py`, `gateway/platforms/base.py`, `gateway/run.py`, `plugins/platforms/telegram/adapter.py`, `run_agent.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -191,6 +200,7 @@ soju/patches/gateway-max-iterations-config-authority ← runtime topic, config.y
 soju/patches/strict-chat-reasoning-details ← runtime topic, strip provider replay fields from strict chat_completions wire payloads
 soju/patches/discord-home-autothread-fix ← runtime topic, restore Discord home-channel auto-thread creation
 soju/patches/runtime-override-rehydrate-credentials ← runtime-control child, atomic restart rehydration for persisted runtime routes
+soju/patches/turn-waterfall-tracing ← runtime topic, HERMES_TURN_TRACE per-turn waterfall spans + JSONL sink + renderer
 soju/production                       ← rebuilt: base_commit + runtime patches only
                                          NEVER hand-edit. Always run `bin/hermes-patches rebuild` from `soju/fork-policy`.
 ```
