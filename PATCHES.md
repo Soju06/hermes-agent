@@ -143,16 +143,7 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **commit:** `8a610a67e fix(discord): restore home channel auto-threading`
 - **touches:** `gateway/config.py`, `plugins/platforms/discord/adapter.py`, `tests/gateway/test_discord_channel_controls.py`
 
-### 14. slash-command-mixin-shadow
-- **branch:** `soju/patches/slash-command-mixin-shadow`
-- **origin:** `local-author`
-- **upstream_pr:** _(none — dogfood gateway slash-command refactor safety)_
-- **state:** `local-only`
-- **rationale:** Extracted gateway slash-command handlers must resolve through `GatewaySlashCommandsMixin`. Stale same-named methods left directly on `GatewayRunner` shadow the mixin through Python MRO; that broke Discord `/model` after `parse_model_flags` started returning the `--session` flag. Remove the stale handlers and add an MRO regression test for the extracted slash-command handler class.
-- **commit:** `7e6dcc103 fix(gateway): unshadow slash command mixin handlers`
-- **touches:** `gateway/run.py`, `tests/gateway/test_slash_commands_mixin.py`
-
-### 15. runtime-override-rehydrate-credentials
+### 14. runtime-override-rehydrate-credentials
 - **branch:** `soju/patches/runtime-override-rehydrate-credentials`
 - **origin:** `local-author`
 - **upstream_pr:** _(none — dogfood runtime-control follow-up fix)_
@@ -199,7 +190,6 @@ soju/patches/gateway-max-iterations-config-authority ← runtime topic, config.y
 soju/patches/strict-chat-reasoning-details ← runtime topic, strip provider replay fields from strict chat_completions wire payloads
 soju/patches/discord-home-autothread-fix ← runtime topic, restore Discord home-channel auto-thread creation
 soju/patches/runtime-override-rehydrate-credentials ← runtime topic, coherent provider endpoint re-resolution for persisted session runtime overrides
-soju/patches/slash-command-mixin-shadow ← runtime topic, remove stale GatewayRunner slash-command handlers shadowing extracted mixin implementations
 soju/production                       ← rebuilt: base_commit + runtime patches only
                                          NEVER hand-edit. Always run `bin/hermes-patches rebuild` from `soju/fork-policy`.
 ```
