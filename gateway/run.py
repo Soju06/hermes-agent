@@ -7620,8 +7620,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # caller owns finish() (idempotent) for the bound trace.
             try:
                 _handoff_trace = turn_trace.get_bound(synthetic_event)
+                if _handoff_trace is None:
+                    # Pre-dispatch hooks may have replaced the runner's event
+                    # copy; the shared SessionSource still carries the binding.
+                    _handoff_trace = turn_trace.get_bound(
+                        getattr(synthetic_event, "source", None)
+                    )
                 if _handoff_trace is not None:
                     _handoff_trace.finish(status="ok")
+                    turn_trace.bind(getattr(synthetic_event, "source", None), None)
             except Exception:
                 pass
         if not response_text:
@@ -10807,6 +10814,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         if _trace is not None:
             turn_trace.bind(event, _trace)
+            # The pre-dispatch hook loop may swap `event` for a copy
+            # (dataclasses.replace on prepend/rewrite directives), but the
+            # adapter's finish site still holds the ORIGINAL event.  The
+            # SessionSource object survives the replace, so bind it as the
+            # durable carrier; adapters resolve event-then-source and clear
+            # both after finish.
+            turn_trace.bind(source, _trace)
             try:
                 _dbnc_ts = getattr(event, "_hermes_debounce_enqueue_ts", None)
                 if _dbnc_ts:
