@@ -162,6 +162,15 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **commit:** `50b72568b feat(telemetry): per-turn waterfall tracing spans`
 - **touches:** `agent/turn_trace.py` _(new)_, `agent/turn_trace_render.py` _(new)_, `tests/agent/test_turn_trace.py` _(new)_, `agent/chat_completion_helpers.py`, `agent/conversation_loop.py`, `agent/tool_executor.py`, `agent/turn_context.py`, `agent/turn_finalizer.py`, `gateway/platforms/base.py`, `gateway/run.py`, `plugins/platforms/telegram/adapter.py`, `run_agent.py`
 
+### 16. tool-delay-env-default
+- **branch:** `soju/patches/tool-delay-env-default`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — fork latency tuning)_
+- **state:** `local-only`
+- **rationale:** Upstream sleeps `time.sleep(1.0)` between every pair of sequential tool calls (`agent.tool_delay` default), costing (N-1)s of pure latency on multi-tool turns (log-confirmed: 0.06s tools spaced 1.08s apart; the concurrent read-only path already runs with no delay). Fork default is now 0.0; an unset `tool_delay` resolves `HERMES_TOOL_DELAY` (clamped ≥ 0) so a pause can be restored per-host without a code change, and explicit constructor args still win. Found via the turn-waterfall-tracing `tools.delay` span (patch #15).
+- **commit:** `be2d4b795 perf(tools): default inter-tool delay to 0, env-tunable`
+- **touches:** `agent/agent_init.py`, `run_agent.py`, `tests/agent/test_tool_delay_default.py` _(new)_
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -201,6 +210,7 @@ soju/patches/strict-chat-reasoning-details ← runtime topic, strip provider rep
 soju/patches/discord-home-autothread-fix ← runtime topic, restore Discord home-channel auto-thread creation
 soju/patches/runtime-override-rehydrate-credentials ← runtime-control child, atomic restart rehydration for persisted runtime routes
 soju/patches/turn-waterfall-tracing ← runtime topic, HERMES_TURN_TRACE per-turn waterfall spans + JSONL sink + renderer
+soju/patches/tool-delay-env-default ← runtime topic, inter-tool sleep default 0 (HERMES_TOOL_DELAY override)
 soju/production                       ← rebuilt: base_commit + runtime patches only
                                          NEVER hand-edit. Always run `bin/hermes-patches rebuild` from `soju/fork-policy`.
 ```
