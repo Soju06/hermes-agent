@@ -26,10 +26,12 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional
 
+from agent import turn_trace
 from agent.conversation_compression import conversation_history_after_compression
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
@@ -290,6 +292,10 @@ def build_turn_context(
     ``conversation_loop`` module are passed in explicitly to keep this module
     free of an import cycle with ``agent.conversation_loop``.
     """
+    # Per-turn trace (None when tracing is disabled).
+    _tt = turn_trace.get_bound(agent)
+    _prologue_started = time.time() if _tt is not None else None
+
     # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
     install_safe_stdio()
 
@@ -522,8 +528,10 @@ def build_turn_context(
         )
 
     # ── System prompt (cached per session for prefix caching) ──
-    if agent._cached_system_prompt is None:
-        restore_or_build_system_prompt(agent, system_message, conversation_history)
+    _sp_rebuilt = agent._cached_system_prompt is None
+    with turn_trace.span("prologue.system_prompt", trace=_tt, rebuilt=_sp_rebuilt):
+        if _sp_rebuilt:
+            restore_or_build_system_prompt(agent, system_message, conversation_history)
 
     active_system_prompt = agent._cached_system_prompt
 
@@ -539,31 +547,33 @@ def build_turn_context(
     # once with its final api_content — both steps take the same per-agent
     # persist lock as CLI close persistence.
     persist_lock = getattr(agent, "_session_persist_lock", None)
-    try:
-        if persist_lock is None:
-            agent._ensure_db_session()
-        else:
-            with persist_lock:
+    with turn_trace.span("prologue.persist_early", trace=_tt):
+        try:
+            if persist_lock is None:
                 agent._ensure_db_session()
-    except Exception:
-        logger.warning(
-            "Turn-start session row creation failed for session=%s",
-            agent.session_id or "none",
-            exc_info=True,
-        )
-    finally:
-        # Clear the staged CLI input eagerly (as the pre-refactor code did)
-        # so a crash in preflight compression — which runs between this row
-        # create and the late crash-persist below — doesn't leave a stale
-        # _pending_cli_user_message that the next turn would mistake for a
-        # fresh staged input.
-        if not isinstance(pending_cli_message, dict) or pending_cli_message.get("_db_persisted"):
-            agent._pending_cli_user_message = None
+            else:
+                with persist_lock:
+                    agent._ensure_db_session()
+        except Exception:
+            logger.warning(
+                "Turn-start session row creation failed for session=%s",
+                agent.session_id or "none",
+                exc_info=True,
+            )
+        finally:
+            # Clear the staged CLI input eagerly (as the pre-refactor code did)
+            # so a crash in preflight compression — which runs between this row
+            # create and the late crash-persist below — doesn't leave a stale
+            # _pending_cli_user_message that the next turn would mistake for a
+            # fresh staged input.
+            if not isinstance(pending_cli_message, dict) or pending_cli_message.get("_db_persisted"):
+                agent._pending_cli_user_message = None
 
     # ── Preflight context compression ──
     # Gate the (expensive) full token estimate behind a cheap pre-check.
     # See ``_should_run_preflight_estimate`` for the OR semantics that fix
     # issue #27405 (a few very large messages slipping past the count gate).
+    _cpf_started = time.time() if _tt is not None else None
     _preflight_compressed = False
     if agent.compression_enabled and _should_run_preflight_estimate(
         messages,
@@ -689,8 +699,13 @@ def build_turn_context(
         )
         agent._persist_user_message_idx = current_turn_user_idx
 
+    if _cpf_started is not None:
+        _tt.add_span("prologue.compression_preflight", _cpf_started, time.time(),
+                     compressed=_preflight_compressed)
+
     # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
     plugin_user_context = ""
+    _hook_started = time.time() if _tt is not None else None
     try:
         from hermes_cli.plugins import invoke_hook as _invoke_hook
         _pre_results = _invoke_hook(
@@ -741,6 +756,8 @@ def build_turn_context(
             plugin_user_context = "\n\n".join(_ctx_parts)
     except Exception as exc:
         logger.warning("pre_llm_call hook failed: %s", exc)
+    if _hook_started is not None:
+        _tt.add_span("prologue.pre_llm_hook", _hook_started, time.time())
 
     # Gateway must-deliver notes (auto-reset note, first-contact intro,
     # voice-channel change) ride the same user-message injection channel as
@@ -795,11 +812,13 @@ def build_turn_context(
     # External memory provider: prefetch once before the tool loop.
     ext_prefetch_cache = ""
     if agent._memory_manager:
-        try:
-            _query = original_user_message if isinstance(original_user_message, str) else ""
-            ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
-        except Exception:
-            pass
+        with turn_trace.span("prologue.memory_prefetch", trace=_tt) as _mp_span:
+            try:
+                _query = original_user_message if isinstance(original_user_message, str) else ""
+                ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
+            except Exception:
+                pass
+            _mp_span.tag(decision="hit" if ext_prefetch_cache else "empty")
 
     # ── api_content sidecar: persist what you send ──
     # The prefetch/plugin context above is injected into the API copy of this
@@ -868,24 +887,32 @@ def build_turn_context(
         agent._ensure_db_session()
         agent._persist_session(messages, conversation_history)
 
-    try:
-        if persist_lock is None:
-            _ensure_and_persist()
-        else:
-            with persist_lock:
+    # trace: successor of the pre-restructure crash persist that
+    # prologue.persist_early used to cover (upstream moved the user-turn
+    # persist after prefetch/pre_llm_call so the row is written once with
+    # its final api_content); measured separately from the early row create.
+    with turn_trace.span("prologue.persist_user_turn", trace=_tt):
+        try:
+            if persist_lock is None:
                 _ensure_and_persist()
-    except Exception:
-        logger.warning(
-            "Early turn-start session persistence failed for session=%s",
-            agent.session_id or "none",
-            exc_info=True,
-        )
-    finally:
-        # Keep an unmarked staged input available to a later close retry if the
-        # normal persistence attempt failed. Once the marker is present, the
-        # close path must no longer treat it as a pre-worker UI input.
-        if not isinstance(pending_cli_message, dict) or pending_cli_message.get("_db_persisted"):
-            agent._pending_cli_user_message = None
+            else:
+                with persist_lock:
+                    _ensure_and_persist()
+        except Exception:
+            logger.warning(
+                "Early turn-start session persistence failed for session=%s",
+                agent.session_id or "none",
+                exc_info=True,
+            )
+        finally:
+            # Keep an unmarked staged input available to a later close retry if the
+            # normal persistence attempt failed. Once the marker is present, the
+            # close path must no longer treat it as a pre-worker UI input.
+            if not isinstance(pending_cli_message, dict) or pending_cli_message.get("_db_persisted"):
+                agent._pending_cli_user_message = None
+
+    if _prologue_started is not None:
+        _tt.add_span("turn.prologue", _prologue_started, time.time())
 
     return TurnContext(
         user_message=user_message,
