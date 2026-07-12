@@ -11,6 +11,7 @@ import os
 import queue
 import threading
 import time
+from agent import turn_trace
 from agent.i18n import t
 from agent.session_activity import format_iteration_progress
 from contextlib import nullcontext, suppress
@@ -833,11 +834,18 @@ class GatewayTurnPrepareMixin:
 
         # An unreadable store is not an empty conversation: stop before the agent invents continuity
         # from []. Restore task-local context here (before the broad cleanup finally).
+        _trace = turn_trace.get_bound(event)  # turn trace begun in _handle_message_with_agent
         try:
+            _t_span = time.time() if _trace is not None else 0.0
             history = await self.async_session_store.load_transcript(session_entry.session_id)
+            if _trace is not None:
+                _trace.add_span("gateway.transcript_load", _t_span, time.time())
+                _t_span = time.time()
             history = await self._hmwa_run_session_hygiene(
                 event, source, session_entry, session_key, history, _quick_key, run_generation,
             )
+            if _trace is not None:
+                _trace.add_span("gateway.hygiene", _t_span, time.time())
         except TranscriptReadError:
             self._clear_session_env(_session_env_tokens)
             from gateway.session_results import record_unexecuted_failure

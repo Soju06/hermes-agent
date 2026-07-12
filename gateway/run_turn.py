@@ -16,6 +16,7 @@ import os
 import queue
 import threading
 import time
+from agent import turn_trace
 from agent.i18n import t
 from agent.session_activity import format_iteration_progress
 from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND, FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE
@@ -196,6 +197,28 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             len(event.text or ""), getattr(event, "reply_to_message_id", None),
         )
 
+        # Turn trace: gateway owns begin(); finish() happens in the adapter's
+        # _process_message_background after delivery (bound to the event so it
+        # is reachable there).  None when HERMES_TURN_TRACE is unset — every
+        # use below is guarded.  Carried in locals/bound objects, never via
+        # thread-local: this coroutine shares the event loop thread with
+        # concurrent sessions.  The pre-agent setup guard times
+        # gateway.session_resolve off the event's binding.
+        _trace = turn_trace.begin(
+            key=_quick_key, started_at=_msg_start_time, platform=_platform_name,
+        )
+        if _trace is not None:
+            turn_trace.bind(event, _trace)
+            try:
+                _dbnc_ts = getattr(event, "_hermes_debounce_enqueue_ts", None)
+                if _dbnc_ts:
+                    _trace.mark("transport.inbound_debounce", at=float(_dbnc_ts))
+                    _trace.tag(debounce_ms=round(
+                        (_msg_start_time - float(_dbnc_ts)) * 1000.0, 1,
+                    ))
+            except Exception:
+                pass
+
         from gateway.run_turn_setup_guard import run_preagent_setup
         setup, reply = await run_preagent_setup(self, event, source, _quick_key, run_generation)
         if setup is None:
@@ -231,7 +254,9 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                     **reply_expected_metadata(event.reply_expected), **diagnostic_metadata(event)},
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
+                turn_trace_obj=_trace,
             )
+            _t_persist = time.time() if _trace is not None else 0.0
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
             # A queued (/queue) chain answered the LAST message of the chain, so the outer final
@@ -286,12 +311,16 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             await self._record_room_silence_decision(
                 session_key, agent_result, _intentional_silence,
                 display_kind=prepared.persist_user_display_kind, reply_expected=event.reply_expected)
+            if _trace is not None:
+                _trace.add_span("gateway.persist", _t_persist, time.time())
             return await self._deliver_turn_response_then_limit_offer(
                 event, source, session_entry, session_key, run_generation,
                 agent_result, agent_messages, response, _footer_line, _intentional_silence,
             )
 
         except Exception as e:
+            if _trace is not None:
+                _trace.tag(gateway_error=type(e).__name__)
             return await self._hmwa_agent_error_reply(e, event, source, session_entry, session_key, prepared)
         finally:
             # Restore session context variables to their pre-handler state
@@ -1774,6 +1803,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                     reply_expected=next_reply_expected, persist_user_display_metadata={
                         **display_metadata_for_event(pending_event),
                         **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event)} or None,
+                    turn_trace_obj=turn_ctx.turn_trace_obj,
                 )
         except asyncio.CancelledError:
             await _run_followup_processing_hook(
@@ -2052,11 +2082,18 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         reply_expected: Optional[bool] = None,
         scheduled_heartbeat: bool = False,
         title_user_message: Optional[str] = None,
+        turn_trace_obj: Optional[Any] = None,
     ) -> dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
         Keys: "final_response", "messages", "api_calls", "completed"."""
         if self._get_proxy_url():
+            if turn_trace_obj is not None:
+                turn_trace_obj.add_span(
+                    "gateway.ingest", turn_trace_obj.started_at, time.time(),
+                    platform=source.platform.value if source.platform else "",
+                    session_key=session_key,
+                )
             result = await self._run_agent_via_proxy(
                 message=message, context_prompt=context_prompt, history=history, source=source,
                 session_id=session_id, session_key=session_key, run_generation=run_generation,
@@ -2095,6 +2132,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             reply_expected=reply_expected,
             persist_user_display_metadata=persist_user_display_metadata, scheduled_heartbeat=scheduled_heartbeat,
             voice_turn=str(getattr(message_type, "value", message_type) or "").lower() == "voice",
+            turn_trace_obj=turn_trace_obj,
         )
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,
@@ -2122,6 +2160,12 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         )
 
         try:
+            if turn_trace_obj is not None:
+                turn_trace_obj.add_span(
+                    "gateway.ingest", turn_trace_obj.started_at, time.time(),
+                    platform=source.platform.value if source.platform else "",
+                    session_key=session_key,
+                )
             # run_sync is TurnRunner.run_sync (bound method; executor call unchanged).
             worker = self._run_agent_start_turn_worker(turn_ctx, turn_runner.run_sync)
             _executor_task_holder[0] = worker.executor_task  # read late by _notify_long_running

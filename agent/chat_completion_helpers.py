@@ -2784,6 +2784,9 @@ class _StreamingCall(StreamingWaitMonitor):
     def _new_diag(self) -> dict:
         diag = self.agent._stream_diag_init()
         self.clients.diag = diag
+        # Turn trace: the loop reads first_chunk_at/started_at off this dict for the
+        # in-flight llm.call span's TTFT tag (agent/turn_trace.py).
+        self.agent._last_stream_diag = diag
         return diag
 
     def _count_chunk(self, diag, chunk) -> None:

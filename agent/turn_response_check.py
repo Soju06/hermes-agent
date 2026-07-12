@@ -13,6 +13,7 @@ import logging
 import time
 from typing import Any, Dict, Optional
 
+from agent import turn_trace
 from agent.error_classifier import FailoverReason
 from agent.prompt_cache_lifecycle import start_prompt_cache_warming
 from agent.turn_api_call import stop_thinking_spinner
@@ -198,6 +199,8 @@ def check_api_response(
 
     # Fold provider usage into compressor / anchors / session counters / state.db
     # (agent/turn_usage.py). A rearmed budget also clears the preflight-block latch.
+    _tt = turn_trace.get_bound(agent)
+    _acct_started = time.time() if _tt is not None else None
     _usage_outcome = record_response_usage(
         agent, response, messages=messages, api_call_count=api_call_count,
         api_duration=api_duration, compression_attempts=compression_attempts,
@@ -207,6 +210,19 @@ def check_api_response(
     if _usage_outcome.rearmed:
         _preflight_compression_blocked = False
         _last_preflight_pressure = None
+    if _acct_started is not None:
+        try:
+            _acct_tags = {}
+            # record_response_usage leaves the canonical usage dict on the agent.
+            _lu = getattr(agent, "_last_turn_usage", None)
+            if (hasattr(response, "usage") and response.usage and isinstance(_lu, dict)
+                    and _lu.get("cache_read_tokens") and _lu.get("prompt_tokens")):
+                _acct_tags["cache_pct"] = round(
+                    100.0 * _lu["cache_read_tokens"] / _lu["prompt_tokens"], 1
+                )
+        except Exception:
+            _acct_tags = {}
+        _tt.add_span("llm.accounting", _acct_started, time.time(), **_acct_tags)
     # Arm a bounded replay (smallest output cap) of THIS request before the clock's guaranteed window
     # ends, so a tool round longer than the TTL does not turn the next request into a full-price cache write.
     start_prompt_cache_warming(agent, api_kwargs, response)

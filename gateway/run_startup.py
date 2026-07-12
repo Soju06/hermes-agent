@@ -17,6 +17,7 @@ import time
 from contextlib import nullcontext, suppress
 from contextvars import copy_context
 from pathlib import Path
+from agent import turn_trace
 from agent.i18n import t
 from gateway.config import Platform
 from gateway.delivery import looks_like_telegram_private_chat_id, prime_revived_egress
@@ -1959,7 +1960,18 @@ class GatewayStartupMixin:
             cli_session_id, dest.platform_name, dest.home.chat_id, dest.effective_thread_id, session_key,
         )
         # Inline _handle_message keeps success/failure observable (handle_message would detach it).
-        response_text = await self._handle_message(synthetic_event)
+        try:
+            response_text = await self._handle_message(synthetic_event)
+        finally:
+            # Inline dispatch bypasses the adapter's _process_message_background — the only
+            # place turn traces begun in _handle_message_with_agent are normally finished — so
+            # this caller owns finish() (idempotent) for the bound trace.
+            try:
+                _handoff_trace = turn_trace.get_bound(synthetic_event)
+                if _handoff_trace is not None:
+                    _handoff_trace.finish(status="ok")
+            except Exception:
+                pass
         if not response_text:
             # Streaming may have delivered inline; the agent ran without raising — success.
             return

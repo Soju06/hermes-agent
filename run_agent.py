@@ -90,6 +90,7 @@ def _gateway_origin_json(agent: "AIAgent") -> Optional[str]:
 
 
 from agent.iteration_budget import IterationBudget
+from agent import turn_trace
 from hermes_cli.env_loader import load_hermes_dotenv
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 
@@ -1367,22 +1368,41 @@ class AIAgent(
         """
         tool_calls = assistant_message.tool_calls
         args = (assistant_message, messages, effective_task_id, api_call_count)
+
+        # Per-turn trace: running tool_calls total lives in the trace tags so
+        # the run_conversation wrapper can copy it onto the root `turn` span.
+        _tt = turn_trace.get_bound(self)
+        if _tt is not None:
+            try:
+                _tt.tag(tool_calls=_tt.tags.get("tool_calls", 0) + len(tool_calls))
+            except Exception:
+                pass
+
         self._executing_tools = True  # allow _vprint during tool execution even with stream consumers
         try:
             with scoped_connection_surface(agent_connection_surface(self)):
                 if len(tool_calls) <= 1:
-                    self._execute_tool_calls_sequential(*args)
+                    with turn_trace.span("tools.batch", trace=_tt, count=len(tool_calls), mode="sequential"):
+                        self._execute_tool_calls_sequential(*args)
                 else:
                     from agent.tool_dispatch_helpers import _plan_tool_batch_segments
                     active_env = get_active_env(effective_task_id)
                     exec_cwd = Path(active_env.cwd) if active_env is not None and active_env.cwd else None
                     segments = _plan_tool_batch_segments(tool_calls, execution_cwd=exec_cwd)
                     if len(segments) == 1:
+                        # mode tag mirrors the actual dispatch path: a homogeneous plan keeps its
+                        # single-path executor.
+                        _mode = "concurrent" if segments[0][0] == "parallel" else "sequential"
                         run = self._execute_tool_calls_concurrent if segments[0][0] == "parallel" else self._execute_tool_calls_sequential
-                        run(*args)
+                        with turn_trace.span("tools.batch", trace=_tt, count=len(tool_calls), mode=_mode):
+                            run(*args)
                     else:
                         from agent.tool_executor import execute_tool_calls_segmented
-                        execute_tool_calls_segmented(self, *args, segments=segments)
+                        # Mixed batch: one tools.batch span covers the whole batch; per-tool tools.call
+                        # spans come from the sequential/concurrent executors reused per segment.
+                        with turn_trace.span("tools.batch", trace=_tt, count=len(tool_calls),
+                                             mode="segmented", segments=len(segments)):
+                            execute_tool_calls_segmented(self, *args, segments=segments)
         finally:
             self._executing_tools = False
         # getattr: test stubs built without _set_defaults drive this method too

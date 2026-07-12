@@ -8,9 +8,11 @@ re-prompt, scaffolding pop, stop gates, then the durable final flush. Extracted 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 import logging
 from typing import Any, Callable, Dict, Optional
 
+from agent import turn_trace
 from agent.message_metadata import append_message
 from agent.reasoning_promotion import answer_in_reasoning_capability
 from agent.repetition_guard import STOP_PATH_MIN_CHARS, is_runaway_repetition
@@ -369,6 +371,8 @@ def finish_text_response(
     ):
         messages.pop()
 
+    _tt = turn_trace.get_bound(agent)
+    _verify_gate_started = time.time() if _tt is not None else None
     _sg = apply_stop_gates(
         agent, final_msg, final_response=final_response, messages=messages,
         conversation_history=conversation_history,
@@ -377,6 +381,9 @@ def finish_text_response(
     )
     _pending_verification_response = _sg.pending_verification_response
     _pending_verification_response_previewed = _sg.pending_verification_response_previewed
+    if _verify_gate_started is not None:
+        _gate_tags = {"nudge_fired": True} if _sg.continue_turn else {}
+        _tt.add_span("turn.verify_gate", _verify_gate_started, time.time(), **_gate_tags)
     if _sg.continue_turn:
         final_response = None
         return _verdict("continue")
