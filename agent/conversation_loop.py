@@ -3291,8 +3291,11 @@ def _run_conversation_impl(
                 from hermes_cli.middleware import run_llm_execution_middleware
 
                 _llm_call_started = time.time() if _tt is not None else None
+                _pfp_tags = None
                 if _llm_call_started is not None:
                     agent._last_stream_diag = None
+                    if turn_trace.prefix_fingerprint_enabled():
+                        _pfp_tags = turn_trace.prefix_fingerprint(api_kwargs)
                 _model_request_active = getattr(agent, "_model_request_active", None)
                 _redirect_lock = getattr(agent, "_pending_redirect_lock", None)
                 if _redirect_lock is not None:
@@ -3356,6 +3359,8 @@ def _run_conversation_impl(
                                 (stream_diag["first_chunk_at"] - stream_diag["started_at"]) * 1000.0,
                                 1,
                             )
+                        if _pfp_tags:
+                            llm_tags.update(_pfp_tags)
                         _tt.add_span("llm.call", _llm_call_started, time.time(), **llm_tags)
                     except Exception:
                         pass
