@@ -1575,11 +1575,17 @@ def _run_conversation_impl(
                 from hermes_cli.middleware import run_llm_execution_middleware
 
                 _llm_call_started = None
+                _pfp_tags = None
                 if _tt is not None:
                     _llm_call_started = time.time()
                     # Cleared per attempt so a stale diag from a previous
                     # streaming call can't leak a wrong ttft_ms onto this one.
                     agent._last_stream_diag = None
+                    if turn_trace.prefix_fingerprint_enabled():
+                        # Captured pre-middleware: hermes middleware does not
+                        # rewrite messages/tools today, and hashing here keeps
+                        # the fingerprint next to the payload we assembled.
+                        _pfp_tags = turn_trace.prefix_fingerprint(api_kwargs)
 
                 response = run_llm_execution_middleware(
                     api_kwargs,
@@ -1610,6 +1616,8 @@ def _run_conversation_impl(
                             _llm_tags["ttft_ms"] = round(
                                 (_sd["first_chunk_at"] - _sd["started_at"]) * 1000.0, 1
                             )
+                        if _pfp_tags:
+                            _llm_tags.update(_pfp_tags)
                         _tt.add_span("llm.call", _llm_call_started, time.time(), **_llm_tags)
                     except Exception:
                         pass
