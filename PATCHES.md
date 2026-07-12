@@ -159,7 +159,10 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **upstream_pr:** _(none — perf instrumentation for local bottleneck hunt)_
 - **state:** `local-only`
 - **rationale:** Per-turn waterfall tracing to attribute end-to-end turn latency (observed ~30% slower than a minimal agent on the same LLM). New `agent/turn_trace.py` collects wall-clock spans across the whole turn lifecycle — gateway ingest/session-resolve/transcript-load/agent-setup, prologue children (system-prompt restore, early persist, compression preflight, pre-LLM hook, memory prefetch), per-iteration context assembly/request setup/`llm.call` (TTFT + failed attempts) /accounting, tool batches incl. the inter-tool delay sleep, verify gates, finalize children, gateway persist, transport delivery — and emits one JSONL record per turn to `~/.hermes/logs/turn_traces.jsonl`. `agent/turn_trace_render.py` renders terminal/HTML waterfalls and cross-turn p50/p95 summaries with a model-time vs hermes-overhead split. Gated by `HERMES_TURN_TRACE=1` (default off = no-op); tracing failures can never break a turn.
-- **commit:** `50b72568b feat(telemetry): per-turn waterfall tracing spans`
+- **commits:**
+  - `50b72568b feat(telemetry): per-turn waterfall tracing spans`
+  - `437d22fa5 fix(telemetry): carry turn trace across pre-dispatch event replacement` _(pre-dispatch hooks may swap the event via dataclasses.replace; bind the trace to the surviving SessionSource so adapter finish sites can always reach it)_
+  - `e59fe6ef9 feat(telemetry): request prefix fingerprints for cache-break diffing` _(HERMES_TURN_TRACE_PREFIX=1 adds wire-faithful per-message hashes to llm.call spans; `turn_trace_render --cache-diff` names the first divergent message across consecutive turns — for the first-call cache p50 13% hunt)_
 - **touches:** `agent/turn_trace.py` _(new)_, `agent/turn_trace_render.py` _(new)_, `tests/agent/test_turn_trace.py` _(new)_, `agent/chat_completion_helpers.py`, `agent/conversation_loop.py`, `agent/tool_executor.py`, `agent/turn_context.py`, `agent/turn_finalizer.py`, `gateway/platforms/base.py`, `gateway/run.py`, `plugins/platforms/telegram/adapter.py`, `run_agent.py`
 
 ### 16. tool-delay-env-default
