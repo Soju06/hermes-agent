@@ -4700,8 +4700,11 @@ class BasePlatformAdapter(ABC):
         """
         try:
             _t = _turn_trace_mod.get_bound(event) if _turn_trace_mod is not None else None
+            if _t is None and _turn_trace_mod is not None:
+                _t = _turn_trace_mod.get_bound(getattr(event, "source", None))
             if _t is not None:
                 _t.finish(status="ok")
+                _turn_trace_mod.bind(getattr(event, "source", None), None)
         except Exception:
             pass
 
@@ -5059,15 +5062,30 @@ class BasePlatformAdapter(ABC):
                 metadata=_thread_metadata,
             )
 
+        def _resolve_turn_trace():
+            # The runner binds the trace to the event AND to event.source: the
+            # pre-dispatch hook loop may have swapped the runner's event for a
+            # dataclasses.replace copy (prepend/rewrite directives), in which
+            # case only the shared SessionSource still carries the binding.
+            if _turn_trace_mod is None:
+                return None
+            _t = _turn_trace_mod.get_bound(event)
+            if _t is None:
+                _t = _turn_trace_mod.get_bound(getattr(event, "source", None))
+            return _t
+
         def _finish_turn_trace(status: str) -> None:
             # Gateway owns the turn-trace lifecycle: the runner begin()s it at
             # message ingress and binds it to this event; delivery timing and
             # the (idempotent, first-status-wins) finish() happen here so the
-            # trace covers the full ingress → delivery interval.
+            # trace covers the full ingress → delivery interval.  Clear the
+            # source binding afterwards — SessionSource can outlive the event,
+            # and a stale trace must not leak into a later turn.
             try:
-                _t = _turn_trace_mod.get_bound(event) if _turn_trace_mod is not None else None
+                _t = _resolve_turn_trace()
                 if _t is not None:
                     _t.finish(status=status)
+                    _turn_trace_mod.bind(getattr(event, "source", None), None)
             except Exception:
                 pass
 
@@ -5077,8 +5095,7 @@ class BasePlatformAdapter(ABC):
 
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
-            if _turn_trace_mod is not None:
-                _turn_trace = _turn_trace_mod.get_bound(event)
+            _turn_trace = _resolve_turn_trace()
             is_ephemeral_response = isinstance(response, EphemeralReply)
 
             # Slash-command handlers may return an EphemeralReply sentinel to
@@ -5445,6 +5462,8 @@ class BasePlatformAdapter(ABC):
                         delivered=delivery_succeeded,
                     )
                 _turn_trace.finish(status="ok")
+                if _turn_trace_mod is not None:
+                    _turn_trace_mod.bind(getattr(event, "source", None), None)
 
             # Determine overall success for the processing hook
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
