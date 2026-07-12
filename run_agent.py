@@ -425,7 +425,7 @@ class AIAgent:
         args: list[str] | None = None,
         model: str = "",
         max_iterations: int = 90,  # Default tool-calling iterations (shared with subagents)
-        tool_delay: float = 1.0,
+        tool_delay: float | None = None,  # None -> HERMES_TOOL_DELAY, else 0.0 (agent_init)
         enabled_toolsets: List[str] = None,
         disabled_toolsets: List[str] = None,
         save_trajectories: bool = False,
