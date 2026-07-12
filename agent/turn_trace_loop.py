@@ -16,9 +16,12 @@ from typing import Any, Iterator, Optional
 from agent import turn_trace
 
 
-def trace_llm_call(_tt, started, agent, s: Any, error: Optional[str] = None) -> None:
+def trace_llm_call(
+    _tt, started, agent, s: Any, error: Optional[str] = None, pfp_tags: Optional[dict] = None,
+) -> None:
     """Close the in-flight ``llm.call`` span (turn trace). Failed / interrupted attempts are
-    recorded too (tagged ``error``) so their wall time isn't misread as hermes overhead."""
+    recorded too (tagged ``error``) so their wall time isn't misread as hermes overhead.
+    ``pfp_tags`` (HERMES_TURN_TRACE_PREFIX request-prefix fingerprints) ride successful calls."""
     if _tt is None or started is None:
         return
     try:
@@ -31,6 +34,8 @@ def trace_llm_call(_tt, started, agent, s: Any, error: Optional[str] = None) -> 
                 llm_tags["ttft_ms"] = round(
                     (stream_diag["first_chunk_at"] - stream_diag["started_at"]) * 1000.0, 1,
                 )
+            if pfp_tags:
+                llm_tags.update(pfp_tags)
         _tt.add_span("llm.call", started, time.time(), **llm_tags)
     except Exception:
         pass

@@ -1568,13 +1568,16 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[dict[str, Any]]:
             if _req_setup_started is not None:
                 _tt.add_span("iteration.request_setup", _req_setup_started, time.time())
             _llm_call_started = time.time() if _tt is not None else None
+            _pfp_tags = None
             if _llm_call_started is not None:
                 agent._last_stream_diag = None
+                if turn_trace.prefix_fingerprint_enabled():
+                    _pfp_tags = turn_trace.prefix_fingerprint(s.api_kwargs)
             if _run_phase(perform_api_call, agent, s).action == "break":
                 trace_llm_call(_tt, _llm_call_started, agent, s, error="interrupted")
                 _llm_call_started = None
                 return None
-            trace_llm_call(_tt, _llm_call_started, agent, s)
+            trace_llm_call(_tt, _llm_call_started, agent, s, pfp_tags=_pfp_tags)
             _llm_call_started = None
             _rc = _run_phase(check_api_response, agent, s)
             if _rc.action == "return":
