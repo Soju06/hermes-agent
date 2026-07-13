@@ -5876,6 +5876,11 @@ class TurnRunner:
         agent.notice_clear_callback = None
         agent.event_callback = ctx._event_callback_sync
         agent.reasoning_config = reasoning_config
+        if hasattr(agent, "_runtime_reasoning_source"):
+            try:
+                delattr(agent, "_runtime_reasoning_source")
+            except AttributeError:
+                pass
         agent.service_tier = self._runner._service_tier
         agent.request_overrides = turn_route.get("request_overrides") or {}
         agent._runtime_route_state = self._runner._consume_pending_runtime_route_state(
@@ -5886,9 +5891,18 @@ class TurnRunner:
         # _handle_message_with_agent (auto-reset note, first-contact
         # intro, voice-channel change).  Assigned unconditionally so a
         # reused cached agent never replays a stale note.
-        agent._gateway_turn_context_notes = "\n\n".join(
-            self._runner._consume_pending_turn_sidecar_notes(ctx.session_key)
+        turn_sidecar_parts = self._runner._consume_pending_turn_sidecar_notes(
+            ctx.session_key
         )
+        if agent._runtime_route_state:
+            try:
+                from agent.system_prompt import format_routing_directive
+                directive_line = format_routing_directive(agent._runtime_route_state)
+                if directive_line:
+                    turn_sidecar_parts.append(directive_line)
+            except Exception:
+                logger.debug("routing directive render failed", exc_info=True)
+        agent._gateway_turn_context_notes = "\n\n".join(turn_sidecar_parts)
 
         def _runtime_update_callback(
             *, scope: str, model_override=None, reasoning_config=None
@@ -26834,6 +26848,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
 
         changed = False
+        # Effective-delta guard: evict the cached agent (a full system-prompt
+        # + prompt-cache rebuild) ONLY when the override actually moves a
+        # runtime axis.  A router that re-selects the already-active route
+        # every triggering message must not bust the cache each time.
+        # Reasoning-only overrides never require eviction: reasoning is
+        # excluded from the agent-cache signature and re-applied per turn on
+        # the cached agent (see the per-turn assignment in run_sync).
+        evict_needed = False
         if model_input or explicit_provider:
             try:
                 from hermes_cli.config import get_compatible_custom_providers
@@ -26875,6 +26897,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         result.error_message,
                     )
                     return changed
+                previous_api_mode = override.get("api_mode")
+                model_axes_changed = (
+                    str(result.new_model or "") != str(current_model or "")
+                    or str(result.target_provider or "") != str(current_provider or "")
+                    or str(result.base_url or "") != str(current_base_url or "")
+                    or (
+                        previous_api_mode is not None
+                        and str(result.api_mode or "") != str(previous_api_mode or "")
+                    )
+                )
                 self._session_state(
                     session_key
                 ).conversation.model_override = {
@@ -26890,10 +26922,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     provider=result.target_provider,
                     include_model=True,
                 )
-                pending = getattr(self, "_pending_model_notes", None)
-                if pending is None:
-                    self._pending_model_notes = {}
-                    pending = self._pending_model_notes
                 reason = str(
                     directive.get("reason") or "pre-dispatch routing"
                 ).strip()
@@ -26907,12 +26935,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         reason=reason,
                     ),
                 )
-                pending[session_key] = (
-                    "[Note: runtime route selected before this turn: "
-                    f"{current_model or 'default'} -> {result.new_model} via "
-                    f"{result.provider_label or result.target_provider} ({reason}). "
-                    "Adjust your self-identification accordingly.]"
-                )
+                if model_axes_changed:
+                    pending = getattr(self, "_pending_model_notes", None)
+                    if pending is None:
+                        self._pending_model_notes = {}
+                        pending = self._pending_model_notes
+                    pending[session_key] = (
+                        "[Note: runtime route selected before this turn: "
+                        f"{current_model or 'default'} -> {result.new_model} via "
+                        f"{result.provider_label or result.target_provider} ({reason}). "
+                        "Adjust your self-identification accordingly.]"
+                    )
+                    evict_needed = True
                 changed = True
             except Exception as exc:
                 logger.warning(
@@ -26931,6 +26965,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 else:
                     self._set_session_reasoning_override(session_key, parsed)
+                    self._persist_session_runtime_override(
+                        session_key,
+                        reasoning_config=parsed,
+                        include_reasoning=True,
+                    )
                     if not (model_input or explicit_provider):
                         self._set_pending_runtime_route_state(
                             session_key,
@@ -26943,7 +26982,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as exc:
                 logger.warning("Reasoning runtime override failed: %s", exc)
         if changed:
-            self._evict_cached_agent(session_key)
+            if evict_needed:
+                self._evict_cached_agent(session_key)
         return changed
 
     def _apply_session_model_override(
