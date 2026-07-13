@@ -185,6 +185,17 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
   - `67ab2dce0 fix(cache): close review gaps in the api_content sidecar`
 - **touches:** `hermes_state.py`, `agent/turn_context.py`, `agent/conversation_loop.py`, `agent/chat_completion_helpers.py`, `agent/context_compressor.py`, `agent/replay_cleanup.py`, `agent/agent_runtime_helpers.py`, `agent/transports/chat_completions.py`, `run_agent.py`, `gateway/run.py`, `gateway/session.py`, `gateway/slash_commands.py`, `hermes_cli/cli_commands_mixin.py`, `tests/agent/test_api_content_sidecar.py` _(new)_, `tests/gateway/test_replay_entry_fields.py` _(new)_
 
+### 18. prompt-tail-freeze
+- **branch:** `soju/patches/prompt-tail-freeze`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — fork latency work, candidate for upstreaming after burn-in)_
+- **state:** `local-only`
+- **rationale:** Byte-stable gateway system prompts (the second half of the turn-boundary prompt-cache fix; pairs with #17). Live sys-tail diffs proved the composed system prompt tail changes between consecutive turns — DesiredRoute one-shot flips, CurrentRuntime reasoning value/suffix instability, per-turn ephemeral recomposition (auto-thread rename, reset notes, VC state) — which kills the provider prefix at the head and re-keys the content-addressed `prompt_cache_key` on codex/xai routes (observed 0.1% cache despite a 14.5%-matching head). Fix: pin the session-context prompt per session keyed by a hash of exactly the fields it renders (re-render only on legitimate changes: renames, /sethome, redact_pii, toolset flips); freeze the runtime/route block behind a runtime key-tuple cache with `reasoning_source=` always emitted and a permanently static DesiredRoute; deliver one-shot facts (routing directives, VC changes, auto-reset notes, first-contact intro) on the current user message via the #17 api_content sidecar (multimodal turns get a durable appended text part); guard `_apply_gateway_runtime_override` so same-route re-selections stop evicting the cached agent; persist the reasoning half of runtime overrides (fixes the post-restart `reasoning=max`↔`unknown` byte flip); sort `get_connected_platforms`.
+- **commits:** (stacked on `soju/patches/prompt-cache-stability` + tips of `runtime-route-awareness`/`turn-waterfall-tracing`; branch contains those commits plus these)
+  - `39d47f64b merge: stack prompt-tail-freeze on runtime-route + waterfall tips`
+  - `66849a10f feat(cache): prompt-tail freeze — byte-stable gateway system prompts (patch #18)`
+- **touches:** `gateway/run.py`, `gateway/session.py`, `gateway/config.py`, `agent/system_prompt.py`, `agent/turn_context.py`, `tests/gateway/test_prompt_tail_freeze.py` _(new)_, `tests/agent/test_gateway_turn_sidecar.py` _(new)_, `tests/agent/test_runtime_route_prompt.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -226,6 +237,7 @@ soju/patches/runtime-override-rehydrate-credentials ← runtime-control child, a
 soju/patches/turn-waterfall-tracing ← runtime topic, HERMES_TURN_TRACE per-turn waterfall spans + JSONL sink + renderer
 soju/patches/tool-delay-env-default ← runtime topic, inter-tool sleep default 0 (HERMES_TOOL_DELAY override)
 soju/patches/prompt-cache-stability ← runtime topic (stacked on turn-waterfall-tracing), api_content sidecar for byte-stable prompt-cache replay
+soju/patches/prompt-tail-freeze ← runtime topic (stacked on prompt-cache-stability + route-awareness tips), byte-stable gateway system prompts
 soju/production                       ← rebuilt: base_commit + runtime patches only
                                          NEVER hand-edit. Always run `bin/hermes-patches rebuild` from `soju/fork-policy`.
 ```
