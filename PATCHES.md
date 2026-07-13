@@ -174,6 +174,17 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **commit:** `be2d4b795 perf(tools): default inter-tool delay to 0, env-tunable`
 - **touches:** `agent/agent_init.py`, `run_agent.py`, `tests/agent/test_tool_delay_default.py` _(new)_
 
+### 17. prompt-cache-stability
+- **branch:** `soju/patches/prompt-cache-stability` _(stacked on `soju/patches/turn-waterfall-tracing`; branch contains the tracing commits plus these)_
+- **origin:** `local-author`
+- **upstream_pr:** _(none — fork latency work, candidate for upstreaming after burn-in)_
+- **state:** `local-only`
+- **rationale:** Turn-boundary prompt-cache stabilization ("persist what you send"). Live tracing proved the first LLM call of every gateway turn gets ~0% provider prompt cache (in-turn calls 97–99%) because the bytes sent differ from the bytes replayed from the transcript next turn: API-call-time injections into the current user message (memory prefetch, plugin pre_llm_call context) were never persisted, the #48677 persist override stores cleaned content, and `get_messages_as_conversation` sanitizes on load. Fix: nullable `api_content` sidecar column on `messages` stores the exact wire bytes when they differ from clean content; the api_messages build replays the sidecar verbatim for historical user/assistant rows and pops the field from every outgoing copy. Prologue stamps the sidecar (persist_early moved after memory prefetch so the row is written once, complete); flush captures override/sanitize divergences; gateway replay, append_to_transcript, /branch copies, max-iterations summary, compression/repair rewrite sites and MoA all audited to carry or safely drop it. Expected effect: first-call cache from p50 13% toward 90%+ once the system-prompt tail churn (next patch) is also fixed.
+- **commits:**
+  - `2a476737d feat(cache): api_content sidecar — persist the exact bytes sent`
+  - `67ab2dce0 fix(cache): close review gaps in the api_content sidecar`
+- **touches:** `hermes_state.py`, `agent/turn_context.py`, `agent/conversation_loop.py`, `agent/chat_completion_helpers.py`, `agent/context_compressor.py`, `agent/replay_cleanup.py`, `agent/agent_runtime_helpers.py`, `agent/transports/chat_completions.py`, `run_agent.py`, `gateway/run.py`, `gateway/session.py`, `gateway/slash_commands.py`, `hermes_cli/cli_commands_mixin.py`, `tests/agent/test_api_content_sidecar.py` _(new)_, `tests/gateway/test_replay_entry_fields.py` _(new)_
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -214,6 +225,7 @@ soju/patches/discord-home-autothread-fix ← runtime topic, restore Discord home
 soju/patches/runtime-override-rehydrate-credentials ← runtime-control child, atomic restart rehydration for persisted runtime routes
 soju/patches/turn-waterfall-tracing ← runtime topic, HERMES_TURN_TRACE per-turn waterfall spans + JSONL sink + renderer
 soju/patches/tool-delay-env-default ← runtime topic, inter-tool sleep default 0 (HERMES_TOOL_DELAY override)
+soju/patches/prompt-cache-stability ← runtime topic (stacked on turn-waterfall-tracing), api_content sidecar for byte-stable prompt-cache replay
 soju/production                       ← rebuilt: base_commit + runtime patches only
                                          NEVER hand-edit. Always run `bin/hermes-patches rebuild` from `soju/fork-policy`.
 ```
