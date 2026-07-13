@@ -464,10 +464,16 @@ def direct_api_call(agent, api_kwargs: dict):
 
     def _abort_active_request(reason: str) -> None:
         """Abort the inline request from cron's watchdog/interrupt thread."""
+        # Abort while still holding the holder lock: the instant it is
+        # released, the inline finally may pop + cache the client for reuse
+        # and the NEXT call check it out — a late abort would then poison
+        # the slot and shut down an innocent in-flight request's sockets
+        # (same atomicity contract as _close_request_client_once in the
+        # interruptible variants; the abort itself never blocks).
         with request_client_lock:
             request_client = request_client_holder["client"]
-        if request_client is not None:
-            agent._abort_request_openai_client(request_client, reason=reason)
+            if request_client is not None:
+                agent._abort_request_openai_client(request_client, reason=reason)
 
     def _make_client(reason: str, kind: str = "openai"):
         # direct_api_call only runs for OpenAI-wire chat_completions cron
