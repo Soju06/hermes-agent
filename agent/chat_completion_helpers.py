@@ -1702,7 +1702,9 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             # timestamp (preserved on gateway user replay entries for the
             # stale-confirmation expiry check — #47868 rejection class),
             # and every Hermes-internal underscore-prefixed scaffolding key.
-            for schema_foreign in ("tool_name", "codex_reasoning_items", "codex_message_items", "timestamp"):
+            # api_content (the persist-what-you-send sidecar) is likewise
+            # Hermes bookkeeping, never a provider field.
+            for schema_foreign in ("tool_name", "codex_reasoning_items", "codex_message_items", "timestamp", "api_content"):
                 api_msg.pop(schema_foreign, None)
             for internal_key in [k for k in api_msg if isinstance(k, str) and k.startswith("_")]:
                 api_msg.pop(internal_key, None)

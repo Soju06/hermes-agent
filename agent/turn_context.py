@@ -3,8 +3,9 @@
 ``run_conversation`` opened with ~470 lines of straight-line setup before the
 tool-calling loop ever started: stdio guarding, runtime-main wiring, retry-counter
 resets, user-message sanitization, todo/nudge-counter hydration, system-prompt
-restore-or-build, crash-resilience persistence, preflight context compression, the
-``pre_llm_call`` plugin hook, and external-memory prefetch.
+restore-or-build, preflight context compression, the ``pre_llm_call`` plugin
+hook, external-memory prefetch, and crash-resilience persistence (last, so the
+user row is written once with its final ``api_content`` sidecar).
 
 All of that is *prologue* — it runs once per turn, has no back-references into the
 loop, and produces a fixed set of values the loop then consumes. ``TurnContext``
@@ -32,12 +33,48 @@ from typing import Any, Dict, List, Optional
 from agent import turn_trace
 from agent.conversation_compression import conversation_history_after_compression
 from agent.iteration_budget import IterationBudget
+from agent.memory_manager import build_memory_context_block
 from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def compose_user_api_content(
+    content: Any,
+    ext_prefetch_cache: str,
+    plugin_user_context: str,
+) -> Optional[str]:
+    """Compose the API-bound content of the current turn's user message.
+
+    Sources: memory-manager prefetch + ``pre_llm_call`` plugin context with
+    target="user_message" (the default). Both are appended to the *API copy*
+    of the user message only — the stored content stays clean.
+
+    This is the single source of that composition. The prologue stamps the
+    result onto the live message as ``api_content`` (persisted alongside the
+    clean content) and the ``api_messages`` build in ``conversation_loop``
+    sends the same helper's output, so the persisted sidecar can never drift
+    from the bytes on the wire — which is the whole prompt-cache invariant:
+    what turn N sends must be what turn N+1 replays.
+
+    Returns ``None`` when nothing is injected (multimodal/non-string content,
+    or no ephemeral context), meaning the message is sent as-is.
+    """
+    if not isinstance(content, str):
+        return None
+    injections = []
+    if ext_prefetch_cache:
+        fenced = build_memory_context_block(ext_prefetch_cache)
+        if fenced:
+            injections.append(fenced)
+    if plugin_user_context:
+        injections.append(plugin_user_context)
+    if not injections:
+        return None
+    return content + "\n\n" + "\n\n".join(injections)
 
 
 def _compression_made_progress(
@@ -357,18 +394,12 @@ def build_turn_context(
     # Create the DB session row now that _cached_system_prompt is populated, so
     # the persisted snapshot is written non-NULL on the first turn (Issue
     # #45499). Idempotent: _ensure_db_session() no-ops once the row exists.
-    with turn_trace.span("prologue.persist_early", trace=_tt):
-        agent._ensure_db_session()
-
-        # Crash-resilience: persist the inbound user turn as soon as the session row exists.
-        try:
-            agent._persist_session(messages, conversation_history)
-        except Exception:
-            logger.warning(
-                "Early turn-start session persistence failed for session=%s",
-                agent.session_id or "none",
-                exc_info=True,
-            )
+    # Must run BEFORE preflight compression: session rotation ends this row
+    # and creates a child with parent_session_id pointing at it — with
+    # PRAGMA foreign_keys=ON, a missing parent row fails the child INSERT.
+    # The user-turn crash persist itself runs LATER (after memory prefetch /
+    # pre_llm_call), so the row is written once with its final api_content.
+    agent._ensure_db_session()
 
     # ── Preflight context compression ──
     # Gate the (expensive) full token estimate behind a cheap pre-check.
@@ -491,6 +522,20 @@ def build_turn_context(
         _tt.add_span("prologue.compression_preflight", _cpf_started, time.time(),
                      compressed=_cpf_compressed)
 
+    if _cpf_compressed:
+        # Compression rebuilt the list (tail messages are fresh compaction
+        # copies), so the pre-compression index of this turn's user message
+        # is stale. It is still the LAST user message in the compacted list
+        # (_ensure_compressed_has_user_turn guarantees one survives), so
+        # re-anchor both index trackers: the api_content stamp below, the
+        # loop's injection site, and the flush's persist-override row (#48677)
+        # must all target the surviving dict, not a stale position.
+        for _i in range(len(messages) - 1, -1, -1):
+            if isinstance(messages[_i], dict) and messages[_i].get("role") == "user":
+                current_turn_user_idx = _i
+                agent._persist_user_message_idx = _i
+                break
+
     # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
     plugin_user_context = ""
     _hook_started = time.time() if _tt is not None else None
@@ -584,6 +629,47 @@ def build_turn_context(
             except Exception:
                 pass
             _mp_span.tag(decision="hit" if ext_prefetch_cache else "empty")
+
+    # ── api_content sidecar: persist what you send ──
+    # The prefetch/plugin context above is injected into the API copy of this
+    # turn's user message, never into the stored content — so on the next
+    # turn the message would replay WITHOUT the injection, diverging the
+    # request prefix at this point and re-prefilling everything after it
+    # (the whole previous turn's assistant/tool chain). Stamp the exact
+    # API-bound bytes on the live dict, only when they differ from the clean
+    # content, so the crash persist below writes both in the same row and
+    # replay can reproduce the sent prefix byte-for-byte. Guarded by the
+    # same predicate the api_messages build uses, so the stamped bytes are
+    # exactly the bytes the loop sends. codex_app_server turns bypass the
+    # api_messages build entirely (the codex thread gets the plain user
+    # message), so stamping there would persist bytes that were never sent.
+    if (
+        getattr(agent, "api_mode", None) != "codex_app_server"
+        and 0 <= current_turn_user_idx < len(messages)
+        and messages[current_turn_user_idx].get("role") == "user"
+    ):
+        _turn_user_msg = messages[current_turn_user_idx]
+        _api_content = compose_user_api_content(
+            _turn_user_msg.get("content", ""), ext_prefetch_cache, plugin_user_context
+        )
+        if _api_content is not None and _api_content != _turn_user_msg.get("content"):
+            _turn_user_msg["api_content"] = _api_content
+
+    # Crash-resilience: persist the inbound user turn before the first LLM
+    # call. Runs after preflight compression (which rewrites history anyway)
+    # and after prefetch/pre_llm_call, so the user row is written once with
+    # its final api_content instead of being re-written mid-turn.
+    with turn_trace.span("prologue.persist_early", trace=_tt):
+        # Retry the row create if the earlier attempt failed transiently.
+        agent._ensure_db_session()
+        try:
+            agent._persist_session(messages, conversation_history)
+        except Exception:
+            logger.warning(
+                "Early turn-start session persistence failed for session=%s",
+                agent.session_id or "none",
+                exc_info=True,
+            )
 
     if _prologue_started is not None:
         _tt.add_span("turn.prologue", _prologue_started, time.time())
