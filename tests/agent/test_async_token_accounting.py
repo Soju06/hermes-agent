@@ -284,6 +284,89 @@ class TestReaderFlush:
         assert db.flush_token_counts()
         assert _totals(db, "s-late")["input_tokens"] == 9
 
+    def test_flush_waits_for_stop_flagged_live_writer(self, db):
+        """A stop-flagged but still-running writer owns the queue: flush must
+        wait for it (its loop drains before exiting), never drain on the
+        caller's thread — that would commit newer deltas before the writer's
+        in-flight older batch and could return True with that batch
+        unapplied."""
+        db.create_session("s-stop", "test")
+
+        applied = []
+        gate = threading.Event()
+        first_apply_started = threading.Event()
+        original = db.update_token_counts
+
+        def gated(session_id, **kwargs):
+            applied.append(kwargs.get("input_tokens"))
+            if len(applied) == 1:
+                first_apply_started.set()
+                assert gate.wait(timeout=10)
+            return original(session_id, **kwargs)
+
+        db.update_token_counts = gated
+        try:
+            db.queue_token_counts("s-stop", input_tokens=1, api_call_count=1)
+            assert first_apply_started.wait(timeout=10)
+            # close() has set the stop flag but the writer is mid-apply.
+            db._token_writer_stop = True
+            db._token_queue.append(
+                ("s-stop", dict(input_tokens=2, api_call_count=1))
+            )
+            # The writer is alive, so flush waits — timing out, NOT applying
+            # the newer delta on this thread ahead of the in-flight batch.
+            assert db.flush_token_counts(timeout=0.3) is False
+            assert applied == [1]
+            gate.set()
+            # Once released, the stop-flagged writer drains the queue itself
+            # before exiting, preserving enqueue order.
+            assert db.flush_token_counts()
+        finally:
+            db.update_token_counts = original
+
+        assert applied == [1, 2]
+        assert _totals(db, "s-stop")["input_tokens"] == 3
+
+
+# =========================================================================
+# Ordering vs synchronous route writes (/model switch)
+# =========================================================================
+
+
+class TestRouteSwitchBarrier:
+    def test_model_switch_applies_queued_deltas_first(self, db):
+        """update_session_model / update_session_billing_route bypass the
+        queue, so they must flush it first: a still-queued first delta
+        carries the pre-switch route, and applying it after the switch
+        UPDATE trips first_accounted_route (api_call_count == 0 + route
+        mismatch) and resurrects the old model/provider on the row."""
+        db.create_session("s-sw", "test")
+        # First delta of the session, queued but not yet applied (writer
+        # not started — same state as a backlogged writer).
+        db._token_queue.append(("s-sw", dict(
+            input_tokens=10, model="m1", billing_provider="p1",
+            api_call_count=1,
+        )))
+
+        db.update_session_model("s-sw", "m2")
+        db.update_session_billing_route(
+            "s-sw", provider="p2", base_url="https://p2.example"
+        )
+
+        totals = _totals(db, "s-sw")
+        # The switch wins on the session row…
+        assert totals["model"] == "m2"
+        assert _model_usage(db, "s-sw")[0]["model"] == "m1"
+        with db._lock:
+            row = db._conn.execute(
+                "SELECT billing_provider FROM sessions WHERE id = ?",
+                ("s-sw",),
+            ).fetchone()
+        assert row["billing_provider"] == "p2"
+        # …and the queued delta was applied (before it), not dropped.
+        assert totals["input_tokens"] == 10
+        assert totals["api_call_count"] == 1
+
 
 # =========================================================================
 # Durability
@@ -315,6 +398,24 @@ class TestDurability:
         db._drain_token_queue_at_exit()
         db._drain_token_queue_at_exit()  # second call: writer already stopped
         assert _totals(db, "s-x")["input_tokens"] == 3
+
+    def test_close_unregisters_atexit_hook(self, tmp_path):
+        """close() must unregister the atexit drain hook: it holds a strong
+        reference (bound method) that would otherwise pin every closed
+        SessionDB — and its sqlite connection object — until interpreter
+        exit in multi-open/close processes."""
+        import gc
+        import weakref
+
+        db = SessionDB(db_path=tmp_path / "atexit.db")
+        db.create_session("s-gc", "test")
+        db.queue_token_counts("s-gc", input_tokens=1, api_call_count=1)
+        db.close()
+
+        ref = weakref.ref(db)
+        del db
+        gc.collect()
+        assert ref() is None
 
     def test_persist_session_drains_queue(self, tmp_path, monkeypatch):
         """Turn finalize (_persist_session) flushes the accounting queue —
