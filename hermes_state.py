@@ -1463,6 +1463,12 @@ class SessionDB:
         exiting processes help shrink the WAL file.
         """
         self._stop_token_writer()
+        # The atexit hook holds a strong reference to this instance (bound
+        # method); without unregistering, every closed SessionDB stays
+        # reachable until interpreter exit. Bound methods compare equal by
+        # (instance, function), so this removes exactly our registration;
+        # no-op when the writer never started.
+        atexit.unregister(self._drain_token_queue_at_exit)
         with self._lock:
             if self._conn:
                 try:
@@ -2793,6 +2799,9 @@ class SessionDB:
         column unchanged.  Routes through _execute_write for the standard
         BEGIN IMMEDIATE + jitter-retry + lock guarantee.
         """
+        # Barrier against queued token deltas — see update_session_model.
+        self.flush_token_counts()
+
         def _do(conn):
             conn.execute(
                 "UPDATE sessions SET model_config = ?, model = COALESCE(?, model) WHERE id = ?",
@@ -2816,6 +2825,14 @@ class SessionDB:
         (only filling in NULL), this unconditionally sets the model column
         so that the dashboard reflects the user's latest /model choice.
         """
+        # This write bypasses the token queue, so deltas enqueued before the
+        # switch must land first: a still-queued first delta carries the
+        # pre-switch route, and applying it after this UPDATE would trip the
+        # first_accounted_route overwrite in update_token_counts (row sees
+        # api_call_count == 0 + a route mismatch) and resurrect the old
+        # model/provider. Flushing here restores the pre-queue ordering.
+        self.flush_token_counts()
+
         def _do(conn):
             conn.execute(
                 "UPDATE sessions SET model = ? WHERE id = ?",
@@ -2841,6 +2858,9 @@ class SessionDB:
         stale ``Model:`` / ``Provider:`` header) is rebuilt — matching the
         behavior of ``update_session_model`` (see #48173, #48248).
         """
+        # Barrier against queued token deltas — see update_session_model.
+        self.flush_token_counts()
+
         def _do(conn):
             conn.execute(
                 """UPDATE sessions SET
@@ -2917,23 +2937,27 @@ class SessionDB:
             return True
         batch = None
         with self._token_queue_cond:
-            thread = self._token_writer_thread
-            writer_alive = (
-                thread is not None and thread.is_alive()
-                and not self._token_writer_stop
-            )
-            if not writer_alive:
-                # Writer unavailable (stopped by close(), or died) — drain
-                # on the caller's thread so readers still get exact totals.
-                batch = list(self._token_queue)
-                self._token_queue.clear()
-            else:
-                deadline = time.monotonic() + timeout
-                while self._token_queue or self._token_writer_busy:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        return False
-                    self._token_queue_cond.wait(remaining)
+            deadline = time.monotonic() + timeout
+            while self._token_queue or self._token_writer_busy:
+                # A live writer is authoritative even when stop-flagged
+                # (close() in progress): its loop drains the queue before
+                # exiting, and draining here instead would race its
+                # in-flight batch — newer deltas committing before older
+                # ones breaks the last-non-None-wins / first-accounted-
+                # route / COALESCE-backfill fields. Only when the writer is
+                # dead (or never started for these deltas) does the caller
+                # take the leftovers. Re-checked each wakeup: the writer
+                # can exit mid-wait with deltas enqueued after its final
+                # empty-queue check.
+                thread = self._token_writer_thread
+                if thread is None or not thread.is_alive():
+                    batch = list(self._token_queue)
+                    self._token_queue.clear()
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._token_queue_cond.wait(remaining)
         if batch:
             self._apply_token_batch(batch)
         return True
