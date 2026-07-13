@@ -579,3 +579,334 @@ class TestWireInvariant:
         # And the new current-turn message got its own injection + sidecar.
         current = _user_messages(_chat_requests(handler)[0])[-1]
         assert current["content"] == "second question\n\nPLUGIN-CTX"
+
+
+# ---------------------------------------------------------------------------
+# Review fixes: re-anchoring, MoA, in-place compaction backfill, override
+# guard, sanitize-divergence capture, max-iterations replay, replay cleanup
+# ---------------------------------------------------------------------------
+
+from agent.turn_context import reanchor_current_turn_user_idx
+
+
+class TestReanchorCurrentTurnUserIdx:
+    def test_exact_match_beats_later_todo_snapshot(self):
+        """compress_context can append a todo-snapshot USER message after the
+        surviving current-turn copy — the anchor must stay on the real turn."""
+        messages = [
+            {"role": "assistant", "content": "summary"},
+            {"role": "user", "content": "hello"},
+            {"role": "user", "content": "## Current TODOs\n- [ ] thing"},
+        ]
+        assert reanchor_current_turn_user_idx(messages, "hello") == 1
+
+    def test_most_recent_duplicate_wins(self):
+        messages = [
+            {"role": "user", "content": "ok"},
+            {"role": "assistant", "content": "a"},
+            {"role": "user", "content": "ok"},
+        ]
+        assert reanchor_current_turn_user_idx(messages, "ok") == 2
+
+    def test_falls_back_to_last_user_without_exact_match(self):
+        """Merge-summary-into-tail rewrites the content; the trackers still
+        need a live anchor."""
+        messages = [
+            {"role": "user", "content": "[prior context]\nsummary\nhello"},
+            {"role": "assistant", "content": "a"},
+        ]
+        assert reanchor_current_turn_user_idx(messages, "hello") == 0
+
+    def test_minus_one_when_no_user_message(self):
+        messages = [{"role": "assistant", "content": "a"}]
+        assert reanchor_current_turn_user_idx(messages, "hello") == -1
+        assert reanchor_current_turn_user_idx([], "hello") == -1
+
+    def test_non_dict_entries_ignored(self):
+        messages = ["junk", {"role": "user", "content": "hello"}, None]
+        assert reanchor_current_turn_user_idx(messages, "hello") == 1
+
+
+class TestPrologueMoaAndInPlaceBackfill:
+    def test_no_stamp_for_moa_turns(self):
+        """MoA appends per-call aggregated context to the API copy AFTER the
+        composition — a stamped sidecar would persist bytes that never match
+        the wire."""
+        agent = _FakeAgent()
+        with patch(
+            "hermes_cli.plugins.invoke_hook",
+            return_value=[{"context": "PLUGIN-CTX"}],
+        ):
+            ctx = _build(agent, moa_active=True)
+        assert "api_content" not in ctx.messages[ctx.current_turn_user_idx]
+
+    def test_inplace_compaction_backfills_sidecar_into_db(self):
+        """In-place preflight compaction inserts the current-turn user row
+        BEFORE the stamp (archive_and_compact), and the crash persist
+        identity-skips every compacted dict — the stamp must be pushed into
+        the existing row directly."""
+        agent = _FakeAgent()
+        agent.compression_enabled = True
+        agent._session_db = MagicMock()
+
+        calls = {"n": 0}
+
+        def _should_compress(_tokens):
+            calls["n"] += 1
+            return calls["n"] == 1  # compress once, then stop
+
+        agent.context_compressor = types.SimpleNamespace(
+            protect_first_n=0,
+            protect_last_n=0,
+            threshold_tokens=1,
+            context_length=1000,
+            last_prompt_tokens=-1,
+            should_compress=_should_compress,
+            should_defer_preflight_to_real_usage=lambda _t: False,
+            get_active_compression_failure_cooldown=lambda: None,
+        )
+
+        def _compress(messages, _system, approx_tokens=None, task_id=None):
+            # Emulate compress_context in in_place mode: archive_and_compact
+            # already inserted these rows (api_content=NULL — the stamp has
+            # not happened yet), fresh copies replace the live dicts.
+            agent._last_compaction_in_place = True
+            return (
+                [
+                    {"role": "assistant", "content": "compaction summary"},
+                    dict(messages[-1]),  # surviving current-turn user copy
+                ],
+                "SYSTEM",
+            )
+
+        agent._compress_context = _compress
+
+        big = "x" * 4000
+        history = [
+            {"role": "user", "content": big},
+            {"role": "assistant", "content": big},
+        ]
+        with patch(
+            "hermes_cli.plugins.invoke_hook",
+            return_value=[{"context": "PLUGIN-CTX"}],
+        ):
+            ctx = _build(agent, conversation_history=history)
+
+        msg = ctx.messages[ctx.current_turn_user_idx]
+        assert msg["content"] == "hello"
+        assert msg["api_content"] == "hello\n\nPLUGIN-CTX"
+        agent._session_db.set_latest_user_api_content.assert_called_once_with(
+            "sess-1", "hello", "hello\n\nPLUGIN-CTX"
+        )
+
+
+class TestSetLatestUserApiContent:
+    def _open(self, tmp_path):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.create_session("s1", source="cli")
+        return db
+
+    def test_updates_newest_active_user_row(self, tmp_path):
+        db = self._open(tmp_path)
+        try:
+            db.append_message("s1", "user", content="q1")
+            db.append_message("s1", "assistant", content="a1")
+            db.append_message("s1", "user", content="q2")
+            assert db.set_latest_user_api_content("s1", "q2", "q2\n\nCTX") == 1
+            msgs = db.get_messages_as_conversation("s1")
+            assert "api_content" not in msgs[0]
+            assert msgs[2]["api_content"] == "q2\n\nCTX"
+        finally:
+            db.close()
+
+    def test_content_mismatch_writes_nothing(self, tmp_path):
+        db = self._open(tmp_path)
+        try:
+            db.append_message("s1", "user", content="q1")
+            assert db.set_latest_user_api_content("s1", "other", "other+CTX") == 0
+            msgs = db.get_messages_as_conversation("s1")
+            assert "api_content" not in msgs[0]
+        finally:
+            db.close()
+
+
+class TestFlushCompressedSummaryOverrideGuard:
+    def _make_agent(self, db, sid):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            session_db=db,
+            session_id=sid,
+        )
+        agent._session_db_created = True
+        return agent
+
+    def test_override_skipped_for_compression_merged_row(self, tmp_path):
+        """The #48677 override must not replace a compression-merged user
+        message: that would silently drop the compaction summary from the
+        durable clean transcript."""
+        from agent.context_compressor import COMPRESSED_SUMMARY_METADATA_KEY
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        sid = "sess-merged"
+        db.create_session(session_id=sid, source="cli")
+        try:
+            agent = self._make_agent(db, sid)
+            merged = "[prior context]\ncompaction summary\n\nactual question"
+            messages = [
+                {
+                    "role": "user",
+                    "content": merged,
+                    COMPRESSED_SUMMARY_METADATA_KEY: True,
+                }
+            ]
+            agent._persist_user_message_idx = 0
+            agent._persist_user_message_override = "actual question"
+            agent._persist_user_message_timestamp = None
+            agent._flush_messages_to_session_db(messages, None)
+
+            msgs = db.get_messages_as_conversation(sid)
+            assert msgs[0]["content"] == merged  # summary survives
+            assert "api_content" not in msgs[0]  # wire == row, no sidecar
+        finally:
+            db.close()
+
+
+class TestFlushSanitizeDivergenceCapture:
+    def _make_agent(self, db, sid):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            session_db=db,
+            session_id=sid,
+        )
+        agent._session_db_created = True
+        return agent
+
+    def test_user_content_sanitize_would_rewrite_is_captured(self, tmp_path):
+        """get_messages_as_conversation strips <memory-context> fences on
+        load; the sent bytes must survive in the sidecar so a reloaded
+        session replays what was actually on the wire."""
+        from agent.memory_manager import sanitize_context
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        sid = "sess-fence"
+        db.create_session(session_id=sid, source="cli")
+        try:
+            agent = self._make_agent(db, sid)
+            raw = "what does a literal <memory-context> tag do?"
+            assert sanitize_context(raw) != raw  # test precondition
+            messages = [
+                {"role": "user", "content": raw},
+                {"role": "assistant", "content": "it fences recalled memory <memory-context>"},
+            ]
+            agent._flush_messages_to_session_db(messages, None)
+
+            msgs = db.get_messages_as_conversation(sid)
+            assert msgs[0]["content"] == sanitize_context(raw).strip()
+            assert msgs[0]["api_content"] == raw
+            assert msgs[1]["api_content"] == (
+                "it fences recalled memory <memory-context>"
+            )
+        finally:
+            db.close()
+
+    def test_plain_whitespace_padding_not_captured(self, tmp_path):
+        """The api build strips every outgoing content string, so mere
+        surrounding whitespace replays identically — no sidecar bloat."""
+        db = SessionDB(db_path=tmp_path / "state.db")
+        sid = "sess-ws"
+        db.create_session(session_id=sid, source="cli")
+        try:
+            agent = self._make_agent(db, sid)
+            messages = [{"role": "user", "content": "  hello  \n"}]
+            agent._flush_messages_to_session_db(messages, None)
+            msgs = db.get_messages_as_conversation(sid)
+            assert "api_content" not in msgs[0]
+        finally:
+            db.close()
+
+
+class TestMaxIterationsSummaryReplay:
+    def test_summary_request_substitutes_sidecar_bytes(self):
+        """The forced-summary request must replay the same bytes every
+        main-loop call sent — popping the sidecar without substituting sends
+        CLEAN content and diverges the prefix at the earliest injected
+        message, exactly when the context is largest."""
+        from run_agent import AIAgent
+        from agent.chat_completion_helpers import handle_max_iterations
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent._cached_system_prompt = "SYS"
+
+        captured = {}
+
+        class _Completions:
+            def create(self, **kwargs):
+                captured.update(kwargs)
+                return "RAW-RESPONSE"
+
+        client = types.SimpleNamespace(
+            chat=types.SimpleNamespace(completions=_Completions())
+        )
+        transport = types.SimpleNamespace(
+            normalize_response=lambda _r: types.SimpleNamespace(content="SUMMARY")
+        )
+
+        messages = [
+            {"role": "user", "content": "q1", "api_content": "q1\n\nPLUGIN-CTX"},
+            {"role": "assistant", "content": "a1"},
+        ]
+        with patch.object(
+            agent, "_ensure_primary_openai_client", return_value=client
+        ), patch.object(agent, "_get_transport", return_value=transport):
+            out = handle_max_iterations(agent, messages, 5)
+
+        assert out == "SUMMARY"
+        sent_users = [
+            m for m in captured["messages"] if m.get("role") == "user"
+        ]
+        assert sent_users[0]["content"] == "q1\n\nPLUGIN-CTX"
+        for m in captured["messages"]:
+            assert "api_content" not in m
+        # The live history dict is never mutated.
+        assert messages[0]["content"] == "q1"
+        assert messages[0]["api_content"] == "q1\n\nPLUGIN-CTX"
+
+
+class TestStaleConfirmationRedactionDropsSidecar:
+    def test_redaction_pops_api_content(self):
+        """The expired-confirmation redaction rewrites content — replaying
+        the sidecar verbatim would resend the dangerous bytes it just
+        redacted."""
+        from agent.replay_cleanup import strip_stale_dangerous_confirmations
+
+        history = [
+            {
+                "role": "user",
+                "content": "confirm forced restart",
+                "api_content": "confirm forced restart\n\nPLUGIN-CTX",
+                "timestamp": 1000.0,
+            }
+        ]
+        cleaned = strip_stale_dangerous_confirmations(
+            history, now=1000.0 + 999999.0
+        )
+        assert cleaned[0]["content"] != "confirm forced restart"
+        assert "api_content" not in cleaned[0]

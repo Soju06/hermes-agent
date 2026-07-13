@@ -33,7 +33,11 @@ from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.iteration_budget import IterationBudget
 from agent import turn_trace
-from agent.turn_context import build_turn_context, compose_user_api_content
+from agent.turn_context import (
+    build_turn_context,
+    compose_user_api_content,
+    reanchor_current_turn_user_idx,
+)
 from agent.turn_retry_state import TurnRetryState
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
@@ -676,6 +680,9 @@ def _run_conversation_impl(
         set_session_context=set_session_context,
         set_current_write_origin=set_current_write_origin,
         ra=_ra,
+        # MoA turns append per-call aggregated context to the API copy of the
+        # user message, so no byte-stable api_content sidecar can be stamped.
+        moa_active=bool(moa_config),
     )
     user_message = _ctx.user_message
     original_user_message = _ctx.original_user_message
@@ -935,11 +942,20 @@ def _run_conversation_impl(
                     )
                     if _composed is not None:
                         api_msg["content"] = _composed
-            elif isinstance(_api_content, str) and _api_content and msg.get("role") == "user":
-                # Historical user message: replay the exact bytes sent when
-                # it was the live turn, so the provider prompt-cache prefix
-                # stays byte-stable instead of diverging at the injection
-                # point and re-prefilling everything after it.
+            elif (
+                isinstance(_api_content, str)
+                and _api_content
+                and msg.get("role") in ("user", "assistant")
+            ):
+                # Historical message: replay the exact bytes sent when it was
+                # live, so the provider prompt-cache prefix stays byte-stable
+                # instead of diverging at the injection point and
+                # re-prefilling everything after it. User rows carry the
+                # prefetch/plugin injection sidecar; user AND assistant rows
+                # can carry a sanitize-divergence sidecar (content that
+                # ``get_messages_as_conversation``'s sanitize_context/strip
+                # would rewrite on reload — see the capture in
+                # ``_flush_messages_to_session_db``).
                 api_msg["content"] = _api_content
 
             # For ALL assistant messages, pass reasoning back to the API
@@ -4415,6 +4431,16 @@ def _run_conversation_impl(
             # to fit the context window.
             retry_count += 1
             _retry.restart_with_compressed_messages = False
+            # In-loop compression rebuilt `messages` with fresh compaction
+            # copies, so the pre-compression current-turn index is stale.
+            # Re-anchor exactly like the prologue does: a stale index that
+            # lands on a historical user message would make the live-compose
+            # fallback inject this turn's prefetch into that message on the
+            # wire only, diverging the next turn's replayed prefix there.
+            current_turn_user_idx = reanchor_current_turn_user_idx(
+                messages, user_message
+            )
+            agent._persist_user_message_idx = current_turn_user_idx
             continue
 
         if _retry.restart_with_rebuilt_messages:

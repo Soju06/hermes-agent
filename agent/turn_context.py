@@ -77,6 +77,32 @@ def compose_user_api_content(
     return content + "\n\n" + "\n\n".join(injections)
 
 
+def reanchor_current_turn_user_idx(messages: List[Any], user_message: Any) -> int:
+    """Locate this turn's user message after compaction rebuilt ``messages``.
+
+    Compression replaces list entries with fresh copies (and may append a
+    todo-snapshot user message or a restored user turn AFTER the surviving
+    copy of the current turn's message), so a pre-compression index is
+    meaningless. Prefer the LAST user message whose content exactly matches
+    this turn's text — the surviving copy in the common case — so the
+    injection stamp and the #48677 persist override can't land on a
+    todo-snapshot or historical row. Fall back to the last user message when
+    no exact match survives (merge-summary-into-tail rewrites the content but
+    the trackers still need a live anchor). Returns -1 when the list has no
+    user message at all.
+    """
+    fallback = -1
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        if not (isinstance(msg, dict) and msg.get("role") == "user"):
+            continue
+        if fallback < 0:
+            fallback = i
+        if msg.get("content") == user_message:
+            return i
+    return fallback
+
+
 def _compression_made_progress(
     orig_len: int, new_len: int, orig_tokens: int, new_tokens: int
 ) -> bool:
@@ -172,6 +198,7 @@ def build_turn_context(
     set_session_context,
     set_current_write_origin,
     ra,
+    moa_active: bool = False,
 ) -> TurnContext:
     """Run the once-per-turn setup and return the loop's input context.
 
@@ -525,16 +552,15 @@ def build_turn_context(
     if _cpf_compressed:
         # Compression rebuilt the list (tail messages are fresh compaction
         # copies), so the pre-compression index of this turn's user message
-        # is stale. It is still the LAST user message in the compacted list
-        # (_ensure_compressed_has_user_turn guarantees one survives), so
-        # re-anchor both index trackers: the api_content stamp below, the
-        # loop's injection site, and the flush's persist-override row (#48677)
-        # must all target the surviving dict, not a stale position.
-        for _i in range(len(messages) - 1, -1, -1):
-            if isinstance(messages[_i], dict) and messages[_i].get("role") == "user":
-                current_turn_user_idx = _i
-                agent._persist_user_message_idx = _i
-                break
+        # is stale. Re-anchor both index trackers: the api_content stamp
+        # below, the loop's injection site, and the flush's persist-override
+        # row (#48677) must all target the surviving dict, not a stale
+        # position. Exact-content match first so a todo-snapshot user message
+        # appended after the tail can't steal the anchor.
+        current_turn_user_idx = reanchor_current_turn_user_idx(
+            messages, user_message
+        )
+        agent._persist_user_message_idx = current_turn_user_idx
 
     # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
     plugin_user_context = ""
@@ -643,8 +669,13 @@ def build_turn_context(
     # exactly the bytes the loop sends. codex_app_server turns bypass the
     # api_messages build entirely (the codex thread gets the plain user
     # message), so stamping there would persist bytes that were never sent.
+    # MoA turns append per-call aggregated reference context to the same API
+    # copy AFTER this composition, so the stamped bytes would never match the
+    # wire either — skip the stamp rather than persist provably wrong "exact
+    # sent bytes" (MoA keeps its pre-sidecar cache behavior).
     if (
-        getattr(agent, "api_mode", None) != "codex_app_server"
+        not moa_active
+        and getattr(agent, "api_mode", None) != "codex_app_server"
         and 0 <= current_turn_user_idx < len(messages)
         and messages[current_turn_user_idx].get("role") == "user"
     ):
@@ -654,6 +685,32 @@ def build_turn_context(
         )
         if _api_content is not None and _api_content != _turn_user_msg.get("content"):
             _turn_user_msg["api_content"] = _api_content
+            # In-place preflight compaction has ALREADY inserted this turn's
+            # user row (archive_and_compact runs before prefetch/pre_llm_call
+            # can compose the sidecar), and the crash persist below identity-
+            # skips every compacted dict (they are all in the rebound
+            # conversation_history) — so the stamp would never reach the DB.
+            # Backfill it onto the freshly-inserted row directly. Rotation
+            # mode needs nothing here: its compacted copies flush to the
+            # child session after this stamp.
+            if _cpf_compressed and bool(
+                getattr(agent, "_last_compaction_in_place", False)
+            ):
+                _db = getattr(agent, "_session_db", None)
+                if _db is not None:
+                    try:
+                        _db.set_latest_user_api_content(
+                            agent.session_id,
+                            _turn_user_msg.get("content"),
+                            _api_content,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "in-place compaction api_content backfill failed "
+                            "for session=%s",
+                            agent.session_id or "none",
+                            exc_info=True,
+                        )
 
     # Crash-resilience: persist the inbound user turn before the first LLM
     # call. Runs after preflight compression (which rewrites history anyway)
