@@ -480,6 +480,10 @@ def direct_api_call(agent, api_kwargs: dict):
         agent._active_request_abort = _abort_active_request
         return client
 
+    # Only a clean return may report the reuse reason (request_complete):
+    # after an error or interrupt the wire client is really closed so the
+    # retry builds a fresh pool (see _REQUEST_CLIENT_REUSE_REASONS).
+    succeeded = False
     try:
         response = _dispatch_nonstreaming_api_request(
             agent, api_kwargs, make_client=_make_client
@@ -492,6 +496,7 @@ def direct_api_call(agent, api_kwargs: dict):
         if getattr(agent, "_interrupt_requested", False):
             raise InterruptedError("Agent interrupted during API call")
         _reset_stale_streak(agent)
+        succeeded = True
         return response
     finally:
         if getattr(agent, "_active_request_abort", None) is _abort_active_request:
@@ -500,7 +505,10 @@ def direct_api_call(agent, api_kwargs: dict):
             request_client = request_client_holder["client"]
             request_client_holder["client"] = None
         if request_client is not None:
-            agent._close_request_openai_client(request_client, reason="request_complete")
+            agent._close_request_openai_client(
+                request_client,
+                reason="request_complete" if succeeded else "request_error_cleanup",
+            )
 
 
 def interruptible_api_call(agent, api_kwargs: dict):
@@ -628,7 +636,15 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 return
             result["error"] = e
         finally:
-            _close_request_client_once("request_complete")
+            # Reuse reason only on a clean response; any other outcome —
+            # error, or the cancel-swallow return above (which leaves both
+            # result slots None) — really closes so the next attempt builds
+            # a fresh pool (see _REQUEST_CLIENT_REUSE_REASONS).
+            _close_request_client_once(
+                "request_complete"
+                if result["response"] is not None
+                else "request_error_cleanup"
+            )
 
     # ── Stale-call timeout (mirrors streaming stale detector) ────────
     # Non-streaming calls return nothing until the full response is
@@ -3550,7 +3566,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             result["error"] = e
             return
         finally:
-            _close_request_client_once("stream_request_complete")
+            # Reuse reason only on a clean stream; any other outcome (error,
+            # cancel-swallow) really closes so the next attempt builds a
+            # fresh pool (see _REQUEST_CLIENT_REUSE_REASONS).
+            _close_request_client_once(
+                "stream_request_complete"
+                if result["response"] is not None
+                else "stream_error_cleanup"
+            )
 
     # Provider-configured stale timeout takes priority over env default.
     _cfg_stale = get_provider_stale_timeout(agent.provider, agent.model)
