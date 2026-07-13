@@ -586,20 +586,33 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 and owner_tid is not None
                 and owner_tid != threading.get_ident()
             )
-            if not stranger_thread:
-                # Owning thread (or no recorded owner) → pop and fully close.
-                request_client_holder["client"] = None
-                request_client_holder["owner_tid"] = None
+            # Read the kind under the lock too: the worker's finally clears
+            # the holder and a later _set_request_client may restamp the kind
+            # for the next attempt — a post-lock read could pair the popped
+            # client with the wrong flavor's abort/close.
+            kind = request_client_kind.get("value", "openai")
+            if stranger_thread:
+                # Abort while still holding the holder lock: the instant it
+                # is released, the worker's finally may pop + cache the client
+                # for reuse and the NEXT call check it out — an abort landing
+                # after that would poison the slot and shut down an innocent
+                # in-flight request's sockets. The abort itself never blocks
+                # (socket shutdown + slot poison), so holding the lock across
+                # it only delays the racing pop, never the data path. The same
+                # TOCTOU applies to the anthropic flavor (#67142) even though
+                # anthropic request clients never enter the reuse cache.
+                if kind == "anthropic_messages":
+                    agent._abort_request_anthropic_client(request_client, reason=reason)
+                else:
+                    agent._abort_request_openai_client(request_client, reason=reason)
+                return
+            # Owning thread (or no recorded owner) → pop and fully close.
+            request_client_holder["client"] = None
+            request_client_holder["owner_tid"] = None
         if request_client is None:
             return
-        kind = request_client_kind.get("value", "openai")
         if kind == "anthropic_messages":
-            if stranger_thread:
-                agent._abort_request_anthropic_client(request_client, reason=reason)
-            else:
-                agent._close_request_anthropic_client(request_client, reason=reason)
-        elif stranger_thread:
-            agent._abort_request_openai_client(request_client, reason=reason)
+            agent._close_request_anthropic_client(request_client, reason=reason)
         else:
             agent._close_request_openai_client(request_client, reason=reason)
 
@@ -2511,19 +2524,25 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 and owner_tid is not None
                 and owner_tid != threading.get_ident()
             )
-            if not stranger_thread:
-                request_client_holder["client"] = None
-                request_client_holder["owner_tid"] = None
+            # Kind read under the lock — see the non-streaming variant.
+            kind = request_client_kind.get("value", "openai")
+            if stranger_thread:
+                # Abort under the holder lock — see the non-streaming variant
+                # for why the holder read and the abort must be atomic (a late
+                # abort would otherwise hit the NEXT request's checkout). Both
+                # flavors share the TOCTOU even though only openai-wire
+                # clients enter the reuse cache.
+                if kind == "anthropic_messages":
+                    agent._abort_request_anthropic_client(request_client, reason=reason)
+                else:
+                    agent._abort_request_openai_client(request_client, reason=reason)
+                return
+            request_client_holder["client"] = None
+            request_client_holder["owner_tid"] = None
         if request_client is None:
             return
-        kind = request_client_kind.get("value", "openai")
         if kind == "anthropic_messages":
-            if stranger_thread:
-                agent._abort_request_anthropic_client(request_client, reason=reason)
-            else:
-                agent._close_request_anthropic_client(request_client, reason=reason)
-        elif stranger_thread:
-            agent._abort_request_openai_client(request_client, reason=reason)
+            agent._close_request_anthropic_client(request_client, reason=reason)
         else:
             agent._close_request_openai_client(request_client, reason=reason)
 
@@ -2784,6 +2803,19 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     "(model=%s).",
                     api_kwargs.get("model", "unknown"),
                 )
+                # Same half-read-SSE leak shape as the interrupt break below
+                # (#65991 supersede): abandoning the stream leaves its
+                # connection checked out of the httpx pool while the partial
+                # response built afterwards makes this worker's finally report
+                # a reuse-reason close — caching the client together with the
+                # leaked connection. Close the stream here on the owning
+                # thread; poison the slot if that close fails.
+                try:
+                    stream.close()
+                except Exception:
+                    agent._abort_request_openai_client(
+                        request_client, reason="superseded_stream_close_failed"
+                    )
                 break
             last_chunk_time["t"] = time.time()
             agent._touch_activity("receiving stream response")
@@ -2807,6 +2839,23 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 pass
 
             if agent._interrupt_requested:
+                # Abandoning a half-read SSE response leaves its connection
+                # permanently checked out of the httpx pool — and the partial
+                # response built below makes the worker's finally report a
+                # reuse-reason close, which would cache the client together
+                # with the leaked connection (each interrupt leaking one more
+                # until the pool exhausts). Close the stream here, on the
+                # owning thread, so the connection is released first.
+                try:
+                    stream.close()
+                except Exception:
+                    # Connection may still be checked out — poison the slot so
+                    # the finally's close really closes the pool instead of
+                    # caching it (owner-thread abort: shutdown is safe, and the
+                    # FD release still happens in the finally below).
+                    agent._abort_request_openai_client(
+                        request_client, reason="interrupt_stream_close_failed"
+                    )
                 break
 
             if not _stream_attempt_is_active(stream_attempt_id):
