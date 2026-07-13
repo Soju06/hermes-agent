@@ -327,6 +327,78 @@ class TestReaderFlush:
         assert applied == [1, 2]
         assert _totals(db, "s-stop")["input_tokens"] == 3
 
+    def test_concurrent_flush_waits_for_caller_drain(self, db):
+        """The dead-writer caller-drain claims busy: a second flush must not
+        report drained (fast path or locked path) while the first flusher's
+        popped batch is still being applied outside the condition lock."""
+        db.create_session("s-cc", "test")
+        db.flush_token_counts()
+        db._stop_token_writer()  # writer dead, connection still open
+
+        applied = threading.Event()
+        gate = threading.Event()
+        original = db.update_token_counts
+
+        def gated(session_id, **kwargs):
+            applied.set()
+            assert gate.wait(timeout=10)
+            return original(session_id, **kwargs)
+
+        db.update_token_counts = gated
+        try:
+            db._token_queue.append(
+                ("s-cc", dict(input_tokens=4, api_call_count=1))
+            )
+            results = {}
+            t_a = threading.Thread(
+                target=lambda: results.__setitem__(
+                    "a", db.flush_token_counts()
+                )
+            )
+            t_a.start()
+            assert applied.wait(timeout=10)
+            # Flusher A is mid-apply with the queue already popped: B must
+            # wait on the claimed busy flag, not return True.
+            assert db.flush_token_counts(timeout=0.3) is False
+            gate.set()
+            t_a.join(timeout=10)
+            assert results.get("a") is True
+            assert db.flush_token_counts()
+        finally:
+            db.update_token_counts = original
+
+        assert _totals(db, "s-cc")["input_tokens"] == 4
+
+    def test_enqueue_after_writer_stop_applies_synchronously(self, db):
+        """Once the writer is stopped for good, queue_token_counts falls back
+        to the synchronous path instead of parking deltas on a queue no
+        writer will ever drain."""
+        db.create_session("s-sync", "test")
+        db.queue_token_counts("s-sync", input_tokens=1, api_call_count=1)
+        db._stop_token_writer()  # writer dead, connection still open
+
+        db.queue_token_counts("s-sync", input_tokens=2, api_call_count=1)
+
+        # Applied inline — nothing queued, no writer restarted.
+        assert not db._token_queue
+        assert db._token_writer_thread is None or not db._token_writer_thread.is_alive()
+        totals = _totals(db, "s-sync")
+        assert totals["input_tokens"] == 3
+        assert totals["api_call_count"] == 2
+
+    def test_enqueue_after_close_raises_at_call_site(self, tmp_path):
+        """After close() the synchronous fallback surfaces the failure to the
+        caller (whose try/except logs it) — the pre-queue contract — instead
+        of silently dropping the delta."""
+        db = SessionDB(db_path=tmp_path / "closed.db")
+        db.create_session("s-closed", "test")
+        db.queue_token_counts("s-closed", input_tokens=1, api_call_count=1)
+        db.close()
+
+        with pytest.raises(Exception):
+            db.queue_token_counts("s-closed", input_tokens=2, api_call_count=1)
+        assert not db._token_queue  # not parked on a dead queue either
+
 
 # =========================================================================
 # Ordering vs synchronous route writes (/model switch)

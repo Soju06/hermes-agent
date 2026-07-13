@@ -2906,23 +2906,38 @@ class SessionDB:
         Accepts the same keyword arguments as :meth:`update_token_counts`
         and applies them asynchronously with identical semantics.  Cheap
         (append + notify) — safe to call on the turn thread after every
-        API call.
+        API call.  After close() has stopped the writer, falls back to the
+        synchronous path and may raise like :meth:`update_token_counts`.
         """
         with self._token_queue_cond:
-            self._token_queue.append((session_id, kwargs))
-            if self._token_writer_thread is None:
-                # Daemon so process exit never hangs on accounting; the
-                # atexit hook drains anything still queued at interpreter
-                # shutdown (registered once per instance, on first use).
-                thread = threading.Thread(
-                    target=self._token_writer_loop,
-                    name="session-db-token-writer",
-                    daemon=True,
-                )
-                self._token_writer_thread = thread
-                thread.start()
-                atexit.register(self._drain_token_queue_at_exit)
-            self._token_queue_cond.notify_all()
+            thread = self._token_writer_thread
+            writer_stopped = self._token_writer_stop and (
+                thread is None or not thread.is_alive()
+            )
+            if not writer_stopped:
+                self._token_queue.append((session_id, kwargs))
+                if thread is None:
+                    # Daemon so process exit never hangs on accounting; the
+                    # atexit hook drains anything still queued at interpreter
+                    # shutdown (registered once per instance, on first use).
+                    thread = threading.Thread(
+                        target=self._token_writer_loop,
+                        name="session-db-token-writer",
+                        daemon=True,
+                    )
+                    self._token_writer_thread = thread
+                    thread.start()
+                    atexit.register(self._drain_token_queue_at_exit)
+                self._token_queue_cond.notify_all()
+        if writer_stopped:
+            # Writer permanently stopped (close() ran; a stop-flagged but
+            # still-live writer keeps accepting — its loop drains before
+            # exiting). Enqueueing now would drop the delta silently: no
+            # writer will run and close() already unregistered the atexit
+            # hook. Apply inline instead so a closed-connection failure
+            # raises at the call site, exactly like the old synchronous
+            # update_token_counts path these call sites still guard for.
+            self.update_token_counts(session_id, **kwargs)
 
     def flush_token_counts(self, timeout: float = 5.0) -> bool:
         """Block until every queued token delta has been applied.
@@ -2948,9 +2963,17 @@ class SessionDB:
                 # dead (or never started for these deltas) does the caller
                 # take the leftovers. Re-checked each wakeup: the writer
                 # can exit mid-wait with deltas enqueued after its final
-                # empty-queue check.
+                # empty-queue check. busy is claimed while draining (same
+                # protocol as the writer) so a concurrent flush cannot
+                # report drained — or pop a newer delta — while this batch
+                # is still unapplied; a claimed busy therefore also means
+                # "wait", never "drain alongside".
                 thread = self._token_writer_thread
-                if thread is None or not thread.is_alive():
+                if (
+                    (thread is None or not thread.is_alive())
+                    and not self._token_writer_busy
+                ):
+                    self._token_writer_busy = True
                     batch = list(self._token_queue)
                     self._token_queue.clear()
                     break
@@ -2959,7 +2982,12 @@ class SessionDB:
                     return False
                 self._token_queue_cond.wait(remaining)
         if batch:
-            self._apply_token_batch(batch)
+            try:
+                self._apply_token_batch(batch)
+            finally:
+                with self._token_queue_cond:
+                    self._token_writer_busy = False
+                    self._token_queue_cond.notify_all()
         return True
 
     def _token_writer_loop(self) -> None:
@@ -3045,11 +3073,34 @@ class SessionDB:
                 )
                 return
         # Writer exited (or never started) — apply leftovers synchronously.
+        # Claim busy like the writer/flush drains do, so a concurrent
+        # flush_token_counts cannot fast-path True while this batch is
+        # still being applied; conversely, wait out a flush caller-drain
+        # that already claimed busy — close() nulls the connection right
+        # after this returns, and must not yank it mid-batch.
         with self._token_queue_cond:
+            deadline = time.monotonic() + join_timeout
+            while self._token_writer_busy:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    logger.warning(
+                        "async token accounting: concurrent drain did not "
+                        "finish within %.0fs; %d queued delta(s) not persisted",
+                        join_timeout, len(self._token_queue),
+                    )
+                    return
+                self._token_queue_cond.wait(remaining)
             batch = list(self._token_queue)
             self._token_queue.clear()
+            if batch:
+                self._token_writer_busy = True
         if batch:
-            self._apply_token_batch(batch)
+            try:
+                self._apply_token_batch(batch)
+            finally:
+                with self._token_queue_cond:
+                    self._token_writer_busy = False
+                    self._token_queue_cond.notify_all()
 
     def _drain_token_queue_at_exit(self) -> None:
         try:
