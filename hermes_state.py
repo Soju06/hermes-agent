@@ -15,6 +15,7 @@ Key design decisions:
 """
 
 import asyncio
+import atexit
 import json
 import logging
 import random
@@ -23,6 +24,7 @@ import sqlite3
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 from agent.memory_manager import sanitize_context
@@ -1039,6 +1041,14 @@ class SessionDB:
         self._trigram_available = False
         self._fts_unavailable_warned = False
         self._conn = None
+        # Async token accounting (see queue_token_counts). The condition
+        # guards queue + writer state; it is distinct from self._lock so
+        # enqueue/flush bookkeeping never contends with SQLite writes.
+        self._token_queue: deque = deque()
+        self._token_queue_cond = threading.Condition(threading.Lock())
+        self._token_writer_thread: Optional[threading.Thread] = None
+        self._token_writer_stop = False
+        self._token_writer_busy = False
         try:
             if read_only:
                 # Read-only attach for cross-profile aggregation: SELECT-only,
@@ -1448,9 +1458,11 @@ class SessionDB:
     def close(self):
         """Close the database connection.
 
-        Attempts a TRUNCATE WAL checkpoint first so that exiting processes
-        help shrink the WAL file.
+        Drains queued token deltas first (the background writer needs the
+        connection), then attempts a TRUNCATE WAL checkpoint so that
+        exiting processes help shrink the WAL file.
         """
+        self._stop_token_writer()
         with self._lock:
             if self._conn:
                 try:
@@ -2167,6 +2179,9 @@ class SessionDB:
         filters on ``source``; ``active_only`` restricts to sessions that
         have not ended.
         """
+        # Full rows carry token/cost totals (MCP listings, /status) — drain
+        # queued async accounting deltas so consumers see exact counters.
+        self.flush_token_counts()
         query = """
             SELECT sessions.*,
                    COALESCE(
@@ -2838,6 +2853,186 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    # ── Async token accounting ──
+    # update_token_counts() runs a sessions UPDATE (plus a per-model usage
+    # upsert) inside BEGIN IMMEDIATE; against a cold multi-GB state.db one
+    # call can stall the turn thread for tens to hundreds of ms, and the
+    # tool loop pays it after EVERY API call (llm.accounting span p50 3.3ms
+    # / p95 70ms). queue_token_counts() reduces the critical path to a
+    # deque append: a dedicated single-writer thread applies deltas in
+    # enqueue order, coalescing consecutive same-route deltas into one
+    # UPDATE when a backlog forms. Readers that need exact mid-turn totals
+    # (get_session and friends) call flush_token_counts() first — a plain
+    # attribute check when nothing is queued.
+
+    # Delta fields summed when coalescing. Route fields must be equal for
+    # two deltas to merge: model/billing_* feed COALESCE backfill and the
+    # per-model usage attribution key, and cost_status/cost_source are
+    # last-non-None-wins — equality makes the merged UPDATE byte-for-byte
+    # equivalent to applying the deltas sequentially.
+    _TOKEN_DELTA_SUM_FIELDS = (
+        "input_tokens", "output_tokens", "cache_read_tokens",
+        "cache_write_tokens", "reasoning_tokens", "api_call_count",
+    )
+    _TOKEN_DELTA_COST_FIELDS = ("estimated_cost_usd", "actual_cost_usd")
+    _TOKEN_DELTA_ROUTE_FIELDS = (
+        "model", "cost_status", "cost_source", "pricing_version",
+        "billing_provider", "billing_base_url", "billing_mode",
+    )
+
+    def queue_token_counts(self, session_id: str, **kwargs) -> None:
+        """Enqueue a token/cost delta for the background writer.
+
+        Accepts the same keyword arguments as :meth:`update_token_counts`
+        and applies them asynchronously with identical semantics.  Cheap
+        (append + notify) — safe to call on the turn thread after every
+        API call.
+        """
+        with self._token_queue_cond:
+            self._token_queue.append((session_id, kwargs))
+            if self._token_writer_thread is None:
+                # Daemon so process exit never hangs on accounting; the
+                # atexit hook drains anything still queued at interpreter
+                # shutdown (registered once per instance, on first use).
+                thread = threading.Thread(
+                    target=self._token_writer_loop,
+                    name="session-db-token-writer",
+                    daemon=True,
+                )
+                self._token_writer_thread = thread
+                thread.start()
+                atexit.register(self._drain_token_queue_at_exit)
+            self._token_queue_cond.notify_all()
+
+    def flush_token_counts(self, timeout: float = 5.0) -> bool:
+        """Block until every queued token delta has been applied.
+
+        Returns True when the queue is fully drained, False on timeout
+        (callers then read totals that are stale by the still-queued
+        deltas — no worse than reading before the flush existed).
+        Never raises: apply failures are logged by the writer.
+        """
+        # Fast path — nothing queued, nothing in flight.
+        if not self._token_queue and not self._token_writer_busy:
+            return True
+        batch = None
+        with self._token_queue_cond:
+            thread = self._token_writer_thread
+            writer_alive = (
+                thread is not None and thread.is_alive()
+                and not self._token_writer_stop
+            )
+            if not writer_alive:
+                # Writer unavailable (stopped by close(), or died) — drain
+                # on the caller's thread so readers still get exact totals.
+                batch = list(self._token_queue)
+                self._token_queue.clear()
+            else:
+                deadline = time.monotonic() + timeout
+                while self._token_queue or self._token_writer_busy:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    self._token_queue_cond.wait(remaining)
+        if batch:
+            self._apply_token_batch(batch)
+        return True
+
+    def _token_writer_loop(self) -> None:
+        while True:
+            with self._token_queue_cond:
+                while not self._token_queue and not self._token_writer_stop:
+                    self._token_queue_cond.wait()
+                if not self._token_queue:
+                    return  # stop requested and fully drained
+                # busy is set BEFORE the queue is cleared: the lock-free
+                # fast path in flush_token_counts() reads queue-then-busy,
+                # so this order guarantees it can never observe an empty
+                # queue while the popped batch is still unapplied.
+                self._token_writer_busy = True
+                batch = list(self._token_queue)
+                self._token_queue.clear()
+            try:
+                self._apply_token_batch(batch)
+            finally:
+                with self._token_queue_cond:
+                    self._token_writer_busy = False
+                    self._token_queue_cond.notify_all()
+
+    def _apply_token_batch(self, batch: List[Tuple[str, Dict[str, Any]]]) -> None:
+        """Apply queued deltas in order, coalescing where safe. Never raises."""
+        for session_id, kwargs in self._coalesce_token_deltas(batch):
+            try:
+                self.update_token_counts(session_id, **kwargs)
+            except Exception as exc:
+                # Same contract as the old inline call sites: accounting
+                # loss is logged, never raised into a turn.
+                logger.warning(
+                    "async token accounting: apply failed (session=%s): %s",
+                    session_id, exc,
+                )
+
+    def _coalesce_token_deltas(
+        self, batch: List[Tuple[str, Dict[str, Any]]]
+    ) -> List[Tuple[str, Dict[str, Any]]]:
+        """Merge consecutive incremental deltas with an identical route.
+
+        Only adjacent deltas merge, so ordering across sessions and across
+        a mid-session /model switch is preserved exactly.  absolute=True
+        deltas (cumulative overwrites) never merge.
+        """
+        groups: List[Tuple[Optional[tuple], str, Dict[str, Any]]] = []
+        for session_id, kwargs in batch:
+            key = None
+            if not kwargs.get("absolute"):
+                key = (session_id,) + tuple(
+                    kwargs.get(f) for f in self._TOKEN_DELTA_ROUTE_FIELDS
+                )
+            if groups and key is not None and groups[-1][0] == key:
+                merged = groups[-1][2]
+                for f in self._TOKEN_DELTA_SUM_FIELDS:
+                    merged[f] = merged.get(f, 0) + kwargs.get(f, 0)
+                for f in self._TOKEN_DELTA_COST_FIELDS:
+                    value = kwargs.get(f)
+                    if value is not None:
+                        # None-preserving sum: an all-None run must stay
+                        # None so COALESCE keeps the stored value untouched.
+                        merged[f] = (merged.get(f) or 0.0) + value
+            else:
+                groups.append((key, session_id, dict(kwargs)))
+        return [(sid, kw) for _, sid, kw in groups]
+
+    def _stop_token_writer(self, join_timeout: float = 10.0) -> None:
+        """Stop the writer thread and drain remaining deltas. Never raises."""
+        with self._token_queue_cond:
+            self._token_writer_stop = True
+            self._token_queue_cond.notify_all()
+            thread = self._token_writer_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=join_timeout)
+            if thread.is_alive():
+                # Writer stuck mid-apply (pathological lock contention).
+                # Leave any queued deltas unapplied rather than racing the
+                # stuck apply and misordering/double-counting.
+                logger.warning(
+                    "async token accounting: writer did not stop within %.0fs; "
+                    "%d queued delta(s) not persisted",
+                    join_timeout, len(self._token_queue),
+                )
+                return
+        # Writer exited (or never started) — apply leftovers synchronously.
+        with self._token_queue_cond:
+            batch = list(self._token_queue)
+            self._token_queue.clear()
+        if batch:
+            self._apply_token_batch(batch)
+
+    def _drain_token_queue_at_exit(self) -> None:
+        try:
+            self._stop_token_writer()
+        except Exception:
+            pass  # Best effort — never fatal at interpreter shutdown.
+
     def update_token_counts(
         self,
         session_id: str,
@@ -3250,6 +3445,10 @@ class SessionDB:
 
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Get a session by ID."""
+        # Cost/usage readers (/status, /usage, gateway endpoints) reach the
+        # row through here; drain queued token deltas so they see exact
+        # totals. No-op attribute check when nothing is queued.
+        self.flush_token_counts()
         with self._lock:
             cursor = self._conn.execute(
                 "SELECT * FROM sessions WHERE id = ?", (session_id,)
@@ -3749,6 +3948,9 @@ class SessionDB:
         significant I/O saving on large databases where the blob routinely
         runs to tens of kilobytes per row.
         """
+        # Rows carry token/cost totals — drain queued deltas first so
+        # listings (sidebar, /resume, dashboards) show exact counters.
+        self.flush_token_counts()
         where_clauses = []
         params = []
 
@@ -4059,6 +4261,8 @@ class SessionDB:
         Pass ``compact_rows=True`` to omit the ``system_prompt`` blob (see
         ``list_sessions_rich`` for details).
         """
+        # Same read-your-writes guarantee as list_sessions_rich.
+        self.flush_token_counts()
         _sel = self._compact_session_cols() if compact_rows else "s.*"
         query = f"""
             SELECT {_sel},
