@@ -17652,6 +17652,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
 
         changed = False
+        # Effective-delta guard: evict the cached agent (a full system-prompt
+        # + prompt-cache rebuild) ONLY when the override actually moves a
+        # runtime axis.  A router that re-selects the already-active route
+        # every triggering message must not bust the cache each time.
+        # Reasoning-only overrides never require eviction: reasoning is
+        # excluded from the agent-cache signature and re-applied per turn on
+        # the cached agent (see the per-turn assignment in run_sync).
+        evict_needed = False
         if model_input or explicit_provider:
             try:
                 from hermes_cli.config import get_compatible_custom_providers
@@ -17694,6 +17702,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         result.error_message,
                     )
                     return changed
+                _prev_override_api_mode = (override or {}).get("api_mode")
+                _model_axes_changed = (
+                    str(result.new_model or "") != str(current_model or "")
+                    or str(result.target_provider or "") != str(current_provider or "")
+                    or str(result.base_url or "") != str(current_base_url or "")
+                    or (
+                        _prev_override_api_mode is not None
+                        and str(result.api_mode or "") != str(_prev_override_api_mode or "")
+                    )
+                )
                 self._session_model_overrides[session_key] = {
                     "model": result.new_model,
                     "provider": result.target_provider,
@@ -17707,8 +17725,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     provider=result.target_provider,
                     include_model=True,
                 )
-                if not hasattr(self, "_pending_model_notes"):
-                    self._pending_model_notes = {}
                 reason = str(directive.get("reason") or "pre-dispatch routing").strip()
                 self._set_pending_runtime_route_state(
                     session_key,
@@ -17720,11 +17736,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         reason=reason,
                     ),
                 )
-                self._pending_model_notes[session_key] = (
-                    f"[Note: runtime route selected before this turn: {current_model or 'default'} "
-                    f"-> {result.new_model} via {result.provider_label or result.target_provider}"
-                    f" ({reason}). Adjust your self-identification accordingly.]"
-                )
+                if _model_axes_changed:
+                    # The "X -> Y" switch note only makes sense (and is only
+                    # worth a transcript line) when the route actually moved.
+                    if not hasattr(self, "_pending_model_notes"):
+                        self._pending_model_notes = {}
+                    self._pending_model_notes[session_key] = (
+                        f"[Note: runtime route selected before this turn: {current_model or 'default'} "
+                        f"-> {result.new_model} via {result.provider_label or result.target_provider}"
+                        f" ({reason}). Adjust your self-identification accordingly.]"
+                    )
+                    evict_needed = True
                 changed = True
             except Exception as exc:
                 logger.warning(
@@ -17745,6 +17767,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 else:
                     self._set_session_reasoning_override(session_key, parsed)
+                    # Persist the reasoning half too.  Previously only the
+                    # model half survived a gateway restart: the rehydrated
+                    # session came back with the routed model but
+                    # reasoning=None, so the SAME session rendered
+                    # "reasoning=max reasoning_source=agent" before the
+                    # restart and "reasoning=unknown" after it — a
+                    # nondeterministic CurrentRuntime byte flip for one
+                    # effective route.
+                    self._persist_session_runtime_override(
+                        session_key,
+                        reasoning_config=parsed,
+                        include_reasoning=True,
+                    )
                     if not (model_input or explicit_provider):
                         reason = str(directive.get("reason") or "pre-dispatch routing").strip()
                         self._set_pending_runtime_route_state(
@@ -17764,13 +17799,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
         if changed:
-            self._evict_cached_agent(session_key)
+            if evict_needed:
+                self._evict_cached_agent(session_key)
             logger.info(
-                "Applied pre-dispatch runtime override for session %s (model=%s provider=%s reasoning=%s)",
+                "Applied pre-dispatch runtime override for session %s (model=%s provider=%s reasoning=%s rebuild=%s)",
                 session_key,
                 model_input or "<unchanged>",
                 explicit_provider or "<unchanged>",
                 reasoning_effort or "<unchanged>",
+                evict_needed,
             )
         return changed
 
@@ -20698,18 +20735,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             agent.notice_clear_callback = None
             agent.event_callback = _event_callback_sync
             agent.reasoning_config = reasoning_config
+            # Reset per-agent reasoning attribution at the turn boundary.  The
+            # gateway resolve above is the source of truth each turn, but a
+            # mid-turn model_switch (or a restored snapshot) leaves a stale
+            # ``_runtime_reasoning_source`` on the CACHED agent while a
+            # rebuilt agent has none — the same effective reasoning config
+            # then rendered different CurrentRuntime bytes depending on
+            # whether the agent happened to be reused or rebuilt.  Clearing
+            # it here makes the rendered value a pure function of the
+            # effective config (dict → "agent", None → "default").
+            if hasattr(agent, "_runtime_reasoning_source"):
+                try:
+                    delattr(agent, "_runtime_reasoning_source")
+                except AttributeError:
+                    pass
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides") or {}
             # One-shot route intent for this gateway message.  Clear stale state
             # on reused cached agents when no runtime router fired this turn.
             agent._runtime_route_state = self._consume_pending_runtime_route_state(session_key)
             # Must-deliver notes for THIS turn ride the current user message
-            # (api_content sidecar), never the system prompt: staged by
-            # _handle_message_with_agent (auto-reset note, first-contact
-            # intro, voice-channel change).  Assigned unconditionally so a
-            # reused cached agent never replays a stale note.
-            agent._gateway_turn_context_notes = "\n\n".join(
-                self._consume_pending_turn_sidecar_notes(session_key)
+            # (api_content sidecar), never the system prompt: staged notes
+            # from _handle_message_with_agent (auto-reset, intro, VC change)
+            # plus the rendered routing directive when a router fired.
+            # Assigned unconditionally so a reused cached agent never
+            # replays a stale note.
+            _turn_sidecar_parts = self._consume_pending_turn_sidecar_notes(session_key)
+            if agent._runtime_route_state:
+                try:
+                    from agent.system_prompt import format_routing_directive
+                    _directive_line = format_routing_directive(agent._runtime_route_state)
+                    if _directive_line:
+                        _turn_sidecar_parts.append(_directive_line)
+                except Exception:
+                    logger.debug("routing directive render failed", exc_info=True)
+            agent._gateway_turn_context_notes = (
+                "\n\n".join(_turn_sidecar_parts) if _turn_sidecar_parts else ""
             )
 
             def _runtime_update_callback(*, scope: str, model_override=None, reasoning_config=None) -> None:
