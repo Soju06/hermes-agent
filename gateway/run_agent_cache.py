@@ -339,6 +339,12 @@ class GatewayAgentCacheMixin:
             return False
 
         changed = False
+        # Effective-delta guard: evict the cached agent (a full system-prompt + prompt-cache rebuild)
+        # ONLY when the override actually moves a runtime axis. A router that re-selects the
+        # already-active route every triggering message must not bust the cache each time.
+        # Reasoning-only overrides never require eviction: reasoning is excluded from the
+        # agent-cache signature and re-applied per turn on the cached agent.
+        evict_needed = False
         if model_input or explicit_provider:
             try:
                 from gateway.run import _load_gateway_config
@@ -378,6 +384,16 @@ class GatewayAgentCacheMixin:
                         session_key, result.error_message,
                     )
                     return changed
+                previous_api_mode = override.get("api_mode")
+                model_axes_changed = (
+                    str(result.new_model or "") != str(current_model or "")
+                    or str(result.target_provider or "") != str(current_provider or "")
+                    or str(result.base_url or "") != str(current_base_url or "")
+                    or (
+                        previous_api_mode is not None
+                        and str(result.api_mode or "") != str(previous_api_mode or "")
+                    )
+                )
                 self._session_state(session_key).conversation.model_override = {
                     "model": result.new_model,
                     "provider": result.target_provider,
@@ -388,10 +404,6 @@ class GatewayAgentCacheMixin:
                 self._persist_session_runtime_override(
                     session_key, model=result.new_model, provider=result.target_provider, include_model=True,
                 )
-                pending = getattr(self, "_pending_model_notes", None)
-                if pending is None:
-                    self._pending_model_notes = {}
-                    pending = self._pending_model_notes
                 reason = str(directive.get("reason") or "pre-dispatch routing").strip()
                 self._set_pending_runtime_route_state(
                     session_key,
@@ -403,12 +415,18 @@ class GatewayAgentCacheMixin:
                         reason=reason,
                     ),
                 )
-                pending[session_key] = (
-                    "[Note: runtime route selected before this turn: "
-                    f"{current_model or 'default'} -> {result.new_model} via "
-                    f"{result.provider_label or result.target_provider} ({reason}). "
-                    "Adjust your self-identification accordingly.]"
-                )
+                if model_axes_changed:
+                    pending = getattr(self, "_pending_model_notes", None)
+                    if pending is None:
+                        self._pending_model_notes = {}
+                        pending = self._pending_model_notes
+                    pending[session_key] = (
+                        "[Note: runtime route selected before this turn: "
+                        f"{current_model or 'default'} -> {result.new_model} via "
+                        f"{result.provider_label or result.target_provider} ({reason}). "
+                        "Adjust your self-identification accordingly.]"
+                    )
+                    evict_needed = True
                 changed = True
             except Exception as exc:
                 logger.warning("pre_gateway_dispatch runtime_override raised for %s: %s", session_key, exc)
@@ -421,6 +439,11 @@ class GatewayAgentCacheMixin:
                     logger.warning("Ignoring unknown reasoning_effort=%r", reasoning_effort)
                 else:
                     self._set_session_reasoning_override(session_key, parsed)
+                    # Persist the reasoning half too: a restart must render the same effective
+                    # route (reasoning=<effort>) as before instead of reasoning=unknown.
+                    self._persist_session_runtime_override(
+                        session_key, reasoning_config=parsed, include_reasoning=True,
+                    )
                     if not (model_input or explicit_provider):
                         self._set_pending_runtime_route_state(
                             session_key,
@@ -431,7 +454,7 @@ class GatewayAgentCacheMixin:
                     changed = True
             except Exception as exc:
                 logger.warning("Reasoning runtime override failed: %s", exc)
-        if changed:
+        if changed and evict_needed:
             self._evict_cached_agent(session_key)
         return changed
 

@@ -601,6 +601,14 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         agent.notice_clear_callback = self._local_notice_clear_callback_sync if local_viewer_turn(self) else None
         agent.event_callback = ctx._event_callback_sync
         agent.reasoning_config, agent.service_tier = reasoning_config, turn_route.get("service_tier")
+        # Prompt-tail freeze: the rendered reasoning_source must be a pure function of the effective
+        # config (dict -> "agent", None -> "default"); a mid-turn model_switch leaves a stale
+        # attribution on the CACHED agent that a rebuilt agent would not have.
+        if hasattr(agent, "_runtime_reasoning_source"):
+            try:
+                delattr(agent, "_runtime_reasoning_source")
+            except AttributeError:
+                pass
         _load_daybreak = getattr(runner, "_load_daybreak", None)  # absent on minimal test runners
         agent.daybreak = callable(_load_daybreak) and _load_daybreak(ctx.source) is True
         _surface = getattr(runner, "_daybreak_surface", None)  # read by Daybreak delegation routes
@@ -615,10 +623,21 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             _consume_route_state(ctx.session_key) if callable(_consume_route_state) else None
         ) or {}
         agent._runtime_route_state = pending_runtime_route_state or None
+        turn_sidecar_parts = runner._consume_pending_turn_sidecar_notes(ctx.session_key)
+        if agent._runtime_route_state:
+            # Routed directives ride the triggering turn's user message (one-shot) so the system
+            # prompt tail stays byte-stable across routing events.
+            try:
+                from agent.system_prompt import format_routing_directive
+                directive_line = format_routing_directive(agent._runtime_route_state)
+                if directive_line:
+                    turn_sidecar_parts.append(directive_line)
+            except Exception:
+                logger.debug("routing directive render failed", exc_info=True)
         from gateway.session_surface import arm_surface_turn
         # auxiliary.voice_chat route (a voice note, or an admission committed as a voice turn) and
         # this turn's must-deliver notes; a managed worker arms its agent through the same helper.
-        arm_surface_turn(agent, runner._consume_pending_turn_sidecar_notes(ctx.session_key), voice_turn=ctx.voice_turn)
+        arm_surface_turn(agent, turn_sidecar_parts, voice_turn=ctx.voice_turn)
         # Session-scoped runtime switches (agent model_switch) mirror into the session override state
         # and the durable SessionEntry runtime fields so the route survives cache eviction/restart.
         agent.runtime_update_callback = TurnRunner._make_runtime_update_callback(ctx, runner)
