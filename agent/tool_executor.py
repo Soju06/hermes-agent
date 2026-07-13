@@ -1256,6 +1256,25 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 error_message=getattr(_guardrail_block_decision, "message", None) or "Tool blocked by guardrail policy",
                 middleware_trace=list(middleware_trace),
             )
+        elif function_name == "model_status":
+            from agent.runtime_control import model_status as _model_status
+            function_result = _model_status(agent)
+            tool_duration = time.time() - tool_start_time
+            if agent._should_emit_quiet_tool_messages():
+                agent._vprint(f"  {_get_cute_tool_message_impl(function_name, function_args, tool_duration, result=function_result)}")
+        elif function_name == "model_switch":
+            from agent.runtime_control import model_switch as _model_switch
+            function_result = _model_switch(
+                agent,
+                model=function_args.get("model"),
+                provider=function_args.get("provider"),
+                reasoning_effort=function_args.get("reasoning_effort"),
+                scope=function_args.get("scope", "turn"),
+                reason=function_args.get("reason"),
+            )
+            tool_duration = time.time() - tool_start_time
+            if agent._should_emit_quiet_tool_messages():
+                agent._vprint(f"  {_get_cute_tool_message_impl(function_name, function_args, tool_duration, result=function_result)}")
         elif function_name == "todo":
             def _execute(next_args: dict) -> Any:
                 from tools.todo_tool import todo_tool as _todo_tool

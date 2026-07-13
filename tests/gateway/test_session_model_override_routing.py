@@ -15,20 +15,46 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import gateway.run as gateway_run
-from gateway.config import Platform
-from gateway.session import SessionSource
+from gateway.config import GatewayConfig, Platform
+from gateway.session import SessionSource, SessionStore
 
 
 class _CapturingAgent:
     """Fake agent that records init kwargs for assertions."""
 
     last_init = None
+    last_instance = None
 
     def __init__(self, *args, **kwargs):
         type(self).last_init = dict(kwargs)
+        type(self).last_instance = self
         self.tools = []
+        self.runtime_update_callback = None
 
     def run_conversation(self, user_message: str, conversation_history=None, task_id=None):
+        return {
+            "final_response": "ok",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class _RuntimeSwitchingAgent(_CapturingAgent):
+    """Fake agent that exercises the gateway runtime_update_callback seam."""
+
+    def run_conversation(self, user_message: str, conversation_history=None, task_id=None):
+        assert callable(self.runtime_update_callback)
+        self.runtime_update_callback(
+            scope="session",
+            model_override={
+                "model": "session-model",
+                "provider": "session-provider",
+                "api_key": "***",
+                "base_url": "https://runtime.example/v1",
+                "api_mode": "codex_responses",
+            },
+            reasoning_config={"enabled": True, "effort": "low"},
+        )
         return {
             "final_response": "ok",
             "messages": [],
@@ -76,6 +102,23 @@ def _codex_override():
     }
 
 
+class _RuntimeOverrideStore:
+    def __init__(self):
+        self.calls = []
+
+    def update_runtime_override(self, session_key, **kwargs):
+        self.calls.append((session_key, kwargs))
+        return True
+
+
+def _session_store(tmp_path):
+    cfg = GatewayConfig()
+    cfg.sessions_dir = tmp_path
+    store = SessionStore(sessions_dir=tmp_path, config=cfg)
+    store._db = None
+    return store
+
+
 def _explode_runtime_resolution():
     raise AssertionError(
         "global runtime resolution should not run when a complete session override exists"
@@ -88,7 +131,7 @@ def test_run_agent_prefers_session_override_over_global_runtime(monkeypatch):
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", _explode_runtime_resolution)
 
     fake_run_agent = types.ModuleType("run_agent")
-    fake_run_agent.AIAgent = _CapturingAgent
+    setattr(fake_run_agent, "AIAgent", _CapturingAgent)
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
     _CapturingAgent.last_init = None
@@ -126,13 +169,143 @@ def test_run_agent_prefers_session_override_over_global_runtime(monkeypatch):
     assert _CapturingAgent.last_init["reasoning_config"] == {"enabled": True, "effort": "high"}
 
 
+def test_runtime_update_callback_persists_session_overrides(monkeypatch):
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda *args, **kwargs: {"model": "base-model", "provider": "base-provider"},
+    )
+
+    fake_run_agent = types.ModuleType("run_agent")
+    setattr(fake_run_agent, "AIAgent", _RuntimeSwitchingAgent)
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    runner = _make_runner()
+    runtime_store = _RuntimeOverrideStore()
+    runner.session_store = runtime_store
+    source = SessionSource(
+        platform=Platform.LOCAL,
+        chat_id="cli",
+        chat_name="CLI",
+        chat_type="dm",
+        user_id="user-1",
+    )
+    session_key = "agent:main:local:dm"
+
+    result = asyncio.run(
+        runner._run_agent(
+            message="switch runtime",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id="session-1",
+            session_key=session_key,
+        )
+    )
+
+    assert result["final_response"] == "ok"
+    assert runner._session_model_overrides[session_key] == {
+        "model": "session-model",
+        "provider": "session-provider",
+        "api_key": "***",
+        "base_url": "https://runtime.example/v1",
+        "api_mode": "codex_responses",
+    }
+    assert runner._session_reasoning_overrides[session_key] == {"enabled": True, "effort": "low"}
+    assert runtime_store.calls == [
+        (
+            session_key,
+            {
+                "model": "session-model",
+                "provider": "session-provider",
+                "reasoning_effort": "low",
+            },
+        )
+    ]
+
+
+def test_persisted_runtime_override_survives_gateway_restart(tmp_path, monkeypatch):
+    """Model/reasoning overrides should be rehydrated from sessions.json after restart."""
+    source = SessionSource(
+        platform=Platform.LOCAL,
+        chat_id="cli",
+        chat_name="CLI",
+        chat_type="dm",
+        user_id="user-1",
+    )
+    store1 = _session_store(tmp_path)
+    entry = store1.get_or_create_session(source)
+    session_key = entry.session_key
+    assert store1.update_runtime_override(
+        session_key,
+        model="gpt-5.5",
+        provider="codex-nekos",
+        reasoning_effort="high",
+    )
+
+    # Simulate a fresh gateway process: a new SessionStore loads only sessions.json.
+    store2 = _session_store(tmp_path)
+    runner = _make_runner()
+    runner.session_store = store2
+
+    def fake_resolve_runtime_provider(
+        *,
+        requested=None,
+        explicit_base_url=None,
+        explicit_api_key=None,
+        target_model=None,
+    ):
+        assert requested == "codex-nekos"
+        assert explicit_base_url is None
+        assert explicit_api_key is None
+        assert target_model == "gpt-5.5"
+        return {
+            "api_key": "runtime-secret",
+            "base_url": "https://codex.nekos.me/v1",
+            "provider": "codex-nekos",
+            "api_mode": "codex_responses",
+            "command": None,
+            "args": [],
+            "credential_pool": None,
+        }
+
+    import hermes_cli.runtime_provider as runtime_provider
+
+    monkeypatch.setattr(runtime_provider, "resolve_runtime_provider", fake_resolve_runtime_provider)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+
+    model, runtime_kwargs = runner._resolve_session_agent_runtime(
+        session_key=session_key,
+        user_config={"model": {"default": "base-model", "provider": "base-provider"}},
+    )
+    reasoning = runner._resolve_session_reasoning_config(session_key=session_key)
+
+    assert model == "gpt-5.5"
+    assert runtime_kwargs["provider"] == "codex-nekos"
+    assert runtime_kwargs["api_key"] == "runtime-secret"
+    assert runtime_kwargs["base_url"] == "https://codex.nekos.me/v1"
+    assert runtime_kwargs["api_mode"] == "codex_responses"
+    assert reasoning == {"enabled": True, "effort": "high"}
+
+    restored = store2.get_entry(session_key)
+    persisted = restored.to_dict()
+    assert persisted["runtime_model"] == "gpt-5.5"
+    assert persisted["runtime_provider"] == "codex-nekos"
+    assert persisted["runtime_reasoning_effort"] == "high"
+    assert "api_key" not in persisted
+    assert "base_url" not in persisted
+    assert "api_mode" not in persisted
+
+
 @pytest.mark.asyncio
 async def test_background_task_prefers_session_override_over_global_runtime(monkeypatch):
     monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", _explode_runtime_resolution)
 
     fake_run_agent = types.ModuleType("run_agent")
-    fake_run_agent.AIAgent = _CapturingAgent
+    setattr(fake_run_agent, "AIAgent", _CapturingAgent)
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
     _CapturingAgent.last_init = None
@@ -260,4 +433,3 @@ fallback_providers:
     assert runtime_kwargs["api_key"] == "env-secret"
     assert runtime_kwargs["base_url"] == "https://fallback.example/v1"
     assert runtime_kwargs["model"] == "fallback-model"
-
