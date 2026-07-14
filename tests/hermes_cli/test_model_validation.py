@@ -948,6 +948,9 @@ class TestProbeApiModelsUserAgent:
         from hermes_cli.models import _HERMES_VERSION
 
         body = b'{"data":[]}'
+        # Patch the catalog-request seam, not urllib.request.urlopen: probe
+        # requests go through open_credentialed_url's OpenerDirector, which
+        # never calls the module-level urlopen.
         with patch(
             "hermes_cli.models._urlopen_model_catalog_request",
             return_value=self._make_mock_response(body),
