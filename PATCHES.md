@@ -230,6 +230,40 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
   - `4e28ace06 perf(gateway): single-row routing UPSERT fast path for metadata-only saves`
 - **touches:** `gateway/session.py`, `tests/gateway/test_routing_save_fast_path.py`
 
+### 19. request-client-reuse
+- **branch:** `soju/patches/request-client-reuse`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — fork latency tuning)_
+- **state:** `local-only`
+- **rationale:** A fresh OpenAI wire client (new httpx pool, TCP+TLS handshake) was built and torn down for EVERY LLM call (`llm.client_create` p50 19.2ms / p95 35.5ms x ~5 calls/turn = 13.5%% of pooled hermes self-time). Now cached per agent keyed by the effective request kwargs (incl. max_retries=0 and the copilot vision default_headers variant) and reused across sequential calls: success paths keep the client; request/stream errors, cross-thread aborts (poison), credential/base_url rotation (key change), and agent teardown rebuild or close it. Preserves the #29507 stranger-thread abort discipline (abort sockets + detach; owner closes) and extends atomic holder-abort to the cron inline path. Warm reuse measured 0.008-0.039ms vs ~19ms build — ~75-80ms saved per typical turn.
+- **commits:** (stacked on `soju/patches/prompt-tail-freeze`)
+  - `b5f8a9b4c perf(llm): reuse the per-request OpenAI wire client across sequential calls`
+  - `e53c73c51 fix(llm): plug interrupt-break connection leak; make stranger abort atomic`
+  - `cdbc057fc fix(llm): extend atomic holder-abort to cron inline path; poison on codex stream close failure`
+- **touches:** `run_agent.py`, `agent/chat_completion_helpers.py`, `agent/codex_runtime.py`, `tests/agent/test_request_client_reuse.py` _(new)_, `tests/run_agent/test_openai_client_lifecycle.py`
+
+### 20. async-token-accounting
+- **branch:** `soju/patches/async-token-accounting`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — fork latency tuning)_
+- **state:** `local-only`
+- **rationale:** Per-call token/cost accounting (`update_token_counts`) ran synchronously on the turn thread after every API call (`llm.accounting` p50 3.3ms / p95 70.4ms, historically 299ms into the cold 6.8GB state.db). Deltas now enqueue to a single-writer background thread (ordered, coalescing consecutive same-session deltas), with flush barriers where readers need exactness (model-switch route updates flush first so a queued pre-switch delta cannot resurrect the old route), drain on turn finalize/close/atexit (unregistered on close), busy-claim protocol so concurrent drains cannot interleave, and enqueue-after-close applying inline instead of dropping. The `llm.accounting` span now measures the enqueue.
+- **commits:** (stacked on `soju/patches/prompt-tail-freeze`)
+  - `7fb0d5330 perf(accounting): async token accounting — per-call deltas off the turn thread (patch #19)`
+  - `3a74edb97 fix(accounting): close review gaps in the async token writer (patch #19 review)`
+  - `20cde884f fix(accounting): enqueue-after-close applies inline instead of dropping`
+- **touches:** `hermes_state.py`, `agent/conversation_loop.py`, `agent/codex_runtime.py`, `tests/agent/test_async_token_accounting.py` _(new)_
+
+### 21. gateway-persist-trim
+- **branch:** `soju/patches/gateway-persist-trim`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — fork latency tuning)_
+- **state:** `local-only`
+- **rationale:** Profiled `gateway.session_resolve`/`gateway.persist` (~175ms per gateway turn): the steady-state turn bumps updated_at/last_prompt_tokens on ONE routing entry but paid the full index rewrite twice — every entry re-serialized, DELETE+INSERT of every gateway_routing row, and a multi-MB sessions.json dump+fsync (~50ms p50 at ~1100 keys). Metadata-only saves now UPSERT the single row (<1ms) via the pre-existing `save_gateway_routing_entry`; structural transitions (create/recover/reset/switch/prune, compression-tip heals) keep the full rewrite which also refreshes the legacy sessions.json mirror; a generation guard prevents a racing full snapshot from being regressed by a stale single-row write; no-DB installs keep the full rewrite (sessions.json is their primary store).
+- **commits:** (stacked on `soju/patches/prompt-tail-freeze`)
+  - `4e28ace06 perf(gateway): single-row routing UPSERT fast path for metadata-only saves`
+- **touches:** `gateway/session.py`, `tests/gateway/test_routing_save_fast_path.py` _(new)_
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -272,6 +306,9 @@ soju/patches/turn-waterfall-tracing ← runtime topic, HERMES_TURN_TRACE per-tur
 soju/patches/tool-delay-env-default ← runtime topic, inter-tool sleep default 0 (HERMES_TOOL_DELAY override)
 soju/patches/prompt-cache-stability ← runtime topic (stacked on turn-waterfall-tracing), api_content sidecar for byte-stable prompt-cache replay
 soju/patches/prompt-tail-freeze ← runtime topic (stacked on prompt-cache-stability + route-awareness tips), byte-stable gateway system prompts
+soju/patches/request-client-reuse ← runtime topic (stacked on prompt-tail-freeze), reuse OpenAI wire client across sequential calls
+soju/patches/async-token-accounting ← runtime topic (stacked on prompt-tail-freeze), token accounting off the turn thread
+soju/patches/gateway-persist-trim ← runtime topic (stacked on prompt-tail-freeze), single-row routing UPSERT fast path
 soju/patches/request-client-reuse ← runtime topic (stacked on prompt-tail-freeze), per-request wire client reuse
 soju/patches/async-token-accounting ← runtime topic (stacked on prompt-tail-freeze), token accounting off the turn thread
 soju/patches/gateway-persist-trim ← runtime topic (stacked on prompt-tail-freeze), single-row routing UPSERT fast path
