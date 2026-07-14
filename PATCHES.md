@@ -165,14 +165,15 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
   - `e59fe6ef9 feat(telemetry): request prefix fingerprints for cache-break diffing` _(HERMES_TURN_TRACE_PREFIX=1 adds wire-faithful per-message hashes to llm.call spans; `turn_trace_render --cache-diff` names the first divergent message across consecutive turns — for the first-call cache p50 13% hunt)_
 - **touches:** `agent/turn_trace.py` _(new)_, `agent/turn_trace_render.py` _(new)_, `tests/agent/test_turn_trace.py` _(new)_, `agent/chat_completion_helpers.py`, `agent/conversation_loop.py`, `agent/tool_executor.py`, `agent/turn_context.py`, `agent/turn_finalizer.py`, `gateway/platforms/base.py`, `gateway/run.py`, `plugins/platforms/telegram/adapter.py`, `run_agent.py`
 
-### 16. tool-delay-env-default
-- **branch:** `soju/patches/tool-delay-env-default`
+### 16. tool-delay-removal
+- **branch:** `soju/patches/tool-delay-removal`
 - **origin:** `local-author`
-- **upstream_pr:** [#64172](https://github.com/NousResearch/hermes-agent/pull/64172) _(upstream variant keeps default 1.0s, adds HERMES_TOOL_DELAY knob)_
+- **upstream_pr:** [#64172](https://github.com/NousResearch/hermes-agent/pull/64172) _(being rewritten from env-knob to full removal)_
 - **state:** `local-only`
-- **rationale:** Upstream sleeps `time.sleep(1.0)` between every pair of sequential tool calls (`agent.tool_delay` default), costing (N-1)s of pure latency on multi-tool turns (log-confirmed: 0.06s tools spaced 1.08s apart; the concurrent read-only path already runs with no delay). Fork default is now 0.0; an unset `tool_delay` resolves `HERMES_TOOL_DELAY` (clamped ≥ 0) so a pause can be restored per-host without a code change, and explicit constructor args still win. Found via the turn-waterfall-tracing `tools.delay` span (patch #15).
-- **commit:** `be2d4b795 perf(tools): default inter-tool delay to 0, env-tunable`
-- **touches:** `agent/agent_init.py`, `run_agent.py`, `tests/agent/test_tool_delay_default.py` _(new)_
+- **rationale:** Remove the inter-tool 1.0s sleep entirely (supersedes the earlier env-knob patch). The delay has been present verbatim since upstream's initial commit with no documented rationale; it sleeps between LOCAL tool executions (the next LLM request only goes out after the whole batch), so it rate-limits nothing — pure (N-1)s dead time per multi-tool turn. Also removes the `tool_delay` parameter plumbing, dead `agent.tool_delay = 0` test remnants, and the now-dead `tools.delay` trace span from the renderer.
+- **commits:** (stacked on `soju/patches/turn-waterfall-tracing` — the removal deletes the span-wrapped sleep the tracing patch instrumented)
+  - `6f5dffad5 refactor(agent): remove the inter-tool delay entirely`
+- **touches:** `agent/tool_executor.py`, `agent/agent_init.py`, `run_agent.py`, `agent/turn_trace_render.py`, `tests/` _(dead assignments removed)_
 
 ### 17. prompt-cache-stability
 - **branch:** `soju/patches/prompt-cache-stability`
@@ -303,7 +304,7 @@ soju/patches/strict-chat-reasoning-details ← runtime topic, strip provider rep
 soju/patches/discord-home-autothread-fix ← runtime topic, restore Discord home-channel auto-thread creation
 soju/patches/runtime-override-rehydrate-credentials ← runtime-control child, atomic restart rehydration for persisted runtime routes
 soju/patches/turn-waterfall-tracing ← runtime topic, HERMES_TURN_TRACE per-turn waterfall spans + JSONL sink + renderer
-soju/patches/tool-delay-env-default ← runtime topic, inter-tool sleep default 0 (HERMES_TOOL_DELAY override)
+soju/patches/tool-delay-removal ← runtime topic (stacked on turn-waterfall-tracing), inter-tool sleep removed entirely
 soju/patches/prompt-cache-stability ← runtime topic (stacked on turn-waterfall-tracing), api_content sidecar for byte-stable prompt-cache replay
 soju/patches/prompt-tail-freeze ← runtime topic (stacked on prompt-cache-stability + route-awareness tips), byte-stable gateway system prompts
 soju/patches/request-client-reuse ← runtime topic (stacked on prompt-tail-freeze), reuse OpenAI wire client across sequential calls
