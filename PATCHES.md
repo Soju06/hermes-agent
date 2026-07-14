@@ -168,7 +168,7 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 ### 16. tool-delay-env-default
 - **branch:** `soju/patches/tool-delay-env-default`
 - **origin:** `local-author`
-- **upstream_pr:** _(none — fork latency tuning)_
+- **upstream_pr:** [#64172](https://github.com/NousResearch/hermes-agent/pull/64172) _(upstream variant keeps default 1.0s, adds HERMES_TOOL_DELAY knob)_
 - **state:** `local-only`
 - **rationale:** Upstream sleeps `time.sleep(1.0)` between every pair of sequential tool calls (`agent.tool_delay` default), costing (N-1)s of pure latency on multi-tool turns (log-confirmed: 0.06s tools spaced 1.08s apart; the concurrent read-only path already runs with no delay). Fork default is now 0.0; an unset `tool_delay` resolves `HERMES_TOOL_DELAY` (clamped ≥ 0) so a pause can be restored per-host without a code change, and explicit constructor args still win. Found via the turn-waterfall-tracing `tools.delay` span (patch #15).
 - **commit:** `be2d4b795 perf(tools): default inter-tool delay to 0, env-tunable`
@@ -199,7 +199,7 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 ### 19. request-client-reuse
 - **branch:** `soju/patches/request-client-reuse`
 - **origin:** `local-author`
-- **upstream_pr:** _(none — fork latency work)_
+- **upstream_pr:** [#64170](https://github.com/NousResearch/hermes-agent/pull/64170)
 - **state:** `local-only`
 - **rationale:** A fresh OpenAI wire client (new httpx pool, TCP+TLS handshake) was built and torn down for EVERY LLM call (`llm.client_create` p50 19.2ms / p95 35.5ms, ~5 calls/turn, 13.5%% of pooled overhead self-time). Now one reusable client is cached per agent keyed by the effective request kwargs (incl. resolved headers): reuse on identical kwargs, rebuild on credential rotation/failover/vision-header variant, poison-on-abort so a stranger-thread socket shutdown (#29507) can never hand a dead client to the next call, real close on kwargs change/agent teardown/gateway eviction. Interrupt-break SSE leak plugged (stream closed on early break); holder-read+abort made atomic at all three abort sites (streaming, non-streaming, cron inline); codex stream close-failure poisons the slot.
 - **commits:** (stacked on `soju/patches/prompt-tail-freeze`)
@@ -211,7 +211,7 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 ### 20. async-token-accounting
 - **branch:** `soju/patches/async-token-accounting`
 - **origin:** `local-author`
-- **upstream_pr:** _(none — fork latency work)_
+- **upstream_pr:** [#64171](https://github.com/NousResearch/hermes-agent/pull/64171)
 - **state:** `local-only`
 - **rationale:** `update_token_counts` ran a synchronous sqlite UPDATE on the turn thread after every API call (`llm.accounting` p50 3.3ms / p95 70ms, historically 299ms into the cold 6.8GB state.db). Deltas now enqueue to a single-writer daemon thread that applies them in order with backlog coalescing; sync model/billing-route writers flush the queue first (happens-before preserved); drains at turn finalize, close(), and atexit; enqueue-after-close applies inline instead of dropping; readers needing exact values call flush() (cheap when empty).
 - **commits:** (stacked on `soju/patches/prompt-tail-freeze`)
@@ -223,7 +223,7 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 ### 21. gateway-persist-trim
 - **branch:** `soju/patches/gateway-persist-trim`
 - **origin:** `local-author`
-- **upstream_pr:** _(none — fork latency work)_
+- **upstream_pr:** [#64169](https://github.com/NousResearch/hermes-agent/pull/64169)
 - **state:** `local-only`
 - **rationale:** The steady-state gateway turn bumps `updated_at`/`last_prompt_tokens` on ONE routing entry but paid the full index rewrite twice per turn — every entry re-serialized, DELETE+INSERT of every `gateway_routing` row, and a multi-MB sessions.json dump+fsync (~50ms p50 at ~1100 keys, inside the ~175ms/turn session_resolve+persist spans). Metadata-only saves now UPSERT the single row (<1ms) with a routing-generation guard against regressing a racing full snapshot; structural transitions (create/recover/reset/switch/prune, compression-tip heals) keep the full rewrite incl. the sessions.json mirror; peer fields snapshot under `_lock` (no torn rows); DB-less installs fall back to the full rewrite.
 - **commits:** (stacked on `soju/patches/prompt-tail-freeze`)
