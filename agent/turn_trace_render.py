@@ -74,7 +74,7 @@ class Node:
         return max(0.0, self.d - covered)
 
     def is_hot(self) -> bool:
-        return self.name == "tools.delay" or bool(self.tags.get("error"))
+        return bool(self.tags.get("error"))
 
 
 def _f(v: Any) -> float:
@@ -553,7 +553,7 @@ def render_html(traces: List[Dict[str, Any]], min_ms: float, path: str) -> None:
     parts.append(
         '<p class="legend"><span><i class="dot" style="background:var(--model)"></i>model (llm.call)</span>'
         '<span><i class="dot" style="background:var(--over)"></i>hermes overhead</span>'
-        '<span><i class="dot" style="background:var(--hot)"></i>tools.delay / error</span>'
+        '<span><i class="dot" style="background:var(--hot)"></i>error</span>'
         "<span>click a row to collapse its children</span></p>"
     )
     for rec in traces:
@@ -679,7 +679,6 @@ def demo_traces(n: int = 3, seed: int = 7) -> List[Dict[str, Any]]:
                     )
                     t += ex + 42
                     tool_calls += 1
-                add("tools.delay", t, 1000)
                 t += 1001
                 add("tools.batch", b0, t - b0 - 1, count=ncalls, mode="sequential")
             add("iteration", it0, t - it0, i=i)

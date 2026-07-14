@@ -3966,7 +3966,6 @@ class TestRunConversation:
         """Common setup for run_conversation tests."""
         agent._cached_system_prompt = "You are helpful."
         agent._use_prompt_caching = False
-        agent.tool_delay = 0
         agent.compression_enabled = False
         agent.save_trajectories = False
 
@@ -5413,7 +5412,6 @@ class TestRetryExhaustion:
     def _setup_agent(self, agent):
         agent._cached_system_prompt = "You are helpful."
         agent._use_prompt_caching = False
-        agent.tool_delay = 0
         agent.compression_enabled = False
         agent.save_trajectories = False
 
@@ -7213,7 +7211,6 @@ class TestReasoningReplayForStrictProviders:
     def _setup_agent(self, agent):
         agent._cached_system_prompt = "You are helpful."
         agent._use_prompt_caching = False
-        agent.tool_delay = 0
         agent.compression_enabled = False
         agent.save_trajectories = False
 
