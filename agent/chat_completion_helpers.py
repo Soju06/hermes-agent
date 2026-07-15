@@ -1704,15 +1704,30 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             # and every Hermes-internal underscore-prefixed scaffolding key.
             for schema_foreign in ("tool_name", "codex_reasoning_items", "codex_message_items", "timestamp"):
                 api_msg.pop(schema_foreign, None)
+            # api_content (the persist-what-you-send sidecar) carries the
+            # exact bytes every main-loop call sent for this message —
+            # substitute it before dropping the key (Hermes bookkeeping,
+            # never a provider field), mirroring the loop's api_messages
+            # build. Popping without substituting would send CLEAN content
+            # here, diverging the summary request's prefix at the EARLIEST
+            # sidecar-carrying message and re-prefilling the whole transcript
+            # at exactly the moment the context is largest.
+            _sidecar = api_msg.pop("api_content", None)
+            if (
+                isinstance(_sidecar, str)
+                and _sidecar
+                and api_msg.get("role") in ("user", "assistant")
+            ):
+                api_msg["content"] = _sidecar
             for internal_key in [k for k in api_msg if isinstance(k, str) and k.startswith("_")]:
                 api_msg.pop(internal_key, None)
             if _needs_sanitize:
                 agent._sanitize_tool_calls_for_strict_api(api_msg, model=agent.model)
             api_messages.append(api_msg)
 
-        effective_system = agent._cached_system_prompt or ""
-        if agent.ephemeral_system_prompt:
-            effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
+        from agent.system_prompt import compose_effective_system_prompt
+
+        effective_system = compose_effective_system_prompt(agent, agent._cached_system_prompt or "")
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
         if agent.prefill_messages:
@@ -2242,6 +2257,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # ``request_client_holder["diag"]`` for closure access.
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
+        # Also stamped on the agent so the turn-trace retrofit in
+        # conversation_loop can tag ttft_ms on the llm.call span (the
+        # conversation loop clears this per attempt).
+        agent._last_stream_diag = _diag
         stream = request_client.chat.completions.create(**stream_kwargs)
 
         # Some OpenAI-compatible adapters (for example copilot-acp, and the MoA
@@ -2606,6 +2625,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # Per-attempt diagnostic dict for the retry block to consume.
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
+        # Also stamped on the agent so the turn-trace retrofit in
+        # conversation_loop can tag ttft_ms on the llm.call span (the
+        # conversation loop clears this per attempt).
+        agent._last_stream_diag = _diag
         # Defensive: strip Responses-only kwargs (instructions, input, ...)
         # that can leak in under an api_mode-flip race. The Anthropic SDK
         # raises a non-retryable TypeError on them, killing the turn. See

@@ -113,6 +113,7 @@ from agent.process_bootstrap import (
     _SafeWriter,  # noqa: F401  # re-exported for tests that `from run_agent import _SafeWriter`
     _get_proxy_for_base_url,
 )
+from agent import turn_trace
 from agent.iteration_budget import IterationBudget
 
 
@@ -154,7 +155,10 @@ from agent.model_metadata import (
 )
 from agent.usage_pricing import normalize_usage
 # Re-exported for tests that monkeypatch these symbols on run_agent.
-from agent.context_compressor import ContextCompressor  # noqa: F401
+from agent.context_compressor import (  # noqa: F401
+    COMPRESSED_SUMMARY_METADATA_KEY,
+    ContextCompressor,
+)
 from agent.retry_utils import jittered_backoff  # noqa: F401
 from agent.prompt_builder import (  # noqa: F401  # re-exported via _ra() / mock.patch("run_agent.<name>") / from run_agent import <name>
     DEFAULT_AGENT_IDENTITY,
@@ -1857,16 +1861,69 @@ class AIAgent:
                     continue
                 role = msg.get("role", "unknown")
                 content = msg.get("content")
+                # api_content sidecar: the exact bytes sent to the API when
+                # they differ from the clean content (stamped by the turn
+                # prologue for prefetch/plugin injections). Written verbatim
+                # so replay can reproduce the sent prefix byte-for-byte.
+                _row_api_content = msg.get("api_content")
+                if not isinstance(_row_api_content, str):
+                    _row_api_content = None
                 _row_timestamp = msg.get("timestamp")
                 # Apply the persist override to THIS row's written values only
                 # (never to the live dict). Match the original guard: text-only
                 # content is replaced; multimodal (list) content is left intact
                 # so image/audio blocks aren't clobbered by the text override.
                 if _ov_idx == _msg_idx and msg.get("role") == "user":
-                    if _ov_content is not None and not isinstance(content, list):
+                    # Preflight compaction can re-anchor the override index at
+                    # a message whose content was MERGED with the compaction
+                    # summary (merge-summary-into-tail). Overwriting that with
+                    # the clean gateway text would silently drop the summary
+                    # from the durable transcript (UI, search, memory
+                    # consolidation, later re-compression). The wire is
+                    # already consistent — the merge popped the sidecar and
+                    # the merged content is what gets sent — so keep it.
+                    if (
+                        _ov_content is not None
+                        and not isinstance(content, list)
+                        and not msg.get(COMPRESSED_SUMMARY_METADATA_KEY)
+                    ):
+                        # The live content is what the API call sends; the
+                        # override is the cleaned transcript value. If they
+                        # differ and no injection already stamped the sidecar,
+                        # keep the sent bytes in api_content so replay matches
+                        # the wire (#48677 divergence, closed for the cache
+                        # prefix too).
+                        if (
+                            _row_api_content is None
+                            and isinstance(content, str)
+                            and content != _ov_content
+                        ):
+                            _row_api_content = content
                         content = _ov_content
                     if _ov_timestamp is not None:
                         _row_timestamp = _ov_timestamp
+                # Store the sidecar only when it actually differs.
+                if _row_api_content == content:
+                    _row_api_content = None
+                # Load-time sanitize divergence: get_messages_as_conversation
+                # replays user/assistant rows through
+                # ``sanitize_context(content).strip()``, so content that
+                # sanitize would rewrite (echoed/pasted <memory-context>
+                # fences or system notes) replays different bytes after a
+                # session reload even though THIS turn sent it verbatim.
+                # Capture the sent bytes in the sidecar so a reloaded session
+                # replays what was actually on the wire. Compared in wire form
+                # (both sides .strip()-ed — the api_messages build strips
+                # every outgoing content string) so plain surrounding
+                # whitespace doesn't grow redundant sidecars.
+                if (
+                    _row_api_content is None
+                    and role in ("user", "assistant")
+                    and isinstance(content, str)
+                    and content
+                    and sanitize_context(content).strip() != content.strip()
+                ):
+                    _row_api_content = content
                 # Persist multimodal tool results as their text summary only —
                 # base64 images would bloat the session DB and aren't useful
                 # for cross-session replay.
@@ -1903,6 +1960,7 @@ class AIAgent:
                     codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
                     codex_message_items=msg.get("codex_message_items") if role == "assistant" else None,
                     timestamp=_row_timestamp,
+                    api_content=_row_api_content,
                 )
                 msg[_DB_PERSISTED_MARKER] = True
             # The intrinsic markers are now the sole source of truth. Reset the
@@ -3294,6 +3352,139 @@ class AIAgent:
         except Exception:
             pass  # Never let header parsing break the agent loop
 
+    @staticmethod
+    def _recap_tool_label(fn: str, args: str) -> str:
+        """Semantic one-liner for a tool call — raw JSON args are noise."""
+        import json as _json
+
+        parsed = None
+        try:
+            parsed = _json.loads(args) if isinstance(args, str) else args
+        except Exception:
+            pass
+        if isinstance(parsed, dict):
+            if fn == "terminal" and parsed.get("command"):
+                return f"terminal: {str(parsed['command'])[:70]}"
+            for key in ("path", "file_path", "file"):
+                if parsed.get(key):
+                    return f"{fn}: {str(parsed[key])[:70]}"
+            if fn == "search_files" and (parsed.get("pattern") or parsed.get("query")):
+                return f"search: {str(parsed.get('pattern') or parsed.get('query'))[:60]}"
+            if parsed.get("action"):
+                return f"{fn} {parsed['action']}"
+            if parsed.get("query"):
+                return f"{fn}: {str(parsed['query'])[:60]}"
+        return f"{fn}({str(args)[:50]})"
+
+    def get_activity_recap_context(self) -> dict:
+        """Snapshot of current-turn activity for the gateway's LLM recap.
+
+        Read-only view over the live message list (GIL-consistent snapshot;
+        called from the gateway event loop while the turn runs on a worker
+        thread). Real gateway user messages are frequently wrapped in
+        bracketed note/coordination prefixes — strip those rather than skip
+        the message, and fall back to the bracketed text itself (inbox
+        threads' whole goal IS the coordinator note) so the goal is never
+        empty when any user text exists.
+        """
+        msgs = list(getattr(self, "_session_messages", None) or [])
+        goal = ""
+        goal_fallback = ""
+        for m in reversed(msgs):
+            if not isinstance(m, dict) or m.get("role") != "user":
+                continue
+            content = m.get("content")
+            if not isinstance(content, str) or not content.strip():
+                continue
+            text = content.strip()
+            if not goal_fallback:
+                goal_fallback = text[:300]
+            # Strip leading bracketed note blocks ("[Note: ...]\n\n" etc.).
+            stripped = re.sub(r"^(\[[^\]]*\]\s*)+", "", text).strip()
+            if stripped:
+                goal = stripped[:300]
+                break
+        if not goal:
+            goal = goal_fallback
+
+        recent_tools: list = []
+        for m in reversed(msgs):
+            if len(recent_tools) >= 5:
+                break
+            if not isinstance(m, dict) or m.get("role") != "assistant":
+                continue
+            for tc in m.get("tool_calls") or []:
+                try:
+                    if isinstance(tc, dict):
+                        fn = tc.get("function", {}).get("name", "?")
+                        args = tc.get("function", {}).get("arguments", "")
+                    else:
+                        fn = tc.function.name
+                        args = tc.function.arguments
+                except Exception:
+                    continue
+                recent_tools.append(self._recap_tool_label(fn, args))
+                if len(recent_tools) >= 5:
+                    break
+
+        # The agent's own recent utterances carry the strongest recap
+        # signal AND define the voice: persona, tone, and language all live
+        # in how the agent already talks in this conversation. Skip
+        # synthetic/interrupt notices — they aren't the agent's voice.
+        def _is_real_utterance(text: str) -> bool:
+            lowered = text.strip().lower()
+            return bool(lowered) and not (
+                lowered.startswith("operation interrupted")
+                or lowered.startswith("(tool call")
+                or lowered.startswith("[")
+            )
+
+        voice_samples: list = []
+        for m in reversed(msgs):
+            if len(voice_samples) >= 3:
+                break
+            if (
+                isinstance(m, dict)
+                and m.get("role") == "assistant"
+                and isinstance(m.get("content"), str)
+                and _is_real_utterance(m["content"])
+            ):
+                voice_samples.append(" ".join(m["content"].strip().split())[:180])
+        voice_samples.reverse()
+
+        last_result = ""
+        for m in reversed(msgs):
+            if (
+                isinstance(m, dict)
+                and m.get("role") == "tool"
+                and isinstance(m.get("content"), str)
+                and m["content"].strip()
+            ):
+                last_result = " ".join(m["content"].strip().split())[:150]
+                break
+
+        # First turn of a fresh session has no utterances yet — the persona
+        # definition (SOUL identity + conversation-style rules sit at the head
+        # of the cached system prompt) is the voice source of last resort.
+        persona_snippet = ""
+        _sp = getattr(self, "_cached_system_prompt", None)
+        if isinstance(_sp, str) and _sp.strip():
+            persona_snippet = _sp.strip()[:900]
+
+        summary = self.get_activity_summary()
+        return {
+            "goal": goal,
+            "recent_tools": list(reversed(recent_tools)),
+            "voice_samples": voice_samples,
+            "persona_snippet": persona_snippet,
+            "last_tool_result": last_result,
+            "current_tool": summary.get("current_tool"),
+            "seconds_since_activity": summary.get("seconds_since_activity"),
+            "last_activity_desc": summary.get("last_activity_desc"),
+            "iteration": summary.get("api_call_count"),
+            "max_iterations": summary.get("max_iterations"),
+        }
+
     def get_activity_summary(self) -> dict:
         """Return a snapshot of the agent's current activity for diagnostics.
 
@@ -4116,30 +4307,33 @@ class AIAgent:
     def _create_request_openai_client(self, *, reason: str, api_kwargs: Optional[dict] = None) -> Any:
         from unittest.mock import Mock
 
-        primary_client = self._ensure_primary_openai_client(reason=reason)
-        if self.provider == "moa":
-            return primary_client
-        if isinstance(primary_client, Mock):
-            return primary_client
-        with self._openai_client_lock():
-            request_kwargs = dict(self._client_kwargs)
-        # Per-request OpenAI-wire clients (used by both the non-streaming
-        # chat-completions path and the streaming chat-completions path
-        # in `_interruptible_api_call`) should not run the SDK's built-in
-        # retry loop: the agent's outer loop owns retries with credential
-        # rotation, provider fallback, and backoff that the SDK can't
-        # see. Leaving SDK retries on (default 2) compounds with our outer
-        # retries and lets a single hung provider request stretch to ~3x
-        # the per-call timeout before our stale detector reports it.
-        # Shared/primary clients and Anthropic / Bedrock paths are
-        # unaffected (they don't go through here).
-        request_kwargs["max_retries"] = 0
-        if (
-            base_url_host_matches(str(request_kwargs.get("base_url", "")), "githubcopilot.com")
-            and self._api_kwargs_have_image_parts(api_kwargs or {})
-        ):
-            request_kwargs["default_headers"] = self._copilot_headers_for_request(is_vision=True)
-        return self._create_openai_client(request_kwargs, reason=reason, shared=False)
+        # obj=self: this can run on a per-LLM-call worker thread, where the
+        # thread-local trace is not adopted — resolve via the bound agent.
+        with turn_trace.span("llm.client_create", obj=self):
+            primary_client = self._ensure_primary_openai_client(reason=reason)
+            if self.provider == "moa":
+                return primary_client
+            if isinstance(primary_client, Mock):
+                return primary_client
+            with self._openai_client_lock():
+                request_kwargs = dict(self._client_kwargs)
+            # Per-request OpenAI-wire clients (used by both the non-streaming
+            # chat-completions path and the streaming chat-completions path
+            # in `_interruptible_api_call`) should not run the SDK's built-in
+            # retry loop: the agent's outer loop owns retries with credential
+            # rotation, provider fallback, and backoff that the SDK can't
+            # see. Leaving SDK retries on (default 2) compounds with our outer
+            # retries and lets a single hung provider request stretch to ~3x
+            # the per-call timeout before our stale detector reports it.
+            # Shared/primary clients and Anthropic / Bedrock paths are
+            # unaffected (they don't go through here).
+            request_kwargs["max_retries"] = 0
+            if (
+                base_url_host_matches(str(request_kwargs.get("base_url", "")), "githubcopilot.com")
+                and self._api_kwargs_have_image_parts(api_kwargs or {})
+            ):
+                request_kwargs["default_headers"] = self._copilot_headers_for_request(is_vision=True)
+            return self._create_openai_client(request_kwargs, reason=reason, shared=False)
 
     def _close_request_openai_client(self, client: Any, *, reason: str) -> None:
         self._close_openai_client(client, reason=reason, shared=False)
@@ -5679,17 +5873,28 @@ class AIAgent:
         """
         tool_calls = assistant_message.tool_calls
 
+        # Per-turn trace: running tool_calls total lives in the trace tags so
+        # the run_conversation wrapper can copy it onto the root `turn` span.
+        _tt = turn_trace.get_bound(self)
+        if _tt is not None:
+            try:
+                _tt.tag(tool_calls=_tt.tags.get("tool_calls", 0) + len(tool_calls))
+            except Exception:
+                pass
+
         # Allow _vprint during tool execution even with stream consumers
         self._executing_tools = True
         try:
-            if not _should_parallelize_tool_batch(tool_calls):
-                return self._execute_tool_calls_sequential(
+            _mode = "concurrent" if _should_parallelize_tool_batch(tool_calls) else "sequential"
+            with turn_trace.span("tools.batch", trace=_tt, count=len(tool_calls), mode=_mode):
+                if _mode == "sequential":
+                    return self._execute_tool_calls_sequential(
+                        assistant_message, messages, effective_task_id, api_call_count
+                    )
+
+                return self._execute_tool_calls_concurrent(
                     assistant_message, messages, effective_task_id, api_call_count
                 )
-
-            return self._execute_tool_calls_concurrent(
-                assistant_message, messages, effective_task_id, api_call_count
-            )
         finally:
             self._executing_tools = False
 

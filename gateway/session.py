@@ -22,6 +22,8 @@ from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
 
+_RUNTIME_UNSET = object()
+
 
 def _now() -> datetime:
     """Return the current local time."""
@@ -541,6 +543,16 @@ def build_session_context_prompt(
                 "Do not promise to perform these actions. If the user asks, explain "
                 "that you can only read messages sent directly to you and respond."
             )
+        # Static (never per-turn): live voice-channel state used to be
+        # appended here and changed bytes every turn the bot sat in a voice
+        # channel, busting the prompt cache.  It now arrives on the current
+        # user message as a `[Voice channel now: ...]` note, injected only
+        # when it actually changed.
+        lines.append("")
+        lines.append(
+            "Voice-channel state, when relevant, appears in the current "
+            "message as a `[Voice channel now: ...]` note."
+        )
     elif context.source.platform == Platform.BLUEBUBBLES:
         lines.append("")
         lines.append(
@@ -731,6 +743,13 @@ class SessionEntry:
     # (see sanitize_model_override / SessionStore.set_model_override).
     model_override: Optional[Dict[str, str]] = None
 
+    # Session-scoped runtime overrides. These are durable session metadata,
+    # unlike per-process GatewayRunner caches. Only stable identifiers are
+    # stored; resolved credentials/endpoints are re-derived after restart.
+    runtime_model: Optional[str] = None
+    runtime_provider: Optional[str] = None
+    runtime_reasoning_effort: Optional[str] = None
+
     def to_dict(self) -> Dict[str, Any]:
         result = {
             "session_key": self.session_key,
@@ -761,6 +780,9 @@ class SessionEntry:
             "was_auto_reset": self.was_auto_reset,
             "auto_reset_reason": self.auto_reset_reason,
             "reset_had_activity": self.reset_had_activity,
+            "runtime_model": self.runtime_model,
+            "runtime_provider": self.runtime_provider,
+            "runtime_reasoning_effort": self.runtime_reasoning_effort,
         }
         if self.active_turn:
             result["active_turn"] = dict(self.active_turn)
@@ -839,6 +861,9 @@ class SessionEntry:
             auto_reset_reason=data.get("auto_reset_reason"),
             reset_had_activity=data.get("reset_had_activity", False),
             model_override=sanitize_model_override(data.get("model_override")),
+            runtime_model=data.get("runtime_model"),
+            runtime_provider=data.get("runtime_provider"),
+            runtime_reasoning_effort=data.get("runtime_reasoning_effort"),
             active_turn=(
                 dict(data["active_turn"])
                 if isinstance(data.get("active_turn"), dict)
@@ -2077,9 +2102,15 @@ class SessionStore:
             if entry is None:
                 return
             cleaned = sanitize_model_override(override)
-            if entry.model_override == cleaned:
+            has_runtime_route = bool(entry.runtime_model or entry.runtime_provider)
+            if entry.model_override == cleaned and not (
+                cleaned is not None and has_runtime_route
+            ):
                 return
             entry.model_override = cleaned
+            if cleaned is not None:
+                entry.runtime_model = None
+                entry.runtime_provider = None
             self._save()
 
     def get_model_override(self, session_key: str) -> Optional[Dict[str, str]]:
@@ -2090,6 +2121,71 @@ class SessionStore:
             if entry is None:
                 return None
             return dict(entry.model_override) if entry.model_override else None
+
+    def get_entry(self, session_key: str) -> Optional[SessionEntry]:
+        """Return a loaded SessionEntry by key without creating a new session."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            return self._entries.get(session_key)
+
+    def update_runtime_override(
+        self,
+        session_key: str,
+        *,
+        model: Any = _RUNTIME_UNSET,
+        provider: Any = _RUNTIME_UNSET,
+        reasoning_effort: Any = _RUNTIME_UNSET,
+    ) -> bool:
+        """Persist session-scoped runtime override metadata.
+
+        ``_RUNTIME_UNSET`` means leave unchanged while ``None``/empty string
+        clears a field. Credentials and resolved endpoint details are never
+        stored.
+        """
+        if not session_key:
+            return False
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return False
+            if model is not _RUNTIME_UNSET or provider is not _RUNTIME_UNSET:
+                entry.model_override = None
+            if model is not _RUNTIME_UNSET:
+                entry.runtime_model = str(model).strip() if model else None
+            if provider is not _RUNTIME_UNSET:
+                entry.runtime_provider = str(provider).strip() if provider else None
+            if reasoning_effort is not _RUNTIME_UNSET:
+                entry.runtime_reasoning_effort = (
+                    str(reasoning_effort).strip().lower() if reasoning_effort else None
+                )
+            entry.updated_at = _now()
+            self._save()
+            return True
+
+    def clear_runtime_overrides(
+        self,
+        session_key: str,
+        *,
+        model: bool = True,
+        reasoning: bool = True,
+    ) -> bool:
+        """Clear persisted runtime overrides at conversation/session boundaries."""
+        if not session_key:
+            return False
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return False
+            if model:
+                entry.runtime_model = None
+                entry.runtime_provider = None
+            if reasoning:
+                entry.runtime_reasoning_effort = None
+            entry.updated_at = _now()
+            self._save()
+            return True
 
     def suspend_session(self, session_key: str) -> bool:
         """Mark a session as suspended so it auto-resets on next access.
@@ -2531,6 +2627,15 @@ class SessionStore:
                     ),
                     observed=bool(message.get("observed")),
                     timestamp=message.get("timestamp"),
+                    # api_content sidecar: the exact bytes sent to the API for
+                    # this message (prompt-cache-stable replay). Must survive
+                    # any gateway-side persistence path or the next turn's
+                    # replay diverges at this row.
+                    api_content=(
+                        message.get("api_content")
+                        if isinstance(message.get("api_content"), str)
+                        else None
+                    ),
                 )
             except Exception as e:
                 logger.debug("Session DB operation failed: %s", e)

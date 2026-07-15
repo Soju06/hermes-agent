@@ -2612,6 +2612,22 @@ class TestConcurrentToolExecution:
                 mock_seq.assert_called_once()
                 mock_con.assert_not_called()
 
+    def test_model_switch_batch_forces_sequential(self, agent):
+        """Model switches mutate agent state and must preserve tool order."""
+        tc1 = _mock_tool_call(
+            name="model_switch",
+            arguments='{"reasoning_effort":"high","scope":"turn"}',
+            call_id="c1",
+        )
+        tc2 = _mock_tool_call(name="web_search", arguments='{"q":"after"}', call_id="c2")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
+        messages = []
+        with patch.object(agent, "_execute_tool_calls_sequential") as mock_seq:
+            with patch.object(agent, "_execute_tool_calls_concurrent") as mock_con:
+                agent._execute_tool_calls(mock_msg, messages, "task-1")
+                mock_seq.assert_called_once()
+                mock_con.assert_not_called()
+
     def test_non_dict_args_forces_sequential(self, agent):
         """Tool arguments that parse to a non-dict type should fall back to sequential."""
         tc1 = _mock_tool_call(name="web_search", arguments='{}', call_id="c1")
@@ -2986,6 +3002,14 @@ class TestConcurrentToolExecution:
         assert post_call[1]["status"] == "ok"
         assert post_call[1]["error_type"] is None
         assert isinstance(post_call[1]["duration_ms"], int)
+
+    def test_invoke_tool_handles_model_status_directly(self, agent):
+        """_invoke_tool should handle model_status without registry dispatch."""
+        result = agent._invoke_tool("model_status", {}, "task-1")
+        data = json.loads(result)
+        assert data["success"] is True
+        assert data["model"] == agent.model
+        assert data["provider"] == agent.provider
 
     def test_invoke_tool_blocked_returns_error_and_skips_execution(self, agent, monkeypatch):
         """_invoke_tool should return error JSON when a plugin blocks the tool."""
