@@ -6490,6 +6490,8 @@ class AIAgent:
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        resume_turn: bool = False,
+        turn_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.aux_accounting import (
@@ -6532,6 +6534,8 @@ class AIAgent:
                     persist_user_message,
                     persist_user_timestamp=persist_user_timestamp,
                     moa_config=moa_config,
+                    resume_turn=resume_turn,
+                    turn_id=turn_id,
                 )
             finally:
                 reset_accounting_context(acct_token)

@@ -144,6 +144,7 @@ def make_restart_runner(
     )
     runner.request_restart = GatewayRunner.request_restart.__get__(runner, GatewayRunner)
     runner._is_user_authorized = lambda _source: True
+    runner._boot_id = "test-boot-current"
     runner.hooks = MagicMock()
     runner.hooks.emit = AsyncMock()
     runner.pairing_store = MagicMock()
