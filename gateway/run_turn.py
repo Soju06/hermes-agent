@@ -167,9 +167,13 @@ from gateway.run_turn_prepare import GatewayTurnPrepareMixin
 from gateway.run_background import GatewayBackgroundMixin
 from gateway.run_turn_hygiene import GatewayTurnHygieneMixin
 from gateway.run_turn_persistence import GatewayTurnPersistenceMixin
+from gateway.run_turn_activity_recap import GatewayTurnActivityRecapMixin
 
 
-class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, GatewayTurnPersistenceMixin):
+class GatewayTurnMixin(
+    GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, GatewayTurnPersistenceMixin,
+    GatewayTurnActivityRecapMixin,
+):
     """Agent-turn execution for GatewayRunner (see module docstring)."""
 
 
@@ -854,6 +858,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         def _display_surface_mode(
             setting: str, *, default: bool = False,
             require_platform_override_for: set[Any] | None = None, allow_generic: bool = False,
+            allow_recap: bool = False,
         ) -> str:
             """Return off|raw|generic for a gateway visibility surface."""
             if require_platform_override_for:
@@ -867,6 +872,11 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             value = resolve_display_setting(user_config, platform_key, setting, default)
             if isinstance(value, str) and value.strip().lower() == "generic":
                 return "generic" if allow_generic else "off"
+            if isinstance(value, str) and value.strip().lower() == "recap":
+                # LLM-generated one-line activity recap (long-running
+                # notifications only). Surfaces that don't support it treat
+                # the setting as plain "on".
+                return "recap" if allow_recap else "raw"
             return "raw" if bool(value) else "off"
 
         def _generic_status_phrase(kind: str, *, tool_name: str | None = None, preview: str | None = None, args: Any = None) -> str:
@@ -1977,7 +1987,9 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         from gateway.run import _float_env, _interim_metadata, _non_conversational_metadata
         _notify_start = time.time()
         _NOTIFY_INTERVAL = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 180)
-        _long_running_mode = disp._display_surface_mode("long_running_notifications", default=True, allow_generic=True)
+        _long_running_mode = disp._display_surface_mode(
+            "long_running_notifications", default=True, allow_generic=True, allow_recap=True,
+        )
         if _NOTIFY_INTERVAL <= 0 or _long_running_mode == "off":
             return
         source, session_key, agent_holder = turn_ctx.source, turn_ctx.session_key, turn_ctx.agent_holder
@@ -2009,13 +2021,30 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                         _parts.append(str(_action))
                     if _parts:
                         _status_detail = " — " + ", ".join(_parts)
-            _heartbeat_text = (
-                disp._generic_status_phrase("status")
-                if _long_running_mode == "generic"
-                else t("gateway.progress.working_heartbeat", minutes=_elapsed_mins, detail=_status_detail)
-            )
+            _recap_line = None
+            if _long_running_mode == "recap" and agent_holder[0] is not None:
+                _recap_line = await self._llm_activity_recap(agent_holder[0], session_key)
+            if _long_running_mode == "generic":
+                _heartbeat_text = disp._generic_status_phrase("status")
+            elif _recap_line:
+                _heartbeat_text = f"⏳ {_elapsed_mins} min — {_recap_line}"
+            else:
+                _heartbeat_text = t("gateway.progress.working_heartbeat", minutes=_elapsed_mins, detail=_status_detail)
             try:
                 _notify_res = None
+                # Recap mode keeps the bubble at the thread bottom: an
+                # edited message buried by hours of tool traffic is
+                # invisible, so delete-and-resend instead of edit when the
+                # adapter supports deletion.
+                if (
+                    _heartbeat_msg_id
+                    and _long_running_mode == "recap"
+                    and type(_notify_adapter).delete_message
+                    is not BasePlatformAdapter.delete_message
+                ):
+                    with suppress(Exception):
+                        await _notify_adapter.delete_message(source.chat_id, _heartbeat_msg_id)
+                    _heartbeat_msg_id = None
                 if _heartbeat_msg_id:
                     try:
                         _notify_res = await _notify_adapter.edit_message(source.chat_id, _heartbeat_msg_id, _heartbeat_text)
