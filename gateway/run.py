@@ -17808,6 +17808,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ctx.get("goal"),
             tuple(ctx.get("recent_tools") or ()),
             ctx.get("current_tool"),
+            ctx.get("last_assistant_text"),
         ))
         cached = cache.get(session_key)
         if cached and cached[0] == ctx_key:
@@ -17818,13 +17819,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             tools_str = "; ".join(ctx.get("recent_tools") or []) or "(none yet)"
             current = ctx.get("current_tool") or ctx.get("last_activity_desc") or "thinking"
+            lang = ctx.get("language_hint")
+            lang_rule = (
+                f"Write the line in {lang}."
+                if lang
+                else "Write in the same language as the goal and the agent's own words."
+            )
+            extra = ""
+            if ctx.get("last_assistant_text"):
+                extra += f"Agent's own last words: {ctx['last_assistant_text']}\n"
+            if ctx.get("last_tool_result"):
+                extra += f"Last tool result (truncated): {ctx['last_tool_result']}\n"
             prompt = (
                 "You are narrating an AI agent's progress to its user while a "
                 "long turn runs. Reply with ONE line (max 100 chars), present "
-                "tense, no prefix/quotes, in the SAME LANGUAGE as the goal "
-                "text below.\n"
+                f"tense, no prefix/quotes. {lang_rule}\n"
                 f"Goal: {ctx.get('goal') or '(unknown)'}\n"
                 f"Recent tool calls (oldest first): {tools_str}\n"
+                + extra +
                 f"Currently: {current} "
                 f"({int(ctx.get('seconds_since_activity') or 0)}s since last activity, "
                 f"iteration {ctx.get('iteration')}/{ctx.get('max_iterations')})"
