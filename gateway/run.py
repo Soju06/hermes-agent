@@ -26923,6 +26923,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             tuple(ctx.get("recent_tools") or ()),
             ctx.get("current_tool"),
             tuple(ctx.get("voice_samples") or ()),
+            bool(ctx.get("persona_snippet")),
         ))
         cached = cache.get(session_key)
         if cached and cached[0] == ctx_key:
@@ -26940,6 +26941,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 voice_block = (
                     "Your recent messages in this conversation (this is YOUR "
                     f"voice — match its language, tone, and persona exactly):\n{joined}\n"
+                )
+            elif ctx.get("persona_snippet"):
+                # Fresh session, nothing said yet: the persona definition
+                # (SOUL identity + conversation-style rules) IS the voice.
+                voice_block = (
+                    "Your persona and conversation-style definition (write "
+                    f"in this voice):\n{ctx['persona_snippet']}\n"
                 )
             extra = ""
             if ctx.get("last_tool_result"):
