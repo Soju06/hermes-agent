@@ -17302,8 +17302,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Plugins receive the MessageEvent and may return a dict influencing flow:
         #   {"action": "skip",    "reason": ...}    -> drop (no reply, plugin handled)
         #   {"action": "rewrite", "text":  ...}     -> replace event.text, continue
-        #   {"action": "prepend", "text":  ...}     -> prepend text, continue
-        #   {"action": "runtime_override", ...}     -> update runtime after auth
+        #   {"action": "prepend", "text":  ...}     -> prepend text to event.text, continue
+        #                                              (dropped when the event is a slash command)
+        #   {"action": "runtime_override", ...}     -> switch session model/provider/reasoning after auth
         #   {"action": "allow"}   /   None          -> normal dispatch
         # Hook runs BEFORE auth so plugins can handle unauthorized senders
         # (e.g. customer handover ingest) without triggering the pairing flow.
@@ -17354,6 +17355,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _action == "allow":
                     break
 
+            if _hook_prepends and event.is_command():
+                # Slash commands must reach the dispatcher unmodified:
+                # is_command()/get_command() key off text.startswith("/"),
+                # so a prepended advisory would demote /model, /status,
+                # etc. into plain chat that falls through to the agent.
+                # Command handlers can't consume hook context anyway.
+                logger.debug(
+                    "pre_gateway_dispatch prepend dropped for slash command %r",
+                    (event.text or "").split(maxsplit=1)[0],
+                )
+                _hook_prepends = []
             if _hook_prepends:
                 _combined = "\n\n".join(_hook_prepends)
                 _original = event.text or ""
