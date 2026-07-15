@@ -971,7 +971,7 @@ Background: Set background=true to get a session_id. Almost always pair with not
   (2) Long-running bounded tasks (tests, builds, deploys, CI pollers, batch jobs) — MUST set notify_on_complete=true. Without it you'll either forget to poll or sit blocked waiting for the user to surface the result.
 For servers/watchers, do NOT use shell-level background wrappers (nohup/disown/setsid/trailing '&') in foreground mode. Use background=true so Hermes can track lifecycle and output.
 After starting a server, verify readiness with a health check or log signal, then run tests in a separate terminal() call. Avoid blind sleep loops.
-Use process(action="poll") for progress checks, process(action="wait") to block until done.
+Use process(action="poll") for progress checks, process(action="wait") to block until done. ONE wait per process: if a wait times out, the job is long — ensure notify_on_complete is set and END YOUR TURN with a short summary of what is running and why; you will be re-invoked automatically when it completes. Never chain repeated waits in the foreground.
 Working directory: Use 'workdir' for per-command cwd.
 PTY mode: Set pty=true for interactive CLI tools (Codex, Claude Code, Python REPL).
 
