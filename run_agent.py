@@ -3542,11 +3542,20 @@ class AIAgent:
                 last_result = " ".join(m["content"].strip().split())[:150]
                 break
 
+        # First turn of a fresh session has no utterances yet — the persona
+        # definition (SOUL identity + conversation-style rules sit at the head
+        # of the cached system prompt) is the voice source of last resort.
+        persona_snippet = ""
+        _sp = getattr(self, "_cached_system_prompt", None)
+        if isinstance(_sp, str) and _sp.strip():
+            persona_snippet = _sp.strip()[:900]
+
         summary = self.get_activity_summary()
         return {
             "goal": goal,
             "recent_tools": list(reversed(recent_tools)),
             "voice_samples": voice_samples,
+            "persona_snippet": persona_snippet,
             "last_tool_result": last_result,
             "current_tool": summary.get("current_tool"),
             "seconds_since_activity": summary.get("seconds_since_activity"),
