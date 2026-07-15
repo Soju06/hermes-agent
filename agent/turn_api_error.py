@@ -1,7 +1,8 @@
 """API-call exception handler for the conversation turn's retry loop: pre-/post-classification
-recovery, interpreter-shutdown abandon, classified-error routing, overflow recovery, the
-non-retryable client-error exit, max-retries exhaustion (primary transport recovery →
-fallback → terminal result) and the interruptible backoff. Nothing here imports
+recovery, interpreter-shutdown abandon, classified-error routing, the instant-transport fail-fast
+(``turn_recovery_fail_fast``), overflow recovery, the non-retryable client-error exit,
+max-retries exhaustion (primary transport recovery → fallback → terminal result) and the
+interruptible backoff. Nothing here imports
 ``agent.conversation_loop`` at module level (cycle) — loop-internal helpers resolve lazily so
 ``patch("agent.conversation_loop.X")`` sites keep intercepting.
 """
@@ -25,6 +26,7 @@ from agent.turn_recovery import (
     max_retries_exhausted_result, nonretryable_client_error_result, recover_after_classification,
     recover_before_classification, route_classified_error, settle_delivered_partial,
 )
+from agent.turn_recovery_fail_fast import fast_transport_failure_result, track_instant_transport_failure
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -178,6 +180,8 @@ def handle_api_error(
             interrupt_text=f"Operation interrupted: handling API error ({error_type}: {agent._clean_error_message(str(api_error))}).",
         ))
 
+    # Instant deaths (refused/reset before any bytes) build a fail-fast streak; slow timeouts reset it.
+    track_instant_transport_failure(_retry, classified)
     _ce = route_classified_error(
         agent, api_error, classified, _retry, error_msg=error_msg, error_context=error_context,
         recovered_with_pool=recovered_with_pool, base_url=_base, model=_model, messages=messages,
@@ -201,6 +205,14 @@ def handle_api_error(
         _provider_overflow_recovery_pending = True
     if _ce.action != "fallthrough":
         return _verdict(_ce.action, _ce.result)
+    # Past the eager fallback: an instant-failure streak with no fallback left ends the turn instead
+    # of burning the remaining retries against an endpoint that refuses connections outright.
+    _fast_fail = fast_transport_failure_result(
+        agent, api_error, classified, _retry, messages=messages,
+        conversation_history=conversation_history, api_call_count=api_call_count,
+    )
+    if _fast_fail is not None:
+        return _verdict("return", _fast_fail)
 
     _ov = recover_from_overflow(
         agent, api_error, classified, _retry, status_code=status_code, error_msg=error_msg,

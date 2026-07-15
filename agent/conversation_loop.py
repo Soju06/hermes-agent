@@ -1574,6 +1574,9 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[dict[str, Any]]:
                 agent._last_stream_diag = None
                 if turn_trace.prefix_fingerprint_enabled():
                     _pfp_tags = turn_trace.prefix_fingerprint(s.api_kwargs)
+            # Fail-fast streak timer: a refused/reset-before-bytes death (<2s) vs a slow timeout.
+            if s._retry is not None:
+                s._retry.attempt_started_at = time.time()
             if _run_phase(perform_api_call, agent, s).action == "break":
                 trace_llm_call(_tt, _llm_call_started, agent, s, error="interrupted")
                 _llm_call_started = None
