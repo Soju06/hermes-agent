@@ -132,3 +132,39 @@ hermes gateway --replace
 - Related skill: `hermes-live-system-modification` (separation playbook BEFORE patches enter PATCHES.md)
 - External: Linux kernel `Documentation/process/applying-patches.rst`, Debian "source format 3.0 (quilt)" docs
 - Live host paths: `~/.hermes/hermes-agent/` (live tree, editable install root), `~/projects/hermes-agent-fork-policy/` (this work tree)
+
+---
+
+## ADR-002 — Durable turns: same-turn resume across gateway restarts (2026-07-15)
+
+**Status:** Decided
+**Type:** Architecture (gateway + agent loop)
+**Resolves:** Restart recovery is a paper-over: an interrupted turn is abandoned and a NEW synthetic empty user turn is spawned with a system note that explicitly tells the model to "skip any unfinished work" and ask what to do next. The restart banner promises "I'll try to resume where you left off" — nothing implements that promise. Live incident 2026-07-15 (discord thread 1526457680527622247): two deploy restarts each reduced an in-flight PR-workflow turn to "응 오빠, 여기 있어".
+
+### Context
+
+The transcript layer is already durable and resume-ready upstream: incremental SQLite flush with an idempotent cursor (`_last_flushed_db_idx`), assistant tool_calls persisted BEFORE tool execution (intent journaling), per-tool progress flushes (`_flush_session_db_after_tool_progress`), `effect_disposition` stamping, and replay hygiene that fills dangling side-effecting calls with UNKNOWN orphan-recovery results instead of erasing them (`agent/replay_cleanup.py`). What is missing is purely the resume semantics:
+
+1. No first-class notion of an in-flight turn. Recovery signals are session-level heuristics (`resume_pending` + `updated_at` freshness windows, 120s unclean-boot window).
+2. No entry point that re-enters the conversation loop on an interrupted transcript tail. The only entry is `run_conversation(user_message=...)`, so recovery must fabricate a user turn.
+3. The fabricated turn's guidance is anti-resume by design (stale-task-revival scars #4493/#16802), and its successful completion consumes `resume_pending`, so even the user's next real message gets no recovery context.
+
+### Decision
+
+1. **Turn record (SessionEntry.active_turn).** Each gateway chat turn writes a durable record at dispatch — `{turn_id, started_at, boot_id, resume_count, status}` — cleared on normal finalize, marked `interrupted` on drain-timeout. A record with a stale `boot_id` (SIGKILL/crash) or `interrupted` status is an orphaned turn. Per-session concurrency slot ⇒ at most one record per session; it lives on SessionEntry, no new table.
+2. **Same-turn re-entry.** `run_conversation` gains a resume mode (no new user row appended; reuses recorded `turn_id`). Pre-entry tail normalization: strip synthetic interrupt-closer assistant rows ("Operation interrupted…"), fill unanswered tool_calls via existing `strip_dangling_tool_call_tail` orphan recovery, and if the tail is a genuine final assistant text (turn finished but delivery was cut), deliver it directly instead of re-calling the model. The next LLM call then continues the SAME turn — LLM statelessness makes this a true resume.
+3. **Boot resume replaces the synthetic empty turn.** `_schedule_resume_pending_sessions` selects orphaned turn records (legacy `resume_pending`-only sessions fall back to the same-turn path with a fresh turn_id) and dispatches resume events through the existing startup-restore gate/queue. The anti-resume "report restored / skip unfinished work" wording is retired for resumed turns; it remains only for genuinely stale/abandoned tails.
+4. **Guards.** `resume_count` cap (default 2, `HERMES_TURN_RESUME_MAX`, poison-turn protection; exceeded ⇒ status `abandoned` + honest notice to the thread) on top of existing freshness window, restart-loop guard, allowlist and suspension checks.
+5. **Honest banner.** Restart notification says work resumes automatically after restart; no more "send any message" instruction.
+
+Kill switch: `agent.gateway_turn_resume: false` (config) / `HERMES_GATEWAY_TURN_RESUME=0` restores legacy behavior.
+
+### Anti-goals
+
+- Resuming CLI/TUI turns (gateway-origin turns only; CLI has a human at the keyboard).
+- Replaying tool side effects. Resume NEVER re-executes persisted tool calls; unanswered calls surface as UNKNOWN-effect results (existing replay_cleanup semantics).
+- Preserving in-flight LLM generation. A response cut mid-stream is simply re-requested; prompt cache keeps the cost low.
+
+### Patch
+
+`soju/patches/durable-turns` (PATCHES.md entry TBD in same change).
