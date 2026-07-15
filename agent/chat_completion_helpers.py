@@ -573,6 +573,9 @@ def interruptible_api_call(agent, api_kwargs: dict):
     t = threading.Thread(target=_call, daemon=True)
     t.start()
     _poll_count = 0
+    from agent.tool_executor import _wait_heartbeat_seconds
+    _beat_interval = _wait_heartbeat_seconds()
+    _next_beat = _beat_interval if _beat_interval > 0 else float("inf")
     while t.is_alive():
         t.join(timeout=0.3)
         _poll_count += 1
@@ -583,6 +586,16 @@ def interruptible_api_call(agent, api_kwargs: dict):
             _elapsed = time.time() - _call_start
             agent._touch_activity(
                 f"waiting for non-streaming response ({int(_elapsed)}s elapsed)"
+            )
+
+        # User-visible heartbeat: without it, a slow or stalled model call
+        # is total silence and the session looks frozen.
+        _hb_elapsed = time.time() - _call_start
+        if _hb_elapsed >= _next_beat:
+            _next_beat += _beat_interval
+            agent._emit_status(
+                f"⏳ still waiting for {agent.model} — "
+                f"{int(_hb_elapsed) // 60}m {int(_hb_elapsed) % 60:02d}s"
             )
 
         _elapsed = time.time() - _call_start

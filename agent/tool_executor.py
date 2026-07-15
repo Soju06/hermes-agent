@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import random
+import contextlib
 import threading
 import time
 from typing import Any, Optional
@@ -1037,6 +1038,57 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
 
 
+def _wait_heartbeat_seconds() -> float:
+    """Interval for user-visible long-wait heartbeats (0 disables).
+
+    Long tool executions (process waits, slow terminal commands) and stalled
+    model calls previously produced total silence — sessions looked frozen for
+    up to 12 minutes while the agent was legitimately waiting. Past this
+    interval, and every interval after, the agent posts a lifecycle status so
+    the user can see WHAT it is waiting on and for how long.
+    """
+    import os as _os
+
+    try:
+        return max(0.0, float(_os.environ.get("HERMES_WAIT_HEARTBEAT_SECONDS", "90") or 90))
+    except ValueError:
+        return 90.0
+
+
+@contextlib.contextmanager
+def _long_wait_heartbeat(agent, function_name: str, function_args):
+    """Post '⏳ still running <tool> — NmSSs' while a tool runs long."""
+    interval = _wait_heartbeat_seconds()
+    if interval <= 0 or getattr(agent, "status_callback", None) is None:
+        yield
+        return
+    done = threading.Event()
+    start = time.time()
+    try:
+        display_args = _redact_tool_args_for_display(function_name, function_args) or function_args
+        label = _build_tool_label(function_name, display_args) or function_name
+        if function_name not in label:
+            label = f"{function_name} {label}"
+    except Exception:
+        label = function_name
+
+    def _beat() -> None:
+        while not done.wait(interval):
+            elapsed = int(time.time() - start)
+            agent._emit_status(
+                f"⏳ still running {label} — {elapsed // 60}m {elapsed % 60:02d}s"
+            )
+
+    beat_thread = threading.Thread(
+        target=_beat, daemon=True, name="tool-wait-heartbeat"
+    )
+    beat_thread.start()
+    try:
+        yield
+    finally:
+        done.set()
+
+
 def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
     """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools."""
     # Resolve the context-scaled tool-output budget once per turn.
@@ -1514,19 +1566,20 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 spinner.start()
             _spinner_result = None
             try:
-                function_result = _ra().handle_function_call(
-                    function_name, function_args, effective_task_id,
-                    tool_call_id=tool_call.id,
-                    session_id=agent.session_id or "",
-                    turn_id=getattr(agent, "_current_turn_id", "") or "",
-                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                    enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
-                    skip_pre_tool_call_hook=True,
-                    skip_tool_request_middleware=True,
-                    enabled_toolsets=getattr(agent, "enabled_toolsets", None),
-                    disabled_toolsets=getattr(agent, "disabled_toolsets", None),
-                    tool_request_middleware_trace=list(middleware_trace),
-                )
+                with _long_wait_heartbeat(agent, function_name, function_args):
+                        function_result = _ra().handle_function_call(
+                        function_name, function_args, effective_task_id,
+                        tool_call_id=tool_call.id,
+                        session_id=agent.session_id or "",
+                        turn_id=getattr(agent, "_current_turn_id", "") or "",
+                        api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                        enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
+                        skip_pre_tool_call_hook=True,
+                        skip_tool_request_middleware=True,
+                        enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+                        disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                        tool_request_middleware_trace=list(middleware_trace),
+                    )
                 _spinner_result = function_result
             except KeyboardInterrupt:
                 function_result = _emit_cancelled_terminal_post_tool_call(
@@ -1556,19 +1609,20 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     agent._vprint(f"  {cute_msg}")
         else:
             try:
-                function_result = _ra().handle_function_call(
-                    function_name, function_args, effective_task_id,
-                    tool_call_id=tool_call.id,
-                    session_id=agent.session_id or "",
-                    turn_id=getattr(agent, "_current_turn_id", "") or "",
-                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                    enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
-                    skip_pre_tool_call_hook=True,
-                    skip_tool_request_middleware=True,
-                    enabled_toolsets=getattr(agent, "enabled_toolsets", None),
-                    disabled_toolsets=getattr(agent, "disabled_toolsets", None),
-                    tool_request_middleware_trace=list(middleware_trace),
-                )
+                with _long_wait_heartbeat(agent, function_name, function_args):
+                        function_result = _ra().handle_function_call(
+                        function_name, function_args, effective_task_id,
+                        tool_call_id=tool_call.id,
+                        session_id=agent.session_id or "",
+                        turn_id=getattr(agent, "_current_turn_id", "") or "",
+                        api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                        enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
+                        skip_pre_tool_call_hook=True,
+                        skip_tool_request_middleware=True,
+                        enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+                        disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                        tool_request_middleware_trace=list(middleware_trace),
+                    )
             except KeyboardInterrupt:
                 _emit_cancelled_terminal_post_tool_call(
                     agent,
