@@ -557,7 +557,7 @@ def build_turn_context(
     plugin_user_context = ""
     try:
         from hermes_cli.plugins import invoke_hook as _invoke_hook
-        _pre_results = _invoke_hook(
+        _pre_results = [] if resume_turn else _invoke_hook(
             "pre_llm_call",
             session_id=agent.session_id,
             task_id=effective_task_id,
@@ -625,17 +625,21 @@ def build_turn_context(
         agent._interrupt_message = None
         agent._interrupt_thread_signal_pending = False
 
-    # Notify memory providers of the new turn (BEFORE prefetch_all).
-    if agent._memory_manager:
+    # Notify memory providers of the new turn (BEFORE prefetch_all).  Not on
+    # resume: this is the SAME turn continuing — it already announced itself.
+    if agent._memory_manager and not resume_turn:
         try:
             _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
             agent._memory_manager.on_turn_start(agent._user_turn_count, _turn_msg)
         except Exception:
             pass
 
-    # External memory provider: prefetch once before the tool loop.
+    # External memory provider: prefetch once before the tool loop.  Not on
+    # resume: the resumed turn's user row replays as persisted — a fresh
+    # prefetch would change the request prefix the interrupted rounds were
+    # generated against (and break the provider prompt cache).
     ext_prefetch_cache = ""
-    if agent._memory_manager:
+    if agent._memory_manager and not resume_turn:
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
             ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
