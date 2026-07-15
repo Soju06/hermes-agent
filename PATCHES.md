@@ -295,6 +295,16 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
   - `2b9be80da feat(tools): background-first process waits — escalate chained blocking waits`
 - **touches:** `tools/process_registry.py`, `tools/terminal_tool.py`, `tests/tools/test_background_first_waits.py` _(new)_
 
+### 25. llm-activity-recap
+- **branch:** `soju/patches/llm-activity-recap`
+- **origin:** `local-author`
+- **upstream_pr:** _(none yet — upstream candidate after burn-in)_
+- **state:** `local-only`
+- **rationale:** `display.long_running_notifications` gains a `recap` mode: instead of the terse "⏳ Working — N min — iteration i/max" heartbeat, the gateway asks the auxiliary LLM (compression rail, 8s timeout, ~80 tokens) for a one-line present-tense recap of what the agent is doing — goal + recent tool calls + current wait — in the conversation's language (Claude Code-style). Context-hash caching regenerates only on activity change; failures fall back to the terse heartbeat; in recap mode the bubble is deleted-and-resent (adapters with delete support) so it stays at the thread bottom instead of buried. Complements #24 background-first-waits: waits that should end the turn do, and turns that legitimately run long narrate themselves.
+- **commits:** (stacked on `soju/patches/prompt-tail-freeze`)
+  - `67bbd6f87 feat(gateway): LLM activity recap for long-running notifications`
+- **touches:** `gateway/run.py`, `run_agent.py`, `tests/gateway/test_llm_activity_recap.py` _(new)_
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -343,12 +353,14 @@ soju/patches/gateway-persist-trim ← runtime topic (stacked on prompt-tail-free
 soju/patches/gateway-worker-pool ← runtime topic (stacked on prompt-tail-freeze), agent-turn pool 10→24, config gateway.max_workers
 soju/patches/conn-error-fail-fast ← runtime topic (stacked on prompt-tail-freeze), instant transport-failure streak fail-fast
 soju/patches/background-first-waits ← runtime topic (stacked on prompt-tail-freeze), chained process waits escalate to notify_on_complete + end-turn
+soju/patches/llm-activity-recap ← runtime topic (stacked on prompt-tail-freeze), aux-LLM one-line recap heartbeat (display.long_running_notifications: recap)
 soju/patches/request-client-reuse ← runtime topic (stacked on prompt-tail-freeze), per-request wire client reuse
 soju/patches/async-token-accounting ← runtime topic (stacked on prompt-tail-freeze), token accounting off the turn thread
 soju/patches/gateway-persist-trim ← runtime topic (stacked on prompt-tail-freeze), single-row routing UPSERT fast path
 soju/patches/gateway-worker-pool ← runtime topic (stacked on prompt-tail-freeze), agent-turn pool 10→24, config gateway.max_workers
 soju/patches/conn-error-fail-fast ← runtime topic (stacked on prompt-tail-freeze), instant transport-failure streak fail-fast
 soju/patches/background-first-waits ← runtime topic (stacked on prompt-tail-freeze), chained process waits escalate to notify_on_complete + end-turn
+soju/patches/llm-activity-recap ← runtime topic (stacked on prompt-tail-freeze), aux-LLM one-line recap heartbeat (display.long_running_notifications: recap)
 soju/production                       ← rebuilt: base_commit + runtime patches only
                                          NEVER hand-edit. Always run `bin/hermes-patches rebuild` from `soju/fork-policy`.
 ```
