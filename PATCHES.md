@@ -330,6 +330,16 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
   - `56aecda05 merge: stack durable-turns on config-knob-bridges tip`
 - **touches:** `agent/turn_resume.py` _(new)_, `agent/turn_context.py`, `agent/conversation_loop.py`, `agent/turn_finalizer.py`, `run_agent.py`, `gateway/run.py`, `gateway/session.py`, `hermes_cli/config.py`, `tests/agent/test_turn_resume.py` _(new)_, `tests/gateway/test_durable_turn_records.py` _(new)_, `tests/run_agent/test_resume_turn_loop.py` _(new)_, `tests/gateway/restart_test_helpers.py`, `tests/gateway/test_restart_resume_pending.py`
 
+### 28. hook-prepend-command-safety
+- **branch:** `soju/patches/hook-prepend-command-safety`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — hardens the fork-only pre_gateway_dispatch prepend action from runtime-control)_
+- **state:** `local-only`
+- **rationale:** A `pre_gateway_dispatch` `{"action": "prepend"}` rewrote `event.text` before slash dispatch, and `is_command()`/`get_command()` key off `text.startswith("/")` — so any plugin prepend on a command message demoted it into plain chat that fell through to the agent. Live incident 2026-07-15: the inbox-matter-coordinator advisory rewrite (plugin 9ed17c4) prepends an `[INBOX_MATTER ...]` marker on matter-linked threads; `/model` there was answered by the agent's `model_status` tool instead of the interactive picker, and every slash command in those threads broke the same way. Fix: drop prepends (debug log) when the event is a slash command — advisory context is agent-facing and command handlers can't consume it. Plain-chat prepend behavior unchanged.
+- **commits:** (stacked on `soju/patches/durable-turns` tip)
+  - `28e7b2b5a fix(gateway): drop pre_gateway_dispatch prepends on slash commands`
+- **touches:** `gateway/run.py`, `tests/gateway/test_pre_gateway_dispatch.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -388,6 +398,7 @@ soju/patches/conn-error-fail-fast ← runtime topic (stacked on prompt-tail-free
 soju/patches/background-first-waits ← runtime topic (stacked on prompt-tail-freeze), chained process waits escalate to notify_on_complete + end-turn
 soju/patches/llm-activity-recap ← runtime topic (stacked on prompt-tail-freeze), aux-LLM one-line recap heartbeat (display.long_running_notifications: recap)
 soju/patches/config-knob-bridges ← runtime topic (stacked on prompt-tail-freeze), config.yaml authority for fork knobs (process_wait_cap, fast_conn_fail_limit)
+soju/patches/hook-prepend-command-safety ← runtime topic (stacked on durable-turns), pre_gateway_dispatch prepends dropped on slash commands
 soju/production                       ← rebuilt: base_commit + runtime patches only
                                          NEVER hand-edit. Always run `bin/hermes-patches rebuild` from `soju/fork-policy`.
 ```
