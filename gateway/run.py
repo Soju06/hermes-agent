@@ -1501,6 +1501,12 @@ def _bridge_max_turns_from_config(home: "Path") -> None:
         max_iterations = agent_cfg.get("max_turns")
         if max_iterations is not None:
             os.environ["HERMES_MAX_ITERATIONS"] = str(max_iterations)
+        # Fork knobs ride the same config-authoritative bridge (config.yaml
+        # agent.* wins over stale env; env stays as the no-config override).
+        if "process_wait_cap" in agent_cfg:
+            os.environ["HERMES_PROCESS_WAIT_CAP"] = str(agent_cfg["process_wait_cap"])
+        if "fast_conn_fail_limit" in agent_cfg:
+            os.environ["HERMES_FAST_CONN_FAIL_LIMIT"] = str(agent_cfg["fast_conn_fail_limit"])
     except Exception:
         return
 
@@ -1806,6 +1812,14 @@ if _config_path.exists():
                 os.environ["HERMES_AUTO_CONTINUE_FRESHNESS"] = str(
                     _agent_cfg["gateway_auto_continue_freshness"]
                 )
+            # Fork knobs follow the same config-authoritative bridge: the
+            # canonical setting lives in config.yaml agent.*; the env var is
+            # the cross-process carrier (and a manual override for hosts
+            # without a config entry).
+            if "process_wait_cap" in _agent_cfg:
+                os.environ["HERMES_PROCESS_WAIT_CAP"] = str(_agent_cfg["process_wait_cap"])
+            if "fast_conn_fail_limit" in _agent_cfg:
+                os.environ["HERMES_FAST_CONN_FAIL_LIMIT"] = str(_agent_cfg["fast_conn_fail_limit"])
         _display_cfg = _cfg.get("display", {})
         if _display_cfg and isinstance(_display_cfg, dict):
             if "busy_input_mode" in _display_cfg:
