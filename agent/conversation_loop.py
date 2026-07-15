@@ -1841,6 +1841,8 @@ def run_conversation(
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    resume_turn: bool = False,
+    turn_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run one turn, owning a waterfall trace for direct callers."""
     trace = turn_trace.get_bound(agent)
@@ -1863,6 +1865,7 @@ def run_conversation(
             agent, user_message, system_message, conversation_history, task_id,
             stream_callback, persist_user_message, persist_user_timestamp,
             persist_user_display_kind, persist_user_display_metadata, moa_config,
+            resume_turn, turn_id,
         )
         return result
     finally:
@@ -1903,6 +1906,8 @@ def _run_conversation_impl(
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    resume_turn: bool = False,
+    turn_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -1932,7 +1937,7 @@ def _run_conversation_impl(
     Returns:
         Dict: Complete conversation result with final response and message history
     """
-    if moa_config is None:
+    if moa_config is None and not resume_turn:
         try:
             from hermes_cli.moa_config import decode_moa_turn
 
@@ -1944,6 +1949,26 @@ def _run_conversation_impl(
                     persist_user_message = _decoded_message
         except Exception:
             pass
+
+    # Normalize an interrupted transcript before rebuilding the turn context.
+    # A completed assistant tail is deliverable without another provider call.
+    _resume_composed_final: Optional[str] = None
+    if resume_turn:
+        from agent.turn_resume import prepare_resume_history, resume_entry_reason
+
+        conversation_history, _resume_composed_final = prepare_resume_history(
+            list(conversation_history or [])
+        )
+        user_message = ""
+        persist_user_message = None
+        persist_user_timestamp = None
+        logger.info(
+            "same-turn resume: session=%s turn_id=%s tail=%s composed_final=%s",
+            agent.session_id or "none",
+            turn_id or "(new)",
+            resume_entry_reason(conversation_history),
+            _resume_composed_final is not None,
+        )
 
     # The gateway caches agents across user turns.  Compression state is
     # per-turn: carrying a prior in-place boundary forward would make a later
@@ -1989,6 +2014,8 @@ def _run_conversation_impl(
         # MoA turns append per-call aggregated context to the API copy of the
         # user message, so no byte-stable api_content sidecar can be stamped.
         moa_active=bool(moa_config),
+        resume_turn=resume_turn,
+        turn_id_override=turn_id,
     )
     user_message = _ctx.user_message
     original_user_message = _ctx.original_user_message
@@ -2024,6 +2051,15 @@ def _run_conversation_impl(
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
     final_response = None
+    # Same-turn resume of a turn that had already finished generating: the
+    # composed answer was persisted but never delivered/finalized.  Seed it as
+    # the final response and skip the loop entirely — the normal
+    # finalize/delivery path still runs.  The transcript already ends with
+    # that assistant row, so nothing is appended twice.
+    _resume_skip_loop = False
+    if resume_turn and _resume_composed_final is not None:
+        final_response = _resume_composed_final
+        _resume_skip_loop = True
     interrupted = False
     failed = False
     codex_ack_continuations = 0
@@ -2045,7 +2081,11 @@ def _run_conversation_impl(
     max_compression_attempts = getattr(agent, "max_compression_attempts", 3)
     _last_preflight_pressure: Optional[int] = None
     _preflight_compression_blocked = _ctx.preflight_compression_blocked
-    _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
+    _turn_exit_reason = (
+        "resume_composed_final"
+        if resume_turn and _resume_composed_final is not None
+        else "unknown"
+    )  # Diagnostic: why the loop ended
     # Last composed answer intentionally held back by a verification gate. If
     # that continuation consumes the remaining budget, this is the best
     # user-facing result available; it must not be confused with error or
@@ -2090,7 +2130,10 @@ def _run_conversation_impl(
             should_review_memory=_should_review_memory,
         )
 
-    while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+    while not _resume_skip_loop and (
+        (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0)
+        or agent._budget_grace_call
+    ):
         if _tt is not None:
             now = time.time()
             if _iter_started is not None:

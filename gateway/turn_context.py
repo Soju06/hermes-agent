@@ -97,6 +97,7 @@ class TurnContext:
     # (#82888). DB-only presentation metadata; never sent to the provider.
     persist_user_display_kind: Optional[str] = None
     turn_trace_obj: Any = None
+    turn_resume_marker: Optional[dict] = None
     user_config: Any = None
     enabled_toolsets: Any = None
     disabled_toolsets: Any = None

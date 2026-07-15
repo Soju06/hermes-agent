@@ -475,12 +475,20 @@ def build_turn_context(
     set_current_write_origin,
     ra,
     moa_active: bool = False,
+    resume_turn: bool = False,
+    turn_id_override: Optional[str] = None,
 ) -> TurnContext:
     """Run the once-per-turn setup and return the loop's input context.
 
     The callables/helpers the original prologue referenced from the
     ``conversation_loop`` module are passed in explicitly to keep this module
     free of an import cycle with ``agent.conversation_loop``.
+
+    ``resume_turn=True`` re-enters an interrupted turn on its persisted
+    transcript (same-turn resume): no new user row is appended, the user-turn
+    counters and reaction/nudge bookkeeping are not advanced, and
+    ``turn_id_override`` (the durable turn id recorded by the gateway when the
+    turn first started) keeps the turn's identity stable across the restart.
     """
     # Per-turn trace (None when tracing is disabled).
     _tt = turn_trace.get_bound(agent)
@@ -584,7 +592,11 @@ def build_turn_context(
     # Generate unique task_id if not provided to isolate VMs between tasks.
     effective_task_id = task_id or str(uuid.uuid4())
     agent._current_task_id = effective_task_id
-    turn_id = str(getattr(agent, "_relay_pending_turn_id", "") or "")
+    turn_id = str(
+        turn_id_override
+        or getattr(agent, "_relay_pending_turn_id", "")
+        or ""
+    )
     if not turn_id:
         turn_id = (
             f"{agent.session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
@@ -650,7 +662,8 @@ def build_turn_context(
     _msg_preview = (_preview_text[:80] + "...") if len(_preview_text) > 80 else _preview_text
     _msg_preview = _msg_preview.replace("\n", " ")
     logger.info(
-        "conversation turn: session=%s model=%s provider=%s platform=%s history=%d msg=%r",
+        "conversation turn%s: session=%s model=%s provider=%s platform=%s history=%d msg=%r",
+        " (resume)" if resume_turn else "",
         agent.session_id or "none", agent.model, agent.provider or "unknown",
         agent.platform or "unknown", len(conversation_history or []),
         _msg_preview,
@@ -718,12 +731,20 @@ def build_turn_context(
         if persist_user_display_metadata:
             user_msg["display_metadata"] = persist_user_display_metadata
 
-    append_message(messages, user_msg)
-    current_turn_user_idx = len(messages) - 1
-    agent._persist_user_message_idx = current_turn_user_idx
+    if resume_turn:
+        current_turn_user_idx = -1
+        for _i in range(len(messages) - 1, -1, -1):
+            if messages[_i].get("role") == "user":
+                current_turn_user_idx = _i
+                break
+    else:
+        append_message(messages, user_msg)
+        current_turn_user_idx = len(messages) - 1
+        agent._persist_user_message_idx = current_turn_user_idx
 
     # Track user turns for memory flush and periodic nudge logic.
-    agent._user_turn_count += 1
+    if not resume_turn:
+        agent._user_turn_count += 1
     # Copilot x-initiator: the first API call of this user turn is
     # user-initiated; tool-loop follow-ups revert to "agent" (#3040).
     agent._is_user_initiated_turn = True
@@ -737,12 +758,25 @@ def build_turn_context(
     if think_scrubber is not None:
         think_scrubber.reset()
 
-    # Preserve the original user message (no nudge injection).
-    original_user_message = persist_user_message if persist_user_message is not None else user_message
+    # Preserve the original user message (no nudge injection).  On resume the
+    # turn's user message is the one already in the transcript — recover it so
+    # memory prefetch/queries below still have the real question to work with.
+    if resume_turn:
+        original_user_message = ""
+        for _msg in reversed(messages):
+            if _msg.get("role") == "user":
+                _prior_content = _msg.get("content")
+                if isinstance(_prior_content, str):
+                    original_user_message = _prior_content
+                break
+    else:
+        original_user_message = persist_user_message if persist_user_message is not None else user_message
 
-    # Track memory nudge trigger (turn-based, checked here).
+    # Track memory nudge trigger (turn-based, checked here).  Skipped on
+    # resume: the interrupted turn already paid its nudge tick.
     should_review_memory = False
-    if (agent._memory_nudge_interval > 0
+    if (not resume_turn
+            and agent._memory_nudge_interval > 0
             and "memory" in agent.valid_tool_names
             and agent._memory_store):
         agent._turns_since_memory += 1
@@ -752,9 +786,10 @@ def build_turn_context(
 
     # Cosmetic side-signal: detect an affection "reaction" (ily / <3 / good bot)
     # and notify the host so it can play hearts. Token-free, never touches the
-    # conversation, and never fatal — a purely optional UI beat.
+    # conversation, and never fatal — a purely optional UI beat.  Not replayed
+    # on resume (the reaction already fired when the message first arrived).
     reaction_callback = getattr(agent, "reaction_callback", None)
-    if reaction_callback is not None:
+    if reaction_callback is not None and not resume_turn:
         try:
             from agent.reactions import detect_reaction
 
@@ -1293,7 +1328,7 @@ def build_turn_context(
     _hook_started = time.time() if _tt is not None else None
     try:
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-        _pre_results = _invoke_hook(
+        _pre_results = [] if resume_turn else _invoke_hook(
             "pre_llm_call",
             session_id=agent.session_id,
             task_id=effective_task_id,
@@ -1393,7 +1428,7 @@ def build_turn_context(
         agent._interrupt_thread_signal_pending = False
 
     # Notify memory providers of the new turn (BEFORE prefetch_all).
-    if agent._memory_manager:
+    if agent._memory_manager and not resume_turn:
         try:
             _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
             agent._memory_manager.on_turn_start(agent._user_turn_count, _turn_msg)
@@ -1406,7 +1441,7 @@ def build_turn_context(
     # prevent memory-context injection on turns that carry no semantic signal.
     ext_prefetch_cache = ""
     _memory_prefetch_started = time.time() if _tt is not None else None
-    if agent._memory_manager:
+    if agent._memory_manager and not resume_turn:
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
             if not is_trivial_prompt(_query):
@@ -1449,6 +1484,7 @@ def build_turn_context(
     # sent bytes" (MoA keeps its pre-sidecar cache behavior).
     if (
         not moa_active
+        and not resume_turn  # resumed rows replay their persisted sidecar
         and getattr(agent, "api_mode", None) != "codex_app_server"
         and 0 <= current_turn_user_idx < len(messages)
         and messages[current_turn_user_idx].get("role") == "user"
