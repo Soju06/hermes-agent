@@ -285,6 +285,16 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
   - `c6040f7c6 fix(agent): fail fast on instant transport-failure streaks`
 - **touches:** `agent/conversation_loop.py`, `agent/turn_retry_state.py`, `tests/agent/test_fast_transport_fail_fast.py` _(new)_
 
+### 24. background-first-waits
+- **branch:** `soju/patches/background-first-waits`
+- **origin:** `local-author`
+- **upstream_pr:** _(none yet — upstream candidate after burn-in)_
+- **state:** `local-only`
+- **rationale:** Models foreground-polled long jobs with chained `process wait` calls (observed 4-5 consecutive 180s waits per turn — total user-facing silence while holding a gateway worker). Background-first: the first full block-wait stays a normal flow (180s window unchanged per user request), but from the SECOND consecutive timed-out wait on the same still-running process, `notify_on_complete` is auto-armed and the tool result instructs the model to end its turn with a summary — the completion re-enters the session as an event and the model explains the result there (the natural LLM recap). `HERMES_PROCESS_WAIT_CAP` tunes the quiet-wait allowance (default 1, 0 disables for completion-bound sessions like kanban workers). The process tool schema and terminal guidance now state the one-wait-per-process contract (one-time tools-hash cache bust on deploy, legitimate).
+- **commits:** (stacked on `soju/patches/prompt-tail-freeze`)
+  - `2b9be80da feat(tools): background-first process waits — escalate chained blocking waits`
+- **touches:** `tools/process_registry.py`, `tools/terminal_tool.py`, `tests/tools/test_background_first_waits.py` _(new)_
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -332,11 +342,13 @@ soju/patches/async-token-accounting ← runtime topic (stacked on prompt-tail-fr
 soju/patches/gateway-persist-trim ← runtime topic (stacked on prompt-tail-freeze), single-row routing UPSERT fast path
 soju/patches/gateway-worker-pool ← runtime topic (stacked on prompt-tail-freeze), agent-turn pool 10→24, config gateway.max_workers
 soju/patches/conn-error-fail-fast ← runtime topic (stacked on prompt-tail-freeze), instant transport-failure streak fail-fast
+soju/patches/background-first-waits ← runtime topic (stacked on prompt-tail-freeze), chained process waits escalate to notify_on_complete + end-turn
 soju/patches/request-client-reuse ← runtime topic (stacked on prompt-tail-freeze), per-request wire client reuse
 soju/patches/async-token-accounting ← runtime topic (stacked on prompt-tail-freeze), token accounting off the turn thread
 soju/patches/gateway-persist-trim ← runtime topic (stacked on prompt-tail-freeze), single-row routing UPSERT fast path
 soju/patches/gateway-worker-pool ← runtime topic (stacked on prompt-tail-freeze), agent-turn pool 10→24, config gateway.max_workers
 soju/patches/conn-error-fail-fast ← runtime topic (stacked on prompt-tail-freeze), instant transport-failure streak fail-fast
+soju/patches/background-first-waits ← runtime topic (stacked on prompt-tail-freeze), chained process waits escalate to notify_on_complete + end-turn
 soju/production                       ← rebuilt: base_commit + runtime patches only
                                          NEVER hand-edit. Always run `bin/hermes-patches rebuild` from `soju/fork-policy`.
 ```
