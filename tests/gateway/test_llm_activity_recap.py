@@ -40,7 +40,9 @@ def _resp(text):
 
 CTX = {
     "goal": "apifuse provider 10개 추가",
-    "recent_tools": ["terminal(pytest ...)", "patch(providers.py ...)"],
+    "recent_tools": ["terminal: pytest ...", "patch: providers.py"],
+    "voice_samples": ["테스트 돌려놓고 결과 보는 중이야"],
+    "last_tool_result": "3 passed",
     "current_tool": "terminal",
     "seconds_since_activity": 45,
     "last_activity_desc": "running pytest",
