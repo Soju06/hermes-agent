@@ -285,16 +285,6 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
   - `c6040f7c6 fix(agent): fail fast on instant transport-failure streaks`
 - **touches:** `agent/conversation_loop.py`, `agent/turn_retry_state.py`, `tests/agent/test_fast_transport_fail_fast.py` _(new)_
 
-### 24. long-wait-heartbeat
-- **branch:** `soju/patches/long-wait-heartbeat`
-- **origin:** `local-author`
-- **upstream_pr:** _(none yet — upstream candidate after burn-in)_
-- **state:** `local-only`
-- **rationale:** Long tool executions (process waits chained at 180s timeouts — observed 4-5 consecutive = 12+ min, slow terminal commands) and stalled model calls were total user-facing silence; live sessions (…247, …560) looked frozen while the agent was legitimately waiting. Past `HERMES_WAIT_HEARTBEAT_SECONDS` (default 90, 0 disables) and every interval after, the agent posts a lifecycle status naming what it waits on and for how long ("⏳ still running process wait — 3m 00s" / "⏳ still waiting for <model> — 2m 30s") from the sequential tool executor and the non-streaming API wait loop.
-- **commits:** (stacked on `soju/patches/prompt-tail-freeze`)
-  - `7254e8941 feat(gateway): heartbeat status for long tool and model waits`
-- **touches:** `agent/tool_executor.py`, `agent/chat_completion_helpers.py`, `tests/agent/test_long_wait_heartbeat.py` _(new)_
-
 ## State Vocabulary
 
 | state | meaning | when |
@@ -342,13 +332,11 @@ soju/patches/async-token-accounting ← runtime topic (stacked on prompt-tail-fr
 soju/patches/gateway-persist-trim ← runtime topic (stacked on prompt-tail-freeze), single-row routing UPSERT fast path
 soju/patches/gateway-worker-pool ← runtime topic (stacked on prompt-tail-freeze), agent-turn pool 10→24, config gateway.max_workers
 soju/patches/conn-error-fail-fast ← runtime topic (stacked on prompt-tail-freeze), instant transport-failure streak fail-fast
-soju/patches/long-wait-heartbeat ← runtime topic (stacked on prompt-tail-freeze), user-visible heartbeats for long tool/model waits
 soju/patches/request-client-reuse ← runtime topic (stacked on prompt-tail-freeze), per-request wire client reuse
 soju/patches/async-token-accounting ← runtime topic (stacked on prompt-tail-freeze), token accounting off the turn thread
 soju/patches/gateway-persist-trim ← runtime topic (stacked on prompt-tail-freeze), single-row routing UPSERT fast path
 soju/patches/gateway-worker-pool ← runtime topic (stacked on prompt-tail-freeze), agent-turn pool 10→24, config gateway.max_workers
 soju/patches/conn-error-fail-fast ← runtime topic (stacked on prompt-tail-freeze), instant transport-failure streak fail-fast
-soju/patches/long-wait-heartbeat ← runtime topic (stacked on prompt-tail-freeze), user-visible heartbeats for long tool/model waits
 soju/production                       ← rebuilt: base_commit + runtime patches only
                                          NEVER hand-edit. Always run `bin/hermes-patches rebuild` from `soju/fork-policy`.
 ```
