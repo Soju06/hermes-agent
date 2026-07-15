@@ -303,6 +303,7 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **rationale:** `display.long_running_notifications` gains a `recap` mode: instead of the terse "⏳ Working — N min — iteration i/max" heartbeat, the gateway asks the auxiliary LLM (compression rail, 8s timeout, ~80 tokens) for a one-line present-tense recap of what the agent is doing — goal + recent tool calls + current wait — in the conversation's language (Claude Code-style). Context-hash caching regenerates only on activity change; failures fall back to the terse heartbeat; in recap mode the bubble is deleted-and-resent (adapters with delete support) so it stays at the thread bottom instead of buried. Complements #24 background-first-waits: waits that should end the turn do, and turns that legitimately run long narrate themselves.
 - **commits:** (stacked on `soju/patches/prompt-tail-freeze`)
   - `67bbd6f87 feat(gateway): LLM activity recap for long-running notifications`
+  - `4bd93f530 feat(gateway): tune activity recap context from live-session evaluation` _(real-session eval: bracket-note goal stripping + fallback, user-message language detection, agent-last-words + last-tool-result in context, per-tool semantic labels)_
 - **touches:** `gateway/run.py`, `run_agent.py`, `tests/gateway/test_llm_activity_recap.py` _(new)_
 
 ## State Vocabulary
