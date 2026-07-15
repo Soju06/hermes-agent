@@ -1454,6 +1454,7 @@ def run_conversation(
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 
+                _attempt_started = time.time()
                 response = run_llm_execution_middleware(
                     api_kwargs,
                     _perform_api_call,
@@ -3337,6 +3338,14 @@ def run_conversation(
                     FailoverReason.timeout,
                     FailoverReason.overloaded,
                 }
+                # Track instant transport deaths (sub-2s: refused/reset before
+                # any bytes). Distinct from slow timeouts — those suggest
+                # congestion where backoff helps; a refused streak means the
+                # endpoint is down and every retry just extends the silence.
+                if _is_transport_failure and (time.time() - _attempt_started) < 2.0:
+                    _retry.fast_transport_failures += 1
+                else:
+                    _retry.fast_transport_failures = 0
                 # Z.AI Coding Plan GLM-5.2 overload 429s classify as
                 # `overloaded` (to spare the credential pool), but `overloaded`
                 # is excluded from `is_rate_limited` — the gate for the adaptive
@@ -3395,6 +3404,53 @@ def run_conversation(
                             compression_attempts = 0
                             _retry.primary_recovery_attempted = False
                             continue
+
+                # ── Instant-transport-failure fail-fast ──────────────────
+                # Reaching here with a streak means fallback either does not
+                # exist or already failed to absorb the outage. Burning the
+                # remaining max_retries (a dozen attempts with growing
+                # backoff) adds minutes of user-visible silence against an
+                # endpoint that is refusing connections outright — end the
+                # turn with an actionable error instead.
+                # HERMES_FAST_CONN_FAIL_LIMIT tunes the streak (0 disables).
+                try:
+                    _fast_limit = int(os.environ.get("HERMES_FAST_CONN_FAIL_LIMIT", "3") or 3)
+                except ValueError:
+                    _fast_limit = 3
+                if (
+                    _is_transport_failure
+                    and _fast_limit > 0
+                    and _retry.fast_transport_failures >= _fast_limit
+                    and not agent._has_pending_fallback()
+                ):
+                    agent._flush_status_buffer()
+                    _fail_summary = agent._summarize_api_error(api_error)
+                    _msg = (
+                        f"Provider unreachable: {_retry.fast_transport_failures} "
+                        f"consecutive instant connection failures "
+                        f"({_fail_summary}). Giving up early — the endpoint "
+                        f"appears to be down and no fallback provider is available."
+                    )
+                    agent._emit_status(f"❌ {_msg}")
+                    logger.error(
+                        "Fail-fast after %d instant transport failures %s error=%s",
+                        _retry.fast_transport_failures,
+                        agent._client_log_context(),
+                        api_error,
+                    )
+                    close_interrupted_tool_sequence(
+                        messages, f"[System: API call aborted — {_msg}]"
+                    )
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "final_response": _msg,
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "failed": True,
+                        "error": _msg,
+                        "failure_reason": classified.reason.value,
+                    }
 
                 # ── Auth-failure provider failover ───────────────────────
                 # A 401/403 that survives the per-provider credential-refresh
