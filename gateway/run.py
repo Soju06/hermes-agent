@@ -1482,6 +1482,37 @@ def _bridge_max_turns_from_config(home: "Path") -> None:
         os.environ["HERMES_MAX_ITERATIONS"] = str(agent_cfg["max_turns"])
 
 
+def _gateway_max_workers(default: int = 24) -> int:
+    """Size of the gateway's shared agent-turn thread pool.
+
+    Every gateway agent turn occupies one worker for its FULL duration —
+    including multi-hour kanban/background marathons and blocking process
+    waits. A batch of long turns can therefore consume the whole pool and
+    silently queue every other session's messages behind it (observed: 8+
+    concurrent 3-12h turns on a 10-worker pool starving all interactive
+    sessions for hours). Workers spend almost all their time blocked on
+    network I/O, so a pool well above the core count is cheap insurance.
+
+    Resolution order: config.yaml ``gateway.max_workers`` >
+    ``HERMES_GATEWAY_MAX_WORKERS`` env > default (24). Clamped to >= 2.
+    """
+    value = None
+    try:
+        cfg = _load_gateway_config()
+        gw = cfg.get("gateway") if isinstance(cfg, dict) else None
+        if isinstance(gw, dict) and gw.get("max_workers") is not None:
+            value = gw.get("max_workers")
+    except Exception:
+        pass
+    if value is None:
+        value = os.environ.get("HERMES_GATEWAY_MAX_WORKERS")
+    try:
+        workers = int(value) if value is not None else default
+    except (TypeError, ValueError):
+        workers = default
+    return max(2, workers)
+
+
 def _current_max_iterations() -> int:
     """Return the current per-turn iteration budget after runtime env refresh."""
     _reload_runtime_env_preserving_config_authority()
@@ -16414,7 +16445,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             executor = getattr(self, "_executor", None)
             if executor is None or getattr(executor, "_shutdown", False):
                 executor = concurrent.futures.ThreadPoolExecutor(
-                    max_workers=10,
+                    max_workers=_gateway_max_workers(),
                     thread_name_prefix="hermes-gateway",
                 )
                 self._executor = executor
