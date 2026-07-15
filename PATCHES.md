@@ -308,6 +308,16 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
   - `feat(gateway): persona-definition voice fallback for fresh sessions` _(SOUL identity+style head injected as the voice when no utterance exists yet — first-turn recaps keep the persona register; chosen over prior-session DB lookup)_
 - **touches:** `gateway/run.py`, `run_agent.py`, `tests/gateway/test_llm_activity_recap.py` _(new)_
 
+### 26. config-knob-bridges
+- **branch:** `soju/patches/config-knob-bridges`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — fork knob plumbing)_
+- **state:** `local-only`
+- **rationale:** Fork knobs were env-only, breaking the house convention (config.yaml is authoritative; env is the cross-process carrier/override — see upstream PR #64298). Bridge `agent.process_wait_cap` → `HERMES_PROCESS_WAIT_CAP` (#24) and `agent.fast_conn_fail_limit` → `HERMES_FAST_CONN_FAIL_LIMIT` (#23) in both the startup export block and the per-turn reload bridge. Recap interval already had the upstream `agent.gateway_notify_interval` bridge.
+- **commits:** (stacked on `soju/patches/prompt-tail-freeze`)
+  - `feat(gateway): config.yaml bridges for fork knobs`
+- **touches:** `gateway/run.py`, `tests/gateway/test_fork_knob_config_bridges.py` _(new)_
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -357,6 +367,7 @@ soju/patches/gateway-worker-pool ← runtime topic (stacked on prompt-tail-freez
 soju/patches/conn-error-fail-fast ← runtime topic (stacked on prompt-tail-freeze), instant transport-failure streak fail-fast
 soju/patches/background-first-waits ← runtime topic (stacked on prompt-tail-freeze), chained process waits escalate to notify_on_complete + end-turn
 soju/patches/llm-activity-recap ← runtime topic (stacked on prompt-tail-freeze), aux-LLM one-line recap heartbeat (display.long_running_notifications: recap)
+soju/patches/config-knob-bridges ← runtime topic (stacked on prompt-tail-freeze), config.yaml authority for fork knobs (process_wait_cap, fast_conn_fail_limit)
 soju/patches/request-client-reuse ← runtime topic (stacked on prompt-tail-freeze), per-request wire client reuse
 soju/patches/async-token-accounting ← runtime topic (stacked on prompt-tail-freeze), token accounting off the turn thread
 soju/patches/gateway-persist-trim ← runtime topic (stacked on prompt-tail-freeze), single-row routing UPSERT fast path
@@ -364,6 +375,7 @@ soju/patches/gateway-worker-pool ← runtime topic (stacked on prompt-tail-freez
 soju/patches/conn-error-fail-fast ← runtime topic (stacked on prompt-tail-freeze), instant transport-failure streak fail-fast
 soju/patches/background-first-waits ← runtime topic (stacked on prompt-tail-freeze), chained process waits escalate to notify_on_complete + end-turn
 soju/patches/llm-activity-recap ← runtime topic (stacked on prompt-tail-freeze), aux-LLM one-line recap heartbeat (display.long_running_notifications: recap)
+soju/patches/config-knob-bridges ← runtime topic (stacked on prompt-tail-freeze), config.yaml authority for fork knobs (process_wait_cap, fast_conn_fail_limit)
 soju/production                       ← rebuilt: base_commit + runtime patches only
                                          NEVER hand-edit. Always run `bin/hermes-patches rebuild` from `soju/fork-policy`.
 ```
