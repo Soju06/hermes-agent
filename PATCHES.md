@@ -265,6 +265,26 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
   - `4e28ace06 perf(gateway): single-row routing UPSERT fast path for metadata-only saves`
 - **touches:** `gateway/session.py`, `tests/gateway/test_routing_save_fast_path.py` _(new)_
 
+### 22. gateway-worker-pool
+- **branch:** `soju/patches/gateway-worker-pool`
+- **origin:** `local-author`
+- **upstream_pr:** _(none yet — upstream candidate after burn-in)_
+- **state:** `local-only`
+- **rationale:** The gateway's shared agent-turn ThreadPoolExecutor was hardcoded to 10 workers; every agent turn holds one worker for its full duration, so a kanban batch of 8+ concurrent multi-hour marathon turns (300-iteration workers, blocking process waits) starved every other session for hours — observed 9.1h between a finished turn's finalize and its delivery, and users reporting sessions "quietly frozen". Default raised to 24 and exposed as config.yaml `gateway.max_workers` with `HERMES_GATEWAY_MAX_WORKERS` env fallback (clamped ≥ 2); workers are network-I/O-bound so the larger pool is cheap.
+- **commits:** (stacked on `soju/patches/prompt-tail-freeze`)
+  - `183085fff perf(gateway): size the agent-turn pool from config, default 24`
+- **touches:** `gateway/run.py`, `tests/gateway/test_gateway_max_workers.py` _(new)_
+
+### 23. conn-error-fail-fast
+- **branch:** `soju/patches/conn-error-fail-fast`
+- **origin:** `local-author`
+- **upstream_pr:** _(none yet — upstream candidate after burn-in)_
+- **state:** `local-only`
+- **rationale:** Consecutive sub-2s transport failures (connection refused/reset before any bytes) mean the endpoint is down, not congested; with no fallback available the retry loop burned a dozen attempts with growing backoff (observed 13 attempts / 170-250s of user-visible silence per turn against a briefly-down codex-lb). Track the instant-failure streak on TurnRetryState and end the turn with an actionable error after `HERMES_FAST_CONN_FAIL_LIMIT` (default 3, 0 disables) once the fallback chain has had its chance; slow timeouts keep the full retry budget.
+- **commits:** (stacked on `soju/patches/prompt-tail-freeze`)
+  - `c6040f7c6 fix(agent): fail fast on instant transport-failure streaks`
+- **touches:** `agent/conversation_loop.py`, `agent/turn_retry_state.py`, `tests/agent/test_fast_transport_fail_fast.py` _(new)_
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -310,9 +330,13 @@ soju/patches/prompt-tail-freeze ← runtime topic (stacked on prompt-cache-stabi
 soju/patches/request-client-reuse ← runtime topic (stacked on prompt-tail-freeze), reuse OpenAI wire client across sequential calls
 soju/patches/async-token-accounting ← runtime topic (stacked on prompt-tail-freeze), token accounting off the turn thread
 soju/patches/gateway-persist-trim ← runtime topic (stacked on prompt-tail-freeze), single-row routing UPSERT fast path
+soju/patches/gateway-worker-pool ← runtime topic (stacked on prompt-tail-freeze), agent-turn pool 10→24, config gateway.max_workers
+soju/patches/conn-error-fail-fast ← runtime topic (stacked on prompt-tail-freeze), instant transport-failure streak fail-fast
 soju/patches/request-client-reuse ← runtime topic (stacked on prompt-tail-freeze), per-request wire client reuse
 soju/patches/async-token-accounting ← runtime topic (stacked on prompt-tail-freeze), token accounting off the turn thread
 soju/patches/gateway-persist-trim ← runtime topic (stacked on prompt-tail-freeze), single-row routing UPSERT fast path
+soju/patches/gateway-worker-pool ← runtime topic (stacked on prompt-tail-freeze), agent-turn pool 10→24, config gateway.max_workers
+soju/patches/conn-error-fail-fast ← runtime topic (stacked on prompt-tail-freeze), instant transport-failure streak fail-fast
 soju/production                       ← rebuilt: base_commit + runtime patches only
                                          NEVER hand-edit. Always run `bin/hermes-patches rebuild` from `soju/fork-policy`.
 ```
