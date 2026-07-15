@@ -314,7 +314,7 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **upstream_pr:** _(none — fork knob plumbing)_
 - **state:** `local-only`
 - **rationale:** Fork knobs were env-only, breaking the house convention (config.yaml is authoritative; env is the cross-process carrier/override — see upstream PR #64298). Bridge `agent.process_wait_cap` → `HERMES_PROCESS_WAIT_CAP` (#24) and `agent.fast_conn_fail_limit` → `HERMES_FAST_CONN_FAIL_LIMIT` (#23) in both the startup export block and the per-turn reload bridge. Recap interval already had the upstream `agent.gateway_notify_interval` bridge.
-- **commits:** (stacked on `soju/patches/prompt-tail-freeze`)
+- **commits:** (stacked on `soju/patches/prompt-tail-freeze` + `soju/patches/gateway-max-iterations-config-authority` tip — shares the bridge function)
   - `feat(gateway): config.yaml bridges for fork knobs`
 - **touches:** `gateway/run.py`, `tests/gateway/test_fork_knob_config_bridges.py` _(new)_
 
