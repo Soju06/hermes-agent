@@ -3427,17 +3427,31 @@ class AIAgent:
                 if len(recent_tools) >= 5:
                     break
 
-        # The agent's own narration is the strongest recap signal.
-        last_say = ""
+        # The agent's own recent utterances carry the strongest recap
+        # signal AND define the voice: persona, tone, and language all live
+        # in how the agent already talks in this conversation. Skip
+        # synthetic/interrupt notices — they aren't the agent's voice.
+        def _is_real_utterance(text: str) -> bool:
+            lowered = text.strip().lower()
+            return bool(lowered) and not (
+                lowered.startswith("operation interrupted")
+                or lowered.startswith("(tool call")
+                or lowered.startswith("[")
+            )
+
+        voice_samples: list = []
         for m in reversed(msgs):
+            if len(voice_samples) >= 3:
+                break
             if (
                 isinstance(m, dict)
                 and m.get("role") == "assistant"
                 and isinstance(m.get("content"), str)
-                and m["content"].strip()
+                and _is_real_utterance(m["content"])
             ):
-                last_say = " ".join(m["content"].strip().split())[:200]
-                break
+                voice_samples.append(" ".join(m["content"].strip().split())[:180])
+        voice_samples.reverse()
+
         last_result = ""
         for m in reversed(msgs):
             if (
@@ -3449,32 +3463,12 @@ class AIAgent:
                 last_result = " ".join(m["content"].strip().split())[:150]
                 break
 
-        # Language hint from a wide conversation tail — the goal alone is
-        # unreliable (bracket-wrapped English coordinator notes and injected
-        # reminders in Korean conversations broke language mirroring in live
-        # evaluation; post-interrupt snapshots have English-only tails).
-        # The conversation language is defined by what the USER writes —
-        # tool results and injected templates flood the tail with English.
-        _tail_parts = [goal, last_say, goal_fallback]
-        _seen_users = 0
-        for m in reversed(msgs):
-            if _seen_users >= 30:
-                break
-            if isinstance(m, dict) and m.get("role") == "user" and isinstance(m.get("content"), str):
-                _tail_parts.append(m["content"][:400])
-                _seen_users += 1
-        _tail_text = " ".join(_tail_parts)
-        language_hint = (
-            "Korean" if re.search(r"[\uac00-\ud7a3]", _tail_text) else ""
-        )
-
         summary = self.get_activity_summary()
         return {
             "goal": goal,
             "recent_tools": list(reversed(recent_tools)),
-            "last_assistant_text": last_say,
+            "voice_samples": voice_samples,
             "last_tool_result": last_result,
-            "language_hint": language_hint,
             "current_tool": summary.get("current_tool"),
             "seconds_since_activity": summary.get("seconds_since_activity"),
             "last_activity_desc": summary.get("last_activity_desc"),
