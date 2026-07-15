@@ -329,6 +329,104 @@ async def test_hook_runtime_override_model_half_is_refused_under_code_skew(monke
 
 
 @pytest.mark.asyncio
+async def test_hook_prepend_applies_to_plain_chat(monkeypatch):
+    """A plugin returning {'action': 'prepend', 'text': ...} prefixes event.text."""
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+
+    seen_text = {}
+
+    async def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            return [{"action": "prepend", "text": "[INBOX_MATTER det_key=x]"}]
+        return []
+
+    async def _capture(event, source, _quick_key, _run_generation):
+        seen_text["value"] = event.text
+        return "ok"
+
+    monkeypatch.setattr("hermes_cli.plugins.ainvoke_hook", _fake_hook)
+
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._handle_message_with_agent = _capture
+
+    await runner._handle_message(_make_event("hello there"))
+
+    assert seen_text.get("value") == "[INBOX_MATTER det_key=x]\n\nhello there"
+
+
+@pytest.mark.asyncio
+async def test_hook_prepend_dropped_for_slash_command(monkeypatch):
+    """Prepends must not mutate slash commands.
+
+    is_command()/get_command() key off text.startswith("/"): a prepended
+    advisory marker would demote a recognized command (/model, /status, ...)
+    into plain chat that falls through to the agent (live incident
+    2026-07-15: /model in an inbox-matter Discord thread answered by the
+    agent's model_status tool instead of the interactive picker).
+    """
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+
+    async def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            return [{"action": "prepend", "text": "[INBOX_MATTER det_key=x]"}]
+        return []
+
+    seen = {}
+
+    async def _capture_model(event):
+        seen["model_event_text"] = event.text
+        return "picker"
+
+    async def _capture_agent(event, source, _quick_key, _run_generation):
+        seen["agent_event_text"] = event.text
+        return "ok"
+
+    monkeypatch.setattr("hermes_cli.plugins.ainvoke_hook", _fake_hook)
+
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._handle_model_command = _capture_model
+    runner._handle_message_with_agent = _capture_agent
+
+    result = await runner._handle_message(_make_event("/model"))
+
+    # The command must reach the /model handler with its text intact —
+    # not fall through to the agent as prepended plain chat.
+    assert seen.get("model_event_text") == "/model"
+    assert "agent_event_text" not in seen
+    assert result == "picker"
+
+
+@pytest.mark.asyncio
+async def test_hook_prepend_kept_for_path_like_plain_chat(monkeypatch):
+    """Text that merely starts with ``/`` but names no command (a pasted path) is plain chat for
+    the agent, so its advisory prepend still applies; only real commands drop it."""
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+
+    async def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            return [{"action": "prepend", "text": "[INBOX_MATTER det_key=x]"}]
+        return []
+
+    seen = {}
+
+    async def _capture_agent(event, source, _quick_key, _run_generation):
+        seen["agent_event_text"] = event.text
+        return "ok"
+
+    monkeypatch.setattr("hermes_cli.plugins.ainvoke_hook", _fake_hook)
+
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._handle_message_with_agent = _capture_agent
+
+    await runner._handle_message(_make_event("/home/me/notes.txt summarize this"))
+
+    assert seen.get("agent_event_text") == "[INBOX_MATTER det_key=x]\n\n/home/me/notes.txt summarize this"
+
+
+@pytest.mark.asyncio
 async def test_hook_allow_falls_through_to_auth(monkeypatch):
     """A plugin returning {'action': 'allow'} continues to normal dispatch."""
     _clear_auth_env(monkeypatch)

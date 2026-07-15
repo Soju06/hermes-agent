@@ -76,7 +76,8 @@ class GatewayInboundHooksMixin:
     ) -> Optional[MessageEvent]:
         """Run the ``pre_gateway_dispatch`` plugin hook; None = drop, else the (maybe rewritten) event.
         Results: ``{"action": "skip"}`` → drop; ``{"action": "rewrite", "text"}`` → replace ``event.text``;
-        ``{"action": "prepend", "text"}`` → prepend text (accumulates); ``{"action": "runtime_override", ...}``
+        ``{"action": "prepend", "text"}`` → prepend text (accumulates; dropped when the event is a slash
+        command); ``{"action": "runtime_override", ...}``
         → staged on the event and applied by ``_hm_apply_runtime_override_directives`` only after auth and
         the emergency-stop gate (``_hm_apply_producer_runtime_overrides`` before a producer commit);
         ``allow``/None → normal dispatch. On the messaging path it runs BEFORE
@@ -141,6 +142,14 @@ class GatewayInboundHooksMixin:
             if _action == "allow":
                 break
 
+        if _hook_prepends and (_command := event.get_command()):
+            # Slash commands must reach the dispatcher unmodified: is_command()/get_command() key off
+            # text.startswith("/"), so a prepended advisory would demote /model, /status, etc. into
+            # plain chat that falls through to the agent. Command handlers can't consume hook context
+            # anyway, so on command messages prepends are dropped (debug log), not deferred. Path-like
+            # text (``/home/...``, no command name) is plain chat and keeps its prepends.
+            logger.debug("pre_gateway_dispatch prepend dropped for slash command /%s", _command)
+            _hook_prepends = []
         if _hook_prepends:
             _combined = "\n\n".join(_hook_prepends)
             _original = event.text or ""
