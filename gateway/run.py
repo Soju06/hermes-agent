@@ -1329,6 +1329,29 @@ _env_path = _hermes_home / '.env'
 load_hermes_dotenv(hermes_home=_hermes_home, project_env=Path(__file__).resolve().parents[1] / '.env')
 
 
+def _read_config_max_iterations() -> int | None:
+    """Return config.yaml's authoritative agent.max_turns value when present."""
+    config_path = _hermes_home / 'config.yaml'
+    if not config_path.exists():
+        return None
+    try:
+        import yaml as _yaml
+        with open(config_path, encoding="utf-8") as f:
+            cfg = _yaml.safe_load(f) or {}
+        from hermes_cli.config import _expand_env_vars
+        cfg = _expand_env_vars(cfg)
+    except Exception:
+        return None
+
+    agent_cfg = cfg.get("agent", {})
+    if isinstance(agent_cfg, dict) and agent_cfg.get("max_turns") is not None:
+        return int(agent_cfg["max_turns"])
+    # Legacy root-level max_turns compatibility.  Nested agent.max_turns wins.
+    if cfg.get("max_turns") is not None:
+        return int(cfg["max_turns"])
+    return None
+
+
 def _reload_runtime_env_preserving_config_authority() -> None:
     """Reload .env for fresh credentials without letting stale .env override config.
 
@@ -1378,18 +1401,39 @@ def _bridge_max_turns_from_config(home: "Path") -> None:
             cfg = managed_scope.apply_managed_overlay(cfg)
         except Exception:
             pass
+        agent_cfg = cfg.get("agent") or {}
+        max_iterations = agent_cfg.get("max_turns")
+        if max_iterations is not None:
+            os.environ["HERMES_MAX_ITERATIONS"] = str(max_iterations)
+        # Fork knobs ride the same config-authoritative bridge (config.yaml
+        # agent.* wins over stale env; env stays as the no-config override).
+        if "process_wait_cap" in agent_cfg:
+            os.environ["HERMES_PROCESS_WAIT_CAP"] = str(agent_cfg["process_wait_cap"])
+        if "fast_conn_fail_limit" in agent_cfg:
+            os.environ["HERMES_FAST_CONN_FAIL_LIMIT"] = str(agent_cfg["fast_conn_fail_limit"])
     except Exception:
         return
 
-    agent_cfg = cfg.get("agent", {})
-    if isinstance(agent_cfg, dict) and "max_turns" in agent_cfg:
-        os.environ["HERMES_MAX_ITERATIONS"] = str(agent_cfg["max_turns"])
-    # Fork knobs ride the same config-authoritative bridge (config.yaml
-    # agent.* wins over stale env; env stays as the no-config override).
-    if isinstance(agent_cfg, dict) and "process_wait_cap" in agent_cfg:
-        os.environ["HERMES_PROCESS_WAIT_CAP"] = str(agent_cfg["process_wait_cap"])
-    if isinstance(agent_cfg, dict) and "fast_conn_fail_limit" in agent_cfg:
-        os.environ["HERMES_FAST_CONN_FAIL_LIMIT"] = str(agent_cfg["fast_conn_fail_limit"])
+
+def _resolve_gateway_max_iterations(
+    default: int = 90,
+    *,
+    reload_runtime_env: bool = False,
+) -> int:
+    """Resolve the per-agent iteration cap with config.yaml as source of truth.
+
+    ``~/.hermes/.env`` may contain stale ``HERMES_MAX_ITERATIONS`` values from
+    older setup flows.  Always prefer config.yaml ``agent.max_turns`` when it is
+    present; fall back to the environment only when config omits the key.
+    """
+    if reload_runtime_env:
+        _reload_runtime_env_preserving_config_authority()
+
+    max_iterations = _read_config_max_iterations()
+    if max_iterations is not None:
+        os.environ["HERMES_MAX_ITERATIONS"] = str(max_iterations)
+        return max_iterations
+    return int(os.getenv("HERMES_MAX_ITERATIONS", str(default)))
 
 
 def _current_max_iterations() -> int:
@@ -6843,7 +6887,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # config.yaml → env bridge did the right thing at a glance (instead
         # of silently running at a stale .env value for weeks).
         try:
-            _effective_max_iter = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
+            _effective_max_iter = _resolve_gateway_max_iterations()
             logger.info(
                 "Agent budget: max_iterations=%d (agent.max_turns from config.yaml, "
                 "or HERMES_MAX_ITERATIONS from .env, or default 90)",
@@ -13598,7 +13642,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
 
             pr = self._provider_routing
-            max_iterations = _current_max_iterations()
+            max_iterations = _resolve_gateway_max_iterations(reload_runtime_env=True)
             reasoning_config = self._resolve_session_reasoning_config(source=source)
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
@@ -18703,6 +18747,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # --session-key argv, a separate process) — so removing this in-process
             # gateway write does not affect any of them.
 
+
+            # Re-read .env and config for fresh credentials (gateway is long-lived,
+            # keys may change without restart). Resolve the budget after that reload
+            # so config.yaml agent.max_turns remains authoritative over stale .env.
+            max_iterations = _resolve_gateway_max_iterations(reload_runtime_env=True)
+
             # Map platform enum to the platform hint key the agent understands.
             # Platform.LOCAL ("local") maps to "cli"; others pass through as-is.
             platform_key = "cli" if source.platform == Platform.LOCAL else source.platform.value
@@ -18722,8 +18772,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             if cfg_channel_prompt:
                 combined_ephemeral = (combined_ephemeral + "\n\n" + cfg_channel_prompt).strip()
-
-            max_iterations = _current_max_iterations()
 
             try:
                 model, runtime_kwargs = self._resolve_session_agent_runtime(
