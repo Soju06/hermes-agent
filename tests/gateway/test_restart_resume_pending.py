@@ -1530,10 +1530,27 @@ async def test_startup_restore_waits_for_resume_before_draining_inbound():
 
 
 @pytest.mark.asyncio
-async def test_restart_banner_uses_try_to_resume_wording():
-    """The notification sent before drain should hedge the resume promise
-    — the session-continuity fix is best-effort (stuck-loop counter can
-    still escalate to suspended)."""
+async def test_restart_banner_promises_automatic_resume():
+    """With durable turns (default) the interrupted turn resumes by itself
+    after the restart — the banner must say so instead of asking the user
+    to send a message."""
+    runner, adapter = make_restart_runner()
+    runner._restart_requested = True
+    runner._running_agents["agent:main:telegram:dm:999"] = MagicMock()
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    assert len(adapter.sent) == 1
+    msg = adapter.sent[0]
+    assert "restarting" in msg
+    assert "resume automatically" in msg
+    assert "Send any message" not in msg
+
+
+@pytest.mark.asyncio
+async def test_restart_banner_legacy_wording_when_turn_resume_disabled(monkeypatch):
+    """Kill switch restores the legacy best-effort wording."""
+    monkeypatch.setenv("HERMES_GATEWAY_TURN_RESUME", "0")
     runner, adapter = make_restart_runner()
     runner._restart_requested = True
     runner._running_agents["agent:main:telegram:dm:999"] = MagicMock()
@@ -1559,8 +1576,8 @@ async def test_restart_notifies_home_channel_even_without_active_sessions():
     await runner._notify_active_sessions_of_shutdown()
 
     assert adapter.sent == [
-        "⚠️ Gateway restarting — Your current task will be interrupted. "
-        "Send any message after restart and I'll try to resume where you left off."
+        "⚠️ Gateway restarting — Your current task will pause and resume "
+        "automatically after the restart."
     ]
 
 
