@@ -42,7 +42,9 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **upstream_pr:** _(none — dogfood memory hygiene)_
 - **state:** `local-only`
 - **rationale:** Memory `add`/`replace` tool calls require an explicit suitability reason explaining why USER/MEMORY is the right store rather than a skill, Graphiti, or session history. The reason is a guardrail only and is not persisted with the entry.
-- **commit:** `deb240f9d feat(memory): require write reason for memory updates`
+- **commits:**
+  - `deb240f9d feat(memory): require write reason for memory updates`
+  - `11758d1c8 test(memory): pass write reason in null-target dispatcher test`
 - **touches:** `agent/agent_runtime_helpers.py`, `agent/tool_executor.py`, `tools/memory_tool.py`, `tests/tools/test_memory_tool.py`, `tests/tools/test_memory_tool_schema.py`
 
 ### 3. todo-progress-display
