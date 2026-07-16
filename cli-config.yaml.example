@@ -1596,6 +1596,14 @@ delegation:
   #                                           # delegation.model to an inexpensive one — children carry the
   #                                           # vast majority of tokens, so this is where spend is cut while
   #                                           # planning quality stays with the frontier parent.
+  # default_route: ""                         # model_routes route used when a delegate_task call names no
+  #                                           # route (empty/absent = delegation.model/provider above).
+  #                                           # Must name a route declared under model_routes.routes.
+  #                                           # When routes are declared, delegate_task also grows a 'route'
+  #                                           # enum param (top-level and per-task in tasks[]; per-task wins):
+  #                                           # the child runs on the route's health-checked provider/model,
+  #                                           # and the route's reasoning_effort beats delegation.reasoning_effort.
+  #                                           # Unknown or fully-unhealthy routes error — no silent fallback.
 
 # =============================================================================
 # Honcho Integration (Cross-Session User Modeling)
