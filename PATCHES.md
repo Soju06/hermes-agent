@@ -401,6 +401,16 @@ no longer part of the production stack.
   - `ffee9ea3c feat(routing): route-enum delegation on delegate_task (ADR-003 Phase 3a — supersedes and drops patch #5)`
 - **touches:** `hermes_cli/model_routes.py` (new), `hermes_cli/config.py`, `gateway/model_router.py` (new), `gateway/run.py`, `gateway/slash_commands.py`, `tools/delegate_tool.py`, `run_agent.py`, `cli-config.yaml.example`, `tests/conftest.py`, `tests/hermes_cli/test_model_routes.py` (new), `tests/gateway/test_model_router.py` (new), `tests/tools/test_delegate.py`
 
+### 35. audience-personas
+- **branch:** `soju/patches/audience-personas`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — generic and config-off-by-default, upstream candidate once soaked)_
+- **state:** `local-only`
+- **rationale:** Audience-mode persona injection: when `HERMES_HOME/personas/modes.yaml` exists, a mode is selected per session as a pure deterministic function of session-constant inputs (platform/chat_type/chat_id/chat_name/user_id) — first-match rules (string-or-list exact match, chat_name case-insensitive, missing key = wildcard, AND), non-owner guard applied after rules (non-empty `user_id` not in `owners[platform]` forces `guards.non_owner_mode`; missing owners entry fails safe; empty user_id skips), `default_mode` fallback — and the mode's persona markdown is injected as stable-tier slot #2 right after the SOUL.md/DEFAULT_AGENT_IDENTITY identity block, through the same threat scan + truncation cap as SOUL.md. With no modes.yaml the build is byte-identical (strict no-op); all failure paths degrade to the no-op at DEBUG. Cache correctness: an `AudienceMode: <mode>` line joins the volatile tail only while active, and `_stored_prompt_matches_runtime` recomputes the expected mode via a cheap mode-only resolver (both-absent passes → pre-deploy stored prompts stay valid; mismatch/one-sided rebuilds exactly once per session). SOUL.md plumbing parity: `personas/` in profile clone + default-export include set, `hermes_config_mod` threat pattern extended to `.hermes/personas/` paths. The `artifact_register` section of modes.yaml is a tone-gate plugin contract, deliberately not consumed by core.
+- **commits:** (stacked on `soju/patches/model-routing` tip)
+  - `3e64daea6 feat(prompt): audience-mode persona injection from personas/modes.yaml`
+- **touches:** `agent/audience_persona.py` (new), `agent/system_prompt.py`, `agent/conversation_loop.py`, `run_agent.py`, `hermes_cli/profiles.py`, `tools/threat_patterns.py`, `tests/agent/test_audience_persona.py` (new)
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -465,6 +475,8 @@ soju/patches/session-db-read-path-split ← runtime topic, per-thread read-only 
 soju/patches/fts5-cjk-bigram-index ← runtime topic (stacked on read-path-split), cjk_unicode61 bigram FTS5 index replaces trigram+LIKE
 soju/patches/search-slow-query-log ← runtime topic (stacked on fts5-cjk-bigram-index), slow session-search log with path attribution
 soju/patches/fts-v2-config-authority ← runtime topic (stacked on search-slow-query-log), config.yaml authority + default-on + v1 retirement
+soju/patches/model-routing ← runtime topic, ADR-003 model routing core (catalog + health-aware resolver + dynamic router + route-enum delegation)
+soju/patches/audience-personas ← runtime topic (stacked on model-routing), audience-mode persona injection from personas/modes.yaml
 soju/production                       ← rebuilt: base_commit + runtime patches only
                                          NEVER hand-edit. Always run `bin/hermes-patches rebuild` from `soju/fork-policy`.
 ```
