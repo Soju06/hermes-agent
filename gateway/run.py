@@ -1560,6 +1560,10 @@ def _bridge_max_turns_from_config(home: "Path") -> None:
             os.environ["HERMES_PROCESS_WAIT_CAP"] = str(agent_cfg["process_wait_cap"])
         if "fast_conn_fail_limit" in agent_cfg:
             os.environ["HERMES_FAST_CONN_FAIL_LIMIT"] = str(agent_cfg["fast_conn_fail_limit"])
+        if "fts_v2_read" in agent_cfg:
+            os.environ["HERMES_FTS_V2_READ"] = str(agent_cfg["fts_v2_read"])
+        if "search_slow_ms" in agent_cfg:
+            os.environ["HERMES_SEARCH_SLOW_MS"] = str(agent_cfg["search_slow_ms"])
     except Exception:
         return
 
@@ -1873,6 +1877,10 @@ if _config_path.exists():
                 os.environ["HERMES_PROCESS_WAIT_CAP"] = str(_agent_cfg["process_wait_cap"])
             if "fast_conn_fail_limit" in _agent_cfg:
                 os.environ["HERMES_FAST_CONN_FAIL_LIMIT"] = str(_agent_cfg["fast_conn_fail_limit"])
+            if "fts_v2_read" in _agent_cfg:
+                os.environ["HERMES_FTS_V2_READ"] = str(_agent_cfg["fts_v2_read"])
+            if "search_slow_ms" in _agent_cfg:
+                os.environ["HERMES_SEARCH_SLOW_MS"] = str(_agent_cfg["search_slow_ms"])
             if "gateway_turn_resume" in _agent_cfg:
                 os.environ["HERMES_GATEWAY_TURN_RESUME"] = str(
                     _agent_cfg["gateway_turn_resume"]
