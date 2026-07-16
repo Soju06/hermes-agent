@@ -56,6 +56,7 @@ from agent.tool_dispatch_helpers import (
 from session_rules.turns import _is_multimodal_tool_result, _multimodal_text_summary
 from tools.terminal_tool_lifecycle import get_active_env
 from tools.thread_context import propagate_context_to_thread
+from tools.perf_advisor import perf_advisory
 from tools.tool_result_storage import (
     maybe_persist_tool_result,
     enforce_turn_budget,
@@ -1089,6 +1090,19 @@ def _emit_tool_complete_and_risk(agent, ref: _ToolCallRef, result, risk_metadata
         )
 
 
+def _with_perf_advisory(persisted_result, function_name: str, function_args, tool_duration: float):
+    """Slow-tool perf advisor: ONE advisory line when a slow terminal call matches a known
+    antipattern (tree scans, sleep polling, long foreground jobs), appended at the moment the
+    model just paid for the slow call. Advisory only; kill switch HERMES_PERF_ADVISOR=0."""
+    perf_hint = perf_advisory(function_name, function_args, tool_duration)
+    if perf_hint:
+        if _is_multimodal_tool_result(persisted_result):
+            _append_subdir_hint_to_multimodal(persisted_result, perf_hint)
+        elif isinstance(persisted_result, str):
+            persisted_result += perf_hint
+    return persisted_result
+
+
 def _commit_tool_result(
     agent,
     messages: list,
@@ -1169,6 +1183,8 @@ def _commit_tool_result(
             _append_subdir_hint_to_multimodal(persisted_result, subdir_hints)
         else:
             persisted_result += subdir_hints
+
+    persisted_result = _with_perf_advisory(persisted_result, function_name, function_args, tool_duration)
 
     # Multimodal dicts become an OpenAI-style content list; text-only servers get a
     # string-safe fallback so a rejected image result never poisons history.
