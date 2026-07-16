@@ -311,6 +311,7 @@ def _model_switch(agent, args: dict, ctx: InlineToolContext) -> Any:
         model=args.get("model"),
         provider=args.get("provider"),
         reasoning_effort=args.get("reasoning_effort"),
+        route=args.get("route"),
         scope=args.get("scope", "session"),
         reason=args.get("reason"),
     )
