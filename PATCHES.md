@@ -356,8 +356,9 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **upstream_pr:** _(none yet — good candidate after soak; the shared-SessionDB convoy exists upstream too)_
 - **state:** `local-only`
 - **rationale:** The gateway hands ONE SessionDB to every agent (gateway/run.py `session_db=...`), so all recall/browse reads queued behind all writer flushes on `self._lock` — one Python lock in front of a WAL DB that natively supports concurrent readers. Measured production convoy (2026-07-16 trace analysis): a 0.23s FTS query stretched to 112s, a browse flush to 137s, while 6-8 concurrent turns flushed hundreds of tool results; session_search averaged 12.4s in-gateway vs 0.26s standalone. Fix: under WAL the seven read-only recall methods run on per-thread `mode=ro` connections via `_read_ctx()` with no lock; fresh read transactions per statement preserve read-your-committed-writes. Non-WAL (NFS DELETE fallback) or read-conn open failure falls back to the legacy locked path.
-- **commits:**
-  - `e7682653c perf(state): read-path split — per-thread read-only connections for recall reads`
+- **commits:** (stacked on `soju/patches/hook-prepend-command-safety` tip; merges `soju/patches/async-token-accounting` to co-resolve the SessionDB __init__/close/get_session hunks)
+  - `90a6ac9a6 perf(state): read-path split — per-thread read-only connections for recall reads`
+  - `2972cb535 Merge branch 'soju/patches/async-token-accounting' (conflict resolution: flush_token_counts before read_ctx in get_session)`
 - **touches:** `hermes_state.py`, `tests/test_session_db_read_path_split.py` (new)
 
 ## State Vocabulary
