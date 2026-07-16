@@ -12,8 +12,9 @@ quota exhaustion, 402/429, 5xx, connection failures) count as unhealthy;
 auth-scoped 401/403 (or a malformed probe 400) are treated as healthy so a
 probe defect can never freeze routing.
 
-``static_rules`` are parsed and validated here but NOT matched or enforced —
-condition semantics land in Phase 2.
+``static_rules`` are parsed and validated here; condition matching and
+enforcement live in the gateway pre-dispatch router (``gateway/model_router.py``,
+Phase 2), as does the ``router`` sub-block that configures it.
 """
 
 import json
@@ -57,12 +58,22 @@ _CREDIT_SNIFF_KEYWORDS = ("credit", "insufficient", "quota", "billing")
 _HEALTH_ENV = "HERMES_MODEL_ROUTES_HEALTH"
 _HEALTH_TEST_ENV = "HERMES_MODEL_ROUTES_HEALTH_TEST"
 
-_SECTION_KEYS = {"routes", "health", "static_rules"}
+_SECTION_KEYS = {"routes", "health", "static_rules", "router"}
 _ROUTE_KEYS = {"description", "provider", "model", "reasoning_effort", "accepted", "fallbacks"}
 _FALLBACK_KEYS = {"provider", "model", "reasoning_effort"}
 _HEALTH_KEYS = {"enabled", "cache_path", "ok_ttl_seconds", "fail_ttl_seconds", "probe_timeout_seconds"}
 _HEALTH_NUMERIC_KEYS = ("ok_ttl_seconds", "fail_ttl_seconds", "probe_timeout_seconds")
-_RULE_KEYS = {"route", "when", "reason"}
+_RULE_KEYS = {"name", "route", "when", "reason"}
+_ROUTER_KEYS = {
+    "mode", "model", "timeout_ms", "recent_turns", "normal_downgrade_streak",
+    "chat_route", "label_routes", "decision_log",
+}
+_ROUTER_MODES = ("off", "shadow", "enforce")
+# Classifier labels that may map to a route. NORMAL is not mappable — its
+# downgrade target is ``chat_route`` (hysteresis-gated).
+_ROUTER_LABELS = ("SYSTEM_DEV", "FRONTEND_DEV", "DOCUMENT_WORK")
+_ROUTER_NUMERIC_KEYS = ("timeout_ms", "recent_turns", "normal_downgrade_streak")
+DEFAULT_ROUTER_MODEL = "gemini-3-flash-preview"
 
 
 # =============================================================================
@@ -102,12 +113,30 @@ class HealthConfig:
         return get_hermes_home() / "state" / _HEALTH_CACHE_FILENAME
 
 
+@dataclass(frozen=True)
+class RouterConfig:
+    """``model_routes.router`` — the gateway pre-dispatch dynamic router."""
+
+    mode: str = "off"  # off | shadow | enforce
+    model: str = DEFAULT_ROUTER_MODEL
+    timeout_ms: float = 8000.0
+    recent_turns: int = 5
+    normal_downgrade_streak: int = 3
+    chat_route: str = ""  # NORMAL downgrade target; "" = downgrades disabled
+    label_routes: Tuple[Tuple[str, str], ...] = ()  # (label, route-name) pairs
+    decision_log: str = ""  # "" → get_hermes_home()/logs/model_router_decisions.jsonl
+
+    def label_route_map(self) -> Dict[str, str]:
+        return dict(self.label_routes)
+
+
 @dataclass
 class RouteCatalog:
     # Only VALID routes; declaration order preserved (dict insertion order).
     routes: Dict[str, RouteSpec] = field(default_factory=dict)
     health: HealthConfig = field(default_factory=HealthConfig)
-    static_rules: List[Dict[str, Any]] = field(default_factory=list)  # parse-only in Phase 1
+    static_rules: List[Dict[str, Any]] = field(default_factory=list)  # matched in gateway/model_router.py
+    router: RouterConfig = field(default_factory=RouterConfig)
     issues: List[ConfigIssue] = field(default_factory=list)
 
 
@@ -583,9 +612,24 @@ def _parse_static_rules(
             issues.append(ConfigIssue(
                 "error",
                 f"{prefix}: 'when' must be a non-empty mapping",
-                "Condition keys are opaque in Phase 1; matching semantics land in Phase 2",
+                "Conditions: is_owner/chat_id/parent_chat_id/user_id/platform/chat_type "
+                "({eq|in|not_in: ...}) and text_matches_any: [regex, ...]",
             ))
             dropped = True
+        if isinstance(when, dict) and "is_owner" in when:
+            # Same footgun class as health.enabled: YAML string "false" is
+            # truthy, and bool-coercing it would invert the author's intent.
+            # The matcher (gateway/model_router.py) requires a real bool and
+            # never matches otherwise — surface that at parse time.
+            _owner_cond = when["is_owner"]
+            _owner_eq = _owner_cond.get("eq") if isinstance(_owner_cond, dict) else None
+            if not isinstance(_owner_cond, dict) or set(_owner_cond) != {"eq"} or not isinstance(_owner_eq, bool):
+                issues.append(ConfigIssue(
+                    "warning",
+                    f"{prefix}: is_owner condition must be {{eq: <boolean>}} "
+                    f"(got {_owner_cond!r}) — this rule will never match",
+                    "Use an unquoted YAML boolean: is_owner: {eq: false}",
+                ))
         reason = item.get("reason")
         if reason is not None and not isinstance(reason, str):
             issues.append(ConfigIssue(
@@ -593,9 +637,160 @@ def _parse_static_rules(
                 f"{prefix}: 'reason' must be a string (got {type(reason).__name__})",
                 "Use a short human-readable explanation, or omit it",
             ))
+        rule_name = item.get("name")
+        if rule_name is not None and (not isinstance(rule_name, str) or not rule_name.strip()):
+            issues.append(ConfigIssue(
+                "warning",
+                f"{prefix}: 'name' must be a non-empty string (got {rule_name!r}) — ignored",
+                "Name the rule for decision-log attribution, or omit it",
+            ))
         if not dropped:
             rules.append(item)
     return rules
+
+
+def _parse_router(
+    raw: Any,
+    routes: Dict[str, RouteSpec],
+    issues: List[ConfigIssue],
+) -> RouterConfig:
+    if raw is None:
+        return RouterConfig()
+    if not isinstance(raw, dict):
+        issues.append(ConfigIssue(
+            "error",
+            f"model_routes: 'router' must be a mapping (got {type(raw).__name__}) — router stays off",
+            f"Supported router keys: {', '.join(sorted(_ROUTER_KEYS))}",
+        ))
+        return RouterConfig()
+
+    for key in sorted(set(raw) - _ROUTER_KEYS):
+        issues.append(ConfigIssue(
+            "warning",
+            f"model_routes: unknown key '{key}' under router ignored",
+            f"Supported router keys: {', '.join(sorted(_ROUTER_KEYS))}",
+        ))
+
+    kwargs: Dict[str, Any] = {}
+
+    if "mode" in raw:
+        mode_raw = raw["mode"]
+        # YAML 1.1 parses an unquoted ``off`` as boolean False — accept it as
+        # the documented default rather than erroring on the example spelling.
+        if mode_raw is False:
+            kwargs["mode"] = "off"
+        elif isinstance(mode_raw, str) and mode_raw.strip().lower() in _ROUTER_MODES:
+            kwargs["mode"] = mode_raw.strip().lower()
+        else:
+            issues.append(ConfigIssue(
+                "error",
+                f"model_routes: router.mode must be one of {'|'.join(_ROUTER_MODES)} "
+                f"(got {mode_raw!r}) — router stays off",
+                "Example: mode: shadow",
+            ))
+
+    if "model" in raw:
+        model = raw["model"]
+        if isinstance(model, str) and model.strip():
+            kwargs["model"] = model.strip()
+        else:
+            issues.append(ConfigIssue(
+                "warning",
+                f"model_routes: router.model must be a non-empty string "
+                f"(got {model!r}) — default used",
+                f"Example: model: {DEFAULT_ROUTER_MODEL}",
+            ))
+
+    for key in _ROUTER_NUMERIC_KEYS:
+        if key not in raw:
+            continue
+        value = raw[key]
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+            kwargs[key] = int(value) if key != "timeout_ms" else float(value)
+        else:
+            issues.append(ConfigIssue(
+                "warning",
+                f"model_routes: router.{key} must be a number > 0 ({value!r}) — default used",
+                f"Example: {key}: {getattr(RouterConfig(), key)}",
+            ))
+
+    valid_names = {_norm(name) for name in routes}
+
+    if "chat_route" in raw:
+        chat_route = raw["chat_route"]
+        if not isinstance(chat_route, str):
+            issues.append(ConfigIssue(
+                "warning",
+                f"model_routes: router.chat_route must be a string "
+                f"(got {type(chat_route).__name__}) — downgrades disabled",
+                'Use "" to disable NORMAL→chat downgrades',
+            ))
+        elif chat_route.strip() and _norm(chat_route) not in valid_names:
+            issues.append(ConfigIssue(
+                "error",
+                f"model_routes: router.chat_route {chat_route.strip()!r} does not name "
+                "a declared valid route — downgrades disabled",
+                "Point chat_route at a route declared under model_routes.routes",
+            ))
+        else:
+            kwargs["chat_route"] = chat_route.strip()
+
+    if "label_routes" in raw:
+        label_routes = raw["label_routes"]
+        if not isinstance(label_routes, dict):
+            issues.append(ConfigIssue(
+                "error",
+                f"model_routes: router.label_routes must be a mapping "
+                f"(got {type(label_routes).__name__}) — ignored",
+                "Change to:\n  label_routes:\n    SYSTEM_DEV: <route-name>",
+            ))
+        else:
+            pairs: List[Tuple[str, str]] = []
+            for label, route in label_routes.items():
+                label_text = str(label).strip().upper()
+                if label_text not in _ROUTER_LABELS:
+                    issues.append(ConfigIssue(
+                        "warning",
+                        f"model_routes: router.label_routes key {label!r} is not a "
+                        "classifier label — ignored",
+                        f"Valid labels: {', '.join(_ROUTER_LABELS)} "
+                        "(NORMAL downgrades via chat_route)",
+                    ))
+                    continue
+                if route is None or (isinstance(route, str) and not route.strip()):
+                    continue  # explicit "": this label never switches
+                if not isinstance(route, str) or _norm(route) not in valid_names:
+                    issues.append(ConfigIssue(
+                        "error",
+                        f"model_routes: router.label_routes.{label_text} {route!r} does "
+                        "not name a declared valid route — label disabled",
+                        "Point the label at a route declared under model_routes.routes",
+                    ))
+                    continue
+                pairs.append((label_text, route.strip()))
+            kwargs["label_routes"] = tuple(pairs)
+
+    if "decision_log" in raw:
+        decision_log = raw["decision_log"]
+        if isinstance(decision_log, str):
+            kwargs["decision_log"] = decision_log.strip()
+        else:
+            issues.append(ConfigIssue(
+                "warning",
+                f"model_routes: router.decision_log must be a string "
+                f"(got {type(decision_log).__name__}) — default used",
+                'Use "" for the default <hermes home>/logs/model_router_decisions.jsonl',
+            ))
+
+    router = RouterConfig(**kwargs)
+    if router.mode != "off" and not routes:
+        issues.append(ConfigIssue(
+            "warning",
+            f"model_routes: router.mode is '{router.mode}' but no valid routes are "
+            "declared — every decision will be a no-op",
+            "Declare routes under model_routes.routes (see cli-config.yaml.example)",
+        ))
+    return router
 
 
 def load_routes(cfg: Optional[Dict[str, Any]] = None) -> RouteCatalog:
@@ -629,6 +824,7 @@ def load_routes(cfg: Optional[Dict[str, Any]] = None) -> RouteCatalog:
     catalog.routes = _parse_routes(section.get("routes"), cfg, catalog.issues)
     catalog.health = _parse_health(section.get("health"), catalog.issues)
     catalog.static_rules = _parse_static_rules(section.get("static_rules"), catalog.routes, catalog.issues)
+    catalog.router = _parse_router(section.get("router"), catalog.routes, catalog.issues)
     return catalog
 
 
@@ -914,10 +1110,19 @@ def runtime_satisfies_route(
     *,
     catalog: Optional[RouteCatalog] = None,
 ) -> bool:
-    """True when the live runtime's model is already a member of the route.
+    """True when the live runtime is already a member of the route.
 
-    Membership matching is model-only by design: reasoning_effort/provider/
-    base_url are delivery details and never change tier membership.
+    Membership semantics mirror the skill-gate plugin's
+    ``runtime_matches_spec`` (runtime_catalog.py:145-147):
+
+    - ``accepted`` entries are model-only by design — provider/base_url/
+      reasoning_effort are delivery details there and never change tier
+      membership.
+    - Legacy membership (no ``accepted``): the PRIMARY and each FALLBACK are
+      full specs. A spec that declares ``reasoning_effort`` only matches a
+      runtime whose ``reasoning_effort`` equals it — a runtime with a
+      missing or different effort does NOT satisfy that spec (a dev route
+      pinned to xhigh is not satisfied by the same model thinking at low).
     """
     if not isinstance(runtime, dict):
         return False
@@ -925,9 +1130,20 @@ def runtime_satisfies_route(
     spec = _lookup_route(catalog, route_name)
     if spec is None:
         return False
-    membership = spec.accepted or (spec.model,) + tuple(fb.model for fb in spec.fallbacks)
-    current = runtime.get("model")
-    return any(_model_matches(current, candidate) for candidate in membership)
+    current_model = runtime.get("model")
+    if spec.accepted:
+        return any(_model_matches(current_model, candidate) for candidate in spec.accepted)
+    current_effort = _norm(runtime.get("reasoning_effort"))
+    member_specs = [(spec.model, spec.reasoning_effort)]
+    member_specs.extend((fb.model, fb.reasoning_effort) for fb in spec.fallbacks)
+    for model, effort in member_specs:
+        if not _model_matches(current_model, model):
+            continue
+        target_effort = _norm(effort)
+        if target_effort and current_effort != target_effort:
+            continue
+        return True
+    return False
 
 
 def route_catalog_for_schema(
