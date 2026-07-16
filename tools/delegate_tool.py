@@ -1594,6 +1594,9 @@ def _build_child_agent(
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
+    # Route-resolved reasoning effort (pre-validated by model_routes); beats
+    # delegation.reasoning_effort config. None/"" = unset.
+    override_reasoning_effort: Optional[str] = None,
     # Per-call role controlling whether the child can further delegate.
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
@@ -1819,14 +1822,14 @@ def _build_child_agent(
         effective_provider = "copilot-acp"
         effective_api_mode = "chat_completions"
 
-    # Resolve reasoning config: delegation override > parent inherit
+    # Resolve reasoning config: route override > delegation config > parent inherit
     parent_reasoning = getattr(parent_agent, "reasoning_config", None)
     child_reasoning = parent_reasoning
     try:
         # Keep the raw value — ``str(x or "")`` would coerce a YAML boolean
         # False (``reasoning_effort: false``) to "" and inherit the parent
         # instead of disabling thinking for children.
-        delegation_effort = delegation_cfg.get("reasoning_effort")
+        delegation_effort = override_reasoning_effort or delegation_cfg.get("reasoning_effort")
         if delegation_effort or delegation_effort is False:
             from hermes_constants import parse_reasoning_effort
 
@@ -3605,6 +3608,7 @@ def delegate_task(
     action: Optional[str] = None,
     subagent_id: Optional[str] = None,
     message: Optional[str] = None,
+    route: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -3625,6 +3629,11 @@ def delegate_task(
     'leaf' (default) cannot; 'orchestrator' retains the delegation
     toolset and can spawn its own workers, bounded by
     delegation.max_spawn_depth.  Per-task role beats the top-level one.
+
+    The 'route' parameter (only exposed to the model when model_routes
+    routes are declared) runs a task's child on that route's health-checked
+    provider/model. Precedence: per-task route > top-level route >
+    delegation.default_route > delegation.model/provider config.
 
     Returns JSON with results array, one entry per task.
     """
@@ -3694,15 +3703,10 @@ def delegate_task(
         )
     effective_max_iter = default_max_iter
 
-    # Resolve delegation credentials (provider:model pair).
-    # When delegation.provider is configured, this resolves the full credential
-    # bundle (base_url, api_key, api_mode) via the same runtime provider system
-    # used by CLI/gateway startup.  When unconfigured, returns None values so
-    # children inherit from the parent.
-    try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
-    except ValueError as exc:
-        return tool_error(str(exc))
+    # Default (config-driven) delegation credentials are resolved lazily below,
+    # only when at least one task has no route override — a broken
+    # delegation.provider must not fail calls that route every task.
+    creds: Optional[Dict[str, Any]] = None
 
     # Normalize to task list
     max_children = _get_max_concurrent_children()
@@ -3776,6 +3780,35 @@ def delegate_task(
             return tool_error(f"Task {i} output_schema invalid: {schema_err}")
         task_schemas.append(coerced_schema)
 
+    # ── Route resolution (ADR-003 Phase 3a) ────────────────────────────
+    # Precedence: per-task route > top-level route > delegation.default_route.
+    # Each distinct route resolves ONCE (health-checked walk) into a
+    # credential bundle + reasoning effort; tasks without any route keep the
+    # config-driven `creds` above (upstream behavior).
+    top_route = str(route or "").strip()
+    default_route = str(cfg.get("default_route") or "").strip()
+
+    def _task_route_name(task: Dict[str, Any]) -> str:
+        return str(task.get("route") or "").strip() or top_route or default_route
+
+    route_overrides: Dict[str, tuple] = {}
+    try:
+        for name in {rn for t in task_list if (rn := _task_route_name(t))}:
+            route_overrides[name] = _resolve_route_override(name, cfg, parent_agent)
+    except ValueError as exc:
+        return tool_error(str(exc))
+
+    # Resolve delegation credentials (provider:model pair) for tasks that keep
+    # the config-driven path. When delegation.provider is configured, this
+    # resolves the full credential bundle (base_url, api_key, api_mode) via the
+    # same runtime provider system used by CLI/gateway startup. When
+    # unconfigured, returns None values so children inherit from the parent.
+    if any(not _task_route_name(t) for t in task_list):
+        try:
+            creds = _resolve_delegation_credentials(cfg, parent_agent)
+        except ValueError as exc:
+            return tool_error(str(exc))
+
     overall_start = time.monotonic()
     results = []
 
@@ -3794,8 +3827,12 @@ def delegate_task(
         wrap_progress_callback,
     )
 
+    _display_creds = creds or route_overrides[_task_route_name(task_list[0])][0]
     live_deleg_id, live_writers, live_paths = create_live_transcripts(
-        task_list, context, model=creds.get("model"), provider=creds.get("provider")
+        task_list,
+        context,
+        model=_display_creds.get("model"),
+        provider=_display_creds.get("provider"),
     )
 
     # Capture the ORIGINATING session's wake target BEFORE any child agent is
@@ -3829,6 +3866,12 @@ def delegate_task(
         # Per-task role beats top-level; normalise again so unknown
         # per-task values warn and degrade to leaf uniformly.
         effective_role = _normalize_role(t.get("role") or top_role)
+        task_route = _task_route_name(t)
+        if task_route:
+            task_creds, task_effort = route_overrides[task_route]
+        else:
+            task_creds, task_effort = creds, ""
+
         # T1-24: schema'd tasks get the contract appended to their context
         # so the child knows the expected output shape before it starts.
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
@@ -3845,18 +3888,19 @@ def delegate_task(
                 # Subagents always inherit the parent's toolsets; the model
                 # cannot choose or narrow them (no model-facing toolsets arg).
                 toolsets=None,
-                model=creds["model"],
+                model=task_creds["model"],
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
-                override_provider=creds["provider"],
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
-                override_request_overrides=creds.get("request_overrides"),
-                override_max_tokens=creds.get("max_output_tokens"),
-                override_acp_command=creds.get("command"),
-                override_acp_args=creds.get("args"),
+                override_provider=task_creds["provider"],
+                override_base_url=task_creds["base_url"],
+                override_api_key=task_creds["api_key"],
+                override_api_mode=task_creds["api_mode"],
+                override_request_overrides=task_creds.get("request_overrides"),
+                override_max_tokens=task_creds.get("max_output_tokens"),
+                override_acp_command=task_creds.get("command"),
+                override_acp_args=task_creds.get("args"),
+                override_reasoning_effort=task_effort or None,
                 role=effective_role,
             )
         except ValueError as exc:
@@ -4248,7 +4292,7 @@ def delegate_task(
             # parent's toolsets (no model-facing toolsets arg).
             toolsets=None,
             role=top_role,
-            model=creds["model"],
+            model=(creds or route_overrides[_task_route_name(task_list[0])][0])["model"],
             session_key=_session_key,
             origin_ui_session_id=_origin_ui_session_id,
             origin_session_id=_wake_sid,
@@ -4414,7 +4458,13 @@ def _resolve_child_credential_pool(
     return None
 
 
-def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
+def _resolve_delegation_credentials(
+    cfg: dict,
+    parent_agent,
+    *,
+    model_override: Optional[str] = None,
+    provider_override: Optional[str] = None,
+) -> dict:
     """Resolve credentials for subagent delegation.
 
     If ``delegation.base_url`` is configured, subagents use that direct
@@ -4433,11 +4483,19 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     If neither base_url nor provider is configured, returns None values so the
     child inherits everything from the parent agent.
 
+    ``model_override``/``provider_override`` (from a resolved model_routes
+    route) take precedence over the ``delegation.model``/``delegation.provider``
+    config keys and follow the same resolution path.
+
     Raises ValueError with a user-friendly message on credential failure.
     """
-    configured_model = str(cfg.get("model") or "").strip() or None
-    configured_provider = str(cfg.get("provider") or "").strip() or None
+    configured_model = str(model_override or cfg.get("model") or "").strip() or None
+    configured_provider = str(provider_override or cfg.get("provider") or "").strip() or None
     configured_base_url = str(cfg.get("base_url") or "").strip() or None
+    if provider_override:
+        # A route names its provider explicitly; the static delegation.base_url
+        # escape hatch must not hijack a route-resolved runtime.
+        configured_base_url = None
     configured_api_key = str(cfg.get("api_key") or "").strip() or None
     configured_api_mode = str(cfg.get("api_mode") or "").strip().lower() or None
 
@@ -4595,6 +4653,85 @@ def _load_config() -> dict:
         return {}
 
 
+def _load_full_config() -> dict:
+    """Load the FULL active config (not just the ``delegation`` block).
+
+    Route resolution needs the top-level ``model_routes`` and ``providers``
+    sections. Loader preference mirrors ``_load_config()`` so routes are read
+    from the same config source as the rest of delegate_task. Read-only —
+    do NOT mutate the returned dict.
+    """
+    prefer_legacy = os.environ.get("HERMES_IGNORE_USER_CONFIG") == "1"
+    if not prefer_legacy:
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            full = load_config_readonly()
+            if isinstance(full, dict):
+                return full
+        except Exception:
+            pass
+    try:
+        from cli import CLI_CONFIG
+
+        return CLI_CONFIG if isinstance(CLI_CONFIG, dict) else {}
+    except Exception:
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# Model-route delegation (ADR-003 Phase 3a)
+# ---------------------------------------------------------------------------
+
+
+def _route_catalog_pairs() -> List[tuple]:
+    """(name, description) pairs for declared model_routes; [] when dormant."""
+    try:
+        from hermes_cli.model_routes import route_catalog_for_schema
+
+        return route_catalog_for_schema(_load_full_config())
+    except Exception:
+        logger.debug("delegate_task: route catalog unavailable", exc_info=True)
+        return []
+
+
+def _resolve_route_override(route_name: str, cfg: dict, parent_agent) -> tuple:
+    """Resolve a declared route into ``(credential bundle, reasoning_effort)``.
+
+    Walks the route's default → fallbacks chain health-checked (via
+    ``resolve_route``) and feeds the winning provider/model into
+    ``_resolve_delegation_credentials`` as overrides. Raises ValueError —
+    surfaced to the model through ``tool_error`` so it can retry with a
+    different route — when the route is not declared or its whole chain is
+    unhealthy. Never falls back silently.
+    """
+    from hermes_cli.model_routes import load_routes, resolve_route
+
+    full_cfg = _load_full_config()
+    catalog = load_routes(full_cfg)
+    declared = ", ".join(catalog.routes) or "(none declared)"
+    name = str(route_name or "").strip()
+    if not any(spec.name.strip().lower() == name.lower() for spec in catalog.routes.values()):
+        raise ValueError(
+            f"Unknown delegation route '{name}'. Declared routes: {declared}."
+        )
+    resolved = resolve_route(name, full_cfg, catalog=catalog)
+    if resolved is None:
+        raise ValueError(
+            f"Delegation route '{name}' has no healthy runtime (its default and "
+            f"every fallback failed the provider health check). Declared routes: "
+            f"{declared}. Retry with a different route, or omit 'route' to use "
+            f"the default delegation runtime."
+        )
+    creds = _resolve_delegation_credentials(
+        cfg,
+        parent_agent,
+        model_override=resolved["model"],
+        provider_override=resolved["provider"],
+    )
+    return creds, str(resolved.get("reasoning_effort") or "")
+
+
 # ---------------------------------------------------------------------------
 # OpenAI Function-Calling Schema
 # ---------------------------------------------------------------------------
@@ -4704,6 +4841,19 @@ def _build_role_param_description() -> str:
     )
 
 
+def _build_route_param_schema(route_pairs: List[tuple]) -> dict:
+    """Schema for the ``route`` param — enum tracks the declared route names."""
+    lines = "\n".join(
+        f"{name}: {description}" if description else name
+        for name, description in route_pairs
+    )
+    return {
+        "type": "string",
+        "enum": [name for name, _ in route_pairs],
+        "description": "Delegation runtime route. " + lines,
+    }
+
+
 def _build_dynamic_schema_overrides() -> dict:
     """Return per-call schema overrides reflecting current config.
 
@@ -4721,8 +4871,36 @@ def _build_dynamic_schema_overrides() -> dict:
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
     overrides_params["properties"]["role"]["description"] = _build_role_param_description()
 
+    description = _build_top_level_description()
+
+    # Route param (ADR-003 Phase 3a): injected ONLY when the config declares
+    # at least one valid model_routes route. With no routes the schema stays
+    # byte-identical to the route-less shape (dormant).
+    route_pairs = _route_catalog_pairs()
+    if route_pairs:
+        route_schema = _build_route_param_schema(route_pairs)
+        overrides_params["properties"]["route"] = route_schema
+        # The shallow per-property copy above still shares tasks["items"] with
+        # the static schema — rebuild it before injecting the per-task route so
+        # DELEGATE_TASK_SCHEMA itself is never mutated.
+        tasks_prop = overrides_params["properties"]["tasks"]
+        items = dict(tasks_prop["items"])
+        items["properties"] = dict(items["properties"])
+        items["properties"]["route"] = {
+            **route_schema,
+            "description": "Per-task route override; wins over the top-level "
+            "'route'. See top-level 'route' for the catalog.",
+        }
+        tasks_prop["items"] = items
+        description += (
+            "\n- EXCEPTION to the model-pinning note above: this install "
+            "declares delegation routes. Pass 'route' (top-level, or per-task "
+            "in tasks[]; per-task wins) to run a subagent on a declared "
+            "route's provider/model."
+        )
+
     return {
-        "description": _build_top_level_description(),
+        "description": description,
         "parameters": overrides_params,
     }
 
@@ -4918,6 +5096,7 @@ registry.register(
         action=args.get("action"),
         subagent_id=args.get("subagent_id"),
         message=args.get("message"),
+        route=args.get("route"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,
