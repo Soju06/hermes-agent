@@ -965,6 +965,30 @@ def test_stage_takes_runtime_snapshot_on_event_loop(monkeypatch, tmp_path):
     assert seen == {"on_loop": True}
 
 
+def test_stage_routes_on_pre_hook_original_text(monkeypatch, tmp_path):
+    """Plugin hooks may prepend advisories / rewrite event.text before the
+    stage runs; the classifier must see the pre-hook original (bench inputs
+    were stripped of injected advisories — they are label noise)."""
+    monkeypatch.setenv("HERMES_MODEL_ROUTER_DECISION_LOG", str(tmp_path / "d.jsonl"))
+    runner = _make_runner(monkeypatch, _cfg())
+    captured = {}
+
+    def _fake_gemini(user_prompt, **kwargs):
+        captured["prompt"] = user_prompt
+        return json.dumps({"evidence": "S5", "label": "SYSTEM_DEV", "confidence": 0.9})
+
+    monkeypatch.setattr(mr_mod, "_call_gemini", _fake_gemini)
+    mutated = _event("[Learning reminder: consider the deploy skill]\n\ngateway 버그 고쳐줘")
+    asyncio.run(runner._model_router_stage(
+        mutated, _source(), "tg:c1", mode="shadow",
+        original_text="gateway 버그 고쳐줘",
+    ))
+    assert "gateway 버그 고쳐줘" in captured["prompt"]
+    assert "Learning reminder" not in captured["prompt"]
+    record = json.loads((tmp_path / "d.jsonl").read_text().splitlines()[-1])
+    assert record["msg_head"] == "gateway 버그 고쳐줘"
+
+
 def test_enforce_apply_model_path_parity(monkeypatch, tmp_path):
     """A3: enforce apply mirrors /model — pending self-identification note
     (route + reason) and session-DB update_session_model persist."""
