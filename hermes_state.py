@@ -23,6 +23,7 @@ import sqlite3
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from agent.memory_manager import sanitize_context
@@ -936,6 +937,11 @@ class SessionDB:
         self._trigram_available = False
         self._fts_unavailable_warned = False
         self._conn = None
+        # Read-path split (WAL only): recall/browse queries run on per-thread
+        # read-only connections so they never queue behind writer flushes on
+        # self._lock. See _read_ctx().
+        self._read_local = threading.local()
+        self._wal_active = False
         try:
             if read_only:
                 # Read-only attach for cross-profile aggregation: SELECT-only,
@@ -972,7 +978,9 @@ class SessionDB:
                     isolation_level=None,
                 )
                 self._conn.row_factory = sqlite3.Row
-                apply_wal_with_fallback(self._conn, db_label="state.db")
+                self._wal_active = (
+                    apply_wal_with_fallback(self._conn, db_label="state.db") == "wal"
+                )
                 self._conn.execute("PRAGMA foreign_keys=ON")
                 self._init_schema()
 
@@ -1016,6 +1024,62 @@ class SessionDB:
             # ``hermes_state._set_last_init_error(None)`` explicitly.
             _set_last_init_error(f"{type(exc).__name__}: {exc}")
             raise
+
+    # ── Read-path split ──
+
+    def _get_read_conn(self) -> Optional[sqlite3.Connection]:
+        """Per-thread read-only connection, or None when unavailable.
+
+        Only used under WAL: WAL readers see a consistent snapshot and never
+        block on (or get blocked by) the writer, so recall/browse queries can
+        skip self._lock entirely. Under DELETE journal mode (NFS fallback) a
+        reader can hit SQLITE_BUSY storms during writes, so we keep the
+        legacy locked single-connection path there.
+
+        Fresh read transactions begin per statement (autocommit), so each
+        query observes everything committed so far — read-your-writes holds
+        for the flush-then-search patterns in a turn.
+        """
+        if not self._wal_active or self.read_only:
+            return None
+        conn = getattr(self._read_local, "conn", None)
+        if conn is not None:
+            return conn
+        if getattr(self._read_local, "failed", False):
+            return None
+        try:
+            conn = sqlite3.connect(
+                f"file:{self.db_path}?mode=ro",
+                uri=True,
+                timeout=5.0,
+                isolation_level=None,
+            )
+            conn.row_factory = sqlite3.Row
+        except sqlite3.Error:
+            # Mark this thread failed so we don't retry the open on every
+            # query; the locked writer connection still serves reads.
+            self._read_local.failed = True
+            logger.debug("read-only connection open failed for %s", self.db_path, exc_info=True)
+            return None
+        self._read_local.conn = conn
+        return conn
+
+    @contextmanager
+    def _read_ctx(self):
+        """Yield a connection for read-only statements.
+
+        WAL: a per-thread read-only connection with NO lock — recall queries
+        never convoy behind writer flushes (the gateway shares one SessionDB
+        across every agent, so this lock was a global choke point).
+        Non-WAL or read-conn failure: the shared writer connection under
+        self._lock, byte-for-byte the legacy behavior.
+        """
+        conn = self._get_read_conn()
+        if conn is not None:
+            yield conn
+            return
+        with self._lock:
+            yield self._conn
 
     # ── Core write helper ──
 
@@ -1271,6 +1335,16 @@ class SessionDB:
         Attempts a TRUNCATE WAL checkpoint first so that exiting processes
         help shrink the WAL file.
         """
+        # Best-effort close of this thread's read-only connection. Other
+        # threads' read connections are per-thread objects reclaimed by GC;
+        # they hold no locks and never block the checkpoint below.
+        read_conn = getattr(self._read_local, "conn", None)
+        if read_conn is not None:
+            try:
+                read_conn.close()
+            except Exception:
+                pass
+            self._read_local.conn = None
         with self._lock:
             if self._conn:
                 try:
@@ -2809,8 +2883,8 @@ class SessionDB:
 
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Get a session by ID."""
-        with self._lock:
-            cursor = self._conn.execute(
+        with self._read_ctx() as conn:
+            cursor = conn.execute(
                 "SELECT * FROM sessions WHERE id = ?", (session_id,)
             )
             row = cursor.fetchone()
@@ -3058,8 +3132,8 @@ class SessionDB:
         # Also search for numbered variants: "title #2", "title #3", etc.
         # Escape SQL LIKE wildcards (%, _) in the title to prevent false matches
         escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        with self._lock:
-            cursor = self._conn.execute(
+        with self._read_ctx() as conn:
+            cursor = conn.execute(
                 "SELECT id, title, started_at FROM sessions "
                 "WHERE title LIKE ? ESCAPE '\\' ORDER BY started_at DESC",
                 (f"{escaped} #%",),
@@ -3458,8 +3532,8 @@ class SessionDB:
                 LIMIT ? OFFSET ?
             """
             params.extend([limit, offset])
-        with self._lock:
-            cursor = self._conn.execute(query, params)
+        with self._read_ctx() as conn:
+            cursor = conn.execute(query, params)
             rows = cursor.fetchall()
         sessions = []
         for row in rows:
@@ -4045,8 +4119,8 @@ class SessionDB:
             # SQLite's OFFSET requires LIMIT; -1 means "no limit".
             sql += " LIMIT ? OFFSET ?"
             params.extend([-1 if limit is None else limit, offset])
-        with self._lock:
-            cursor = self._conn.execute(sql, params)
+        with self._read_ctx() as conn:
+            cursor = conn.execute(sql, params)
             rows = cursor.fetchall()
         result = []
         for row in rows:
@@ -4089,9 +4163,9 @@ class SessionDB:
         """
         if window < 0:
             window = 0
-        with self._lock:
+        with self._read_ctx() as conn:
             # Confirm the anchor exists in this session.
-            anchor_exists = self._conn.execute(
+            anchor_exists = conn.execute(
                 "SELECT 1 FROM messages WHERE id = ? AND session_id = ? LIMIT 1",
                 (around_message_id, session_id),
             ).fetchone()
@@ -4100,13 +4174,13 @@ class SessionDB:
 
             # Two queries: anchor + before (DESC, take window+1), and after
             # (ASC, take window). Final order is id ASC.
-            before_rows = self._conn.execute(
+            before_rows = conn.execute(
                 "SELECT * FROM messages "
                 "WHERE session_id = ? AND id <= ? "
                 "ORDER BY id DESC LIMIT ?",
                 (session_id, around_message_id, window + 1),
             ).fetchall()
-            after_rows = self._conn.execute(
+            after_rows = conn.execute(
                 "SELECT * FROM messages "
                 "WHERE session_id = ? AND id > ? "
                 "ORDER BY id ASC LIMIT ?",
@@ -4212,7 +4286,7 @@ class SessionDB:
         bookend_start_rows: List[Any] = []
         bookend_end_rows: List[Any] = []
         if bookend > 0:
-            with self._lock:
+            with self._read_ctx() as conn:
                 role_clause = ""
                 role_params: list = []
                 if keep_roles is not None:
@@ -4220,7 +4294,7 @@ class SessionDB:
                     role_clause = f" AND role IN ({role_placeholders})"
                     role_params = list(keep_roles)
 
-                bookend_start_rows = self._conn.execute(
+                bookend_start_rows = conn.execute(
                     f"SELECT * FROM messages "
                     f"WHERE session_id = ? AND id < ?{role_clause} "
                     f"AND length(content) > 0 "
@@ -4228,7 +4302,7 @@ class SessionDB:
                     (session_id, window_min_id, *role_params, bookend),
                 ).fetchall()
 
-                bookend_end_rows = self._conn.execute(
+                bookend_end_rows = conn.execute(
                     f"SELECT * FROM messages "
                     f"WHERE session_id = ? AND id > ?{role_clause} "
                     f"AND length(content) > 0 "
@@ -4975,9 +5049,9 @@ class SessionDB:
                     LIMIT ? OFFSET ?
                 """
                 tri_params.extend([limit, offset])
-                with self._lock:
+                with self._read_ctx() as conn:
                     try:
-                        tri_cursor = self._conn.execute(tri_sql, tri_params)
+                        tri_cursor = conn.execute(tri_sql, tri_params)
                     except sqlite3.OperationalError:
                         # Trigram query failed at runtime — fall through to LIKE.
                         pass
@@ -5028,13 +5102,13 @@ class SessionDB:
                 like_params.extend([limit, offset])
                 # instr() for snippet uses first search token
                 like_params = [non_op_tokens[0]] + like_params
-                with self._lock:
-                    like_cursor = self._conn.execute(like_sql, like_params)
+                with self._read_ctx() as conn:
+                    like_cursor = conn.execute(like_sql, like_params)
                     matches = [dict(row) for row in like_cursor.fetchall()]
         else:
-            with self._lock:
+            with self._read_ctx() as conn:
                 try:
-                    cursor = self._conn.execute(sql, params)
+                    cursor = conn.execute(sql, params)
                 except sqlite3.OperationalError:
                     # FTS5 query syntax error despite sanitization — return empty
                     return []
@@ -5045,8 +5119,8 @@ class SessionDB:
         # Done outside the lock so we don't hold it across N sequential queries.
         for match in matches:
             try:
-                with self._lock:
-                    ctx_cursor = self._conn.execute(
+                with self._read_ctx() as conn:
+                    ctx_cursor = conn.execute(
                         """WITH target AS (
                                SELECT session_id, timestamp, id
                                FROM messages
