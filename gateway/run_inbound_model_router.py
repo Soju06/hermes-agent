@@ -9,6 +9,7 @@ Bound onto ``GatewayRunner`` through ``GatewayInboundMixin``; ``_handle_message`
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import os
 from typing import TYPE_CHECKING, Optional
@@ -90,6 +91,7 @@ class GatewayInboundModelRouterMixin:
 
     async def _model_router_stage(
         self, event: "MessageEvent", source: SessionSource, session_key: str, *, mode: str,
+        original_text: Optional[str] = None,
     ) -> None:
         """Evaluate (and in enforce mode apply) the dynamic model router.
 
@@ -129,6 +131,11 @@ class GatewayInboundModelRouterMixin:
         from gateway.run import _load_gateway_config
         from hermes_cli.model_routes import load_routes as _load_model_routes
 
+        # Route on the PRE-HOOK text: plugin hooks may have prepended advisories or rewritten
+        # event.text before this stage runs, but the classifier was benched on (and the plugin-era
+        # router classified) the original message — injected advisories are label noise.
+        if original_text and original_text != getattr(event, "text", None):
+            event = dataclasses.replace(event, text=original_text)
         raw_text = str(getattr(event, "text", None) or "")
         text = raw_text.strip()
         if not text:  # (1) zero work for empty/whitespace events

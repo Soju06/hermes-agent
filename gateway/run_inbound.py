@@ -222,10 +222,18 @@ class GatewayInboundMixin(
         # scale-to-zero: only real user-originated inbound stamps the last-inbound clock;
         # counting internal/system events would keep a genuinely idle gateway awake.
         self._scale_to_zero_note_real_inbound()
+        # Snapshot the pre-hook message text for the dynamic model router: plugin hooks may rewrite
+        # (or prepend to) event.text, but the router must classify the same text the plugin-era
+        # classifier saw — injected advisories are label noise the bench dataset had to strip.
+        _pre_hook_router_text = str(getattr(event, "text", None) or "")
         event = await self._hm_pre_gateway_dispatch_hook(event, source)
         if event is None:
             return None
         source = event.source
+        # Private event attribute (process-local, never serialized), same pattern as the runtime
+        # override directives; set on the post-hook event since ``rewrite`` may have replaced it.
+        with suppress(Exception):
+            event._hermes_router_pre_hook_text = _pre_hook_router_text
 
         if not self._is_user_authorized_for_source(source):
             if source.user_id is None:
@@ -1407,7 +1415,10 @@ class GatewayInboundMixin(
             _router_mode = _model_router_mode()
             if _router_mode != "off":
                 try:
-                    await self._model_router_stage(event, source, _quick_key, mode=_router_mode)
+                    await self._model_router_stage(
+                        event, source, _quick_key, mode=_router_mode,
+                        original_text=getattr(event, "_hermes_router_pre_hook_text", None),
+                    )
                 except Exception:
                     logger.warning("model router stage failed open", exc_info=True)
 
