@@ -241,6 +241,8 @@ _DEFAULT_EXPORT_INCLUDE_ROOT = frozenset({
     "skills", "cron", "scripts", "sessions",
     # Plugin / memory surfaces (per-profile overrides live here)
     "plugins", "memories", "knowledge", "preferences",
+    # Audience persona packs (personas/modes.yaml + persona markdown)
+    "personas",
 })
 
 # Names that cannot be used as profile aliases
@@ -1097,6 +1099,13 @@ def create_profile(
             source_skills = source_dir / "skills"
             if source_skills.is_dir():
                 shutil.copytree(source_skills, profile_dir / "skills", symlinks=True, dirs_exist_ok=True)
+
+            # Clone audience persona packs (personas/modes.yaml + persona
+            # markdown files). Like SOUL.md, these are part of the agent's
+            # curated identity and must survive a profile clone.
+            source_personas = source_dir / "personas"
+            if source_personas.is_dir():
+                shutil.copytree(source_personas, profile_dir / "personas", symlinks=True, dirs_exist_ok=True)
 
             # Clone memory and other subdirectory files
             for relpath in _CLONE_SUBDIR_FILES:
