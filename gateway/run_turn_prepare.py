@@ -575,6 +575,71 @@ class GatewayTurnPrepareMixin:
             )
         return session_entry
 
+    async def _consume_auto_reset_boundary(self, session_entry, session_key: str) -> None:
+        """Auto-reset conversation-boundary cleanup (was_auto_reset consume).
+
+        Treat auto-reset as a full conversation boundary — drop every session-scoped transient state
+        so the fresh session does not inherit the previous conversation's model/reasoning overrides
+        or a queued "/model switched" note.
+
+        Exception (#48031 class): when the model router's enforce mode applied an override earlier in
+        this SAME inbound turn (pre-dispatch, flagged in ``_model_router_fresh_applies``), the
+        override postdates the reset boundary and must survive it. Its store persistence died with
+        the popped session entry, so re-persist it onto the NEW entry. Mirrors how /model's
+        _finish_switch consumes was_auto_reset before storing its override (Closes #48031).
+
+        Self-guarding: a no-op unless ``session_entry.was_auto_reset`` is set (callers may pre-check
+        for their own flow, but the flag consume lives here, single source of truth).
+        """
+        if getattr(session_entry, "was_auto_reset", False):
+            # Consume the fresh-apply flag BEFORE the funnel (which would pop it): the flag protects
+            # exactly one boundary crossing, never a later genuine conversation reset.
+            _fresh_applies = getattr(self, "_model_router_fresh_applies", None)
+            _router_applied = bool(isinstance(_fresh_applies, dict) and _fresh_applies.pop(session_key, None))
+            # Snapshot the router-applied state the funnel is about to clear so it can be
+            # re-installed on the fresh entry (#48031 survival).
+            _saved_override = None
+            _saved_reasoning = None
+            _saved_note = None
+            if _router_applied:
+                _saved_override = self._session_model_overrides.get(session_key)
+                _reasoning_store = getattr(self, "_session_reasoning_overrides", None)
+                if isinstance(_reasoning_store, dict):
+                    _saved_reasoning = _reasoning_store.get(session_key)
+                _notes = getattr(self, "_pending_model_notes", None)
+                if isinstance(_notes, dict):
+                    _saved_note = _notes.get(session_key)
+            # Treat auto-reset as a full conversation boundary — one funnel call clears every
+            # conversation-scoped per-session dict (model/reasoning overrides, pending model notes,
+            # last-resolved cache, router hysteresis streak, …) plus boundary security state
+            # (#48031, #58403). See _CONVERSATION_SCOPED_STATE.
+            self._clear_conversation_scope(session_key, reason="auto_reset")
+            if _router_applied and _saved_override:
+                # Keep the router-applied override (and its reasoning override / pending
+                # self-identification note): it was applied earlier in this SAME inbound turn, so it
+                # postdates the reset boundary. Re-persist the non-secret parts onto the fresh session
+                # entry (its previous store persistence died with the popped entry).
+                self._session_model_overrides[session_key] = _saved_override
+                if _saved_reasoning is not None:
+                    self._set_session_reasoning_override(session_key, _saved_reasoning)
+                if _saved_note:
+                    if not hasattr(self, "_pending_model_notes"):
+                        self._pending_model_notes = {}
+                    self._pending_model_notes[session_key] = _saved_note
+                try:
+                    await self.async_session_store.set_model_override(
+                        session_key, self._session_model_overrides[session_key],
+                    )
+                except Exception:
+                    logger.debug("model router: re-persist override after auto-reset failed", exc_info=True)
+            # Evict the cached agent so the fresh session does not inherit the previous
+            # conversation's context_compressor._previous_summary — the cache is keyed on the stable
+            # session_key, so an auto-reset otherwise reuses the old agent and leaks prior history
+            # into new compaction summaries. Mirrors /reset and the compression-exhausted path
+            # (#9893). Covers daily/idle/suspended auto-reset.
+            self._evict_cached_agent(session_key)
+            session_entry.was_auto_reset = False
+
     async def _hmwa_open_session(self, session_entry, session_key, source):
         """Consume auto-reset / fresh-reset flags and emit ``session:start`` for new sessions.
         Returns ``(_was_auto_reset, _is_new_session)``."""
@@ -582,15 +647,7 @@ class GatewayTurnPrepareMixin:
         # preventing the cleanup from wiping model/reasoning overrides set between turns (Closes #48031).
         _was_auto_reset = getattr(session_entry, "was_auto_reset", False)
         if _was_auto_reset:
-            # Conversation boundary: the funnel clears every conversation-scoped dict; evict the cached
-            # agent so context_compressor._previous_summary cannot leak into new summaries.
-            # Treat auto-reset as a full conversation boundary — clear every conversation-scoped per-session
-            # dict in one funnel call so the fresh session does not inherit the previous conversation's
-            # model/reasoning overrides, a queued "/model switched" note, or a stale resolved-model cache
-            # (#48031, #58403). See _CONVERSATION_SCOPED_STATE.
-            self._clear_conversation_scope(session_key, reason="auto_reset")
-            self._evict_cached_agent(session_key)
-            session_entry.was_auto_reset = False
+            await self._consume_auto_reset_boundary(session_entry, session_key)
 
         _is_fresh_reset = getattr(session_entry, "is_fresh_reset", False)
         _is_new_session = session_entry.created_at == session_entry.updated_at or _was_auto_reset or _is_fresh_reset

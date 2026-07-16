@@ -2251,7 +2251,14 @@ _CONVERSATION_SCOPED_STATE: tuple = (
     # See #72016.
     "_session_stall_notified",
     # Transcript-lag streak counter (#114266); a fresh conversation starts with no lag history.
-    "_transcript_lag_streaks")
+    "_transcript_lag_streaks",
+    # Dynamic model router (ADR-003 Phase 2): the NORMAL-downgrade hysteresis streak is
+    # conversation-scoped, and a not-yet-consumed fresh-apply flag must never outlive its
+    # conversation. The auto-reset boundary consumes the fresh-apply flag BEFORE the funnel call
+    # (#48031 survival exception, see GatewayTurnPrepareMixin._consume_auto_reset_boundary). Plain dicts
+    # (not SessionState fields) so the funnel pops them by key.
+    "_model_router_state",
+    "_model_router_fresh_applies")
 
 
 def _resolve_runtime_agent_kwargs() -> dict:

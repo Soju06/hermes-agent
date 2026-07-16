@@ -28,6 +28,7 @@ from gateway.run_busy import approval_input_words
 from gateway.run_inbound_media import rehome_inbound_media
 from gateway.run_inbound_hooks import GatewayInboundHooksMixin
 from gateway.run_inbound_moa import GatewayInboundMoaMixin
+from gateway.run_inbound_model_router import GatewayInboundModelRouterMixin
 from gateway.run_inbound_transcription import GatewayInboundTranscriptionMixin
 from gateway.run_plugin_injection import GatewayPluginInjectionMixin
 from gateway.run_turn_setup_guard import cancel_preagent_setup, pending_setup_busy_notice
@@ -76,6 +77,7 @@ def strip_discord_triggering_note(event: Any, message_text: Any) -> Any:
 
 class GatewayInboundMixin(
     GatewayInboundHooksMixin, GatewayInboundTranscriptionMixin, GatewayPluginInjectionMixin, GatewayInboundMoaMixin,
+    GatewayInboundModelRouterMixin,
 ):
     """Inbound message pipeline (_handle_message, text/media preparation, durable-turn markers, plugin injection) for GatewayRunner."""
 
@@ -1392,6 +1394,22 @@ class GatewayInboundMixin(
             self._hm_evict_reaped_agent(_quick_key)
         if self._is_session_running(_quick_key):
             return await self._hm_handle_running_session_message(event, source, _quick_key)
+
+        # Dynamic model router (ADR-003 Phase 2): route evaluation for authorized, non-internal
+        # messages that reached the fresh-agent dispatch leg. Placed AFTER the running-agent
+        # PRIORITY block so steer/stop/queue messages against a running agent gain zero latency and
+        # no suspension point precedes the running-session check — and BEFORE slash-command dispatch
+        # so static rules still apply to slash commands (see _model_router_stage docstring).
+        # mode=off (the default) costs a single config check. Always fail open — routing must never
+        # block dispatch.
+        if not is_internal:
+            from gateway.run_inbound_model_router import _model_router_mode
+            _router_mode = _model_router_mode()
+            if _router_mode != "off":
+                try:
+                    await self._model_router_stage(event, source, _quick_key, mode=_router_mode)
+                except Exception:
+                    logger.warning("model router stage failed open", exc_info=True)
 
         _handled, _result = await self._hm_dispatch_idle_commands(event, source, _quick_key)
         if _handled:

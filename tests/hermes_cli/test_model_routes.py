@@ -34,7 +34,7 @@ def _providers():
     }
 
 
-def _cfg(routes=None, health=None, static_rules=None, providers=None, model_routes=...):
+def _cfg(routes=None, health=None, static_rules=None, router=None, providers=None, model_routes=...):
     cfg = {"providers": _providers() if providers is None else providers}
     if model_routes is not ...:
         cfg["model_routes"] = model_routes
@@ -46,6 +46,8 @@ def _cfg(routes=None, health=None, static_rules=None, providers=None, model_rout
         section["health"] = health
     if static_rules is not None:
         section["static_rules"] = static_rules
+    if router is not None:
+        section["router"] = router
     if section:
         cfg["model_routes"] = section
     return cfg
@@ -367,6 +369,27 @@ def test_static_rules_parse_only():
     assert catalog.static_rules == [rule]
     assert any("priority" in i.message for i in _warnings(catalog))
     assert _errors(catalog) == []
+
+
+def test_static_rule_is_owner_non_bool_operand_warns():
+    # Same footgun class as health.enabled: YAML string "false" is truthy.
+    # The rule is kept (it just never matches) but a warning is surfaced.
+    for bad in ({"eq": "false"}, {"eq": 1}, {"eq": None}, "false", {"in": [True]}):
+        rule = {"route": "dev", "when": {"is_owner": bad}}
+        catalog = mr.load_routes(_cfg(routes={"dev": _route()}, static_rules=[rule]))
+        assert catalog.static_rules == [rule]
+        assert any(
+            "is_owner" in i.message and "never match" in i.message
+            for i in _warnings(catalog)
+        ), bad
+        assert _errors(catalog) == []
+
+    # Real booleans pass without a warning.
+    for good in (True, False):
+        rule = {"route": "dev", "when": {"is_owner": {"eq": good}}}
+        catalog = mr.load_routes(_cfg(routes={"dev": _route()}, static_rules=[rule]))
+        assert catalog.static_rules == [rule]
+        assert not any("is_owner" in i.message for i in _warnings(catalog))
 
 
 def test_default_config_and_known_root_keys():
@@ -885,6 +908,60 @@ def test_non_member_unknown_route_bad_runtime():
     assert mr.runtime_satisfies_route("model-a", "dev", cfg) is False
 
 
+def test_primary_declared_effort_must_match_runtime():
+    # Plugin parity (runtime_matches_spec, runtime_catalog.py:145-147): a spec
+    # that declares reasoning_effort only matches a runtime with that effort.
+    cfg = _cfg(routes={"dev": _route(model="model-a", reasoning_effort="xhigh")})
+    assert mr.runtime_satisfies_route(
+        {"model": "model-a", "reasoning_effort": "xhigh"}, "dev", cfg,
+    ) is True
+    # Case-insensitive comparison, same as the plugin's _norm.
+    assert mr.runtime_satisfies_route(
+        {"model": "model-a", "reasoning_effort": " XHIGH "}, "dev", cfg,
+    ) is True
+    # Missing or differing runtime effort → NOT satisfied.
+    assert mr.runtime_satisfies_route({"model": "model-a"}, "dev", cfg) is False
+    assert mr.runtime_satisfies_route(
+        {"model": "model-a", "reasoning_effort": "low"}, "dev", cfg,
+    ) is False
+
+
+def test_fallback_declared_effort_must_match_runtime():
+    cfg = _cfg(routes={"dev": _route(
+        model="model-a",
+        fallbacks=[{"provider": "p2", "model": "model-b", "reasoning_effort": "low"}],
+    )})
+    # Fallback declares low: runtime must carry it to satisfy via that spec.
+    assert mr.runtime_satisfies_route(
+        {"model": "model-b", "reasoning_effort": "low"}, "dev", cfg,
+    ) is True
+    assert mr.runtime_satisfies_route({"model": "model-b"}, "dev", cfg) is False
+    assert mr.runtime_satisfies_route(
+        {"model": "model-b", "reasoning_effort": "high"}, "dev", cfg,
+    ) is False
+    # Primary declares no effort: any (or no) runtime effort satisfies it.
+    assert mr.runtime_satisfies_route({"model": "model-a"}, "dev", cfg) is True
+    assert mr.runtime_satisfies_route(
+        {"model": "model-a", "reasoning_effort": "minimal"}, "dev", cfg,
+    ) is True
+
+
+def test_accepted_membership_stays_model_only_with_route_effort():
+    # accepted entries are model-only even when the route declares an effort.
+    cfg = _cfg(routes={"dev": _route(
+        model="model-a", reasoning_effort="xhigh", accepted=["model-x"],
+    )})
+    assert mr.runtime_satisfies_route({"model": "model-x"}, "dev", cfg) is True
+    assert mr.runtime_satisfies_route(
+        {"model": "model-x", "reasoning_effort": "low"}, "dev", cfg,
+    ) is True
+    # accepted replaces legacy membership entirely: the effort-declaring
+    # primary is not a member once accepted is set.
+    assert mr.runtime_satisfies_route(
+        {"model": "model-a", "reasoning_effort": "xhigh"}, "dev", cfg,
+    ) is False
+
+
 # =============================================================================
 # route_catalog_for_schema
 # =============================================================================
@@ -904,3 +981,162 @@ def test_schema_pairs_order_and_validity():
         i.severity == "warning" and "chat" in i.message and "description" in i.message
         for i in catalog.issues
     )
+
+
+# =============================================================================
+# router sub-block (ADR-003 Phase 2)
+# =============================================================================
+
+
+def _router_routes():
+    return {"dev": _route(provider="p1"), "chat": _route(provider="p2", model="model-b")}
+
+
+def test_router_absent_defaults_off():
+    catalog = mr.load_routes(_cfg(routes=_router_routes()))
+    assert catalog.issues == []
+    assert catalog.router == mr.RouterConfig()
+    assert catalog.router.mode == "off"
+    assert catalog.router.model == mr.DEFAULT_ROUTER_MODEL
+    assert catalog.router.timeout_ms == 8000.0
+    assert catalog.router.recent_turns == 5
+    assert catalog.router.normal_downgrade_streak == 3
+    assert catalog.router.chat_route == ""
+    assert catalog.router.label_routes == ()
+    assert catalog.router.decision_log == ""
+
+
+def test_router_full_valid_block():
+    router = {
+        "mode": "shadow",
+        "model": "gemini-3-flash-preview",
+        "timeout_ms": 5000,
+        "recent_turns": 8,
+        "normal_downgrade_streak": 2,
+        "chat_route": "chat",
+        "label_routes": {"SYSTEM_DEV": "dev", "FRONTEND_DEV": "dev", "DOCUMENT_WORK": ""},
+        "decision_log": "/tmp/decisions.jsonl",
+    }
+    catalog = mr.load_routes(_cfg(routes=_router_routes(), router=router))
+    assert catalog.issues == []
+    rc = catalog.router
+    assert rc.mode == "shadow"
+    assert rc.timeout_ms == 5000.0
+    assert rc.recent_turns == 8
+    assert rc.normal_downgrade_streak == 2
+    assert rc.chat_route == "chat"
+    # empty-string DOCUMENT_WORK means "never switches" — not an error
+    assert rc.label_route_map() == {"SYSTEM_DEV": "dev", "FRONTEND_DEV": "dev"}
+    assert rc.decision_log == "/tmp/decisions.jsonl"
+
+
+def test_router_not_a_mapping_is_error_and_off():
+    catalog = mr.load_routes(_cfg(routes=_router_routes(), router=[1]))
+    errors = _errors(catalog)
+    assert len(errors) == 1 and "router" in errors[0].message
+    assert catalog.router.mode == "off"
+
+
+def test_router_invalid_mode_is_error_and_off():
+    catalog = mr.load_routes(_cfg(routes=_router_routes(), router={"mode": "audit"}))
+    errors = _errors(catalog)
+    assert len(errors) == 1 and "mode" in errors[0].message
+    assert catalog.router.mode == "off"
+
+
+def test_router_yaml_false_mode_is_off_without_issue():
+    # YAML 1.1: unquoted ``mode: off`` arrives as boolean False.
+    catalog = mr.load_routes(_cfg(routes=_router_routes(), router={"mode": False}))
+    assert catalog.issues == []
+    assert catalog.router.mode == "off"
+
+
+def test_router_unknown_key_warns():
+    catalog = mr.load_routes(
+        _cfg(routes=_router_routes(), router={"mode": "shadow", "modle": "typo"})
+    )
+    warnings = _warnings(catalog)
+    assert any("modle" in w.message for w in warnings)
+    assert catalog.router.mode == "shadow"
+
+
+@pytest.mark.parametrize("key", ["timeout_ms", "recent_turns", "normal_downgrade_streak"])
+@pytest.mark.parametrize("value", [0, -1, "5", True, None])
+def test_router_invalid_numeric_warns_and_defaults(key, value):
+    catalog = mr.load_routes(_cfg(routes=_router_routes(), router={key: value}))
+    warnings = _warnings(catalog)
+    assert any(key in w.message for w in warnings)
+    assert getattr(catalog.router, key) == getattr(mr.RouterConfig(), key)
+
+
+def test_router_chat_route_must_name_declared_route():
+    catalog = mr.load_routes(
+        _cfg(routes=_router_routes(), router={"mode": "shadow", "chat_route": "ghost"})
+    )
+    errors = _errors(catalog)
+    assert len(errors) == 1 and "chat_route" in errors[0].message
+    assert catalog.router.chat_route == ""  # downgrades disabled, mode preserved
+    assert catalog.router.mode == "shadow"
+
+
+def test_router_chat_route_case_insensitive_lookup():
+    catalog = mr.load_routes(
+        _cfg(routes=_router_routes(), router={"chat_route": "CHAT"})
+    )
+    assert _errors(catalog) == []
+    assert catalog.router.chat_route == "CHAT"
+
+
+def test_router_label_routes_unknown_route_is_error_label_disabled():
+    router = {"label_routes": {"SYSTEM_DEV": "ghost", "FRONTEND_DEV": "dev"}}
+    catalog = mr.load_routes(_cfg(routes=_router_routes(), router=router))
+    errors = _errors(catalog)
+    assert len(errors) == 1 and "SYSTEM_DEV" in errors[0].message
+    assert catalog.router.label_route_map() == {"FRONTEND_DEV": "dev"}
+
+
+def test_router_label_routes_unknown_label_warns():
+    router = {"label_routes": {"NORMAL": "chat", "SYSTEM_DEV": "dev"}}
+    catalog = mr.load_routes(_cfg(routes=_router_routes(), router=router))
+    warnings = _warnings(catalog)
+    assert any("NORMAL" in w.message for w in warnings)
+    assert catalog.router.label_route_map() == {"SYSTEM_DEV": "dev"}
+
+
+def test_router_label_routes_not_mapping_is_error():
+    catalog = mr.load_routes(
+        _cfg(routes=_router_routes(), router={"label_routes": ["SYSTEM_DEV"]})
+    )
+    errors = _errors(catalog)
+    assert len(errors) == 1 and "label_routes" in errors[0].message
+    assert catalog.router.label_routes == ()
+
+
+def test_router_active_mode_with_no_routes_warns():
+    catalog = mr.load_routes(_cfg(model_routes={"router": {"mode": "shadow"}}))
+    warnings = _warnings(catalog)
+    assert any("no valid routes" in w.message for w in warnings)
+    assert catalog.router.mode == "shadow"
+
+
+def test_router_off_mode_with_no_routes_is_quiet():
+    catalog = mr.load_routes(_cfg(model_routes={"router": {"mode": "off"}}))
+    assert catalog.issues == []
+
+
+def test_static_rule_optional_name_accepted():
+    rules = [
+        {"name": "pr-shorthand", "route": "dev", "when": {"text_matches_any": ["x"]}},
+        {"route": "chat", "when": {"is_owner": {"eq": False}}},  # legacy: no name
+    ]
+    catalog = mr.load_routes(_cfg(routes=_router_routes(), static_rules=rules))
+    assert catalog.issues == []
+    assert [r.get("name") for r in catalog.static_rules] == ["pr-shorthand", None]
+
+
+def test_static_rule_bad_name_warns_but_rule_kept():
+    rules = [{"name": 3, "route": "dev", "when": {"platform": {"eq": "telegram"}}}]
+    catalog = mr.load_routes(_cfg(routes=_router_routes(), static_rules=rules))
+    warnings = _warnings(catalog)
+    assert any("'name'" in w.message for w in warnings)
+    assert len(catalog.static_rules) == 1
