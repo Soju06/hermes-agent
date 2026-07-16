@@ -63,14 +63,12 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **touches:** `plugins/platforms/discord/adapter.py`, `tests/gateway/test_discord_send.py`
 
 
-### 5. delegate-per-task-model
-- **branch:** `soju/patches/delegate-per-task-model`
-- **origin:** `local-author`
-- **upstream_pr:** _(none — dogfood subagent routing)_
-- **state:** `local-only`
-- **rationale:** `delegate_task` should support per-call and per-task model/provider overrides so the parent can route lightweight research or analysis children to a different configured provider (e.g. `grok-tokenmaxxing/grok-4.3`) without changing `delegation.model/provider` globally for every subagent.
-- **commit:** `b52946a22 feat(delegate): restore per-call model provider override`
-- **touches:** `gateway/run.py`, `run_agent.py`, `tools/delegate_tool.py`, `tests/gateway/test_run_progress_topics.py`, `tests/tools/test_delegate.py`
+### 5. delegate-per-task-model — SUPERSEDED (2026-07-16)
+Superseded by patch #34 Phase 3a (route-enum delegation, `ffee9ea3c`): raw
+per-task model/provider overrides are replaced by config-declared route enums,
+matching upstream's `delegation-model-routing` policy while keeping per-task
+routing. Branch `soju/patches/delegate-per-task-model` retained for history;
+no longer part of the production stack.
 
 ### 6. background-review-guardrails
 - **branch:** `soju/patches/background-review-guardrails`
@@ -400,7 +398,8 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **commits:**
   - `792162537 feat(routing): model_routes catalog + health-aware route resolver (ADR-003 Phase 1)`
   - `27fd5fffd feat(routing): core dynamic model router with shadow mode (ADR-003 Phase 2)`
-- **touches:** `hermes_cli/model_routes.py` (new), `hermes_cli/config.py`, `gateway/model_router.py` (new), `gateway/run.py`, `gateway/slash_commands.py`, `cli-config.yaml.example`, `tests/conftest.py`, `tests/hermes_cli/test_model_routes.py` (new), `tests/gateway/test_model_router.py` (new)
+  - `ffee9ea3c feat(routing): route-enum delegation on delegate_task (ADR-003 Phase 3a — supersedes and drops patch #5)`
+- **touches:** `hermes_cli/model_routes.py` (new), `hermes_cli/config.py`, `gateway/model_router.py` (new), `gateway/run.py`, `gateway/slash_commands.py`, `tools/delegate_tool.py`, `run_agent.py`, `cli-config.yaml.example`, `tests/conftest.py`, `tests/hermes_cli/test_model_routes.py` (new), `tests/gateway/test_model_router.py` (new), `tests/tools/test_delegate.py`
 
 ## State Vocabulary
 
