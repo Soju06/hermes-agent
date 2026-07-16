@@ -140,6 +140,49 @@ model:
 #         stale_timeout_seconds: 1800  # Longer non-stream stale timeout for slow large-context turns
 
 # =============================================================================
+# Model Routing (ADR-003) — purpose-based route catalog
+# =============================================================================
+# Dormant unless routes are declared. Each route maps a purpose to a concrete
+# runtime plus an ordered, health-checked fallback chain. Route provider names
+# must exist under providers: above (or be a built-in provider id).
+#
+# NOTE: this root-level model_routes: catalog is unrelated to the API server's
+# per-client alias map under platforms.api_server.extra.model_routes (below) —
+# that one maps inbound API model aliases to concrete models for API clients.
+#
+# model_routes:
+#   routes:
+#     dev:
+#       description: "Backend/system/debug/PR source-code work"
+#       provider: claude-lb            # must exist under providers: (or built-in)
+#       model: claude-fable-5
+#       reasoning_effort: xhigh        # minimal|low|medium|high|xhigh|max|none, omit to leave unset
+#       accepted:                      # model ids already "in this tier" (no-op suppression);
+#         - claude-fable-5             # use dash forms: claude-opus-4-8 matches a live
+#         - gpt-5.6-sol                # claude-opus-4.8, not the other way around
+#       fallbacks:                     # ordered failover chain, health-probed at switch time
+#         - provider: codex-nekos
+#           model: gpt-5.6-sol
+#           reasoning_effort: xhigh    # (example) fallback effort is NOT inherited from the route
+#         - provider: glm-vooy
+#           model: grok-4.5
+#     chat:
+#       description: "Conversation, quick Q&A"
+#       provider: glm-vooy
+#       model: grok-4.5
+#   health:                            # provider health probing (fail-open: auth errors count healthy)
+#     enabled: true                    # kill switch; env HERMES_MODEL_ROUTES_HEALTH=0/1 overrides
+#     cache_path: ""                   # "" = <hermes home>/state/model_route_health.json
+#     ok_ttl_seconds: 300              # healthy results cached this long
+#     fail_ttl_seconds: 120            # failures retried sooner
+#     probe_timeout_seconds: 2.5
+#   static_rules:                      # parsed+validated now; matching/enforcement lands in Phase 2
+#     - route: dev
+#       when:
+#         channel: codex-lb-pr
+#       reason: "PR channel always routes to dev"
+
+# =============================================================================
 # OpenRouter Provider Routing (only applies when using OpenRouter)
 # =============================================================================
 # Control how requests are routed across providers on OpenRouter.

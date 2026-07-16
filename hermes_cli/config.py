@@ -998,6 +998,10 @@ def _ensure_hermes_home_managed(home: Path):
 DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
+    # Model routing catalog (ADR-003). Empty = feature dormant.
+    # Schema: model_routes: {routes: {...}, health: {...}, static_rules: [...]}
+    # — see cli-config.yaml.example and hermes_cli/model_routes.py.
+    "model_routes": {},
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
@@ -5724,6 +5728,15 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
                 f"Root-level key '{key}' looks misplaced — should it be under 'model:' or inside a 'custom_providers' entry?",
                 f"Move '{key}' under the appropriate section",
             ))
+
+    # ── model_routes catalog validation (ADR-003 Phase 1) ────────────────
+    if config.get("model_routes"):
+        try:
+            # Deferred import — model_routes imports config at module level.
+            from hermes_cli.model_routes import validate_model_routes
+            issues.extend(validate_model_routes(config))
+        except Exception:
+            logger.warning("model_routes validation failed", exc_info=True)
 
     return issues
 
