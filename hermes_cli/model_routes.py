@@ -830,7 +830,33 @@ def load_routes(cfg: Optional[Dict[str, Any]] = None) -> RouteCatalog:
 
 def validate_model_routes(cfg: Optional[Dict[str, Any]] = None) -> List[ConfigIssue]:
     """Config-validation hook — called by ``config.validate_config_structure``."""
-    return load_routes(cfg).issues
+    if cfg is None:
+        cfg = load_config()
+    catalog = load_routes(cfg)
+    issues = catalog.issues
+
+    # delegation.default_route lives OUTSIDE the model_routes section but must
+    # name a declared route — checked here (not in load_routes) so a
+    # default_route with no model_routes section at all still warns.
+    delegation = cfg.get("delegation")
+    default_route = delegation.get("default_route") if isinstance(delegation, dict) else None
+    if default_route is not None:
+        if not isinstance(default_route, str):
+            issues.append(ConfigIssue(
+                "warning",
+                f"delegation.default_route must be a string "
+                f"(got {type(default_route).__name__}) — ignored",
+                "Name a route declared under model_routes.routes, or omit the key",
+            ))
+        elif default_route.strip() and _lookup_route(catalog, default_route) is None:
+            issues.append(ConfigIssue(
+                "warning",
+                f"delegation.default_route {default_route.strip()!r} does not name a "
+                "declared valid route — every delegate_task call without an explicit "
+                "route will fail",
+                "Declare it under model_routes.routes, or remove delegation.default_route",
+            ))
+    return issues
 
 
 # =============================================================================

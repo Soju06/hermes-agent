@@ -3155,5 +3155,398 @@ class TestFallbackModelInheritance(unittest.TestCase):
         self.assertIsNone(kwargs["fallback_model"])
 
 
+# =========================================================================
+# Model-route delegation (ADR-003 Phase 3a)
+# =========================================================================
+
+# Hermetic full config for route tests — never read the real user config
+# (the live gateway may have model_routes declared); tests always patch
+# tools.delegate_tool._load_full_config / _route_catalog_pairs.
+_ROUTES_FULL_CFG = {
+    "providers": {
+        "p1": {"base_url": "https://p1.example/v1"},
+        "p2": {"base_url": "https://p2.example/v1"},
+    },
+    "model_routes": {
+        "routes": {
+            "dev": {
+                "description": "Backend/system work",
+                "provider": "p1",
+                "model": "model-a",
+                "reasoning_effort": "xhigh",
+                "fallbacks": [{"provider": "p2", "model": "model-b"}],
+            },
+            "chat": {
+                "description": "Quick conversation",
+                "provider": "p2",
+                "model": "model-c",
+            },
+        },
+    },
+}
+
+
+def _fake_runtime_resolver(requested=None, target_model=None, **_kw):
+    """Deterministic resolve_runtime_provider stand-in (no network/env)."""
+    return {
+        "provider": "custom",
+        "base_url": f"https://{requested}.example/v1",
+        "api_key": f"key-{requested}",
+        "api_mode": "chat_completions",
+        "model": target_model,
+    }
+
+
+def _health_for(healthy_providers):
+    """provider_health stand-in: only the named providers are healthy."""
+
+    def fake(provider, model="", **_kw):
+        return (provider in healthy_providers, "test verdict")
+
+    return fake
+
+
+class TestDelegateRouteSchema(unittest.TestCase):
+    """Schema dormancy/injection for the route enum param."""
+
+    @patch("tools.delegate_tool._route_catalog_pairs", return_value=[])
+    def test_schema_dormant_without_routes(self, _pairs):
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+
+        overrides = _build_dynamic_schema_overrides()
+        props = overrides["parameters"]["properties"]
+        static_props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
+        # No route param anywhere; property set matches the upstream shape.
+        self.assertNotIn("route", props)
+        self.assertNotIn("route", props["tasks"]["items"]["properties"])
+        self.assertEqual(set(props), set(static_props))
+        self.assertEqual(
+            overrides["parameters"]["required"],
+            DELEGATE_TASK_SCHEMA["parameters"]["required"],
+        )
+        # tasks.items is the SAME object as the static schema's — proof the
+        # dormant schema is byte-identical to upstream, not a lookalike copy.
+        self.assertIs(props["tasks"]["items"], static_props["tasks"]["items"])
+        self.assertNotIn("route", overrides["description"])
+
+    @patch(
+        "tools.delegate_tool._route_catalog_pairs",
+        return_value=[("dev", "Backend/system work"), ("chat", "Quick conversation")],
+    )
+    def test_schema_injects_declared_routes(self, _pairs):
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+
+        overrides = _build_dynamic_schema_overrides()
+        props = overrides["parameters"]["properties"]
+        self.assertEqual(props["route"]["enum"], ["dev", "chat"])
+        self.assertIn("Delegation runtime route.", props["route"]["description"])
+        self.assertIn("dev: Backend/system work", props["route"]["description"])
+        self.assertIn("chat: Quick conversation", props["route"]["description"])
+        # Per-task route mirrors the enum.
+        item_route = props["tasks"]["items"]["properties"]["route"]
+        self.assertEqual(item_route["enum"], ["dev", "chat"])
+        # The static schema must never be mutated by the dynamic rebuild.
+        static_props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
+        self.assertNotIn("route", static_props)
+        self.assertNotIn("route", static_props["tasks"]["items"]["properties"])
+
+    def test_schema_enum_tracks_config_changes(self):
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+
+        with patch(
+            "tools.delegate_tool._route_catalog_pairs", return_value=[("dev", "d")]
+        ):
+            first = _build_dynamic_schema_overrides()
+        with patch(
+            "tools.delegate_tool._route_catalog_pairs",
+            return_value=[("dev", "d"), ("docs", "documents")],
+        ):
+            second = _build_dynamic_schema_overrides()
+        self.assertEqual(first["parameters"]["properties"]["route"]["enum"], ["dev"])
+        self.assertEqual(
+            second["parameters"]["properties"]["route"]["enum"], ["dev", "docs"]
+        )
+
+
+class TestDelegateRouteResolution(unittest.TestCase):
+    """route param → resolve_route → child credentials/reasoning."""
+
+    def _run(
+        self,
+        deleg_cfg=None,
+        healthy=("p1", "p2"),
+        parent=None,
+        **call_kwargs,
+    ):
+        parent = parent or _make_mock_parent()
+        with patch(
+            "tools.delegate_tool._load_config",
+            return_value=deleg_cfg if deleg_cfg is not None else {"max_iterations": 5},
+        ), patch(
+            "tools.delegate_tool._load_full_config", return_value=_ROUTES_FULL_CFG
+        ), patch(
+            "hermes_cli.model_routes.provider_health",
+            side_effect=_health_for(set(healthy)),
+        ), patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            side_effect=_fake_runtime_resolver,
+        ), patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done", "completed": True, "api_calls": 1
+            }
+            MockAgent.return_value = mock_child
+            result = delegate_task(parent_agent=parent, **call_kwargs)
+        return result, MockAgent
+
+    def test_route_healthy_default_reaches_child(self):
+        _, MockAgent = self._run(goal="g", route="dev")
+        kwargs = MockAgent.call_args[1]
+        self.assertEqual(kwargs["model"], "model-a")
+        self.assertEqual(kwargs["provider"], "p1")
+        self.assertEqual(kwargs["base_url"], "https://p1.example/v1")
+        self.assertEqual(kwargs["api_key"], "key-p1")
+
+    def test_route_unhealthy_default_uses_first_healthy_fallback(self):
+        _, MockAgent = self._run(goal="g", route="dev", healthy=("p2",))
+        kwargs = MockAgent.call_args[1]
+        self.assertEqual(kwargs["model"], "model-b")
+        self.assertEqual(kwargs["provider"], "p2")
+        self.assertEqual(kwargs["base_url"], "https://p2.example/v1")
+
+    def test_route_whole_chain_down_errors_naming_declared_routes(self):
+        result, MockAgent = self._run(goal="g", route="dev", healthy=())
+        error = json.loads(result)["error"]
+        self.assertIn("'dev'", error)
+        self.assertIn("no healthy runtime", error)
+        # Declared routes are listed so the model can retry differently.
+        self.assertIn("dev", error)
+        self.assertIn("chat", error)
+        MockAgent.assert_not_called()
+
+    def test_unknown_route_errors_naming_declared_routes(self):
+        result, MockAgent = self._run(goal="g", route="nope")
+        error = json.loads(result)["error"]
+        self.assertIn("Unknown delegation route 'nope'", error)
+        self.assertIn("dev", error)
+        self.assertIn("chat", error)
+        MockAgent.assert_not_called()
+
+    def test_per_task_route_overrides_top_level(self):
+        _, MockAgent = self._run(
+            tasks=[{"goal": "a", "route": "chat"}, {"goal": "b"}],
+            route="dev",
+        )
+        models = [call[1]["model"] for call in MockAgent.call_args_list]
+        self.assertEqual(models, ["model-c", "model-a"])
+
+    def test_default_route_applies_when_none_given(self):
+        _, MockAgent = self._run(
+            goal="g", deleg_cfg={"max_iterations": 5, "default_route": "chat"}
+        )
+        kwargs = MockAgent.call_args[1]
+        self.assertEqual(kwargs["model"], "model-c")
+        self.assertEqual(kwargs["provider"], "p2")
+
+    @patch("tools.delegate_tool._load_full_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._load_config", return_value={"max_iterations": 5})
+    def test_no_route_no_default_keeps_upstream_config_path(
+        self, mock_cfg, mock_creds, mock_full
+    ):
+        """Regression: without route/default_route the config path is untouched
+        — no catalog load, credentials resolved once with no override kwargs."""
+        mock_creds.return_value = {
+            "model": None, "provider": None, "base_url": None,
+            "api_key": None, "api_mode": None,
+            "request_overrides": None, "max_output_tokens": None,
+        }
+        parent = _make_mock_parent()
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done", "completed": True, "api_calls": 1
+            }
+            MockAgent.return_value = mock_child
+            delegate_task(goal="g", parent_agent=parent)
+        mock_full.assert_not_called()
+        mock_creds.assert_called_once()
+        _, creds_kwargs = mock_creds.call_args
+        self.assertNotIn("model_override", creds_kwargs)
+        self.assertNotIn("provider_override", creds_kwargs)
+        # Child inherits the parent runtime, as upstream.
+        kwargs = MockAgent.call_args[1]
+        self.assertEqual(kwargs["model"], parent.model)
+        self.assertEqual(kwargs["base_url"], parent.base_url)
+
+    def test_route_reasoning_effort_reaches_child(self):
+        parent = _make_mock_parent()
+        parent.reasoning_config = {"enabled": True, "effort": "medium"}
+        _, MockAgent = self._run(
+            goal="g", route="dev",
+            deleg_cfg={"max_iterations": 5, "reasoning_effort": "low"},
+            parent=parent,
+        )
+        # Route effort (xhigh) beats delegation.reasoning_effort (low).
+        self.assertEqual(
+            MockAgent.call_args[1]["reasoning_config"],
+            {"enabled": True, "effort": "xhigh"},
+        )
+
+    def test_route_without_effort_keeps_config_effort(self):
+        parent = _make_mock_parent()
+        parent.reasoning_config = {"enabled": True, "effort": "medium"}
+        _, MockAgent = self._run(
+            goal="g", route="chat",
+            deleg_cfg={"max_iterations": 5, "reasoning_effort": "low"},
+            parent=parent,
+        )
+        # 'chat' declares no effort → delegation.reasoning_effort still applies.
+        self.assertEqual(
+            MockAgent.call_args[1]["reasoning_config"],
+            {"enabled": True, "effort": "low"},
+        )
+
+    @patch("tools.delegate_tool._load_config", return_value={"reasoning_effort": "low"})
+    @patch("run_agent.AIAgent")
+    def test_build_child_route_effort_beats_config(self, MockAgent, mock_cfg):
+        MockAgent.return_value = MagicMock()
+        parent = _make_mock_parent()
+        parent.reasoning_config = {"enabled": True, "effort": "medium"}
+        _build_child_agent(
+            task_index=0, goal="t", context=None, toolsets=None, model=None,
+            max_iterations=5, task_count=1, parent_agent=parent,
+            override_reasoning_effort="xhigh",
+        )
+        self.assertEqual(
+            MockAgent.call_args[1]["reasoning_config"],
+            {"enabled": True, "effort": "xhigh"},
+        )
+
+    @patch("tools.delegate_tool._load_config", return_value={"reasoning_effort": "low"})
+    @patch("run_agent.AIAgent")
+    def test_build_child_route_effort_none_disables_thinking(self, MockAgent, mock_cfg):
+        MockAgent.return_value = MagicMock()
+        parent = _make_mock_parent()
+        parent.reasoning_config = {"enabled": True, "effort": "medium"}
+        _build_child_agent(
+            task_index=0, goal="t", context=None, toolsets=None, model=None,
+            max_iterations=5, task_count=1, parent_agent=parent,
+            override_reasoning_effort="none",
+        )
+        self.assertEqual(
+            MockAgent.call_args[1]["reasoning_config"], {"enabled": False}
+        )
+
+
+
+
+class TestDelegateRouteHardening(unittest.TestCase):
+    """Review follow-ups: lazy default creds, real custom-provider resolution,
+    schema stability across repeated builds."""
+
+    def test_all_tasks_routed_tolerates_broken_default_creds(self):
+        """A broken delegation.provider must not fail calls that route every
+        task — default creds resolve lazily, only for route-less tasks."""
+        import tools.delegate_tool as dt
+
+        real = dt._resolve_delegation_credentials
+
+        def guard(cfg, parent_agent, **kw):
+            if not kw.get("model_override") and not kw.get("provider_override"):
+                raise ValueError("delegation provider broken")
+            return real(cfg, parent_agent, **kw)
+
+        parent = _make_mock_parent()
+        with patch(
+            "tools.delegate_tool._load_config",
+            return_value={"max_iterations": 5},
+        ), patch(
+            "tools.delegate_tool._load_full_config", return_value=_ROUTES_FULL_CFG
+        ), patch(
+            "tools.delegate_tool._resolve_delegation_credentials", side_effect=guard
+        ), patch(
+            "hermes_cli.model_routes.provider_health",
+            side_effect=_health_for({"p1", "p2"}),
+        ), patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            side_effect=_fake_runtime_resolver,
+        ), patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done", "completed": True, "api_calls": 1
+            }
+            MockAgent.return_value = mock_child
+            result = dt.delegate_task(parent_agent=parent, goal="g", route="dev")
+        self.assertNotIn("delegation provider broken", result)
+        self.assertEqual(MockAgent.call_args[1]["model"], "model-a")
+
+    def test_custom_provider_route_resolves_real_creds(self):
+        """No resolve_runtime_provider mock: a route naming a providers-dict
+        custom provider (key_env, bare base_url, explicit api_mode) resolves
+        creds through the real _get_named_custom_provider scan path."""
+        import hermes_cli.runtime_provider as rp
+
+        full_cfg = {
+            "providers": {
+                "lbtest": {
+                    "name": "LB Test",
+                    "base_url": "http://10.9.9.9:2455",
+                    "key_env": "LBTEST_KEY",
+                    "api_mode": "anthropic_messages",
+                    "default_model": "other-model",
+                },
+            },
+            "model_routes": {
+                "routes": {
+                    "lbroute": {
+                        "description": "custom provider route",
+                        "provider": "lbtest",
+                        "model": "fable-x",
+                    },
+                },
+            },
+        }
+        parent = _make_mock_parent()
+        with patch(
+            "tools.delegate_tool._load_config", return_value={"max_iterations": 5}
+        ), patch(
+            "tools.delegate_tool._load_full_config", return_value=full_cfg
+        ), patch.object(
+            rp, "load_config", lambda: full_cfg
+        ), patch.dict(
+            os.environ, {"LBTEST_KEY": "sekret-lb"}
+        ), patch(
+            "hermes_cli.model_routes.provider_health",
+            side_effect=_health_for({"lbtest"}),
+        ), patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done", "completed": True, "api_calls": 1
+            }
+            MockAgent.return_value = mock_child
+            result = delegate_task(parent_agent=parent, goal="g", route="lbroute")
+        self.assertNotIn("error", json.loads(result))
+        kwargs = MockAgent.call_args[1]
+        self.assertEqual(kwargs["model"], "fable-x")  # route model beats default_model
+        self.assertEqual(kwargs["base_url"], "http://10.9.9.9:2455")
+        self.assertEqual(kwargs["api_key"], "sekret-lb")
+        self.assertEqual(kwargs["api_mode"], "anthropic_messages")
+
+    def test_schema_stable_across_repeated_builds(self):
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+        import copy
+
+        static_before = copy.deepcopy(DELEGATE_TASK_SCHEMA)
+        with patch(
+            "tools.delegate_tool._route_catalog_pairs",
+            return_value=[("dev", "d"), ("chat", "c")],
+        ):
+            builds = [_build_dynamic_schema_overrides() for _ in range(3)]
+        self.assertEqual(builds[0], builds[1])
+        self.assertEqual(builds[1], builds[2])
+        self.assertEqual(DELEGATE_TASK_SCHEMA, static_before)
+
+
 if __name__ == "__main__":
     unittest.main()
