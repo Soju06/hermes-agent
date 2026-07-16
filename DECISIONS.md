@@ -168,3 +168,39 @@ Kill switch: `agent.gateway_turn_resume: false` (config) / `HERMES_GATEWAY_TURN_
 ### Patch
 
 `soju/patches/durable-turns` (PATCHES.md entry TBD in same change).
+
+---
+
+## ADR-003 — Model routing as a first-class core subsystem; skill-gate relinquishes model switching (2026-07-16)
+
+**Status:** Decided
+**Type:** Architecture (gateway + agent tools + skill-gate plugin boundary)
+**Resolves:** Model-switching ownership fragmentation. The *application* layer is already unified — `/model` (gateway/slash_commands.py:1402), the agent's `model_switch` tool (agent/runtime_control.py:459, patch #1), and skill-gate's `runtime_override` directive (gateway/run.py:16824) all resolve through `hermes_cli.model_switch.switch_model` and write the same `_session_model_overrides[session_key]` slot. But the *decision* layer is split across three actors with three different bodies of knowledge:
+
+1. **skill-gate accidentally owns the routing brain.** The route catalog (`runtime_catalog.yaml`: per-route default/accepted/fallbacks), provider health probing (`select_healthy_spec`, fail-open semantics), the LLM classifier (dev_routing S1–S7 decision tree, benched at 95.0% holdout), CHAT-downgrade hysteresis, and the decision log all live in a plugin whose original job was skill/rule gating. Route labels are hardcoded (`RuntimeLabel` Literal, policy_router.py:56); adding a category means editing plugin code + rules.yaml + runtime_catalog.yaml.
+2. **`delegate_task` gives the model unbounded freedom.** `model`/`provider` are free-form strings — no enum, no runtime validation of `model` (arbitrary strings flow raw into the child agent; delegate_tool.py:3042-3182). Upstream deliberately rejects this (`delegation-model-routing` sweeper policy); our patch #5 carries it locally. Meanwhile the config-driven alias system (`model_aliases:`, hermes_cli/model_switch.py:236-314) is never consulted on the delegation path.
+3. **The agent's self-switch tool is blind.** `model_switch` is constrained to config-declared providers/models (patch #1) but knows nothing about purposes, route defaults, or health fallbacks — the agent picks raw model ids while skill-gate picks health-checked routes, last-writer-wins on the same session slot.
+
+### Context
+
+The end state we actually operate is "purpose → runtime" routing: dev sessions on claude-fable-5@claude-lb xhigh, chat/document/security on grok-4.5@glm-vooy, with health-probed fallback chains. That knowledge should be one declarative catalog consumed by every decider, and switching should be a core subsystem — skill-gate returns to being a rules engine.
+
+### Decision
+
+1. **`model_routes:` in config.yaml is the SoT.** Each route: `description` (purpose guidance shown to models and the classifier), `provider`, `model`, `reasoning_effort`, `accepted:` (membership for no-op suppression), `fallbacks:` (ordered health-fallback chain). Startup validation: every route's provider/model must exist under `providers:`. Static condition routes (e.g. non-owner sender → security route, codex-lb PR channel → dev route) are declared here too, replacing skill-gate's static runtime_override rules.
+2. **Core route resolver.** One module resolves route → concrete runtime, walking `default → fallbacks` with provider health probing ported verbatim from skill-gate (fail-open semantics preserved: 401/403 = healthy, unhealthy = credit-exhaustion body sniff + 402/429/5xx/connection errors; cached probes; kill switch).
+3. **Core dynamic router.** The LLM classifier moves into the gateway as a pre-dispatch stage (post-auth, pre-first-LLM-call): router model/timeout/downgrade-streak configured in config.yaml, label set + purpose descriptions generated from `model_routes`, asymmetric hysteresis and the decision log (JSONL) carried over. The benched prompt/model/JSON-context configuration is lifted as-is; behavior change target is zero.
+4. **Agent surfaces become route enums.** `model_switch` (patch #1 evolution) and `delegate_task` (supersedes patch #5) drop free-form `model`/`provider` in favor of a `route` parameter whose enum + per-route descriptions are injected at schema-build time (delegate_tool.py already rebuilds schemas per `get_definitions()`). `delegation.model/provider` config becomes `delegation.default_route`. Session-only scope for `model_switch` is unchanged.
+5. **skill-gate shrinks.** Removed from the plugin: `runtime_catalog.yaml`, policy_router dev_routing mode, the health prober, and all `runtime_override` rule outputs. It keeps prepends, notifications, advisory rules — the rules engine proper. The gateway's generic plugin `runtime_override` directive interface (patch #1) stays for now as a plugin capability; skill-gate simply stops using it.
+6. **Rollout gate.** Core router first runs in shadow mode (log-only) against live skill-gate decisions; the dev-routing bench (230-case main + 120-case session-split holdout, `skill-gate/bench/`) MUST be re-run against the core implementation before the flip — lift-and-shift still changes context assembly. Kill switch restores skill-gate routing until the plugin-side removal lands.
+
+### Anti-goals
+
+- Changing `/model` — the human command keeps free-form model/provider selection as the owner escape hatch.
+- Touching the request-error fallback system (`get_fallback_chain` / `agent._fallback_chain`) — it remains the post-hoc outage failover, distinct from switch-time route fallbacks.
+- Re-litigating routing quality — classifier prompt/model changes are out of scope; this is an ownership/interface change gated on behavior parity.
+- Upstreaming in round one. The enum'd delegation design aligns with upstream's `delegation-model-routing` policy and gets a config.yaml surface from day one, so it is a natural later candidate — but the fork ships first.
+
+### Patch
+
+`soju/patches/model-routing` (new topic: catalog, resolver, dynamic router, delegate_task enum — supersedes and drops `soju/patches/delegate-per-task-model`); `model_switch` route-enum lands as an evolution of `soju/patches/runtime-control`. skill-gate removal is a plugin-repo change (Soju06/skill-gate), sequenced after the bench gate passes.
