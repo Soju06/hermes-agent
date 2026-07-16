@@ -2673,6 +2673,13 @@ _CONVERSATION_SCOPED_STATE: tuple = (
     # and run_sync) must not leak into a future conversation's first user
     # message — session keys are source-derived and REUSED.
     "_pending_turn_sidecar_notes",
+    # Dynamic model router (ADR-003 Phase 2): the NORMAL-downgrade hysteresis
+    # streak is conversation-scoped, and a not-yet-consumed fresh-apply flag
+    # must never outlive its conversation. The auto-reset boundary consumes
+    # the fresh-apply flag BEFORE the funnel call (#48031 survival exception,
+    # see _consume_auto_reset_boundary).
+    "_model_router_state",
+    "_model_router_fresh_applies",
 )
 
 # Sentinel for "caller did not pass metadata" vs "caller passed None".
@@ -3642,6 +3649,29 @@ def _resolve_gateway_model(config: dict | None = None) -> str:
     elif isinstance(model_cfg, dict):
         return model_cfg.get("default") or model_cfg.get("model") or ""
     return ""
+
+
+def _model_router_mode() -> str:
+    """Effective dynamic-model-router mode: "off" | "shadow" | "enforce".
+
+    Config-first (``model_routes.router.mode``) with an env escape hatch:
+    ``HERMES_MODEL_ROUTER_MODE`` WINS when set (mirrors the
+    gateway.platform_connect_timeout bridge semantics). Kept to one cheap
+    config-dict read so mode=off costs nothing per message — the router
+    module is only imported once a non-off mode is active.
+    """
+    env = os.environ.get("HERMES_MODEL_ROUTER_MODE", "").strip().lower()
+    if env:
+        return env if env in ("shadow", "enforce") else "off"
+    try:
+        cfg = _load_gateway_config()
+        section = cfg.get("model_routes") if isinstance(cfg, dict) else None
+        router = section.get("router") if isinstance(section, dict) else None
+        raw = router.get("mode") if isinstance(router, dict) else None
+    except Exception:
+        return "off"
+    mode = str(raw).strip().lower() if isinstance(raw, str) else ""
+    return mode if mode in ("shadow", "enforce") else "off"
 
 
 def _channel_override_lookup_keys(
@@ -16234,6 +16264,414 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._handle_loop_command(event)
         return "Agent is running — use /loop status / pause / stop mid-run, or /stop before setting a new loop."
 
+    # ------------------------------------------------------------------
+    # Dynamic model router (ADR-003 Phase 2) — pre-dispatch stage
+    # ------------------------------------------------------------------
+
+    def _model_router_runtime_snapshot(self, source: SessionSource, session_key: str) -> dict:
+        """Non-secret {provider, model, base_url, reasoning_effort} snapshot.
+
+        Equivalent of skill-gate's ``_current_gateway_runtime``: built from the
+        gateway-owned session override / config resolution so the router can
+        suppress pure no-op switches. Secrets (api_key) never enter the
+        snapshot — it is embedded in the classifier prompt payload.
+
+        Callers must take this snapshot ON THE EVENT LOOP (never inside
+        asyncio.to_thread): ``_resolve_session_agent_runtime`` runs
+        ``_rehydrate_session_model_override``, whose check-then-assign on
+        ``_session_model_overrides`` is only safe because every writer of
+        that dict runs loop-atomically between awaits.
+        """
+        try:
+            model, runtime_kwargs = self._resolve_session_agent_runtime(
+                source=source, session_key=session_key,
+            )
+        except Exception:
+            logger.debug("model router: runtime snapshot failed", exc_info=True)
+            return {}
+        snapshot: dict = {}
+        if model:
+            snapshot["model"] = model
+        for name in ("provider", "base_url"):
+            value = (runtime_kwargs or {}).get(name)
+            if value:
+                snapshot[name] = value
+        # Effective reasoning effort (session override → config), needed by
+        # runtime_satisfies_route's effort-aware membership (plugin parity
+        # with runtime_matches_spec). Cheap: dict lookup + config read.
+        try:
+            reasoning = self._resolve_session_reasoning_config(
+                source=source, session_key=session_key,
+            )
+        except Exception:
+            logger.debug("model router: reasoning snapshot failed", exc_info=True)
+            reasoning = None
+        if isinstance(reasoning, dict):
+            if reasoning.get("enabled") is False:
+                snapshot["reasoning_effort"] = "none"
+            else:
+                effort = str(reasoning.get("effort") or "").strip()
+                if effort:
+                    snapshot["reasoning_effort"] = effort
+        return snapshot
+
+    async def _model_router_stage(
+        self,
+        event: MessageEvent,
+        source: SessionSource,
+        session_key: str,
+        *,
+        mode: str,
+    ) -> None:
+        """Evaluate (and in enforce mode apply) the dynamic model router.
+
+        Runs AFTER the running-agent PRIORITY/interrupt/steer interception
+        block, immediately before the fresh-agent dispatch leg. Messages
+        intercepted by that PRIORITY block (steer/stop/queue against a
+        running agent) are therefore NOT routed — a deliberate deviation
+        from the skill-gate plugin, which classified them; the next fresh
+        message routes instead. Expected diff class during shadow soak.
+        The placement also means no router suspension point precedes the
+        ``_quick_key in self._running_agents`` check.
+
+        Evaluation order:
+
+        1. empty/whitespace text — return with zero work (no catalog parse,
+           no runtime snapshot, no thread hop, no log record).
+        2. static rules match on the RAW text + source only; only a match
+           takes the runtime snapshot and resolves/applies/logs. This path
+           runs for slash commands too (plugin parity: skill-gate applies
+           static runtime_overrides even for "/status" from a non-owner).
+        3. no static match + slash command — return (the classifier never
+           runs for slash commands; nothing is logged).
+        4. plain text — runtime snapshot + LLM classifier path.
+
+        The runtime snapshot is taken ON THE EVENT LOOP before any
+        asyncio.to_thread hop (see ``_model_router_runtime_snapshot`` — it
+        keeps ``_rehydrate_session_model_override`` loop-atomic); only
+        blocking work runs in the thread: the classifier HTTP call, health
+        probes inside route resolution, switch_model credential resolution
+        (enforce), and the decision-log append.
+
+        shadow: full evaluation — static rules, classifier, hysteresis streak
+        mutation, health-checked resolution — but NEVER applies a directive.
+        Its only writes are the runner-owned streak dict and the decision log,
+        so it can soak alongside a live skill-gate plugin without interfering.
+
+        enforce: applies ``switch``/``downgrade_to_chat`` directives the same
+        way /model does (session override + store persist + agent eviction),
+        and stamps ``applied: true/false`` on every decision record.
+        """
+        from gateway import model_router as _model_router
+        from hermes_cli.model_routes import load_routes as _load_model_routes
+
+        raw_text = str(getattr(event, "text", None) or "")
+        text = raw_text.strip()
+        if not text:  # (1) zero work for empty/whitespace events
+            return
+
+        state = getattr(self, "_model_router_state", None)
+        if state is None:
+            state = {}
+            self._model_router_state = state
+
+        cfg = _load_gateway_config()
+        catalog = _load_model_routes(cfg)
+
+        # (2) Static-rule matching needs only text + source — no snapshot.
+        matched = _model_router.match_static_rule(
+            list(catalog.static_rules or []),
+            text=raw_text,
+            source_context=_model_router._source_dict(event),
+        )
+        if matched is None and text.startswith("/"):
+            return  # (3) classifier never runs for slash; no log record
+
+        # Runtime snapshot on the event loop — see docstring.
+        runtime = self._model_router_runtime_snapshot(source, session_key)
+
+        if matched is not None:
+            rule, rule_name = matched
+            # Satisfaction check + route resolution can hit health probes
+            # (blocking urllib) — keep the event loop free.
+            decision = await asyncio.to_thread(
+                _model_router.static_rule_decision,
+                rule=rule,
+                rule_name=rule_name,
+                text=raw_text,
+                session_key=_model_router._session_key(self.session_store, event),
+                runtime=runtime,
+                cfg=cfg,
+                catalog=catalog,
+                mode=mode,
+            )
+        else:
+            # (4) The classifier is a blocking urllib call (up to
+            # timeout_ms) — keep the event loop free.
+            decision = await asyncio.to_thread(
+                _model_router.classifier_decision,
+                event=event,
+                session_store=self.session_store,
+                runtime=runtime,
+                cfg=cfg,
+                catalog=catalog,
+                router=catalog.router,
+                mode=mode,
+                state=state,
+                complete_dev=None,
+            )
+
+        directive = decision.directive
+        if mode == "enforce":
+            # Log fidelity: every enforce-mode record carries applied
+            # true/false (false when nothing was applied, switch_model
+            # failed, or the apply raised). Shadow records never carry it.
+            decision.record["applied"] = False
+        if (
+            mode == "enforce"
+            and directive
+            and decision.outcome in ("switch", "downgrade_to_chat")
+        ):
+            reasoning_effort = str(directive.get("reasoning_effort") or "")
+            try:
+                applied, reasoning_applied = await self._apply_model_router_directive(
+                    session_key, directive, cfg, source=source,
+                )
+            except Exception:
+                logger.warning(
+                    "model router: applying directive %s failed", directive, exc_info=True,
+                )
+                applied, reasoning_applied = False, False
+            decision.record["applied"] = bool(applied)
+            if reasoning_effort:
+                decision.record["reasoning_applied"] = bool(reasoning_applied)
+            if applied:
+                logger.info(
+                    "model router: %s session=%s -> route=%s model=%s (%s)",
+                    decision.outcome, session_key,
+                    directive.get("route"), directive.get("model"), decision.label,
+                )
+
+        await asyncio.to_thread(
+            _model_router.log_decision,
+            decision.record,
+            decision_log=getattr(catalog.router, "decision_log", "") or "",
+        )
+
+    async def _apply_model_router_directive(
+        self,
+        session_key: str,
+        directive: dict,
+        cfg: dict,
+        source: Optional[SessionSource] = None,
+    ) -> tuple[bool, bool]:
+        """Apply a resolved route directive the way /model applies a switch.
+
+        Returns (applied, reasoning_applied). Mirrors the commit path of
+        gateway/slash_commands._handle_model_command's _finish_switch:
+        resolve credentials via switch_model, persist the new model to the
+        session DB (dashboard freshness, #34850), queue a pending model note
+        so the agent self-identifies after the silent switch, write the
+        in-memory session override, write-through the non-secret parts to
+        the session store, and evict the cached agent.
+
+        Deliberate simplification vs. the slash path: no in-place
+        ``switch_model`` on a cached agent — the router always evicts and
+        lets the next turn rebuild from the override. The router runs
+        pre-dispatch (never mid-turn), so the rebuild cost is one agent
+        construction and the #50163 in-place-rollback hazard is avoided.
+        """
+        from hermes_cli.model_switch import switch_model as _switch_model
+
+        model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+        if not isinstance(model_cfg, dict):
+            model_cfg = {}
+        current_model = model_cfg.get("default", "")
+        current_provider = model_cfg.get("provider", "openrouter")
+        current_base_url = model_cfg.get("base_url", "")
+        current_api_key = ""
+        user_provs = cfg.get("providers") if isinstance(cfg, dict) else None
+        try:
+            from hermes_cli.config import get_compatible_custom_providers
+            custom_provs = get_compatible_custom_providers(cfg)
+        except Exception:
+            custom_provs = cfg.get("custom_providers") if isinstance(cfg, dict) else None
+        override = self._session_model_overrides.get(session_key, {})
+        if override:
+            current_model = override.get("model", current_model)
+            current_provider = override.get("provider", current_provider)
+            current_base_url = override.get("base_url", current_base_url)
+            current_api_key = override.get("api_key", current_api_key)
+
+        # Credential resolution can fall through to a blocking models.dev
+        # fetch on a cold cache — keep it off the event loop (see #20525).
+        result = await asyncio.to_thread(
+            _switch_model,
+            raw_input=str(directive.get("model") or ""),
+            current_provider=current_provider,
+            current_model=current_model,
+            current_base_url=current_base_url,
+            current_api_key=current_api_key,
+            is_global=False,
+            explicit_provider=str(directive.get("provider") or ""),
+            user_providers=user_provs,
+            custom_providers=custom_provs,
+        )
+        if not result.success:
+            logger.warning(
+                "model router: switch to %s@%s failed: %s",
+                directive.get("model"), directive.get("provider"), result.error_message,
+            )
+            return False, False
+
+        # Persist the new model to the session DB so the dashboard shows the
+        # updated model — same persist the slash path performs (#34850).
+        _sess_db = getattr(self, "_session_db", None)
+        if _sess_db is not None and source is not None:
+            try:
+                _sess_entry = await self.async_session_store.get_or_create_session(source)
+                await _sess_db.update_session_model(
+                    _sess_entry.session_id, result.new_model
+                )
+            except Exception:
+                logger.debug(
+                    "model router: persist model switch to session DB failed",
+                    exc_info=True,
+                )
+
+        # Queue a note for the next agent turn so the model self-identifies
+        # correctly after the silent switch (mirrors the /model note).
+        _route_name = str(directive.get("route") or "")
+        _route_reason = str(directive.get("reason") or "").strip()
+        if not hasattr(self, "_pending_model_notes"):
+            self._pending_model_notes = {}
+        self._pending_model_notes[session_key] = (
+            f"[Note: model was just switched from {current_model} to "
+            f"{result.new_model} by the model router (route '{_route_name}'"
+            + (f": {_route_reason}" if _route_reason and _route_reason != _route_name else "")
+            + "). Adjust your self-identification accordingly.]"
+        )
+
+        self._session_model_overrides[session_key] = {
+            "model": result.new_model,
+            "provider": result.target_provider,
+            "api_key": result.api_key,
+            "base_url": result.base_url,
+            "api_mode": result.api_mode,
+        }
+        # Mark this session as freshly router-applied so the was_auto_reset
+        # conversation-boundary cleanup later in this same inbound turn does
+        # not silently revert the switch (#48031 class) — see
+        # _consume_auto_reset_boundary, which consumes the flag. A dict (not
+        # a set) so the _clear_conversation_scope funnel pops it at every
+        # other conversation boundary automatically.
+        if not hasattr(self, "_model_router_fresh_applies"):
+            self._model_router_fresh_applies = {}
+        self._model_router_fresh_applies[session_key] = True
+        # Write-through the non-secret parts so the override survives a
+        # gateway restart (same as the /model path).
+        try:
+            await self.async_session_store.set_model_override(
+                session_key,
+                self._session_model_overrides[session_key],
+            )
+        except Exception:
+            logger.debug("model router: persist session override failed", exc_info=True)
+
+        reasoning_applied = False
+        effort = str(directive.get("reasoning_effort") or "")
+        if effort:
+            from hermes_constants import parse_reasoning_effort
+            parsed = parse_reasoning_effort(effort)
+            if parsed is not None:
+                self._set_session_reasoning_override(session_key, parsed)
+                reasoning_applied = True
+
+        # Evict cached agent so the next turn creates a fresh agent from the
+        # override (same invalidation the /model path performs).
+        self._evict_cached_agent(session_key)
+        return True, reasoning_applied
+
+    async def _consume_auto_reset_boundary(self, session_entry, session_key: str) -> None:
+        """Auto-reset conversation-boundary cleanup (was_auto_reset consume).
+
+        Treat auto-reset as a full conversation boundary — drop every
+        session-scoped transient state so the fresh session does not inherit
+        the previous conversation's model/reasoning overrides or a queued
+        "/model switched" note.
+
+        Exception (#48031 class): when the model router's enforce mode
+        applied an override earlier in this SAME inbound turn (pre-dispatch,
+        flagged in ``_model_router_fresh_applies``), the override postdates
+        the reset boundary and must survive it. Its store persistence died
+        with the popped session entry, so re-persist it onto the NEW entry.
+        Mirrors how /model's _finish_switch consumes was_auto_reset before
+        storing its override (gateway/slash_commands.py, Closes #48031).
+
+        Self-guarding: a no-op unless ``session_entry.was_auto_reset`` is
+        set (callers may pre-check for their own flow, but the flag consume
+        lives here, single source of truth).
+        """
+        if getattr(session_entry, "was_auto_reset", False):
+            # Consume the fresh-apply flag BEFORE the funnel (which would pop
+            # it): the flag protects exactly one boundary crossing, never a
+            # later genuine conversation reset.
+            _fresh_applies = getattr(self, "_model_router_fresh_applies", None)
+            _router_applied = bool(
+                isinstance(_fresh_applies, dict)
+                and _fresh_applies.pop(session_key, None)
+            )
+            # Snapshot the router-applied state the funnel is about to clear
+            # so it can be re-installed on the fresh entry (#48031 survival).
+            _saved_override = None
+            _saved_reasoning = None
+            _saved_note = None
+            if _router_applied:
+                _saved_override = self._session_model_overrides.get(session_key)
+                _reasoning_store = getattr(self, "_session_reasoning_overrides", None)
+                if isinstance(_reasoning_store, dict):
+                    _saved_reasoning = _reasoning_store.get(session_key)
+                _notes = getattr(self, "_pending_model_notes", None)
+                if isinstance(_notes, dict):
+                    _saved_note = _notes.get(session_key)
+            # Treat auto-reset as a full conversation boundary — one funnel
+            # call clears every conversation-scoped per-session dict
+            # (model/reasoning overrides, pending model notes, last-resolved
+            # cache, router hysteresis streak, …) plus boundary security
+            # state (#48031, #58403). See _CONVERSATION_SCOPED_STATE.
+            self._clear_conversation_scope(session_key, reason="auto_reset")
+            if _router_applied and _saved_override:
+                # Keep the router-applied override (and its reasoning override /
+                # pending self-identification note): it was applied earlier in
+                # this SAME inbound turn, so it postdates the reset boundary.
+                # Re-persist the non-secret parts onto the fresh session entry
+                # (its previous store persistence died with the popped entry).
+                self._session_model_overrides[session_key] = _saved_override
+                if _saved_reasoning is not None:
+                    self._set_session_reasoning_override(session_key, _saved_reasoning)
+                if _saved_note:
+                    if not hasattr(self, "_pending_model_notes"):
+                        self._pending_model_notes = {}
+                    self._pending_model_notes[session_key] = _saved_note
+                try:
+                    await self.async_session_store.set_model_override(
+                        session_key,
+                        self._session_model_overrides[session_key],
+                    )
+                except Exception:
+                    logger.debug(
+                        "model router: re-persist override after auto-reset failed",
+                        exc_info=True,
+                    )
+            # Evict the cached agent so the fresh session does not inherit the
+            # previous conversation's context_compressor._previous_summary —
+            # the cache is keyed on the stable session_key, so an auto-reset
+            # otherwise reuses the old agent and leaks prior history into new
+            # compaction summaries. Mirrors /reset and the compression-exhausted
+            # path (#9893). Covers daily/idle/suspended auto-reset.
+            self._evict_cached_agent(session_key)
+            session_entry.was_auto_reset = False
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -16995,6 +17433,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # The actual interrupt message is delivered via adapter._pending_messages
             # which is read by _run_agent. Removed to prevent unbounded growth.
             return None
+
+        # Dynamic model router (ADR-003 Phase 2): route evaluation for
+        # authorized, non-internal messages that reached the fresh-agent
+        # dispatch leg. Placed AFTER the running-agent PRIORITY block so
+        # steer/stop/queue messages against a running agent gain zero
+        # latency and no suspension point precedes the _running_agents
+        # check — and BEFORE slash-command dispatch so static rules still
+        # apply to slash commands (see _model_router_stage docstring).
+        # mode=off (the default) costs a single config check. Always fail
+        # open — routing must never block dispatch.
+        if not is_internal:
+            _router_mode = _model_router_mode()
+            if _router_mode != "off":
+                try:
+                    await self._model_router_stage(
+                        event, source, _quick_key, mode=_router_mode,
+                    )
+                except Exception:
+                    logger.warning("model router stage failed open", exc_info=True)
 
         # Check for commands
         command = event.get_command()
@@ -18714,22 +19171,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # wiping model/reasoning overrides set between turns (Closes #48031).
         _was_auto_reset = getattr(session_entry, "was_auto_reset", False)
         if _was_auto_reset:
-            # Treat auto-reset as a full conversation boundary — clear every
-            # conversation-scoped per-session dict in one funnel call so the
-            # fresh session does not inherit the previous conversation's
-            # model/reasoning overrides, a queued "/model switched" note, or
-            # a stale resolved-model cache (#48031, #58403). See
-            # _CONVERSATION_SCOPED_STATE.
-            self._clear_conversation_scope(session_key, reason="auto_reset")
-            # Evict the cached agent so the fresh session does not inherit the
-            # previous conversation's context_compressor._previous_summary —
-            # the cache is keyed on the stable session_key, so an auto-reset
-            # otherwise reuses the old agent and leaks prior history into new
-            # compaction summaries. Mirrors /reset and the compression-exhausted
-            # path (#9893). Covers daily/idle/suspended auto-reset.
-            self._evict_cached_agent(session_key)
-            session_entry.was_auto_reset = False
-        
+            await self._consume_auto_reset_boundary(session_entry, session_key)
+
+
         # Emit session:start for new or auto-reset sessions
         _is_new_session = (
             session_entry.created_at == session_entry.updated_at
@@ -20298,8 +20742,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 new_entry = await self.async_session_store.reset_session(session_key)
                 self._evict_cached_agent(session_key)
                 # Conversation boundary: one funnel call clears every
-                # conversation-scoped per-session dict (#58403 and siblings).
-                # See _CONVERSATION_SCOPED_STATE.
+                # conversation-scoped per-session dict (#58403 and siblings),
+                # including the model router's hysteresis streak and any
+                # not-yet-consumed fresh-apply flag (ADR-003 Ph2). See
+                # _CONVERSATION_SCOPED_STATE.
                 self._clear_conversation_scope(
                     session_key, reason="compression_exhausted_reset"
                 )
