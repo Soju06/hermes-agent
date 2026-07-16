@@ -16787,6 +16787,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str,
         *,
         mode: str,
+        original_text: str = "",
     ) -> None:
         """Evaluate (and in enforce mode apply) the dynamic model router.
 
@@ -16830,6 +16831,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from gateway import model_router as _model_router
         from hermes_cli.model_routes import load_routes as _load_model_routes
 
+        # Route on the PRE-HOOK text: plugin hooks may have prepended
+        # advisories or rewritten event.text before this stage runs, but the
+        # classifier was benched on (and the plugin-era router classified)
+        # the original message — injected advisories are label noise.
+        if original_text and original_text != getattr(event, "text", None):
+            event = dataclasses.replace(event, text=original_text)
         raw_text = str(getattr(event, "text", None) or "")
         text = raw_text.strip()
         if not text:  # (1) zero work for empty/whitespace events
@@ -17226,6 +17233,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._queue_startup_restore_event(event)
             return None
 
+        # Snapshot the pre-hook message text for the dynamic model router:
+        # plugin hooks further down may rewrite (or, with plugin patches,
+        # prepend to) event.text, but the router must classify the same text
+        # the plugin-era classifier saw — injected advisories are label
+        # noise the bench dataset had to strip.
+        _pre_hook_router_text = str(getattr(event, "text", None) or "")
         # scale-to-zero (Phase 0, 0.B/F13): stamp the gateway-scoped last-inbound
         # clock for real (user-originated) inbound only. Internal/system events
         # (background-process completions, startup-restore replays) are NOT
@@ -17914,6 +17927,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 try:
                     await self._model_router_stage(
                         event, source, _quick_key, mode=_router_mode,
+                        original_text=_pre_hook_router_text,
                     )
                 except Exception:
                     logger.warning("model router stage failed open", exc_info=True)
