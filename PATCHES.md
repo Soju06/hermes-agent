@@ -350,6 +350,16 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
   - `261253849 feat(tools): slow-tool perf advisor — teach cheaper shapes on slow terminal results`
 - **touches:** `tools/perf_advisor.py` (new), `agent/tool_executor.py`, `tests/test_perf_advisor.py` (new)
 
+### 30. session-db-read-path-split
+- **branch:** `soju/patches/session-db-read-path-split`
+- **origin:** `local-author`
+- **upstream_pr:** _(none yet — good candidate after soak; the shared-SessionDB convoy exists upstream too)_
+- **state:** `local-only`
+- **rationale:** The gateway hands ONE SessionDB to every agent (gateway/run.py `session_db=...`), so all recall/browse reads queued behind all writer flushes on `self._lock` — one Python lock in front of a WAL DB that natively supports concurrent readers. Measured production convoy (2026-07-16 trace analysis): a 0.23s FTS query stretched to 112s, a browse flush to 137s, while 6-8 concurrent turns flushed hundreds of tool results; session_search averaged 12.4s in-gateway vs 0.26s standalone. Fix: under WAL the seven read-only recall methods run on per-thread `mode=ro` connections via `_read_ctx()` with no lock; fresh read transactions per statement preserve read-your-committed-writes. Non-WAL (NFS DELETE fallback) or read-conn open failure falls back to the legacy locked path.
+- **commits:**
+  - `e7682653c perf(state): read-path split — per-thread read-only connections for recall reads`
+- **touches:** `hermes_state.py`, `tests/test_session_db_read_path_split.py` (new)
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -410,6 +420,7 @@ soju/patches/llm-activity-recap ← runtime topic (stacked on prompt-tail-freeze
 soju/patches/config-knob-bridges ← runtime topic (stacked on prompt-tail-freeze), config.yaml authority for fork knobs (process_wait_cap, fast_conn_fail_limit)
 soju/patches/hook-prepend-command-safety ← runtime topic (stacked on durable-turns), pre_gateway_dispatch prepends dropped on slash commands
 soju/patches/slow-tool-perf-advisor ← runtime topic, advisory [perf-advisor] line appended to slow antipattern terminal results
+soju/patches/session-db-read-path-split ← runtime topic, per-thread read-only connections for recall reads (convoy fix)
 soju/production                       ← rebuilt: base_commit + runtime patches only
                                          NEVER hand-edit. Always run `bin/hermes-patches rebuild` from `soju/fork-policy`.
 ```
