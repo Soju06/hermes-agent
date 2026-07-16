@@ -381,6 +381,16 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
   - `d6633adcb feat(state): slow-query log for session search with routing-path attribution`
 - **touches:** `hermes_state.py`, `tests/test_search_slow_query_log.py` (new)
 
+### 33. fts-v2-config-authority
+- **branch:** `soju/patches/fts-v2-config-authority`
+- **origin:** `local-author`
+- **upstream_pr:** _(folds into the #31 upstream submission — sweeper requires the config.yaml surface)_
+- **state:** `local-only`
+- **rationale:** Config SoT for the FTS v2 knobs (`agent.fts_v2_read`, `agent.search_slow_ms` bridged at both gateway bridge sites, house pattern), read default promoted to ON behind a `state_meta fts_v2_ready` backfill-completion marker (a triggers-only/partial index is never served; migrate script sets the marker), fresh DBs with a loadable tokenizer are v2-native (no v1/trigram tables), and `scripts/fts_v1_drop.py` retires the six v1 triggers + two tables behind an integrity/rowcount preflight (~5.6GB logical). After the drop the off-flag is ignored — no fallback exists to select.
+- **commits:** (stacked on `soju/patches/search-slow-query-log` tip)
+  - `a7109d33e feat(state): FTS v2 config authority, default-on reads, v1 retirement path`
+- **touches:** `hermes_state.py`, `gateway/run.py`, `scripts/fts_v2_migrate.py`, `scripts/fts_v1_drop.py` (new), `tests/gateway/test_fts_v2_config_bridge.py` (new), `tests/test_fts_v2_cjk.py`, `tests/test_search_slow_query_log.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -444,6 +454,7 @@ soju/patches/slow-tool-perf-advisor ← runtime topic, advisory [perf-advisor] l
 soju/patches/session-db-read-path-split ← runtime topic, per-thread read-only connections for recall reads (convoy fix)
 soju/patches/fts5-cjk-bigram-index ← runtime topic (stacked on read-path-split), cjk_unicode61 bigram FTS5 index replaces trigram+LIKE
 soju/patches/search-slow-query-log ← runtime topic (stacked on fts5-cjk-bigram-index), slow session-search log with path attribution
+soju/patches/fts-v2-config-authority ← runtime topic (stacked on search-slow-query-log), config.yaml authority + default-on + v1 retirement
 soju/production                       ← rebuilt: base_commit + runtime patches only
                                          NEVER hand-edit. Always run `bin/hermes-patches rebuild` from `soju/fork-policy`.
 ```
