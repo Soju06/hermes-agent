@@ -303,6 +303,19 @@ class TestMemoryToolDispatcher:
         assert result["success"] is False
         assert "not available" in result["error"]
 
+    def test_null_target_defaults_to_memory_store(self, store):
+        result = json.loads(
+            memory_tool(
+                action="add",
+                target=None,
+                content="Project uses pytest with xdist.",
+                reason="Global tooling fact that should persist across sessions.",
+                store=store,
+            )
+        )
+        assert result["success"] is True
+        assert store.memory_entries == ["Project uses pytest with xdist."]
+        assert store.user_entries == []
     def test_add_via_tool(self, store):
         result = json.loads(
             memory_tool(
