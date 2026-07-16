@@ -361,6 +361,16 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
   - `2972cb535 Merge branch 'soju/patches/async-token-accounting' (conflict resolution: flush_token_counts before read_ctx in get_session)`
 - **touches:** `hermes_state.py`, `tests/test_session_db_read_path_split.py` (new)
 
+### 31. fts5-cjk-bigram-index
+- **branch:** `soju/patches/fts5-cjk-bigram-index`
+- **origin:** `local-author`
+- **upstream_pr:** _(none yet — strong candidate; CJK search brokenness is upstream-wide)_
+- **state:** `local-only`
+- **rationale:** unicode61 indexes a CJK run as ONE token, so 2-char Korean terms could never match; hermes routed any query containing one to a 3-column LIKE full-table scan (3-6.4s CPU on the 6.8GB state.db) — the #1 base cost behind session_search's 12.4s production average, and the LIKE scans were also the convoy source amplified by the shared-lock issue fixed in #30. Adds a loadable FTS5 tokenizer `cjk_unicode61` (native/fts5_cjk, unicode61 wrapper emitting CJK character bigrams) + standalone 3-column `messages_fts_v2` whose single MATCH path replaces the unicode61/trigram/LIKE routing (prototype: 3.7s→83ms). Online migration via `scripts/fts_v2_migrate.py` (idempotent batched backfill, resume in state_meta); read cutover behind `HERMES_FTS_V2_READ=1`; self-heal drops v2 triggers when the tokenizer can't load so writes never fail. Update triggers scoped `AFTER UPDATE OF` content columns (v1 re-tokenized whole messages on flag flips).
+- **commits:** (stacked on `soju/patches/session-db-read-path-split` tip)
+  - `3425751c1 feat(state): messages_fts_v2 — cjk_unicode61 bigram index replaces trigram+LIKE routing`
+- **touches:** `hermes_state.py`, `native/fts5_cjk/*` (new), `scripts/fts_v2_migrate.py` (new), `tests/test_fts_v2_cjk.py` (new)
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -422,6 +432,7 @@ soju/patches/config-knob-bridges ← runtime topic (stacked on prompt-tail-freez
 soju/patches/hook-prepend-command-safety ← runtime topic (stacked on durable-turns), pre_gateway_dispatch prepends dropped on slash commands
 soju/patches/slow-tool-perf-advisor ← runtime topic, advisory [perf-advisor] line appended to slow antipattern terminal results
 soju/patches/session-db-read-path-split ← runtime topic, per-thread read-only connections for recall reads (convoy fix)
+soju/patches/fts5-cjk-bigram-index ← runtime topic (stacked on read-path-split), cjk_unicode61 bigram FTS5 index replaces trigram+LIKE
 soju/production                       ← rebuilt: base_commit + runtime patches only
                                          NEVER hand-edit. Always run `bin/hermes-patches rebuild` from `soju/fork-policy`.
 ```
