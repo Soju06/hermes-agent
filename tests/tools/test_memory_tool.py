@@ -548,6 +548,7 @@ class TestMemoryToolDispatcher:
                 action="add",
                 target=None,
                 content="Project uses pytest with xdist.",
+                reason="Global tooling fact that should persist across sessions.",
                 store=store,
             )
         )
