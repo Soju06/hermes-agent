@@ -358,8 +358,13 @@ def cmd_post_update_health(args: argparse.Namespace) -> int:
     log_subject = _git_at(repo, "log", "-1", "--format=%s")
     print(f"HEAD subject: {log_subject}")
     expected_subject = f"merge: assemble production stack [auto, {len(active)} patches]"
-    if log_subject != expected_subject:
-        print(f"FAIL: HEAD subject does not match manifest active patch count: {expected_subject}")
+    # Sequential-fallback rebuilds end on the last active patch's merge commit.
+    expected_sequential = f"merge: apply patch {active[-1].name}" if active else ""
+    if log_subject not in (expected_subject, expected_sequential):
+        print(
+            "FAIL: HEAD subject matches neither octopus nor sequential-fallback "
+            f"assembly: {expected_subject!r} / {expected_sequential!r}"
+        )
         failed = True
 
     try:
