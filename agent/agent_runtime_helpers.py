@@ -3301,6 +3301,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 model=function_args.get("model"),
                 provider=function_args.get("provider"),
                 reasoning_effort=function_args.get("reasoning_effort"),
+                route=function_args.get("route"),
                 scope=function_args.get("scope", "session"),
                 reason=function_args.get("reason"),
             )
