@@ -391,6 +391,16 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
   - `a7109d33e feat(state): FTS v2 config authority, default-on reads, v1 retirement path`
 - **touches:** `hermes_state.py`, `gateway/run.py`, `scripts/fts_v2_migrate.py`, `scripts/fts_v1_drop.py` (new), `tests/gateway/test_fts_v2_config_bridge.py` (new), `tests/test_fts_v2_cjk.py`, `tests/test_search_slow_query_log.py`
 
+### 34. model-routing
+- **branch:** `soju/patches/model-routing`
+- **upstream_pr:** _(none — ADR-003 Phase 1; enum'd delegation aligns with upstream `delegation-model-routing` policy, natural round-2 candidate once Phases 2–3 prove it)_
+- **origin:** `local-author`
+- **state:** `local-only`
+- **rationale:** ADR-003 Phase 1 — model routing SoT as a core subsystem. Config-declared `model_routes:` catalog (per route: description, provider, model, reasoning_effort, accepted membership, ordered fallbacks; parse-only `static_rules` for Phase 2), loader with startup cross-validation against `providers:`, and a health-aware resolver (`resolve_route`) that walks default→fallbacks with TTL-cached fail-open provider probes ported from skill-gate's runtime_catalog (401/403 healthy, credit-sniffed 400, 402/429/5xx unhealthy; config-first kill switch `model_routes.health.enabled` + `HERMES_MODEL_ROUTES_HEALTH` bridge). Dormant with empty config. Phases 2–3 (gateway dynamic router, `model_switch`/`delegate_task` route enums) build on this; supersedes patch #5 when Phase 3 lands.
+- **commits:**
+  - `792162537 feat(routing): model_routes catalog + health-aware route resolver (ADR-003 Phase 1)`
+- **touches:** `hermes_cli/model_routes.py` (new), `hermes_cli/config.py`, `cli-config.yaml.example`, `tests/conftest.py`, `tests/hermes_cli/test_model_routes.py` (new)
+
 ## State Vocabulary
 
 | state | meaning | when |
