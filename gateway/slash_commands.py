@@ -210,6 +210,16 @@ class GatewaySlashCommandsMixin:
         if hasattr(self, "_pending_model_notes"):
             self._pending_model_notes.pop(session_key, None)
 
+        # Conversation boundary: drop the model router's NORMAL-downgrade
+        # hysteresis streak and any not-yet-consumed fresh-apply flag so the
+        # next conversation starts with a clean routing slate (ADR-003 Ph2).
+        _mrs = getattr(self, "_model_router_state", None)
+        if _mrs is not None:
+            _mrs.pop(session_key, None)
+        _mrf = getattr(self, "_model_router_fresh_applies", None)
+        if _mrf is not None:
+            _mrf.discard(session_key)
+
         # Clear the per-session last-resolved-model cache so the next turn
         # reads from current config instead of falling back to a stale model
         # after a config change (#58403).

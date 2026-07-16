@@ -171,11 +171,33 @@ model:
 #     ok_ttl_seconds: 300              # healthy results cached this long
 #     fail_ttl_seconds: 120            # failures retried sooner
 #     probe_timeout_seconds: 2.5
-#   static_rules:                      # parsed+validated now; matching/enforcement lands in Phase 2
-#     - route: dev
-#       when:
-#         channel: codex-lb-pr
-#       reason: "PR channel always routes to dev"
+#   static_rules:                      # matched before the LLM classifier; first match wins
+#     - name: pr-review-shorthand      # optional; shows up as `rule` in the decision log
+#       route: dev
+#       when:                          # every condition must hold (AND)
+#         text_matches_any:            # regex list, any may match
+#           - 'codex-lb\s+#?\d+'
+#       reason: "PR shorthand always routes to dev"
+#     - route: chat
+#       when:                          # supported source conditions ({eq|in|not_in}):
+#         is_owner: { eq: false }      # is_owner (per-platform *_ALLOWED_USERS envs;
+#         chat_type: { in: [dm] }      #  missing/empty allowlist counts everyone as owner),
+#                                      #  chat_id, parent_chat_id, user_id, platform, chat_type
+#       reason: "non-owner DMs stay on the chat tier"
+#   router:                            # dynamic pre-dispatch router (gateway/model_router.py)
+#     mode: off                        # off | shadow (log-only soak) | enforce;
+#                                      # env HERMES_MODEL_ROUTER_MODE wins when set
+#     model: gemini-3-flash-preview    # classifier model (bench winner — keep unless re-benched)
+#     timeout_ms: 8000                 # classifier call budget; on failure a narrow regex
+#                                      # fallback decides (never triggers chat downgrades)
+#     recent_turns: 5                  # dialogue turns shown to the classifier
+#     normal_downgrade_streak: 3       # consecutive LLM NORMALs before the chat downgrade
+#     chat_route: chat                 # NORMAL downgrade target; "" disables downgrades
+#     label_routes:                    # classifier label -> route; missing/"" = never switches
+#       SYSTEM_DEV: dev
+#       FRONTEND_DEV: dev
+#       DOCUMENT_WORK: ""
+#     decision_log: ""                 # "" = <hermes home>/logs/model_router_decisions.jsonl
 
 # =============================================================================
 # OpenRouter Provider Routing (only applies when using OpenRouter)
