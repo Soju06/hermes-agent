@@ -172,6 +172,10 @@ from agent.prompt_builder import (  # noqa: F401  # re-exported via _ra() / mock
     build_environment_hints,
     load_soul_md,
 )
+from agent.audience_persona import (  # noqa: F401  # re-exported via _ra() / mock.patch("run_agent.load_audience_persona")
+    load_audience_persona,
+    resolve_audience_mode,
+)
 from agent.process_bootstrap import _get_proxy_from_env  # noqa: F401
 from agent.message_sanitization import (  # noqa: F401
     _SURROGATE_RE,
