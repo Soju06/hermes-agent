@@ -27,6 +27,7 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, drain_truncation_warnings,
 )
 from agent import prompt_builder as _pb
+from agent import audience_persona as _audience_persona
 from agent.runtime_cwd import resolve_agent_cwd, resolve_context_cwd
 from hermes_constants import get_default_hermes_root, get_hermes_home
 from utils import is_truthy_value
@@ -540,8 +541,15 @@ def _timestamp_line(agent: Any) -> str:
                            "— trust this over the start date for what day it is now; query tools for exact time.")
     if getattr(agent, "_bot_chat_timeless_prompt", False):
         timestamp_line = f"Timezone: {', '.join(_bits)}" if _bits else ""
+    # AudienceMode is present only while the audience-personas feature is active for this session
+    # (agent/audience_persona.py).  Old stored prompts and feature-off builds carry no line, and
+    # _stored_prompt_matches_runtime treats both-absent as a match — so pre-existing sessions stay
+    # byte-stable and each session rebuilds exactly once when a persona pack appears or the resolved
+    # mode changes.  The label is distinct from Model:/Provider: so the fallback model-swap rewrite
+    # (chat_completion_helpers) can never touch it.
     trailer = (("Session ID", agent.session_id if agent.pass_session_id else None), ("Model", agent.model),
-               ("Provider", agent.provider), ("Platform", agent.platform))
+               ("Provider", agent.provider), ("Platform", agent.platform),
+               ("AudienceMode", getattr(agent, "_audience_mode", "") or None))
     return timestamp_line + "".join(f"\n{label}: {value}" for label, value in trailer if value)
 
 
@@ -780,6 +788,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     _ctx_len = _cc_len if isinstance(_cc_len, int) and _cc_len > 0 else None
     # ── Stable tier ────────────────────────────────────────────────
     stable_parts, _soul_loaded = _identity_parts(agent, _ctx_len)
+    # Audience persona: stable slot #2 (no-op without a personas/modes.yaml pack).
+    stable_parts.extend(_audience_persona.persona_prompt_part(agent, _ctx_len))
     # The skill_view() pointer dangles without skill tools OR without the
     # hermes-agent skill installed, so the variant is chosen after the skills
     # index is built; this slot holds its position.

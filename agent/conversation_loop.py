@@ -35,7 +35,7 @@ from agent.runtime_cwd import resolve_agent_cwd
 from agent.surface_switch import (
     identity_line_value, note_inert_pinned_tools, runtime_host_value, stage_surface_switch_note,
 )
-from agent import turn_trace
+from agent import audience_persona, turn_trace
 from agent.turn_context import PRE_LLM_BLOCK_EXIT_REASON, PreflightCompressionTimedOut, build_turn_context
 from agent.turn_trace_loop import IterationSpans, conversation_trace, trace_llm_call
 from hermes_cli.observability.shared_metrics_efficiency import record_cache_break, record_prompt_rebuild
@@ -1009,6 +1009,9 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     # prompt — so TERMINAL_CWD sessions are not falsely rejected.
     stored_cwd = runtime_host_value(prompt, "Current working directory")
     if stored_cwd and stored_cwd != str(resolve_agent_cwd()):
+        return False
+    # AudienceMode tail line: both-absent matches; a mismatch or one-sided presence rebuilds once.
+    if identity_line_value(prompt, "AudienceMode") != audience_persona.expected_audience_mode(agent):
         return False
     # Platform is deliberately NOT an identity field: a surface switch does not invalidate the
     # stored bytes, it only makes their interface section out of date, and that is corrected by
