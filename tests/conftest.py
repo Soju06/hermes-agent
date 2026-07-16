@@ -301,6 +301,11 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_EXEC_ASK",
     "HERMES_HOME_MODE",
     "HERMES_AGENT_USE_LEGACY_SESSION_KEYS",
+    # Model-route health kill switch + pytest-guard opt-in (ADR-003): either
+    # leaking from a developer/CI shell flips probe behavior for the whole
+    # test run; tests that need them set them explicitly.
+    "HERMES_MODEL_ROUTES_HEALTH",
+    "HERMES_MODEL_ROUTES_HEALTH_TEST",
     # Kanban path/board pins must never leak from a developer shell or
     # dispatched worker into tests; otherwise tests can write fake tasks to
     # the real ~/.hermes/kanban.db instead of the per-test HERMES_HOME.

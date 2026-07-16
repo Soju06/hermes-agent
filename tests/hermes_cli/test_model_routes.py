@@ -1,0 +1,906 @@
+"""Tests for hermes_cli.model_routes (ADR-003 Phase 1).
+
+No network: probe tests monkeypatch ``mr._urlopen`` / ``mr._now``.  Health
+tests that must exercise real probe logic opt out of the pytest guard via
+``HERMES_MODEL_ROUTES_HEALTH_TEST=1``.  All disk IO stays inside the hermetic
+``HERMES_HOME`` tmpdir set up by tests/conftest.py.
+"""
+
+import errno
+import io
+import json
+import os
+import urllib.error
+from pathlib import Path
+
+import pytest
+
+import hermes_cli.config as config_mod
+import hermes_cli.model_routes as mr
+from hermes_cli.config import validate_config_structure
+from hermes_constants import get_hermes_home
+
+
+# =============================================================================
+# Helpers
+# =============================================================================
+
+
+def _providers():
+    return {
+        "p1": {"base_url": "https://p1.example/v1"},
+        "p2": {"base_url": "https://p2.example/v1"},
+        "p3": {"base_url": "https://p3.example/v1"},
+    }
+
+
+def _cfg(routes=None, health=None, static_rules=None, providers=None, model_routes=...):
+    cfg = {"providers": _providers() if providers is None else providers}
+    if model_routes is not ...:
+        cfg["model_routes"] = model_routes
+        return cfg
+    section = {}
+    if routes is not None:
+        section["routes"] = routes
+    if health is not None:
+        section["health"] = health
+    if static_rules is not None:
+        section["static_rules"] = static_rules
+    if section:
+        cfg["model_routes"] = section
+    return cfg
+
+
+def _route(provider="p1", model="model-a", **extra):
+    entry = {"description": "test route", "provider": provider, "model": model}
+    entry.update(extra)
+    return entry
+
+
+def _http_error(code, body=b"{}"):
+    return urllib.error.HTTPError(
+        "https://x.example/v1/models", code, f"HTTP {code}", None, io.BytesIO(body)
+    )
+
+
+class _FakeResponse:
+    def __init__(self, status=200):
+        self.status = status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+class _Clock:
+    def __init__(self, t=1000.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
+def _health(tmp_path, **kwargs):
+    return mr.HealthConfig(cache_path=str(tmp_path / "health.json"), **kwargs)
+
+
+def _patch_resolve(monkeypatch, runtime=None, exc=None):
+    """Patch resolve_runtime_provider at model_routes' deferred import site."""
+
+    def fake(**kwargs):
+        if exc is not None:
+            raise exc
+        return dict(runtime or {})
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider", fake
+    )
+
+
+_OPENAI_RUNTIME = {
+    "base_url": "https://x.example/v1",
+    "api_key": "k",
+    "api_mode": "chat_completions",
+}
+
+
+def _errors(catalog):
+    return [i for i in catalog.issues if i.severity == "error"]
+
+
+def _warnings(catalog):
+    return [i for i in catalog.issues if i.severity == "warning"]
+
+
+@pytest.fixture
+def health_test_env(monkeypatch):
+    monkeypatch.setenv("HERMES_MODEL_ROUTES_HEALTH_TEST", "1")
+
+
+# =============================================================================
+# Loader / validation
+# =============================================================================
+
+
+def test_absent_section_dormant():
+    catalog = mr.load_routes(_cfg())
+    assert catalog.routes == {}
+    assert catalog.issues == []
+    assert catalog.static_rules == []
+    assert catalog.health.enabled is True
+    assert catalog.health.ok_ttl_seconds == mr.DEFAULT_OK_TTL_SECONDS
+    assert catalog.health.fail_ttl_seconds == mr.DEFAULT_FAIL_TTL_SECONDS
+    assert catalog.health.probe_timeout_seconds == mr.DEFAULT_PROBE_TIMEOUT_SECONDS
+
+
+@pytest.mark.parametrize("section", [{}, {"routes": {}}, None])
+def test_empty_section_dormant(section):
+    catalog = mr.load_routes(_cfg(model_routes=section))
+    assert catalog.routes == {}
+    assert catalog.issues == []
+    assert catalog.static_rules == []
+
+
+def test_valid_catalog_loads():
+    routes = {
+        "dev": _route(
+            provider="p1",
+            model="model-a",
+            reasoning_effort="xhigh",
+            accepted=["model-a", "model-b"],
+            fallbacks=[
+                {"provider": "p2", "model": "model-b", "reasoning_effort": "high"},
+                {"provider": "p3", "model": "model-c"},
+            ],
+        ),
+        "chat": _route(provider="p2", model="model-b"),
+    }
+    catalog = mr.load_routes(_cfg(routes=routes))
+    assert catalog.issues == []
+    assert list(catalog.routes) == ["dev", "chat"]  # declaration order
+    dev = catalog.routes["dev"]
+    assert dev.name == "dev"
+    assert dev.description == "test route"
+    assert dev.provider == "p1"
+    assert dev.model == "model-a"
+    assert dev.reasoning_effort == "xhigh"
+    assert dev.accepted == ("model-a", "model-b")
+    assert dev.fallbacks == (
+        mr.FallbackSpec(provider="p2", model="model-b", reasoning_effort="high"),
+        mr.FallbackSpec(provider="p3", model="model-c", reasoning_effort=""),
+    )
+
+
+def test_unknown_provider_is_error_and_route_dropped():
+    catalog = mr.load_routes(_cfg(routes={"dev": _route(provider="nope")}))
+    errors = _errors(catalog)
+    assert len(errors) == 1
+    assert "dev" in errors[0].message and "nope" in errors[0].message
+    assert errors[0].hint
+    assert "dev" not in catalog.routes
+
+
+def test_builtin_provider_accepted():
+    catalog = mr.load_routes(
+        _cfg(routes={"dev": _route(provider="anthropic")}, providers={})
+    )
+    assert _errors(catalog) == []
+    assert "dev" in catalog.routes
+
+
+def test_fallback_unknown_provider_error():
+    routes = {
+        "dev": _route(fallbacks=[
+            {"provider": "p2", "model": "m"},
+            {"provider": "glm-voy-typo", "model": "m"},
+        ]),
+    }
+    catalog = mr.load_routes(_cfg(routes=routes))
+    errors = _errors(catalog)
+    assert len(errors) == 1
+    assert "dev" in errors[0].message
+    assert "#2" in errors[0].message
+    assert "glm-voy-typo" in errors[0].message
+    assert "dev" not in catalog.routes
+
+
+@pytest.mark.parametrize(
+    "effort,ok",
+    [("ultra", False), ("max", True), ("none", True), (None, True), ("xhigh", True),
+     (False, True), (True, True)],
+)
+def test_bad_reasoning_effort_error(effort, ok):
+    entry = _route()
+    if effort is not None:
+        entry["reasoning_effort"] = effort
+    catalog = mr.load_routes(_cfg(routes={"dev": entry}))
+    if ok:
+        assert _errors(catalog) == []
+        assert "dev" in catalog.routes
+    else:
+        assert any("reasoning_effort" in i.message for i in _errors(catalog))
+        assert "dev" not in catalog.routes
+
+
+def test_yaml_bool_reasoning_effort_normalization():
+    """YAML 1.1 bools mirror parse_reasoning_effort: `off`/`no`/`false` (bool
+    False) disables reasoning ("none"); `on`/`yes`/`true` (bool True) is
+    treated as unspecified — neither drops the route."""
+    catalog = mr.load_routes(_cfg(routes={
+        "dev": _route(reasoning_effort=False),
+        "chat": _route(reasoning_effort=True),
+    }))
+    assert _errors(catalog) == []
+    assert catalog.routes["dev"].reasoning_effort == "none"
+    assert catalog.routes["chat"].reasoning_effort == ""
+
+
+def test_case_insensitive_duplicate_route_names_error():
+    catalog = mr.load_routes(_cfg(routes={"dev": _route(), "DEV": _route(provider="p2")}))
+    errors = _errors(catalog)
+    assert len(errors) == 1
+    assert catalog.routes == {}
+
+
+@pytest.mark.parametrize("missing", ["provider", "model"])
+def test_missing_model_or_provider_error(missing):
+    entry = _route()
+    del entry[missing]
+    catalog = mr.load_routes(_cfg(routes={"dev": entry}))
+    assert any(missing in i.message for i in _errors(catalog))
+    assert "dev" not in catalog.routes
+
+
+@pytest.mark.parametrize(
+    "cfg",
+    [
+        _cfg(model_routes=["not", "a", "mapping"]),
+        _cfg(model_routes={"routes": ["dev"]}),
+        _cfg(routes={"dev": "just-a-string"}),
+        _cfg(routes={"dev": _route(accepted="model-a")}),
+        _cfg(routes={"dev": _route(accepted=["model-a", 7])}),
+        _cfg(routes={"dev": _route(fallbacks={"provider": "p2"})}),
+        _cfg(routes={"dev": _route(fallbacks=["p2:model-b"])}),
+    ],
+)
+def test_shape_errors(cfg):
+    catalog = mr.load_routes(cfg)
+    assert _errors(catalog)
+    assert catalog.routes == {}
+
+
+def test_unknown_keys_warn():
+    routes = {
+        "dev": _route(
+            surprise=1,
+            fallbacks=[{"provider": "p2", "model": "m", "weight": 3}],
+        ),
+    }
+    cfg = _cfg(routes=routes)
+    cfg["model_routes"]["mystery"] = True
+    catalog = mr.load_routes(cfg)
+    warnings = [i.message for i in _warnings(catalog)]
+    assert any("surprise" in m for m in warnings)
+    assert any("weight" in m for m in warnings)
+    assert any("mystery" in m for m in warnings)
+    assert _errors(catalog) == []
+    assert "dev" in catalog.routes
+
+
+def test_health_defaults_partial_override_and_bad_types():
+    # Absent block → defaults.
+    assert mr.load_routes(_cfg(routes={"dev": _route()})).health == mr.HealthConfig()
+
+    # Partial override keeps the other defaults.
+    catalog = mr.load_routes(_cfg(routes={"dev": _route()}, health={"ok_ttl_seconds": 60}))
+    assert catalog.health.ok_ttl_seconds == 60
+    assert catalog.health.fail_ttl_seconds == mr.DEFAULT_FAIL_TTL_SECONDS
+    assert catalog.health.probe_timeout_seconds == mr.DEFAULT_PROBE_TIMEOUT_SECONDS
+    assert catalog.issues == []
+
+    # Bad type / bad value → warning + default retained (never an error).
+    catalog = mr.load_routes(_cfg(
+        routes={"dev": _route()},
+        health={"probe_timeout_seconds": "fast", "ok_ttl_seconds": -5},
+    ))
+    assert catalog.health.probe_timeout_seconds == mr.DEFAULT_PROBE_TIMEOUT_SECONDS
+    assert catalog.health.ok_ttl_seconds == mr.DEFAULT_OK_TTL_SECONDS
+    assert len(_warnings(catalog)) == 2
+    assert _errors(catalog) == []
+    assert "dev" in catalog.routes
+
+    # Empty cache_path resolves under get_hermes_home(), not a hardcoded home.
+    resolved = mr.HealthConfig(cache_path="").resolved_cache_path()
+    assert resolved == get_hermes_home() / "state" / "model_route_health.json"
+    assert str(resolved).endswith(os.path.join("state", "model_route_health.json"))
+
+
+@pytest.mark.parametrize("bad", ["false", "off", "no", "true", 0, 1, None])
+def test_health_enabled_non_bool_warns_and_defaults(bad):
+    # bool("false") is True — a quoted YAML string must not silently keep
+    # probing enabled; non-bool values warn and fall back to the default.
+    catalog = mr.load_routes(_cfg(routes={"dev": _route()}, health={"enabled": bad}))
+    assert catalog.health.enabled is True
+    assert any("health.enabled" in i.message for i in _warnings(catalog))
+    assert _errors(catalog) == []
+
+
+def test_health_enabled_bool_accepted_without_warning():
+    catalog = mr.load_routes(_cfg(routes={"dev": _route()}, health={"enabled": False}))
+    assert catalog.health.enabled is False
+    assert catalog.issues == []
+
+
+def test_static_rules_parse_only():
+    rule = {"route": "dev", "when": {"channel": "pr", "sender": "any"}, "reason": "pin"}
+    catalog = mr.load_routes(_cfg(routes={"dev": _route()}, static_rules=[rule]))
+    assert catalog.static_rules == [rule]
+    assert catalog.issues == []
+
+    # Unknown route → error, rule dropped.
+    catalog = mr.load_routes(_cfg(
+        routes={"dev": _route()},
+        static_rules=[{"route": "ghost", "when": {"channel": "pr"}}],
+    ))
+    assert catalog.static_rules == []
+    assert any("ghost" in i.message for i in _errors(catalog))
+
+    # Non-mapping item → error.
+    catalog = mr.load_routes(_cfg(routes={"dev": _route()}, static_rules=["dev"]))
+    assert catalog.static_rules == []
+    assert _errors(catalog)
+
+    # Missing/empty when → error.
+    for bad_when in ({}, None):
+        item = {"route": "dev"}
+        if bad_when is not None:
+            item["when"] = bad_when
+        catalog = mr.load_routes(_cfg(routes={"dev": _route()}, static_rules=[item]))
+        assert catalog.static_rules == []
+        assert any("when" in i.message for i in _errors(catalog))
+
+    # Extra top-level rule keys → warning, rule kept.
+    rule = {"route": "dev", "when": {"anything": 1}, "priority": 9}
+    catalog = mr.load_routes(_cfg(routes={"dev": _route()}, static_rules=[rule]))
+    assert catalog.static_rules == [rule]
+    assert any("priority" in i.message for i in _warnings(catalog))
+    assert _errors(catalog) == []
+
+
+def test_default_config_and_known_root_keys():
+    assert config_mod.DEFAULT_CONFIG["model_routes"] == {}
+    assert "model_routes" in config_mod._KNOWN_ROOT_KEYS
+
+
+def test_validate_config_structure_surfaces_route_issues():
+    issues = validate_config_structure({
+        "model_routes": {"routes": {"dev": {"provider": "no-such-provider", "model": "m"}}},
+        "providers": {},
+    })
+    assert any(
+        i.severity == "error" and "no-such-provider" in i.message for i in issues
+    )
+
+    issues = validate_config_structure({"providers": {}})
+    assert not any("model_routes" in i.message for i in issues)
+
+
+def test_load_routes_end_to_end_real_config():
+    home = Path(os.environ["HERMES_HOME"])
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        "providers:\n"
+        "  p1:\n"
+        "    base_url: https://p1.example/v1\n"
+        "model_routes:\n"
+        "  routes:\n"
+        "    dev:\n"
+        "      description: dev work\n"
+        "      provider: p1\n"
+        "      model: model-a\n",
+        encoding="utf-8",
+    )
+    catalog = mr.load_routes(None)
+    assert "dev" in catalog.routes
+    assert catalog.routes["dev"].provider == "p1"
+    assert catalog.routes["dev"].model == "model-a"
+    assert _errors(catalog) == []
+
+
+# =============================================================================
+# Resolution walk
+# =============================================================================
+
+
+_CHAIN_ROUTES = {
+    "dev": _route(
+        provider="p1",
+        model="model-a",
+        reasoning_effort="xhigh",
+        fallbacks=[
+            {"provider": "p2", "model": "model-b", "reasoning_effort": "high"},
+            {"provider": "p3", "model": "model-c"},
+        ],
+    ),
+}
+
+
+def _patch_health_map(monkeypatch, verdicts):
+    """Scripted per-provider health; records call order."""
+    calls = []
+
+    def fake(provider, model="", *, cfg=None, health=None):
+        calls.append(provider)
+        return verdicts[provider]
+
+    monkeypatch.setattr(mr, "provider_health", fake)
+    return calls
+
+
+def test_resolve_healthy_default(monkeypatch):
+    calls = _patch_health_map(monkeypatch, {"p1": (True, "HTTP 200")})
+    result = mr.resolve_route("dev", _cfg(routes=_CHAIN_ROUTES))
+    assert result == {
+        "route": "dev",
+        "provider": "p1",
+        "model": "model-a",
+        "reasoning_effort": "xhigh",
+        "source": "default",
+        "reason": "",
+    }
+    assert all(isinstance(v, str) for v in result.values())
+    assert calls == ["p1"]
+
+
+def test_resolve_default_down_first_fallback(monkeypatch):
+    calls = _patch_health_map(monkeypatch, {
+        "p1": (False, "HTTP 402"),
+        "p2": (True, "HTTP 200"),
+    })
+    result = mr.resolve_route("dev", _cfg(routes=_CHAIN_ROUTES))
+    assert result["source"] == "fallback:1"
+    assert result["provider"] == "p2"
+    assert result["model"] == "model-b"
+    assert result["reasoning_effort"] == "high"
+    assert "failover" in result["reason"]
+    assert "p1" in result["reason"] and "HTTP 402" in result["reason"]
+    assert calls == ["p1", "p2"]
+
+
+def test_resolve_skips_multiple_unhealthy(monkeypatch):
+    calls = _patch_health_map(monkeypatch, {
+        "p1": (False, "HTTP 402"),
+        "p2": (False, "HTTP 503"),
+        "p3": (True, "HTTP 200"),
+    })
+    result = mr.resolve_route("dev", _cfg(routes=_CHAIN_ROUTES))
+    assert result["source"] == "fallback:2"
+    assert result["provider"] == "p3"
+    assert "p1 unhealthy (HTTP 402); p2 unhealthy (HTTP 503)" in result["reason"]
+    assert calls == ["p1", "p2", "p3"]
+
+
+def test_resolve_all_down_returns_none(monkeypatch):
+    _patch_health_map(monkeypatch, {
+        "p1": (False, "HTTP 402"),
+        "p2": (False, "HTTP 503"),
+        "p3": (False, "timed out"),
+    })
+    assert mr.resolve_route("dev", _cfg(routes=_CHAIN_ROUTES)) is None
+
+
+def test_resolve_unknown_or_empty_route_none(monkeypatch):
+    _patch_health_map(monkeypatch, {"p1": (True, "HTTP 200")})
+    cfg = _cfg(routes=_CHAIN_ROUTES)
+    assert mr.resolve_route("ghost", cfg) is None
+    assert mr.resolve_route("", cfg) is None
+    # Case-insensitive lookup finds the route declared as 'dev'.
+    result = mr.resolve_route("DEV", cfg)
+    assert result is not None
+    assert result["route"] == "dev"
+
+
+def test_resolve_health_disabled_short_circuits(monkeypatch, health_test_env):
+    def boom(*args, **kwargs):
+        raise AssertionError("probe must not run when health checks are disabled")
+
+    monkeypatch.setattr(mr, "_probe_provider", boom)
+    cfg = _cfg(routes=_CHAIN_ROUTES, health={"enabled": False})
+    # health_test_env disarms the pytest guard, so only the config kill
+    # switch stands between the resolver and the exploding probe.
+    assert mr.provider_health("p1", cfg=cfg) == (True, "health checks disabled")
+    result = mr.resolve_route("dev", cfg)
+    assert result is not None
+    assert result["source"] == "default"
+
+
+def test_resolve_fallback_effort_not_inherited(monkeypatch):
+    _patch_health_map(monkeypatch, {
+        "p1": (False, "HTTP 500"),
+        "p2": (False, "HTTP 500"),
+        "p3": (True, "HTTP 200"),
+    })
+    result = mr.resolve_route("dev", _cfg(routes=_CHAIN_ROUTES))
+    # Route default declares xhigh; the winning fallback has no effort of its own.
+    assert result["source"] == "fallback:2"
+    assert result["reasoning_effort"] == ""
+
+
+# =============================================================================
+# Health probe fail-open matrix
+# =============================================================================
+
+
+@pytest.mark.parametrize(
+    "outcome,expect_healthy,reason_substr",
+    [
+        (_FakeResponse(200), True, "HTTP 200"),
+        (_http_error(401), True, "assumed healthy"),
+        (_http_error(401), True, "401"),
+        (_http_error(403), True, "403"),
+        (_http_error(400, b"bad request"), True, "assumed healthy"),
+        (_http_error(400, b"error: insufficient credit remaining"), False, "HTTP 400 (credit/quota)"),
+        (_http_error(429, b"billing hold"), False, "(credit/quota)"),
+        (_http_error(402), False, "HTTP 402"),
+        (_http_error(429), False, "HTTP 429"),
+        (_http_error(500), False, "HTTP 500"),
+        (_http_error(503), False, "HTTP 503"),
+        (_http_error(400, b"credit"), False, "(credit/quota)"),
+        (_http_error(400, b"insufficient"), False, "(credit/quota)"),
+        (_http_error(400, b"quota"), False, "(credit/quota)"),
+        (_http_error(400, b"billing"), False, "(credit/quota)"),
+    ],
+)
+def test_probe_matrix(monkeypatch, tmp_path, health_test_env, outcome, expect_healthy, reason_substr):
+    _patch_resolve(monkeypatch, runtime=_OPENAI_RUNTIME)
+
+    def fake_urlopen(req, timeout=None):
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(mr, "_urlopen", fake_urlopen)
+    healthy, reason = mr.provider_health("p1", "model-a", cfg=_cfg(), health=_health(tmp_path))
+    assert healthy is expect_healthy
+    assert reason_substr in reason
+
+
+def test_probe_connection_error_reason_truncated(monkeypatch, tmp_path, health_test_env):
+    _patch_resolve(monkeypatch, runtime=_OPENAI_RUNTIME)
+    exc = urllib.error.URLError(ConnectionRefusedError("refused " + "x" * 200))
+
+    def fake_urlopen(req, timeout=None):
+        raise exc
+
+    monkeypatch.setattr(mr, "_urlopen", fake_urlopen)
+    healthy, reason = mr.provider_health("p1", cfg=_cfg(), health=_health(tmp_path))
+    assert healthy is False
+    assert reason == str(exc)[:80]
+    assert len(reason) <= 80
+
+
+@pytest.mark.parametrize(
+    "base_url,expected_url",
+    [
+        ("https://x.example/v1", "https://x.example/v1/models"),
+        ("https://x.example/v1/", "https://x.example/v1/models"),
+        ("https://x.example", "https://x.example/v1/models"),
+    ],
+)
+def test_probe_openai_url_construction(monkeypatch, tmp_path, health_test_env, base_url, expected_url):
+    _patch_resolve(monkeypatch, runtime={**_OPENAI_RUNTIME, "base_url": base_url})
+    captured = []
+
+    def fake_urlopen(req, timeout=None):
+        captured.append(req)
+        return _FakeResponse(200)
+
+    monkeypatch.setattr(mr, "_urlopen", fake_urlopen)
+    healthy, _ = mr.provider_health("p1", cfg=_cfg(), health=_health(tmp_path))
+    assert healthy is True
+    (req,) = captured
+    assert req.full_url == expected_url
+    assert req.get_method() == "GET"
+    assert req.get_header("Authorization") == "Bearer k"
+
+
+def test_probe_anthropic_messages_shape(monkeypatch, tmp_path, health_test_env):
+    _patch_resolve(monkeypatch, runtime={
+        "base_url": "https://a.example",
+        "api_key": "k",
+        "api_mode": "anthropic_messages",
+    })
+    captured = []
+
+    def fake_urlopen(req, timeout=None):
+        captured.append(req)
+        return _FakeResponse(200)
+
+    monkeypatch.setattr(mr, "_urlopen", fake_urlopen)
+    mr.provider_health("p1", "model-a", cfg=_cfg(), health=_health(tmp_path))
+    (req,) = captured
+    assert req.full_url == "https://a.example/v1/messages"
+    assert req.get_method() == "POST"
+    body = json.loads(req.data.decode("utf-8"))
+    assert body["max_tokens"] == 1
+    assert body["model"] == "model-a"
+    assert body["messages"] == [{"role": "user", "content": "ping"}]
+    assert req.get_header("X-api-key") == "k"
+    assert req.get_header("Authorization") == "Bearer k"
+    assert req.get_header("Anthropic-version") == "2023-06-01"
+
+
+def test_probe_no_base_url_unhealthy(monkeypatch, tmp_path, health_test_env):
+    _patch_resolve(monkeypatch, exc=RuntimeError("no creds"))
+
+    def fake_urlopen(req, timeout=None):  # must never be reached
+        raise AssertionError("no probe without a base_url")
+
+    monkeypatch.setattr(mr, "_urlopen", fake_urlopen)
+    healthy, reason = mr.provider_health(
+        "p1", cfg={"providers": {}}, health=_health(tmp_path)
+    )
+    assert healthy is False
+    assert reason == "no base_url resolved"
+
+
+def test_probe_cred_resolution_failure_falls_back_to_cfg_entry(monkeypatch, tmp_path, health_test_env):
+    _patch_resolve(monkeypatch, exc=RuntimeError("AuthError: nothing usable"))
+    captured = []
+
+    def fake_urlopen(req, timeout=None):
+        captured.append(req)
+        raise _http_error(401)
+
+    monkeypatch.setattr(mr, "_urlopen", fake_urlopen)
+    healthy, reason = mr.provider_health("p1", cfg=_cfg(), health=_health(tmp_path))
+    # Known base_url + missing key → probe fires → 401 → fail-open healthy.
+    assert healthy is True
+    assert "assumed healthy" in reason
+    (req,) = captured
+    assert req.full_url == "https://p1.example/v1/models"
+    assert req.get_header("Authorization") == "Bearer "
+
+
+# =============================================================================
+# Cache TTL behavior
+# =============================================================================
+
+
+def _counting_probe(monkeypatch, results):
+    """Patch _probe_provider with a per-provider scripted, counting stub."""
+    counts = {}
+
+    def fake(provider, model, cfg, health):
+        counts[provider] = counts.get(provider, 0) + 1
+        return results[provider]
+
+    monkeypatch.setattr(mr, "_probe_provider", fake)
+    return counts
+
+
+def test_cache_hit_within_ok_ttl(monkeypatch, tmp_path, health_test_env):
+    clock = _Clock(0.0)
+    monkeypatch.setattr(mr, "_now", clock)
+    counts = _counting_probe(monkeypatch, {"p1": (True, "HTTP 200")})
+    health = _health(tmp_path)
+
+    assert mr.provider_health("p1", health=health) == (True, "HTTP 200")
+    clock.t = health.ok_ttl_seconds - 1
+    assert mr.provider_health("p1", health=health) == (True, "HTTP 200")
+    assert counts["p1"] == 1
+
+
+def test_cache_expiry_reprobes(monkeypatch, tmp_path, health_test_env):
+    clock = _Clock(0.0)
+    monkeypatch.setattr(mr, "_now", clock)
+    counts = _counting_probe(monkeypatch, {"p1": (True, "HTTP 200")})
+    health = _health(tmp_path)
+
+    mr.provider_health("p1", health=health)
+    clock.t = health.ok_ttl_seconds + 1
+    mr.provider_health("p1", health=health)
+    assert counts["p1"] == 2
+
+
+def test_fail_ttl_shorter_than_ok_ttl(monkeypatch, tmp_path, health_test_env):
+    clock = _Clock(0.0)
+    monkeypatch.setattr(mr, "_now", clock)
+    counts = _counting_probe(monkeypatch, {
+        "good": (True, "HTTP 200"),
+        "bad": (False, "HTTP 503"),
+    })
+    health = _health(tmp_path)
+
+    mr.provider_health("good", health=health)
+    mr.provider_health("bad", health=health)
+    clock.t = health.fail_ttl_seconds + 1
+    assert clock.t < health.ok_ttl_seconds
+    mr.provider_health("good", health=health)  # still cached
+    mr.provider_health("bad", health=health)   # fail TTL expired → re-probed
+    assert counts == {"good": 1, "bad": 2}
+
+
+def test_corrupted_cache_file_ignored(monkeypatch, tmp_path, health_test_env):
+    counts = _counting_probe(monkeypatch, {"p1": (True, "HTTP 200")})
+    health = _health(tmp_path)
+    path = health.resolved_cache_path()
+    path.write_bytes(b"{not json")
+
+    assert mr.provider_health("p1", health=health) == (True, "HTTP 200")
+    assert counts["p1"] == 1
+    rewritten = json.loads(path.read_text(encoding="utf-8"))
+    entry = rewritten["p1"]
+    assert entry["healthy"] is True
+    assert entry["reason"] == "HTTP 200"
+    assert isinstance(entry["ts"], (int, float))
+
+
+def test_cache_write_failure_swallowed(monkeypatch, tmp_path, health_test_env):
+    _counting_probe(monkeypatch, {"p1": (True, "HTTP 200")})
+
+    def broken_write(path, data, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(mr, "atomic_json_write", broken_write)
+    assert mr.provider_health("p1", health=_health(tmp_path)) == (True, "HTTP 200")
+
+
+def test_cache_write_merges_concurrent_entries(monkeypatch, tmp_path, health_test_env):
+    """A verdict landed by another process during our probe must survive.
+
+    Simulates the gateway+CLI lost-update race: another process writes its
+    p2 verdict after we snapshot the cache but before we store ours.  The
+    merge-under-lock in _store_health_verdict must keep both entries.
+    """
+    health = _health(tmp_path)
+    path = health.resolved_cache_path()
+    foreign = {"healthy": False, "reason": "HTTP 503", "ts": 10_000.0}
+
+    def fake_probe(provider, model, cfg, hc):
+        # "Other process" lands p2 while our p1 probe is in flight.
+        mr.atomic_json_write(path, {"p2": foreign})
+        return True, "HTTP 200"
+
+    monkeypatch.setattr(mr, "_probe_provider", fake_probe)
+    monkeypatch.setattr(mr, "_now", _Clock(10_000.0))
+    assert mr.provider_health("p1", health=health) == (True, "HTTP 200")
+
+    cache = json.loads(path.read_text(encoding="utf-8"))
+    assert cache["p2"] == foreign  # not clobbered by our pre-probe snapshot
+    assert cache["p1"]["healthy"] is True
+
+
+def test_cache_write_survives_flock_failure(monkeypatch, tmp_path, health_test_env):
+    """A runtime flock() failure (ENOLCK on NFS without lockd, some FUSE
+    mounts) must degrade to the lock-less re-read+merge, not skip caching —
+    otherwise every resolve re-probes every provider."""
+
+    def bad_flock(fd, op):
+        raise OSError(errno.ENOLCK, "No locks available")
+
+    monkeypatch.setattr(mr.fcntl, "flock", bad_flock)
+    counts = _counting_probe(monkeypatch, {"p1": (True, "HTTP 200")})
+    monkeypatch.setattr(mr, "_now", _Clock(1000.0))
+    health = _health(tmp_path)
+
+    assert mr.provider_health("p1", health=health) == (True, "HTTP 200")
+    assert mr.provider_health("p1", health=health) == (True, "HTTP 200")
+    assert counts == {"p1": 1}  # second call served from the cached verdict
+    cache = json.loads(health.resolved_cache_path().read_text(encoding="utf-8"))
+    assert cache["p1"]["healthy"] is True
+
+
+def test_kill_switch_precedence(monkeypatch, tmp_path, health_test_env):
+    counts = _counting_probe(monkeypatch, {"p1": (True, "HTTP 200")})
+
+    # Config kill switch → healthy without probing.
+    result = mr.provider_health("p1", health=_health(tmp_path, enabled=False))
+    assert result == (True, "health checks disabled")
+    assert counts == {}
+
+    # Env "0" overrides config enabled=True.
+    monkeypatch.setenv("HERMES_MODEL_ROUTES_HEALTH", "0")
+    result = mr.provider_health("p1", health=_health(tmp_path, enabled=True))
+    assert result == (True, "health checks disabled")
+    assert counts == {}
+
+    # Env "1" overrides config enabled=False → probe runs.
+    monkeypatch.setenv("HERMES_MODEL_ROUTES_HEALTH", "1")
+    result = mr.provider_health("p1", health=_health(tmp_path, enabled=False))
+    assert result == (True, "HTTP 200")
+    assert counts == {"p1": 1}
+
+
+def test_pytest_guard(monkeypatch, tmp_path):
+    monkeypatch.delenv("HERMES_MODEL_ROUTES_HEALTH_TEST", raising=False)
+    assert "PYTEST_CURRENT_TEST" in os.environ  # naturally present under pytest
+
+    def boom(*args, **kwargs):
+        raise AssertionError("pytest guard must prevent probing")
+
+    monkeypatch.setattr(mr, "_probe_provider", boom)
+    assert mr.provider_health("p1", health=_health(tmp_path)) == (True, "pytest")
+
+
+# =============================================================================
+# runtime_satisfies_route matching
+# =============================================================================
+
+
+def _membership_cfg(accepted=None, fallbacks=None):
+    extra = {}
+    if accepted is not None:
+        extra["accepted"] = accepted
+    if fallbacks is not None:
+        extra["fallbacks"] = fallbacks
+    return _cfg(routes={"dev": _route(model="model-a", **extra)})
+
+
+def test_accepted_exact_match():
+    cfg = _membership_cfg(accepted=["claude-fable-5"])
+    assert mr.runtime_satisfies_route({"model": " Claude-Fable-5 "}, "dev", cfg) is True
+
+
+def test_alias_dotted_to_dashed():
+    cfg = _membership_cfg(accepted=["claude-opus-4-8"])
+    assert mr.runtime_satisfies_route({"model": "claude-opus-4.8"}, "dev", cfg) is True
+    # DIRECTIONAL: only the live runtime model is alias-expanded.
+    cfg = _membership_cfg(accepted=["claude-opus-4.8"])
+    assert mr.runtime_satisfies_route({"model": "claude-opus-4-8"}, "dev", cfg) is False
+
+
+def test_alias_digit_dot_rule_with_prefix():
+    cfg = _membership_cfg(accepted=["anthropic/claude-opus-4-8-fast"])
+    assert mr.runtime_satisfies_route(
+        {"model": "anthropic/claude-opus-4.8-fast"}, "dev", cfg
+    ) is True
+
+
+def test_membership_ignores_effort_and_provider():
+    cfg = _membership_cfg(accepted=["model-x"])
+    runtime = {
+        "model": "model-x",
+        "provider": "completely-different",
+        "reasoning_effort": "minimal",
+        "base_url": "https://elsewhere.example",
+    }
+    assert mr.runtime_satisfies_route(runtime, "dev", cfg) is True
+
+
+def test_legacy_membership_when_accepted_empty():
+    cfg = _membership_cfg(fallbacks=[{"provider": "p2", "model": "model-b"}])
+    assert mr.runtime_satisfies_route({"model": "model-a"}, "dev", cfg) is True
+    assert mr.runtime_satisfies_route({"model": "model-b"}, "dev", cfg) is True
+    assert mr.runtime_satisfies_route({"model": "model-z"}, "dev", cfg) is False
+
+
+def test_non_member_unknown_route_bad_runtime():
+    cfg = _membership_cfg(accepted=["model-a"])
+    assert mr.runtime_satisfies_route({"model": "model-z"}, "dev", cfg) is False
+    assert mr.runtime_satisfies_route({"model": "model-a"}, "ghost", cfg) is False
+    assert mr.runtime_satisfies_route(None, "dev", cfg) is False
+    assert mr.runtime_satisfies_route("model-a", "dev", cfg) is False
+
+
+# =============================================================================
+# route_catalog_for_schema
+# =============================================================================
+
+
+def test_schema_pairs_order_and_validity():
+    routes = {
+        "dev": _route(provider="p1"),
+        "broken": _route(provider="no-such-provider"),
+        "chat": {"provider": "p2", "model": "model-b"},  # no description
+    }
+    cfg = _cfg(routes=routes)
+    catalog = mr.load_routes(cfg)
+    pairs = mr.route_catalog_for_schema(catalog=catalog)
+    assert pairs == [("dev", "test route"), ("chat", "")]
+    assert any(
+        i.severity == "warning" and "chat" in i.message and "description" in i.message
+        for i in catalog.issues
+    )
