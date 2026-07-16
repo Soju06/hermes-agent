@@ -371,6 +371,16 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
   - `3425751c1 feat(state): messages_fts_v2 — cjk_unicode61 bigram index replaces trigram+LIKE routing`
 - **touches:** `hermes_state.py`, `native/fts5_cjk/*` (new), `scripts/fts_v2_migrate.py` (new), `tests/test_fts_v2_cjk.py` (new)
 
+### 32. search-slow-query-log
+- **branch:** `soju/patches/search-slow-query-log`
+- **origin:** `local-author`
+- **upstream_pr:** _(none yet)_
+- **state:** `local-only`
+- **rationale:** The session_search latency investigation (2026-07-16) required turn-trace archaeology + workload replay to attribute 12.4s searches to LIKE full scans. One INFO line per slow search (threshold `HERMES_SEARCH_SLOW_MS`, default 1000ms) naming the routing path (fts_v2/fts5/trigram/like_scan), elapsed, rows, and query makes the next routing regression a journalctl grep. Wrapper around `_search_messages_impl`; zero behavior change.
+- **commits:** (stacked on `soju/patches/fts5-cjk-bigram-index` tip)
+  - `d6633adcb feat(state): slow-query log for session search with routing-path attribution`
+- **touches:** `hermes_state.py`, `tests/test_search_slow_query_log.py` (new)
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -433,6 +443,7 @@ soju/patches/hook-prepend-command-safety ← runtime topic (stacked on durable-t
 soju/patches/slow-tool-perf-advisor ← runtime topic, advisory [perf-advisor] line appended to slow antipattern terminal results
 soju/patches/session-db-read-path-split ← runtime topic, per-thread read-only connections for recall reads (convoy fix)
 soju/patches/fts5-cjk-bigram-index ← runtime topic (stacked on read-path-split), cjk_unicode61 bigram FTS5 index replaces trigram+LIKE
+soju/patches/search-slow-query-log ← runtime topic (stacked on fts5-cjk-bigram-index), slow session-search log with path attribution
 soju/production                       ← rebuilt: base_commit + runtime patches only
                                          NEVER hand-edit. Always run `bin/hermes-patches rebuild` from `soju/fork-policy`.
 ```
