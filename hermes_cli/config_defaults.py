@@ -22,6 +22,8 @@ LEGACY_VERCEL_RUNTIME = "node24"  # the seeded pre-49 default, never a user choi
 DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
+    # Model routing catalog (ADR-003). Empty keeps routing dormant.
+    "model_routes": {},
     "fallback_providers": [],
     # min_switch_reset_seconds: opt-in (0 = off). When a rate-limited primary declares a reset
     # sooner than this many seconds, stay on it (the retry backoff rides out the window) instead
