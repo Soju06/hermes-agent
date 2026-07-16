@@ -410,6 +410,60 @@ def test_validate_config_structure_surfaces_route_issues():
     assert not any("model_routes" in i.message for i in issues)
 
 
+def _default_route_issues(cfg):
+    return [i for i in mr.validate_model_routes(cfg) if "default_route" in i.message]
+
+
+def test_default_route_declared_is_silent():
+    for name in ("dev", "DEV", "  dev  "):  # lookup is case-insensitive, whitespace-tolerant
+        cfg = _cfg(routes={"dev": _route()})
+        cfg["delegation"] = {"default_route": name}
+        assert _default_route_issues(cfg) == [], name
+
+
+def test_default_route_empty_or_absent_is_silent():
+    for delegation in (None, {}, {"default_route": ""}, {"default_route": "  "}):
+        cfg = _cfg(routes={"dev": _route()})
+        if delegation is not None:
+            cfg["delegation"] = delegation
+        assert _default_route_issues(cfg) == [], delegation
+
+
+def test_default_route_undeclared_warns():
+    cfg = _cfg(routes={"dev": _route()})
+    cfg["delegation"] = {"default_route": "nope"}
+    hits = _default_route_issues(cfg)
+    assert hits and all(i.severity == "warning" for i in hits)
+
+    # No model_routes section at all: any default_route is undeclared.
+    cfg = {"providers": _providers(), "delegation": {"default_route": "dev"}}
+    assert any(i.severity == "warning" for i in _default_route_issues(cfg))
+
+    # A route dropped by validation errors does NOT count as declared.
+    cfg = _cfg(routes={"dev": {"provider": "no-such-provider", "model": "m"}})
+    cfg["delegation"] = {"default_route": "dev"}
+    assert any(i.severity == "warning" for i in _default_route_issues(cfg))
+
+
+def test_default_route_non_string_warns():
+    for bad in (["dev"], 7, True):
+        cfg = _cfg(routes={"dev": _route()})
+        cfg["delegation"] = {"default_route": bad}
+        hits = _default_route_issues(cfg)
+        assert hits and all(i.severity == "warning" for i in hits), bad
+
+
+def test_validate_config_structure_surfaces_default_route_warning():
+    issues = validate_config_structure({
+        "providers": _providers(),
+        "model_routes": {"routes": {"dev": _route()}},
+        "delegation": {"default_route": "nope"},
+    })
+    assert any(
+        i.severity == "warning" and "default_route" in i.message for i in issues
+    )
+
+
 def test_load_routes_end_to_end_real_config():
     home = Path(os.environ["HERMES_HOME"])
     home.mkdir(parents=True, exist_ok=True)

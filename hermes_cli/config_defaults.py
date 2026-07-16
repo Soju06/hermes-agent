@@ -1284,6 +1284,7 @@ DEFAULT_CONFIG = {
         "backends": {},
         "model": "",  # e.g. "google/gemini-3-flash-preview" (empty = inherit parent)
         "provider": "",  # e.g. "openrouter" (empty = inherit parent provider + credentials)
+        "default_route": "",  # optional model_routes route for unrouted delegate tasks (ADR-003 Phase 3a)
         # Fallback chain for delegated children (same entry format as the top-level list).
         # For an unpinned child, null = inherit the parent chain; [] = disable fallback.
         # A child pinned by provider, endpoint, or model gets no fallback unless this
