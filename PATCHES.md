@@ -340,6 +340,16 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
   - `28e7b2b5a fix(gateway): drop pre_gateway_dispatch prepends on slash commands`
 - **touches:** `gateway/run.py`, `tests/gateway/test_pre_gateway_dispatch.py`
 
+### 29. slow-tool-perf-advisor
+- **branch:** `soju/patches/slow-tool-perf-advisor`
+- **origin:** `local-author`
+- **upstream_pr:** _(none yet — candidate once soak data confirms hint uptake)_
+- **state:** `local-only`
+- **rationale:** Trace mining across 2,605 turns (2026-07-16) showed the dominant avoidable turn latency is agents routing heavy work through `terminal` in shapes with a cheap native equivalent: full-tree scans (`rglob`/`os.walk`/unpruned `find`/bare `grep -r` — 59+32+209 calls) over repos whose `node_modules` holds >1.7M files (observed 88s + 63s back-to-back scans of the same tree in one Discord turn), foreground `sleep` polling (364 calls), and multi-minute foreground jobs pinning session workers — while `search_files` (rg-backed, .gitignore-aware) answers in ~1s and background+`notify_on_complete` re-enters the session for free. Fix is a thin advisory-only shot mirroring the subdirectory-hints append: when a terminal call is slow AND matches an antipattern, append ONE `[perf-advisor]` line to the tool result at the moment the model just paid for the slow call. Kill switch `HERMES_PERF_ADVISOR=0`; thresholds `HERMES_PERF_ADVISOR_MIN_S` (10s), `HERMES_PERF_ADVISOR_FOREGROUND_S` (120s).
+- **commits:**
+  - `261253849 feat(tools): slow-tool perf advisor — teach cheaper shapes on slow terminal results`
+- **touches:** `tools/perf_advisor.py` (new), `agent/tool_executor.py`, `tests/test_perf_advisor.py` (new)
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -399,6 +409,7 @@ soju/patches/background-first-waits ← runtime topic (stacked on prompt-tail-fr
 soju/patches/llm-activity-recap ← runtime topic (stacked on prompt-tail-freeze), aux-LLM one-line recap heartbeat (display.long_running_notifications: recap)
 soju/patches/config-knob-bridges ← runtime topic (stacked on prompt-tail-freeze), config.yaml authority for fork knobs (process_wait_cap, fast_conn_fail_limit)
 soju/patches/hook-prepend-command-safety ← runtime topic (stacked on durable-turns), pre_gateway_dispatch prepends dropped on slash commands
+soju/patches/slow-tool-perf-advisor ← runtime topic, advisory [perf-advisor] line appended to slow antipattern terminal results
 soju/production                       ← rebuilt: base_commit + runtime patches only
                                          NEVER hand-edit. Always run `bin/hermes-patches rebuild` from `soju/fork-policy`.
 ```
