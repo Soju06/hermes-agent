@@ -84,6 +84,11 @@ def normalize_tool_schema(schema: Any) -> Optional[Dict[str, Any]]:
     return schema
 
 
+def memory_ingest_allowed(agent: Any) -> bool:
+    """Return whether this agent may write/ingest into memory providers."""
+    return not getattr(agent, "_memory_ingest_disabled", False)
+
+
 def memory_provider_tools_enabled(
     enabled_toolsets: Optional[List[str]],
     disabled_toolsets: Optional[List[str]] = None,
