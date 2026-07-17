@@ -182,6 +182,13 @@ def _notes_tool(function_name: str) -> InlineToolExecutor:
     return _exec
 
 
+def _curator_verdict(agent, args: dict, ctx: InlineToolContext) -> Any:
+    """Ingest-curator verdict submission (ADR-004 Phase 2) — agent-scoped: only a curator fork
+    carries the verdict sink; every other agent is refused inside the handler."""
+    from agent.ingest_curator import dispatch_curator_verdict_for_agent
+    return dispatch_curator_verdict_for_agent(agent, args)
+
+
 _read_preview = _callback_tool(
     "tools.read_preview_tool", "read_preview_tool", "read_preview_callback",
     ("start", "start"), ("count", "count"),
@@ -350,6 +357,7 @@ _RAW_INLINE_TOOL_EXECUTORS: dict[str, InlineToolExecutor] = {
     "notes_write": _notes_tool("notes_write"),
     "notes_read": _notes_tool("notes_read"),
     "memory_propose": _notes_tool("memory_propose"),
+    "curator_verdict": _curator_verdict,
     "clarify": _tool(
         "tools.clarify_tool", "clarify_tool", ("questions", "questions"),
         callback=lambda agent, ctx: agent.clarify_callback,
@@ -440,7 +448,7 @@ def memory_manager_tool_call(agent, function_name: str, args: dict) -> Any:
 # ``message_agent`` falls through to the registry there (Bot Mode DM is only injected into
 # the sequential path's schema).
 INVOKE_TOOL_PRE_MEMORY_MANAGER_NAMES = frozenset({
-    "todo_list", "session_search", "memory", "notes_write", "notes_read", "memory_propose",
+    "todo_list", "session_search", "memory", "notes_write", "notes_read", "memory_propose", "curator_verdict",
 })
 
 

@@ -622,14 +622,25 @@ def public_pre_transform(agent, pre_transform: Optional[Any]) -> Optional[Any]:
 def _mirror_turn_to_memory(
     agent, *, original_user_message, final_response, interrupted, messages, review_memory, review_skills, vetoed,
 ) -> None:
-    """External-memory sync (+ next prefetch), then the background memory/skill review. A prompt a
-    ``pre_llm_call`` hook vetoed never leaves the host, so neither runs for that turn."""
+    """External-memory sync (+ next prefetch), the ingest-curator trigger observation, then the
+    background memory/skill review. A prompt a ``pre_llm_call`` hook vetoed never leaves the host,
+    so none of them runs for that turn."""
     if vetoed:
         return
     agent._sync_external_memory_for_turn(
         original_user_message=original_user_message, final_response=final_response,
         interrupted=interrupted, messages=messages,
     )
+    # Ingest-curator trigger observation (ADR-004 Phase 2, SHADOW). Pure O(turn-slice) arithmetic
+    # inline; any curator run spawns on a daemon thread. No-op unless curator.ingest_enabled;
+    # fail-open.
+    if final_response and not interrupted:
+        try:
+            from agent.ingest_curator import observe_turn_completed
+            observe_turn_completed(agent, messages)
+        except Exception:
+            from agent.conversation_loop import logger
+            logger.debug("ingest-curator turn observation failed (fail-open)", exc_info=True)
     # Background memory/skill review runs AFTER delivery so it never competes with the
     # user's task. Suppressed by skip_background_review (e.g. cron): the fork costs
     # ~30K tokens / event with no human-in-the-loop benefit. Best-effort; the review

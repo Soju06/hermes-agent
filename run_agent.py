@@ -913,6 +913,15 @@ class AIAgent(
         if getattr(self, "_memory_provider_shutdown", False):
             return
         self._memory_provider_shutdown = True
+        # Ingest-curator session-end boundary (ADR-004 Phase 2, SHADOW): >=3-turn sessions with a
+        # dirty buffer get a cold curation run on a daemon thread. Observed BEFORE provider
+        # teardown so the fork's memory_search reads still work. No-op unless
+        # curator.ingest_enabled; internally skips ingest-disabled forks; fail-open.
+        try:
+            from agent.ingest_curator import observe_session_end
+            observe_session_end(self, messages)
+        except Exception:
+            logger.debug("ingest-curator session-end observation failed (fail-open)", exc_info=True)
         from agent.memory_manager import memory_ingest_allowed
         # ADR-004 Phase 0: an ingest-disabled fork never OWNS its manager — it is rebound from the parent.
         # on_session_end would run end-of-session extraction (a graph write) on the fork's harness transcript,
@@ -939,6 +948,13 @@ class AIAgent(
     def commit_memory_session(self, messages: list | None = None) -> None:
         """Flush end-of-session extraction on session_id rotation (/new, compression) without tearing providers
         down."""
+        # Ingest-curator session boundary (ADR-004 Phase 2, SHADOW) — same rationale as in
+        # shutdown_memory_provider. Fail-open.
+        try:
+            from agent.ingest_curator import observe_session_end
+            observe_session_end(self, messages)
+        except Exception:
+            logger.debug("ingest-curator session-end observation failed (fail-open)", exc_info=True)
         from agent.memory_manager import memory_ingest_allowed
         if self._memory_manager and memory_ingest_allowed(self):
             _quietly(lambda: self._memory_manager.on_session_end(messages or []))

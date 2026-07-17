@@ -3792,6 +3792,16 @@ def _run_summary_phase(
             agent, approx_tokens=approx_tokens, focus_topic=focus_topic, force=force, memory_context=memory_context,
             bypass_cooldown=bypass_cooldown,
         )
+        # Ingest-curator pre-compress boundary (ADR-004 Phase 2, SHADOW): snapshot synchronously,
+        # curation async on a daemon thread — this path runs mid-turn at context capacity, so
+        # nothing here may block (§4.3: the 10-worker pool saturation was the silent-stall
+        # incident). No-op unless curator.ingest_enabled; fail-open.
+        try:
+            from agent.ingest_curator import observe_pre_compress
+            observe_pre_compress(agent, messages)
+        except Exception:
+            logger.debug("ingest-curator pre-compress observation failed (fail-open)", exc_info=True)
+
         messages_before_compression = copy.deepcopy(messages)
         _activity_heartbeat = _CompressionActivityHeartbeat(
             agent, commit_fence=commit_fence, emit_client_status=lease.status_emitted,

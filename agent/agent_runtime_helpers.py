@@ -91,6 +91,8 @@ AGENT_RUNTIME_POST_HOOK_TOOL_NAMES = frozenset({
     "delegate_task",
     # Notes tier (ADR-004 Phase 1) — dispatched inline like ``memory``.
     "notes_write", "notes_read", "memory_propose",
+    # Ingest-curator verdict submission (ADR-004 Phase 2) — agent-scoped inline tool.
+    "curator_verdict",
 })
 
 _TRAJECTORY_SYSTEM_PROMPT = (
