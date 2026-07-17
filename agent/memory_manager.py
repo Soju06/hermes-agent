@@ -27,7 +27,7 @@ from session_rules.turns import sanitize_context
 from agent.memory_manager_tools import (inject_memory_provider_tools, memory_provider_tools_enabled,
                                         memory_provider_tools_exposed, normalize_tool_schema)
 from agent.memory_provider import MemoryProvider, PRE_COMPRESS_CHECKPOINT_API_VERSION, ctx_bound, spawn_context_thread
-from agent.memory_journal import PendingTurnWAL, run_pending_startup_scan_once
+from agent.memory_journal import L0Mirror, PendingTurnWAL, run_pending_startup_scan_once
 from session_rules.turns import extract_user_instruction_from_skill_message
 from hermes_constants import hermes_home_key
 from tools.hook_output_spill import get_spill_config, spill_if_oversized
@@ -259,6 +259,17 @@ class MemoryManager:
         except Exception:  # pragma: no cover - constructor is allocation-only
             logger.debug("memory-pending WAL unavailable (fail-open)", exc_info=True)
             self._pending_wal = None
+        # ADR-004 Phase 0 (§② L0-mirror): local evidence journal. Every
+        # payload that leaves for external memory (per-turn sync, session-end
+        # extraction input, pre-compress extraction input) is mirrored to a
+        # monthly JSONL on this host, so the graph is no longer the only copy
+        # of the evidence. Fail-open, zero LLM calls, disk only.
+        self._l0_mirror: Optional[L0Mirror] = None
+        try:
+            self._l0_mirror = L0Mirror()
+        except Exception:  # pragma: no cover - constructor is allocation-only
+            logger.debug("l0-mirror unavailable (fail-open)", exc_info=True)
+            self._l0_mirror = None
 
     def _each_provider(self, label: str, call: Callable[[MemoryProvider], Any], *, level: int = logging.DEBUG,
                        providers: Optional[list[MemoryProvider]] = None, exc_info: bool = False) -> list[Any]:
@@ -515,6 +526,16 @@ class MemoryManager:
                 wal.append_turn(session_id, clean_user_content, assistant_content)
                 if wal is not None else None
             )
+            # ADR-004 Phase 0 (§② L0-mirror): mirror the outgoing episode payload locally just
+            # before ingest submit. Fail-open.
+            if self._l0_mirror is not None:
+                self._l0_mirror.append_turn(
+                    session_id,
+                    clean_user_content,
+                    assistant_content,
+                    provider_names=[p.name for p in providers],
+                    wal_entry_id=wal_entry_id,
+                )
             synced = self._each_provider("sync_turn failed", _sync, level=logging.WARNING, providers=providers)
             # Ack only after every provider accepted the turn (``_each_provider`` returns one entry per
             # provider that did not raise; an entry is False when the stuck-call gate skipped that
@@ -688,6 +709,15 @@ class MemoryManager:
         if self._fork_turn_hooks_suppressed() or not self._owner_allows("on_session_end"):
             return
         messages = _redact_messages_for_egress(messages or [])
+        # ADR-004 Phase 0 (§② L0-mirror): the end-of-session extraction input is an outgoing
+        # episode payload too — mirror it before handing it to providers. Fail-open; skipped when
+        # no provider will consume it.
+        if self._providers and self._l0_mirror is not None:
+            self._l0_mirror.append_messages(
+                "session_end",
+                messages,
+                provider_names=[p.name for p in self._providers],
+            )
         self._each_provider("on_session_end failed", lambda p: p.on_session_end(messages), level=logging.WARNING,
                             exc_info=True)
 
@@ -766,6 +796,14 @@ class MemoryManager:
             if require_checkpoint:  # the caller keeps the uncompressed transcript
                 raise RuntimeError("Memory pre-compress checkpoint refused; see `hermes logs errors`")
             return ""
+        # ADR-004 Phase 0 (§② L0-mirror): mirror the pre-compression
+        # extraction input before providers consume it. Fail-open.
+        if self._providers and self._l0_mirror is not None:
+            self._l0_mirror.append_messages(
+                "pre_compress",
+                messages,
+                provider_names=[p.name for p in self._providers],
+            )
         parts = []
         checkpoint_succeeded = False
         from agent.message_metadata import without_withheld_prompts
