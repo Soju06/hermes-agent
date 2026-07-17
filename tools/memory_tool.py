@@ -416,6 +416,12 @@ def apply_memory_pending(payload: dict[str, Any], store: MemoryStore) -> dict[st
     replace/remove applies to exactly its pinned ``matched_entry`` or is refused; a record
     staged before pinning has no verifiable target, so it is refused rather than replayed by
     old_text (which could hit a newer entry the approver never saw)."""
+    # Notes-tier staged writes share the memory subsystem's pending store (one
+    # memory.write_approval switch covers both durable tiers) but apply to the NotesStore,
+    # not MEMORY.md — route them to their own applier.
+    if payload.get("tool") == "notes_write":
+        from agent.memory_pipeline import apply_notes_pending
+        return apply_notes_pending(payload)
     action, target = payload.get("action"), payload.get("target")
     target_error = _memory_target_error(store, target, payload.get("operations"))
     if target_error is not None:
