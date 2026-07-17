@@ -27,6 +27,7 @@ from session_rules.turns import sanitize_context
 from agent.memory_manager_tools import (inject_memory_provider_tools, memory_provider_tools_enabled,
                                         memory_provider_tools_exposed, normalize_tool_schema)
 from agent.memory_provider import MemoryProvider, PRE_COMPRESS_CHECKPOINT_API_VERSION, ctx_bound, spawn_context_thread
+from agent.memory_journal import PendingTurnWAL, run_pending_startup_scan_once
 from session_rules.turns import extract_user_instruction_from_skill_message
 from hermes_constants import hermes_home_key
 from tools.hook_output_spill import get_spill_config, spill_if_oversized
@@ -247,6 +248,17 @@ class MemoryManager:
         # construction path keeps writing.
         self._agent_context = "primary"
         self._tool_call_keywords_cache: dict[int, Optional[frozenset[str]]] = {}
+        # ADR-004 Phase 0 (§4.2): durable per-turn WAL. Turns are journaled
+        # BEFORE ingest dispatch and ack-marked after success, so buffered
+        # turns survive process restarts. Strictly fail-open — a broken
+        # journal must never affect the sync path.
+        self._pending_wal: Optional[PendingTurnWAL] = None
+        try:
+            self._pending_wal = PendingTurnWAL()
+            run_pending_startup_scan_once(self._pending_wal)
+        except Exception:  # pragma: no cover - constructor is allocation-only
+            logger.debug("memory-pending WAL unavailable (fail-open)", exc_info=True)
+            self._pending_wal = None
 
     def _each_provider(self, label: str, call: Callable[[MemoryProvider], Any], *, level: int = logging.DEBUG,
                        providers: Optional[list[MemoryProvider]] = None, exc_info: bool = False) -> list[Any]:
@@ -486,17 +498,32 @@ class MemoryManager:
             clean_user_content, assistant_content, messages)
         optional_kwargs = {"messages": redacted_messages, "turn_author": turn_author}
 
-        def _sync(provider: MemoryProvider) -> None:
+        def _sync(provider: MemoryProvider) -> bool:
             kwargs: dict[str, Any] = {"session_id": session_id}
             for keyword, value in optional_kwargs.items():
                 if value is not None and self._provider_sync_accepts(provider, keyword):
                     kwargs[keyword] = value
-            self._call_unless_stalled(
+            return self._call_unless_stalled(
                 provider, lambda: provider.sync_turn(clean_user_content, assistant_content, **kwargs))
 
-        self._submit_background(
-            lambda: self._each_provider("sync_turn failed", _sync, level=logging.WARNING, providers=providers)
-        )
+        def _run() -> None:
+            # ADR-004 Phase 0 (§4.2): journal the turn durably BEFORE any provider ingest is
+            # attempted. Runs on the mem-sync worker (not the hot path) and is fail-open —
+            # append_turn returns None on any failure and never raises.
+            wal = self._pending_wal
+            wal_entry_id = (
+                wal.append_turn(session_id, clean_user_content, assistant_content)
+                if wal is not None else None
+            )
+            synced = self._each_provider("sync_turn failed", _sync, level=logging.WARNING, providers=providers)
+            # Ack only after every provider accepted the turn (``_each_provider`` returns one entry per
+            # provider that did not raise; an entry is False when the stuck-call gate skipped that
+            # provider) — a failed or skipped ingest leaves the entry unconsumed so it survives for the
+            # Phase-2 curator's replay (and is counted by the startup scan).
+            if wal is not None and wal_entry_id and len(synced) == len(providers) and all(synced):
+                wal.ack(session_id, wal_entry_id)
+
+        self._submit_background(_run)
 
     def _submit_background(self, fn, *, kind: str = "write") -> None:
         """Queue ``fn`` on the serialized worker (created lazily; None once shutting down) and track its
@@ -537,13 +564,13 @@ class MemoryManager:
         except Exception as e:  # pragma: no cover - fn guards internally
             logger.debug("Inline memory background task failed: %s", e)
 
-    def _call_unless_stalled(self, provider: MemoryProvider, call: Callable[[], Any]) -> None:
+    def _call_unless_stalled(self, provider: MemoryProvider, call: Callable[[], Any]) -> bool:
         """Run a background provider call unless _BACKGROUND_GATE skips it (the provider has stuck calls);
         skipping costs that turn's write/prefetch but stops a wedged backend from pinning one more
-        thread per fresh manager. The builtin provider is never gated."""
+        thread per fresh manager. The builtin provider is never gated. Returns whether ``call`` ran."""
         if provider.name == "builtin":
             call()
-            return
+            return True
         key = self._registry_key(provider)
         token = object()
         skipped = self._BACKGROUND_GATE.enter(key, token, _BACKGROUND_CALL_STALL_S)
@@ -555,13 +582,14 @@ class MemoryManager:
                     "skipping its sync/prefetch until it recovers (%d skipped)", provider.name, stuck,
                     _BACKGROUND_CALL_STALL_S, in_flight, skips,
                 )
-            return
+            return False
         ok = False
         try:
             call()
             ok = True
         finally:
             self._BACKGROUND_GATE.leave(key, token, ok=ok)
+        return True
 
     def _registry_key(self, provider: MemoryProvider) -> tuple[str, str]:
         """Process-wide registry key: the home the providers were bound to (``initialize_all``, which may
