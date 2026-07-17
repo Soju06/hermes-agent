@@ -976,6 +976,10 @@ def _ensure_hermes_home_managed(home: Path):
 DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
+    # Model routing catalog (ADR-003). Empty = feature dormant.
+    # Schema: model_routes: {routes: {...}, health: {...}, static_rules: [...]}
+    # — see cli-config.yaml.example and hermes_cli/model_routes.py.
+    "model_routes": {},
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
@@ -2214,6 +2218,9 @@ DEFAULT_CONFIG = {
     "delegation": {
         "model": "",       # e.g. "google/gemini-3-flash-preview" (empty = inherit parent model)
         "provider": "",    # e.g. "openrouter" (empty = inherit parent provider + credentials)
+        "default_route": "",  # model_routes route applied when a delegate_task call names no
+                              # route (empty = use delegation.model/provider). Must name a route
+                              # declared under model_routes.routes.
         "base_url": "",    # direct OpenAI-compatible endpoint for subagents
         "api_key": "",     # API key for delegation.base_url (falls back to OPENAI_API_KEY)
         "api_mode": "",    # wire protocol for delegation.base_url: "chat_completions",
@@ -5220,7 +5227,7 @@ def check_config_version() -> Tuple[int, int]:
 
 # Fields that are valid at root level of config.yaml
 _KNOWN_ROOT_KEYS = {
-    "_config_version", "model", "providers", "fallback_model",
+    "_config_version", "model", "providers", "model_routes", "fallback_model",
     "fallback_providers", "credential_pool_strategies", "toolsets",
     "agent", "terminal", "display", "compression", "delegation",
     "auxiliary", "moa", "custom_providers", "context", "memory", "gateway",
@@ -5390,6 +5397,15 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
                 f"Root-level key '{key}' looks misplaced — should it be under 'model:' or inside a 'custom_providers' entry?",
                 f"Move '{key}' under the appropriate section",
             ))
+
+    # ── model_routes catalog validation (ADR-003 Phase 1) ────────────────
+    if config.get("model_routes"):
+        try:
+            # Deferred import — model_routes imports config at module level.
+            from hermes_cli.model_routes import validate_model_routes
+            issues.extend(validate_model_routes(config))
+        except Exception:
+            logger.warning("model_routes validation failed", exc_info=True)
 
     return issues
 
