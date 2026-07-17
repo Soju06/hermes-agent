@@ -2574,15 +2574,24 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 # results (memory_search etc.) hand memory-derived text back
                 # to the agent — register them in the session's injected-span
                 # registry so assistant paraphrases are taint-tagged at WAL
-                # time. Read-only hook, fail-open, never raises.
+                # time. Gated on memory_ingest_allowed: an ingest-disabled
+                # fork (curator/background review) shares the parent's LIVE
+                # session_id, so its whitelisted reads must not mutate the
+                # shared registry — the shadow observer's reads would change
+                # live confirm-time admission outcomes. The fork's own spans
+                # are never journaled (sync_all is gated on the same flag),
+                # so skipping registration loses no taint coverage.
+                # Fail-open, never raises.
                 if _mem_result:
                     try:
-                        from agent import memory_taint
-                        memory_taint.record_injected_tool_result(
-                            getattr(agent, "session_id", "") or "",
-                            str(_mem_result),
-                            source=function_name,
-                        )
+                        from agent.memory_manager import memory_ingest_allowed
+                        if memory_ingest_allowed(agent):
+                            from agent import memory_taint
+                            memory_taint.record_injected_tool_result(
+                                getattr(agent, "session_id", "") or "",
+                                str(_mem_result),
+                                source=function_name,
+                            )
                     except Exception:
                         pass
             except Exception as tool_error:
