@@ -2112,7 +2112,7 @@ def _read_main_model() -> str:
     that gate on "the active main model" (e.g. ``vision_analyze``'s native
     fast path) see the live runtime, not the persisted config default.
     """
-    override = _RUNTIME_MAIN_MODEL
+    override = _runtime_main_state().model
     if isinstance(override, str) and override.strip():
         return override.strip()
     try:
@@ -2139,7 +2139,7 @@ def _read_main_provider() -> str:
     Runtime override: see ``_read_main_model`` — same mechanism for the
     provider half of the runtime tuple.
     """
-    override = _RUNTIME_MAIN_PROVIDER
+    override = _runtime_main_state().provider
     if isinstance(override, str) and override.strip():
         return override.strip().lower()
     try:
@@ -2168,7 +2168,7 @@ def _read_main_api_key() -> str:
     the main model's credentials instead of falling to ``no-key-required``
     (issue #9318).
     """
-    override = _RUNTIME_MAIN_API_KEY
+    override = _runtime_main_state().api_key
     if isinstance(override, str) and override.strip():
         return override.strip()
     try:
@@ -2189,7 +2189,7 @@ def _read_main_base_url() -> str:
 
     Same override-then-config pattern as ``_read_main_api_key``.
     """
-    override = _RUNTIME_MAIN_BASE_URL
+    override = _runtime_main_state().base_url
     if isinstance(override, str) and override.strip():
         return override.strip()
     try:
@@ -2225,13 +2225,33 @@ def _read_main_api_key_if_same_host(aux_base_url: str) -> str:
     return _read_main_api_key()
 
 
-# Process-local override set by AIAgent at session/turn start. Single-threaded
-# per turn — no lock needed. Cleared by ``clear_runtime_main()``.
+# Runtime override set by AIAgent at session/turn start. Gateway turns run
+# concurrently in different worker threads, so this state must be thread-local:
+# a process-global value lets one Discord thread's model/provider leak into
+# another thread's auxiliary tasks (vision, title generation, compression).
+_RUNTIME_MAIN_STATE = threading.local()
+
+# Backward-compatible mirrors for tests / diagnostics. Runtime code must read
+# through _runtime_main_state() instead of these process-global mirrors.
 _RUNTIME_MAIN_PROVIDER: str = ""
 _RUNTIME_MAIN_MODEL: str = ""
 _RUNTIME_MAIN_BASE_URL: str = ""
 _RUNTIME_MAIN_API_KEY: str = ""
 _RUNTIME_MAIN_API_MODE: str = ""
+
+
+def _runtime_main_state() -> SimpleNamespace:
+    state = getattr(_RUNTIME_MAIN_STATE, "value", None)
+    if state is None:
+        state = SimpleNamespace(
+            provider="",
+            model="",
+            base_url="",
+            api_key="",
+            api_mode="",
+        )
+        _RUNTIME_MAIN_STATE.value = state
+    return state
 
 
 def set_runtime_main(
@@ -2255,17 +2275,29 @@ def set_runtime_main(
     """
     global _RUNTIME_MAIN_PROVIDER, _RUNTIME_MAIN_MODEL
     global _RUNTIME_MAIN_BASE_URL, _RUNTIME_MAIN_API_KEY, _RUNTIME_MAIN_API_MODE
-    _RUNTIME_MAIN_PROVIDER = (provider or "").strip().lower()
-    _RUNTIME_MAIN_MODEL = (model or "").strip()
-    _RUNTIME_MAIN_BASE_URL = (base_url or "").strip()
-    _RUNTIME_MAIN_API_KEY = api_key.strip() if isinstance(api_key, str) else ""
-    _RUNTIME_MAIN_API_MODE = (api_mode or "").strip()
+    state = _runtime_main_state()
+    state.provider = (provider or "").strip().lower()
+    state.model = (model or "").strip()
+    state.base_url = (base_url or "").strip()
+    state.api_key = api_key.strip() if isinstance(api_key, str) else ""
+    state.api_mode = (api_mode or "").strip()
+    _RUNTIME_MAIN_PROVIDER = state.provider
+    _RUNTIME_MAIN_MODEL = state.model
+    _RUNTIME_MAIN_BASE_URL = state.base_url
+    _RUNTIME_MAIN_API_KEY = state.api_key
+    _RUNTIME_MAIN_API_MODE = state.api_mode
 
 
 def clear_runtime_main() -> None:
     """Clear the runtime override (e.g. on session end)."""
     global _RUNTIME_MAIN_PROVIDER, _RUNTIME_MAIN_MODEL
     global _RUNTIME_MAIN_BASE_URL, _RUNTIME_MAIN_API_KEY, _RUNTIME_MAIN_API_MODE
+    state = _runtime_main_state()
+    state.provider = ""
+    state.model = ""
+    state.base_url = ""
+    state.api_key = ""
+    state.api_mode = ""
     _RUNTIME_MAIN_PROVIDER = ""
     _RUNTIME_MAIN_MODEL = ""
     _RUNTIME_MAIN_BASE_URL = ""
@@ -4153,12 +4185,16 @@ def _resolve_auto(
     # base_url/api_key/api_mode alongside provider/model, so custom:
     # providers get the full credential surface in Step 1 of the
     # auto-detect chain.
-    if not runtime_base_url and _RUNTIME_MAIN_BASE_URL:
-        runtime_base_url = _RUNTIME_MAIN_BASE_URL
-    if not runtime_api_key and _RUNTIME_MAIN_API_KEY:
-        runtime_api_key = _RUNTIME_MAIN_API_KEY
-    if not runtime_api_mode and _RUNTIME_MAIN_API_MODE:
-        runtime_api_mode = _RUNTIME_MAIN_API_MODE
+    state = _runtime_main_state()
+    state_base_url = str(getattr(state, "base_url", "") or "")
+    state_api_key = str(getattr(state, "api_key", "") or "")
+    state_api_mode = str(getattr(state, "api_mode", "") or "")
+    if not runtime_base_url and state_base_url:
+        runtime_base_url = state_base_url
+    if not runtime_api_key and state_api_key:
+        runtime_api_key = state_api_key
+    if not runtime_api_mode and state_api_mode:
+        runtime_api_mode = state_api_mode
 
     # ── Warn once if OPENAI_BASE_URL is set but config.yaml uses a named
     #    provider (not 'custom').  This catches the common "env poisoning"
@@ -4222,12 +4258,12 @@ def _resolve_auto(
     if (main_provider and main_model
             and main_provider not in {"auto", ""}):
         resolved_provider = main_provider
-        explicit_base_url = runtime_base_url or None
-        explicit_api_key = None
+        explicit_base_url = runtime_base_url or ""
+        explicit_api_key = ""
         if runtime_base_url and (main_provider == "custom" or main_provider.startswith("custom:")):
             resolved_provider = "custom"
             explicit_base_url = runtime_base_url
-            explicit_api_key = runtime_api_key or None
+            explicit_api_key = runtime_api_key or ""
         elif runtime_api_key:
             # Pin auxiliary to the same api_key as the active main chat session
             # so that a working key is reused instead of re-selecting from the pool
@@ -4247,7 +4283,7 @@ def _resolve_auto(
                 main_model,
                 explicit_base_url=explicit_base_url,
                 explicit_api_key=explicit_api_key,
-                api_mode=runtime_api_mode or None,
+                api_mode=runtime_api_mode or "",
             )
             if client is not None:
                 logger.info("Auxiliary auto-detect: using main provider %s (%s)",

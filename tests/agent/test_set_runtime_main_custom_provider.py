@@ -4,6 +4,8 @@ so that _resolve_auto() can route custom: providers in Step 1.
 Fixes https://github.com/NousResearch/hermes-agent/issues/34777
 """
 import pytest
+import queue
+import threading
 from unittest.mock import patch, MagicMock
 
 
@@ -127,6 +129,60 @@ class TestSetRuntimeMainCustomProvider:
             assert g["api_mode"] == ""
         finally:
             mod.clear_runtime_main()
+
+    def test_runtime_override_is_isolated_per_thread(self):
+        """Concurrent gateway turns must not overwrite each other's live runtime."""
+        import agent.auxiliary_client as mod
+
+        worker_ready = threading.Event()
+        release_worker = threading.Event()
+        errors: queue.Queue[BaseException] = queue.Queue()
+
+        def worker():
+            try:
+                mod.set_runtime_main(
+                    "custom",
+                    "gpt-5.5",
+                    base_url="https://codex.nekos.me/v1",
+                    api_key="worker-key",
+                    api_mode="codex_responses",
+                )
+                worker_ready.set()
+                release_worker.wait(timeout=5)
+                assert mod._read_main_provider() == "custom"
+                assert mod._read_main_model() == "gpt-5.5"
+            except BaseException as exc:  # noqa: BLE001 - surface thread assertion
+                errors.put(exc)
+            finally:
+                mod.clear_runtime_main()
+
+        mod.clear_runtime_main()
+        thread = threading.Thread(target=worker)
+        try:
+            mod.set_runtime_main(
+                "claude-nekos",
+                "claude-opus-4-8",
+                base_url="https://claude.nekos.me",
+                api_key="main-key",
+                api_mode="anthropic_messages",
+            )
+            thread.start()
+            assert worker_ready.wait(timeout=5)
+
+            assert mod._read_main_provider() == "claude-nekos"
+            assert mod._read_main_model() == "claude-opus-4-8"
+            with patch.object(mod, "resolve_provider_client") as mock_resolve:
+                mock_resolve.return_value = (MagicMock(), "claude-opus-4-8")
+                provider, client, model = mod.resolve_vision_provider_client(async_mode=False)
+                assert client is not None
+                assert provider == "claude-nekos"
+                assert model == "claude-opus-4-8"
+        finally:
+            release_worker.set()
+            thread.join(timeout=5)
+            mod.clear_runtime_main()
+
+        assert errors.empty(), errors.get_nowait()
 
 
 class TestResolveAutoCustomEndToEnd:
