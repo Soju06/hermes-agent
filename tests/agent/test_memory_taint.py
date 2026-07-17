@@ -1,11 +1,14 @@
 """Tests for agent/memory_taint.py — origin-taint machinery (ADR-004 §①, Phase 2).
 
 Covers: injected-span registry (prefetch + memory_search results, JSON
-unescaping), WAL/mirror span tagging (assistant paraphrase incl. Korean;
-user spans never tainted; literal fence echoes; proposal records), pipeline
-quote-admissibility enforcement (check='taint', user-span quotes unaffected,
-kill switch), threshold boundary semantics, registry TTL/GC and session-end
-eviction, and the fail-CLOSED posture on registry corruption.
+unescaping, per-session sha dedup), WAL/mirror span tagging (assistant
+paraphrase incl. Korean; user spans never tainted; explicit clean tags;
+literal fence echoes; proposal records), pipeline quote-admissibility
+enforcement (check='taint', user-span quotes unaffected, kill switch, the
+quote self-check that closes the dilution bypass, the as_of time bound that
+prevents retroactive false taint), threshold boundary semantics, registry
+TTL/GC and session-end eviction, and the fail-CLOSED posture on registry
+corruption.
 """
 
 from __future__ import annotations
@@ -90,7 +93,7 @@ class TestRegistryAndTagging:
         assert taint["spans"], "tainted segments must carry offsets"
         assert taint["score"] >= mt.containment_threshold()
 
-    def test_independent_same_topic_text_is_not_tainted(
+    def test_independent_same_topic_text_gets_explicit_clean_tag(
         self, registry, tmp_path
     ):
         mt.record_injected_text(SESSION, INJECTED_KO, source="prefetch")
@@ -101,7 +104,13 @@ class TestRegistryAndTagging:
             tmp_path / "state" / "memory-pending" / f"{SESSION}.jsonl"
         )
         assistant_rec = recs[0]["records"][1]
-        assert "taint" not in assistant_rec  # sparse tagging: clean = no key
+        # Always-stamped: the write-time CLEAN verdict is recorded explicitly
+        # so enforcement never recomputes this span against a registry that
+        # has since grown (retroactive-taint guard).
+        taint = assistant_rec["taint"]
+        assert taint["tainted"] is False
+        assert taint["spans"] == []
+        assert taint["registry"] == "ok"
 
     def test_user_text_identical_to_injection_is_never_tainted(
         self, registry, tmp_path
@@ -170,6 +179,45 @@ class TestRegistryAndTagging:
         taint = fresh.assistant_taint(SESSION, PARAPHRASE_KO)
         assert taint["tainted"] is True
         assert taint["registry"] == "ok"
+
+    def test_identical_injection_registers_once_per_session(
+        self, registry, tmp_path
+    ):
+        """Per-session sha dedup: the prefetch block re-injected every turn
+        must not grow the entry list or the sidecar unboundedly."""
+        for _ in range(5):
+            mt.record_injected_text(SESSION, INJECTED_KO, source="prefetch")
+        registry.drain_io()
+
+        digest = registry.session_injected_digest(SESSION)
+        assert digest["count"] == 1
+        sidecar = (
+            tmp_path / "state" / "memory-pending" / "taint" / f"{SESSION}.jsonl"
+        )
+        lines = [ln for ln in sidecar.read_text(encoding="utf-8").splitlines()
+                 if ln.strip()]
+        assert len(lines) == 1
+        # Taint coverage is unaffected by dedup.
+        assert registry.assistant_taint(SESSION, PARAPHRASE_KO)["tainted"] is True
+
+    def test_pre_dedup_sidecar_with_duplicates_loads_deduped(
+        self, registry, tmp_path
+    ):
+        """Sidecars written before the dedup fix may hold repeats — reload
+        collapses them (earliest ts wins) instead of double-counting."""
+        mt.record_injected_text(SESSION, INJECTED_KO, source="prefetch")
+        registry.drain_io()
+        sidecar = (
+            tmp_path / "state" / "memory-pending" / "taint" / f"{SESSION}.jsonl"
+        )
+        line = sidecar.read_text(encoding="utf-8").strip()
+        sidecar.write_text(line + "\n" + line + "\n" + line + "\n",
+                           encoding="utf-8")
+        fresh = TaintRegistry(
+            base_dir=tmp_path / "state" / "memory-pending" / "taint"
+        )
+        assert fresh.session_injected_digest(SESSION)["count"] == 1
+        assert fresh.assistant_taint(SESSION, PARAPHRASE_KO)["tainted"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -332,6 +380,179 @@ class TestPipelineEnforcement:
         check = pipeline._ground_ref(ref)
         assert check["ok"] is False
         assert check["checked"] == "taint"
+
+
+# ---------------------------------------------------------------------------
+# Dilution bypass (quote self-check) — must-fix #1
+# ---------------------------------------------------------------------------
+
+# A verbatim injected fact embedded inside a longer ORIGINAL assistant
+# sentence: the segment's containment stays below threshold (diluted), but a
+# quote of just the fact is 100% injected text. Single segment on purpose —
+# no sentence-final punctuation + whitespace inside.
+INJECTED_FACT_KO = "codex-lb 프록시 포트는 10.0.0.113:8443이다"
+DILUTED_KO = (
+    "오늘 오후에 확인해 본 내용을 정리하면, 게이트웨이 라우팅 경로와 백엔드 "
+    "헬스체크 설정은 전부 문제없이 잘 동작하고 있었고, "
+    + INJECTED_FACT_KO
+    + "라는 부분만 새로 기록해 두면 될 것 같아"
+)
+
+
+def _confirm_wal_quote(tmp_path, quote: str, *, entry_id: str,
+                       title: str = "타당성 검증", topic_key: str = "t.k"):
+    """propose→confirm an ADD citing an existing WAL entry; return result."""
+    pipeline = MemoryWritePipeline(hermes_home=tmp_path)
+    ref = {
+        "type": "wal",
+        "session_id": SESSION,
+        "entry_id": entry_id,
+        "quote": quote,
+    }
+    proposed = pipeline.propose(
+        title, kind_hint="fact", evidence_refs=[ref], session_id=SESSION
+    )
+    assert proposed["success"], proposed
+    return pipeline.confirm(
+        proposed["token"], "ADD", topic_key=topic_key, session_id=SESSION
+    )
+
+
+class TestDilutionBypass:
+    def _precondition_scores(self):
+        """The scenario is only a bypass while the segment dilutes below
+        threshold AND the quote itself is fully contained — assert both
+        through the module's own primitives, not string luck."""
+        corpus = mt._shingles(INJECTED_FACT_KO)
+        seg_score = mt._containment(mt._shingles(DILUTED_KO), corpus)
+        quote_score = mt._containment(mt._shingles(INJECTED_FACT_KO), corpus)
+        assert seg_score < mt.containment_threshold(), seg_score
+        assert quote_score == 1.0
+        return seg_score
+
+    def test_diluted_segment_gets_clean_write_time_tag(
+        self, registry, tmp_path
+    ):
+        self._precondition_scores()
+        mt.record_injected_text(SESSION, INJECTED_FACT_KO, source="prefetch")
+        wal = _wal(tmp_path)
+        wal.append_turn(SESSION, "오늘 점검 결과 알려줘", DILUTED_KO)
+        recs = _records(
+            tmp_path / "state" / "memory-pending" / f"{SESSION}.jsonl"
+        )
+        taint = recs[0]["records"][1]["taint"]
+        assert taint["tainted"] is False  # segment-level verdict IS diluted
+
+    def test_verbatim_injected_fact_quote_is_rejected_despite_dilution(
+        self, registry, tmp_path
+    ):
+        """must-fix #1 repro: the quote — 100% injected text — must be
+        rejected even though every segment of the span computed clean."""
+        self._precondition_scores()
+        mt.record_injected_text(SESSION, INJECTED_FACT_KO, source="prefetch")
+        wal = _wal(tmp_path)
+        entry_id = wal.append_turn(SESSION, "오늘 점검 결과 알려줘", DILUTED_KO)
+        result = _confirm_wal_quote(
+            tmp_path, INJECTED_FACT_KO, entry_id=entry_id
+        )
+        assert result["success"] is False
+        assert result["grounding"][0]["checked"] == "taint"
+        assert "origin-taint" in result["grounding"][0]["detail"]
+
+    def test_original_prose_quote_from_same_span_still_grounds(
+        self, registry, tmp_path
+    ):
+        """The fix is quote-granular: original prose from the SAME diluted
+        span remains admissible evidence."""
+        self._precondition_scores()
+        mt.record_injected_text(SESSION, INJECTED_FACT_KO, source="prefetch")
+        wal = _wal(tmp_path)
+        entry_id = wal.append_turn(SESSION, "오늘 점검 결과 알려줘", DILUTED_KO)
+        result = _confirm_wal_quote(
+            tmp_path,
+            "게이트웨이 라우팅 경로와 백엔드 헬스체크 설정은 전부 문제없이 잘 동작하고",
+            entry_id=entry_id,
+        )
+        assert result["success"] is True, result
+
+
+# ---------------------------------------------------------------------------
+# Retroactive false taint (as_of time bound + explicit clean tags) — must-fix #2
+# ---------------------------------------------------------------------------
+
+def _write_raw_wal_turn(tmp_path, assistant: str, ts: float,
+                        *, entry_id: str, user: str = "질문") -> None:
+    """Simulate a PRE-taint-patch WAL record: no ``taint`` key at all."""
+    path = tmp_path / "state" / "memory-pending" / f"{SESSION}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rec = {
+        "type": "turn", "id": entry_id, "ts": round(ts, 3),
+        "session_id": SESSION, "seq": 1,
+        "records": [
+            {"role": "user", "content": user},
+            {"role": "assistant", "content": assistant},
+        ],
+    }
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+class TestRetroactiveTaint:
+    def test_later_injection_does_not_taint_stored_clean_span(
+        self, registry, tmp_path
+    ):
+        """must-fix #2 repro: an assistant conclusion authored BEFORE any
+        injection existed (clean write-time tag) stays quotable after the
+        agent's own memory_search later surfaces the same content — the
+        session registry growing must not mutate past admission verdicts."""
+        wal = _wal(tmp_path)
+        entry_id = wal.append_turn(SESSION, "서버 상태 어때?", INDEPENDENT_KO)
+        time.sleep(0.005)
+        # Same-session re-surfacing of the just-ingested content.
+        mt.record_injected_tool_result(
+            SESSION,
+            json.dumps({"results": [{"fact": INDEPENDENT_KO}]}),
+            source="memory_search",
+        )
+        result = _confirm_wal_quote(
+            tmp_path, "postgres 설정을 처음부터 다시 검토하자",
+            entry_id=entry_id,
+        )
+        assert result["success"] is True, result
+
+    def test_untagged_pre_patch_record_recompute_is_bounded_by_record_ts(
+        self, registry, tmp_path
+    ):
+        """Pre-patch records carry no tag — enforcement recomputes, but the
+        corpus is bounded at the record's own ts, so a later injection
+        cannot reach back."""
+        _write_raw_wal_turn(
+            tmp_path, PARAPHRASE_KO, time.time(), entry_id="preinj001"
+        )
+        time.sleep(0.005)
+        mt.record_injected_text(SESSION, INJECTED_KO, source="prefetch")
+        result = _confirm_wal_quote(
+            tmp_path, "codex-lb는 10.0.0.113에서 구성되어 있고",
+            entry_id="preinj001",
+        )
+        assert result["success"] is True, result
+
+    def test_untagged_record_written_after_injection_is_still_rejected(
+        self, registry, tmp_path
+    ):
+        """Control for the bound: injection BEFORE the record ts must still
+        taint an untagged record — the as_of bound is not a blanket admit."""
+        mt.record_injected_text(SESSION, INJECTED_KO, source="prefetch")
+        time.sleep(0.005)
+        _write_raw_wal_turn(
+            tmp_path, PARAPHRASE_KO, time.time(), entry_id="postinj01"
+        )
+        result = _confirm_wal_quote(
+            tmp_path, "codex-lb는 10.0.0.113에서 구성되어 있고",
+            entry_id="postinj01",
+        )
+        assert result["success"] is False
+        assert result["grounding"][0]["checked"] == "taint"
 
 
 # ---------------------------------------------------------------------------
