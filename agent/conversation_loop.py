@@ -428,6 +428,44 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     if stored_provider and current_provider and stored_provider != current_provider:
         return False
 
+    # Audience-mode persona (agent/audience_persona.py): the volatile tail
+    # carries an "AudienceMode: <mode>" line only while the feature is
+    # active.  Recompute the expected mode (mode-only resolution — cheap, no
+    # persona-file reads) and compare.  Both-absent passes, so stored
+    # prompts predating the feature (or with no persona pack installed) stay
+    # valid; a mismatch or one-sided presence forces a rebuild — exactly
+    # once per session after a persona pack is (un)installed, the resolved
+    # mode changes, or the speaker changes in a shared thread (intended: a
+    # non-owner speaking in an owner-created thread flips the mode here,
+    # triggering one rebuild into the correct register).  MUST mirror the
+    # build path in system_prompt.build_system_prompt_parts exactly: same
+    # persona_injection_enabled gate, same current_speaker_user_id speaker
+    # resolution — any skew rebuilds the prompt every turn.  The resolver
+    # goes through run_agent so tests can patch
+    # ``run_agent.resolve_audience_mode``.
+    stored_mode = line_value("AudienceMode")
+    expected_mode = ""
+    try:
+        from agent.audience_persona import (
+            current_speaker_user_id,
+            persona_injection_enabled,
+        )
+
+        if persona_injection_enabled(agent):
+            import run_agent as _run_agent
+
+            expected_mode = _run_agent.resolve_audience_mode(
+                platform=getattr(agent, "platform", "") or "",
+                chat_type=getattr(agent, "_chat_type", "") or "",
+                chat_id=getattr(agent, "_chat_id", "") or "",
+                chat_name=getattr(agent, "_chat_name", "") or "",
+                user_id=current_speaker_user_id(agent),
+            ) or ""
+    except Exception:
+        expected_mode = ""
+    if stored_mode != expected_mode:
+        return False
+
     return True
 
 
