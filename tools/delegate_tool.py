@@ -2769,11 +2769,15 @@ def delegate_task(
         # Covers both the single-task and batch paths. See PR #9126.
         _apply_summary_budget(results, parent_agent)
 
-        # Notify parent's memory provider of delegation outcomes
+        # Notify parent's memory provider of delegation outcomes. Ingest-
+        # disabled parents (ADR-004 Phase 0 forks) must not write delegation
+        # observations into the shared provider.
+        from agent.memory_manager import memory_ingest_allowed as _ingest_allowed
         if (
             parent_agent
             and hasattr(parent_agent, "_memory_manager")
             and parent_agent._memory_manager
+            and _ingest_allowed(parent_agent)
         ):
             for entry in results:
                 try:

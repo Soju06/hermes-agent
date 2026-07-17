@@ -32,7 +32,7 @@ from typing import Any, Dict, List, Mapping, Optional
 
 from agent.conversation_compression import conversation_history_after_compression
 from agent.iteration_budget import IterationBudget
-from agent.memory_manager import build_memory_context_block
+from agent.memory_manager import build_memory_context_block, memory_ingest_allowed
 from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
@@ -785,7 +785,11 @@ def build_turn_context(
         agent._interrupt_thread_signal_pending = False
 
     # Notify memory providers of the new turn (BEFORE prefetch_all).
-    if agent._memory_manager:
+    # Not for ingest-disabled forks (ADR-004 Phase 0): on_turn_start feeds the
+    # provider's ingest cadence and prefetch_all logs recall queries — both
+    # leak the fork's harness turn into the user's real memory namespace.
+    _memory_writes_allowed = memory_ingest_allowed(agent)
+    if agent._memory_manager and _memory_writes_allowed:
         try:
             _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
             agent._memory_manager.on_turn_start(agent._user_turn_count, _turn_msg)
@@ -794,7 +798,7 @@ def build_turn_context(
 
     # External memory provider: prefetch once before the tool loop.
     ext_prefetch_cache = ""
-    if agent._memory_manager:
+    if agent._memory_manager and _memory_writes_allowed:
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
             ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
