@@ -798,6 +798,9 @@ DEFAULT_CONFIG = {
         # prompt-cache prefix (#30532). Set provider/model below to route the review to another model
         # if you want a different effort level; a one-time warning says so when the key is set.
         "background_review": {"enabled": True, **_aux(120)},
+        # ADR-004 ingest-curator fork. "auto" shares the main model and warm transcript; an
+        # explicit provider/model uses the cold WAL context.
+        "ingest_curator": _aux(300),
         # No reasoning_effort on MoA blocks by design — configured PER SLOT in the preset
         # (moa.presets.<name>.reference_models[].reasoning_effort / aggregator.reasoning_effort).
         "moa_reference": _aux(900, reasoning_effort=False),
@@ -1473,6 +1476,19 @@ DEFAULT_CONFIG = {
             "enabled": True,
             "keep": 2,  # retain last N regular snapshots
         },
+        # ADR-004 memory ingest curator. This is deliberately separate from the skill-maintenance
+        # `enabled` switch above and deploys inert.
+        "ingest_enabled": False,
+        "shadow_mode": True,
+        "salience": {
+            "threshold": 12,
+            "weight_proposal": 3,
+            "weight_tool_success": 2,
+            "weight_non_trivial": 1,
+            "fallback_turns": 10,
+        },
+        "idle_seconds": 600,
+        "session_end_min_turns": 3,
     },
     # IANA timezone (e.g. "Asia/Kolkata", "America/New_York"). Empty = server-local time.
     "timezone": "",

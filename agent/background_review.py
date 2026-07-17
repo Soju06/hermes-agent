@@ -258,21 +258,25 @@ _REVIEW_INPUT_CONTEXT_FRACTION = 0.75
 _REVIEW_MAX_INPUT_TOKENS_FALLBACK = 120_000
 
 
-def _task_block(cfg: Any) -> dict[str, Any]:
-    """``cfg["auxiliary"]["background_review"]`` as a dict (``{}`` on any shape mismatch)."""
+def _task_block(cfg: Any, aux_task: str = "background_review") -> dict[str, Any]:
+    """``cfg["auxiliary"][aux_task]`` as a dict (``{}`` on any shape mismatch)."""
     aux = cfg.get("auxiliary", {}) if isinstance(cfg.get("auxiliary"), dict) else {}
-    task = aux.get("background_review", {})
+    task = aux.get(aux_task, {})
     return task if isinstance(task, dict) else {}
 
 
-def _background_review_task_config(task_cfg: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-    """``auxiliary.background_review`` (or ``{}`` on any failure); pass a pre-loaded ``task_cfg``
-    so the spawn / resolve / prompt paths do not re-read config on every turn."""
+def _background_review_task_config(
+    task_cfg: Optional[dict[str, Any]] = None, aux_task: str = "background_review",
+) -> dict[str, Any]:
+    """``auxiliary.<aux_task>`` review-task block (or ``{}`` on any failure); pass a pre-loaded
+    ``task_cfg`` so the spawn / resolve / prompt paths do not re-read config on every turn.
+    ``aux_task`` defaults to ``background_review`` (unchanged behavior); the ADR-004 ingest
+    curator passes ``ingest_curator``."""
     if task_cfg is not None:
         return task_cfg if isinstance(task_cfg, dict) else {}
     try:
         from hermes_cli.config import load_config_readonly
-        return _task_block(load_config_readonly())
+        return _task_block(load_config_readonly(), aux_task)
     except Exception:
         return {}
 
@@ -326,11 +330,17 @@ def load_background_review_settings() -> tuple[bool, dict[str, Any]]:
         return True, {}
 
 
-def _resolve_review_runtime(agent: Any, task_cfg: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-    """Resolve provider/model/credentials for the review fork. Default (auto / unset / same as
+def _resolve_review_runtime(
+    agent: Any, task_cfg: Optional[dict[str, Any]] = None, aux_task: str = "background_review",
+) -> dict[str, Any]:
+    """Resolve provider/model/credentials for a review-style fork. Default (auto / unset / same as
     parent): the parent's live runtime with ``routed=False`` (codex_app_server -> codex_responses
-    downgrade applied). When ``auxiliary.background_review.{provider,model}`` names a different
-    concrete model, resolve that runtime and set ``routed=True``."""
+    downgrade applied). When ``auxiliary.<aux_task>.{provider,model}`` names a different
+    concrete model, resolve that runtime and set ``routed=True``.
+
+    ``aux_task`` selects the auxiliary config block: ``background_review`` (default, unchanged
+    behavior) or ``ingest_curator`` (the ADR-004 §4.4 curator fork, which shares this exact
+    resolution policy by design)."""
     parent_runtime = agent._current_main_runtime()
     parent_api_mode = parent_runtime.get("api_mode") or None
     parent = {
@@ -342,7 +352,7 @@ def _resolve_review_runtime(agent: Any, task_cfg: Optional[dict[str, Any]] = Non
         "max_tokens": getattr(agent, "max_tokens", None), "command": getattr(agent, "acp_command", None),
         "args": list(getattr(agent, "acp_args", []) or []), "routed": False,
     }
-    task = _background_review_task_config(task_cfg)
+    task = _background_review_task_config(task_cfg, aux_task=aux_task)
     task_provider, task_model, task_base_url, task_api_key = (
         str(task.get(key, "")).strip() or None for key in ("provider", "model", "base_url", "api_key")
     )
@@ -363,7 +373,11 @@ def _resolve_review_runtime(agent: Any, task_cfg: Optional[dict[str, Any]] = Non
             "args": list(rp.get("args") or []), "routed": True,
         }
     except Exception as e:
-        _warn_review_routing_fallback(agent, task_provider, task_model, e)
+        if aux_task == "background_review":
+            _warn_review_routing_fallback(agent, task_provider, task_model, e)
+        else:  # the ADR-004 ingest curator runs in shadow: logged, no user-facing review notice
+            logger.warning("auxiliary.%s.provider=%r (model %r) could not be resolved (%s); using the main model",
+                           aux_task, task_provider, task_model, e)
         return parent
 
 

@@ -992,6 +992,47 @@ class MemoryManager:
             lambda: self._each_provider("note backfill failed", _backfill, level=logging.WARNING, providers=providers)
         )
 
+    def sync_curated_episode(self, content: str, *, session_id: str = "",
+                             metadata: Optional[dict[str, Any]] = None) -> None:
+        """Send one curator-approved episode to external providers (ADR-004 §4.5 cutover seam —
+        Phase 2 ships this UNREACHABLE: the only caller, ``agent.ingest_curator.submit_curated``,
+        is double-gated behind ``curator.ingest_enabled`` (default False) AND
+        ``curator.shadow_mode`` (default True)).
+
+        Rides the same single mem-sync worker as every other external write (§4.5 backpressure:
+        curated ingests are an internal allocation of the existing chain — mem-sync worker →
+        plugin breaker/DLQ → daemon bulkhead — never a second writer). The pass-through fields
+        (``source_name``/``source_id``/``episode_type``/``curated_*``) ride the metadata dict
+        exactly like the notes backfill; the daemon-side IngestRequest pass-through consumes them
+        once deployed. Fail-open per provider. Same fan-out contract as ``sync_note_backfill``:
+        owning profile only, egress-scrubbed payload, stuck-call gate on the background call.
+        """
+        providers = [p for p in self._providers if p.name != "builtin"]
+        if not providers or not content or not self._owner_allows("curated_ingest"):
+            return
+
+        content, meta = _redact_for_provider(content, {
+            "source_name": "hermes-curated",
+            "session_id": session_id,
+            **(metadata or {}),
+        })
+
+        def _write(provider: MemoryProvider) -> None:
+            metadata_mode = self._provider_memory_write_metadata_mode(provider)
+            if metadata_mode == "keyword":
+                provider.on_memory_write("add", "curated", content, metadata=dict(meta))
+            elif metadata_mode == "positional":
+                provider.on_memory_write("add", "curated", content, dict(meta))
+            else:
+                provider.on_memory_write("add", "curated", content)
+
+        def _ingest(provider: MemoryProvider) -> None:
+            self._call_unless_stalled(provider, lambda: _write(provider))
+
+        self._submit_background(
+            lambda: self._each_provider("curated ingest failed", _ingest, level=logging.WARNING, providers=providers)
+        )
+
     def on_delegation(self, task: str, result: str, *, child_session_id: str = "", **kwargs) -> None:
         if self._fork_turn_hooks_suppressed() or not self._owner_allows("on_delegation"):
             return
