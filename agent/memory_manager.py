@@ -144,6 +144,11 @@ def _redact_messages_for_egress(messages: Optional[list[Any]]) -> Optional[list[
     return None if messages is None else list(_redact_for_provider(without_withheld_prompts(messages)))
 
 
+def memory_ingest_allowed(agent: Any) -> bool:
+    """Return whether this agent may write/ingest into memory providers."""
+    return not getattr(agent, "_memory_ingest_disabled", False)
+
+
 class _StuckCallGate:
     """Process-wide admission for one kind of external provider call, keyed by (Hermes home, provider).
 

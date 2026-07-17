@@ -913,7 +913,12 @@ class AIAgent(
         if getattr(self, "_memory_provider_shutdown", False):
             return
         self._memory_provider_shutdown = True
-        if self._memory_manager and self._memory_manager.claim_teardown(session_end=True):
+        from agent.memory_manager import memory_ingest_allowed
+        # ADR-004 Phase 0: an ingest-disabled fork never OWNS its manager — it is rebound from the parent.
+        # on_session_end would run end-of-session extraction (a graph write) on the fork's harness transcript,
+        # and shutdown_all would tear down the parent's live provider mid-session. The gate runs before
+        # claim_teardown so the fork never takes the real owner's teardown claim either.
+        if self._memory_manager and memory_ingest_allowed(self) and self._memory_manager.claim_teardown(session_end=True):
             try:
                 self._memory_manager.on_session_end(messages or [])
             except Exception as e:
@@ -924,7 +929,8 @@ class AIAgent(
     def commit_memory_session(self, messages: list | None = None) -> None:
         """Flush end-of-session extraction on session_id rotation (/new, compression) without tearing providers
         down."""
-        if self._memory_manager:
+        from agent.memory_manager import memory_ingest_allowed
+        if self._memory_manager and memory_ingest_allowed(self):
             _quietly(lambda: self._memory_manager.on_session_end(messages or []))
         _notify_context_engine_session_end(self, messages)
 
@@ -942,6 +948,12 @@ class AIAgent(
         fire against stale context. See #15218.
         """
         if interrupted or not (self._memory_manager and final_response and original_user_message):
+            return
+        # ADR-004 Phase 0: ingest-disabled forks (background review, ingest curator) share the
+        # parent's manager for reads only — this is the sync_all/queue_prefetch_all write
+        # chokepoint (turn_finalizer + codex_runtime both land here), so it must gate.
+        from agent.memory_manager import memory_ingest_allowed
+        if not memory_ingest_allowed(self):
             return
         # Flatten multimodal parts to text (newline-joined for memory).
         user_text = _summarize_user_message_for_log(original_user_message, sep="\n")
@@ -975,7 +987,10 @@ class AIAgent(
         # The Codex app-server child is an LLM client, not session tool state: the evicted instance is popped
         # from the cache and a rebuilt agent spawns its own child, so an unclosed one leaks for the gateway's life.
         _quietly(self._close_codex_session)
-        if getattr(self, "_memory_manager", None) is not None:
+        from agent.memory_manager import memory_ingest_allowed
+        # An ingest-disabled fork's manager is the parent's (ADR-004 Phase 0): soft-releasing it would stop
+        # the parent's provider writers mid-session.
+        if getattr(self, "_memory_manager", None) is not None and memory_ingest_allowed(self):
             _quietly(self._memory_manager.release_soft)
         from agent.prepared_compaction import release_for_agent
         _quietly(release_for_agent, self)

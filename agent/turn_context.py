@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 from agent.conversation_compression import recover_rotated_compression_session
 from agent.iteration_budget import IterationBudget
 from agent.memory_context import build_memory_context_block, sanitize_context
+from agent.memory_manager import memory_ingest_allowed
 from agent.memory_provider import is_trivial_prompt
 from session_rules.turns import flatten_message_text
 from agent.lsp.deferred import forward_to_agent as forward_lsp_verdicts
@@ -1068,8 +1069,12 @@ def _memory_turn_start_and_prefetch(
 ) -> str:
     """Notify memory providers of the new turn, then prefetch external memory once
     before the tool loop (skipped on trivial prompts with no semantic signal).
-    Returns the prefetch text (``""`` when nothing was injected)."""
-    if not agent._memory_manager:
+    Returns the prefetch text (``""`` when nothing was injected).
+
+    Not for ingest-disabled forks (ADR-004 Phase 0): on_turn_start feeds the provider's ingest
+    cadence and prefetch_all logs recall queries — both leak the fork's harness turn into the
+    user's real memory namespace."""
+    if not agent._memory_manager or not memory_ingest_allowed(agent):
         return ""
     _query = _memory_query_text(original_user_message)
     # The author rides along so a provider can attribute THIS turn, not whoever opened the session.

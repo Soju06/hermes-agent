@@ -1186,6 +1186,12 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
 
     # External memory provider plugin (one at a time, alongside built-in): memory.provider.
     agent._memory_manager = None
+    # ADR-004 Phase 0: per-agent memory-ingest kill switch. False for every
+    # live agent (unchanged behavior). Forks that need memory READ access but
+    # zero graph-write leakage (background review, the future ingest curator)
+    # set this True at fork construction — every write-leak call site gates on
+    # agent.memory_manager.memory_ingest_allowed(agent).
+    agent._memory_ingest_disabled = False
     if memory_manager is not None and not skip_memory:
         # A caller that rebuilds the agent per turn (gateway api_server) hands back the session's
         # already-initialized manager: providers keep their prefetch/retain state across turns instead

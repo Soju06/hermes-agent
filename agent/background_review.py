@@ -1129,6 +1129,13 @@ def build_cache_parity_fork(
     # same-model path), so its turn-start/turn-exit log lines are otherwise
     # indistinguishable from live turns (#118693).
     review_agent._turn_origin = write_origin
+    # ADR-004 Phase 0: systematic guarantee against graph-write leaks. skip_memory=True above
+    # already prevents this fork from BUILDING a memory manager, but the ingest-curator recipe
+    # (and any future variant) rebinds the PARENT's manager onto the fork for memory_search read
+    # access — this flag is what keeps that safe: every sync/ingest/prefetch call site gates on it
+    # (agent.memory_manager.memory_ingest_allowed), so the fork's harness prompt can never reach
+    # the external graph.
+    review_agent._memory_ingest_disabled = True
     review_agent._memory_store = agent._memory_store
     review_agent._memory_enabled = agent._memory_enabled
     review_agent._user_profile_enabled = agent._user_profile_enabled

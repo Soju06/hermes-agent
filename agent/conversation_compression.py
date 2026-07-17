@@ -1587,7 +1587,8 @@ def _adopt_live_compression_child(
                 bind_state(session_db=context_engine_session_db(agent, session_db), session_id=child_session_id,
                            **context_engine_persistence(bind_state, store))
     with _swallow('memory manager compression-child adoption failed: %s'):
-        if agent._memory_manager:
+        from agent.memory_manager import memory_ingest_allowed as _ingest_allowed
+        if agent._memory_manager and _ingest_allowed(agent):
             agent._memory_manager.on_session_switch(
                 child_session_id, parent_session_id=parent_session_id, reset=False, reason="compression"
             )
@@ -2836,6 +2837,11 @@ def _pre_compress_memory_context(agent: Any, messages: list, checkpoint_required
     required checkpoint cannot be taken."""
     memory_context = ""
     memory_manager = getattr(agent, "_memory_manager", None)
+    # Ingest-disabled forks (ADR-004 Phase 0) must not trigger provider extraction from their
+    # harness transcript (forks pin compression_enabled=False anyway; this is the systematic guarantee).
+    from agent.memory_manager import memory_ingest_allowed
+    if memory_manager is not None and not memory_ingest_allowed(agent):
+        memory_manager = None
     evidence_messages = _direct_messages_for_pre_compress_memory(messages)
     # A detached review/side-question fork (no memory manager, session DB or persistence) cannot checkpoint by design.
     if checkpoint_required and getattr(agent, "_persist_disabled", False) and memory_manager is None:
@@ -3358,7 +3364,8 @@ def _finish_compaction_boundary(
     # Providers refresh cached per-session state; reset=False, conversation goes on.
     # Fires in BOTH modes so buffers don't double-count dropped turns in-place.
     with _swallow('memory manager on_session_switch (compression): %s'):
-        if (bool(_old_sid) or in_place) and agent._memory_manager:
+        from agent.memory_manager import memory_ingest_allowed as _ingest_allowed
+        if (bool(_old_sid) or in_place) and agent._memory_manager and _ingest_allowed(agent):
             agent._memory_manager.on_session_switch(
                 agent.session_id or "", parent_session_id=_boundary_parent, reset=False, reason="compression"
             )
