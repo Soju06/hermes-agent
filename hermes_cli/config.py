@@ -1741,6 +1741,22 @@ DEFAULT_CONFIG = {
             "timeout": 120,
             "extra_body": {},
         },
+        # Ingest curator — the ADR-004 §④ memory-curation fork (Phase 2,
+        # shadow mode). Same routing policy as background_review: "auto"
+        # (default) = run on the main chat model (warm accumulator trips
+        # replay the full snapshot and hit the prefix cache); set
+        # provider/model to route cold (session-end / idle) runs to a
+        # cheaper model — cold runs use an incremental WAL-span context, so
+        # a routed model loses no fidelity. The run is additionally bounded
+        # by ≤16 fork iterations and this timeout.
+        "ingest_curator": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 300,
+            "extra_body": {},
+        },
         "moa_reference": {
             "provider": "auto",
             "model": "",
@@ -2419,6 +2435,34 @@ DEFAULT_CONFIG = {
             "enabled": True,
             "keep": 5,  # retain last N regular snapshots
         },
+
+        # ------------------------------------------------------------------
+        # Ingest curator (ADR-004 §④, Phase 2 — agent/ingest_curator.py).
+        # A separate subsystem from the skills curator above; it shares the
+        # `curator.` namespace but NOT the `enabled` switch: `enabled`
+        # governs skill maintenance (default True), `ingest_enabled` governs
+        # memory-ingest curation (default False). Double gate (§⑧ Phase 2):
+        # deploying changes nothing until `ingest_enabled: true`, and even
+        # then `shadow_mode: true` (the default) means the curator only
+        # LOGS verdicts to ~/.hermes/state/curator-ledger.jsonl — the
+        # per-turn ingest path stays the real path. Flipping shadow_mode to
+        # false is the cutover and must wait for the daemon-side
+        # IngestRequest pass-through deploy + the Phase-2 gate evals.
+        # ------------------------------------------------------------------
+        "ingest_enabled": False,
+        "shadow_mode": True,
+        # Mechanical salience accumulator (§4.3) — weights/threshold are
+        # config so workload-drift recalibration needs no deploy.
+        "salience": {
+            "threshold": 12,
+            "weight_proposal": 3,       # memory_propose in turn
+            "weight_tool_success": 2,   # tool-success-heavy turn
+            "weight_non_trivial": 1,    # non-trivial turn
+            "fallback_turns": 10,       # max user turns between runs
+        },
+        # Cold-run boundary triggers.
+        "idle_seconds": 600,            # idle >=10min with dirty buffer
+        "session_end_min_turns": 3,     # session_end fires at >=3 turns
     },
 
     # Honcho AI-native memory -- reads ~/.honcho/config.json as single source of truth.
