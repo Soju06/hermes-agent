@@ -794,13 +794,17 @@ class MemoryWritePipeline:
                     # Role-aware span list so the origin-taint check (ADR-004
                     # §①, Phase 2) knows WHICH span the quote grounds in:
                     # user spans always admit; assistant/proposal spans are
-                    # checked against the session's injected registry.
+                    # checked against the session's injected registry. The
+                    # record ts rides along to bound registry recomputes and
+                    # the quote self-check — injections registered after the
+                    # span was journaled cannot retroactively taint it.
                     if rec.get("type") == "turn":
                         spans = [
                             (
                                 str(m.get("role") or ""),
                                 str(m.get("content") or ""),
                                 m.get("taint") if isinstance(m.get("taint"), dict) else None,
+                                rec.get("ts"),
                             )
                             for m in rec.get("records") or []
                         ]
@@ -809,6 +813,7 @@ class MemoryWritePipeline:
                             "proposal",
                             str(rec.get("content") or ""),
                             rec.get("taint") if isinstance(rec.get("taint"), dict) else None,
+                            rec.get("ts"),
                         )]
                     matched = [s for s in spans if quote in s[1]]
                     if not matched:
@@ -850,17 +855,19 @@ class MemoryWritePipeline:
                 rec_taint = rec.get("taint") if isinstance(rec.get("taint"), dict) else {}
                 if isinstance(body, dict):
                     # Mirror body keys ARE the roles ("user"/"assistant") —
-                    # reuse them for the origin-taint check.
+                    # reuse them for the origin-taint check; record ts bounds
+                    # the recompute/quote self-check (see the WAL branch).
                     spans = [
                         (
                             str(role),
                             str(content),
                             rec_taint.get(role) if isinstance(rec_taint.get(role), dict) else None,
+                            rec.get("ts"),
                         )
                         for role, content in body.items()
                     ]
                 else:
-                    spans = [("", str(body), None)]
+                    spans = [("", str(body), None, rec.get("ts"))]
                 matched = [s for s in spans if quote in s[1]]
                 if not matched:
                     continue
