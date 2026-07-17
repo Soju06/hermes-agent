@@ -19,12 +19,24 @@ corroborate facts for free, forever. This module closes that loop:
   (user words are user-origin by definition — the one origin corroboration
   is allowed to trust). Assistant spans are tainted per-segment by char
   n-gram containment against the session's injected registry; literal
-  ``<memory-context>`` fence material is tainted unconditionally.
+  ``<memory-context>`` fence material is tainted unconditionally. Assistant
+  spans are ALWAYS stamped — an explicit clean verdict is stamped too — so
+  the write-time verdict (computed against the injections that existed when
+  the span was authored) is authoritative and enforcement never needs to
+  recompute a post-patch span against a registry that has since grown.
+  Registrations carry timestamps; every recompute path is bounded by the
+  record's own ``ts`` (``as_of``), so an injection registered AFTER a span
+  was authored can never retroactively taint it.
 
 * **Enforcement** — ``memory_pipeline`` grounding consults
-  :func:`matched_quote_taint`: a quote whose only occurrences lie inside
-  tainted assistant spans is rejected (check='taint'). The curator (lane A)
-  renders ``[tainted]`` span markers via :func:`curator_taint_label` /
+  :func:`matched_quote_taint`: a quote is rejected (check='taint') when
+  every span it grounds in fails EITHER the span check (all occurrences lie
+  inside tainted segments) OR the quote self-check (the quote's OWN shingle
+  containment against injections registered before that span's ``ts`` is at
+  or above threshold — this closes the dilution bypass where a verbatim
+  injected fact hides inside a longer original sentence whose segment score
+  stays below threshold). The curator (lane A) renders ``[tainted]`` span
+  markers via :func:`curator_taint_label` /
   :func:`annotate_wal_records_for_curator` (§4.6 prompt contract).
 
 * **Phase-3 corroboration API** — :func:`span_taint` and
@@ -46,6 +58,24 @@ Kill switches: recording honors ``HERMES_MEMORY_JOURNAL_DISABLED`` for its
 disk sidecar (in-memory registration continues); enforcement honors config
 ``memory.taint_enforce`` (default ON — flip to false to fall back to the
 Phase-1 caller-marked-only behavior).
+
+Known seams (documented, deliberately out of this lane's scope):
+
+* **L1/MEMORY.md system-prompt injection is NOT registered.** ADR-004 §①
+  covers the ``<memory-context>`` fence and memory-provider tool results;
+  the built-in MEMORY.md block compiled into the system prompt (and the
+  Phase-3 L1 compilation that will feed it) is a memory-derived injection
+  too — an assistant restatement of a MEMORY.md line currently yields a
+  clean quotable span. The Phase-3 dream/promotion lane must register the
+  compiled L1 text at injection time (``record_injected_text(...,
+  source="l1")``) before promotion starts counting corroborations.
+* **Cross-process registration visibility.** A session's sidecar is loaded
+  once per process (on first touch) and only in-process registrations are
+  applied after that; injections appended by ANOTHER process later in the
+  same session become visible only after LRU eviction + reload. Sessions
+  are single-process in this architecture, so this only under-taints in
+  exotic multi-process replays — and under-taint at recompute time is
+  bounded anyway by the always-stamped write-time verdicts.
 """
 
 from __future__ import annotations
@@ -207,10 +237,35 @@ def _segments(content: str) -> List[Tuple[int, int]]:
     return spans
 
 
-def _containment(candidate: set, corpus: set) -> float:
+def _containment(
+    candidate: set, corpus, as_of: Optional[float] = None
+) -> float:
+    """Containment of ``candidate`` shingles in ``corpus``.
+
+    ``corpus`` is either a plain set (legacy/tests) or the registry's
+    ``{shingle: earliest_registration_ts}`` map. With ``as_of`` set, only
+    shingles first registered at or before that timestamp count — the
+    origin-taint time bound: an injection registered AFTER a span was
+    authored cannot have caused the span (ADR-004 §①, retroactive-taint
+    guard). ``as_of=None`` means "the full corpus" (no bound).
+    """
     if not candidate:
         return 0.0
-    return len(candidate & corpus) / len(candidate)
+    if as_of is None or not isinstance(corpus, dict):
+        hits = sum(1 for s in candidate if s in corpus)
+    else:
+        hits = sum(
+            1 for s in candidate if corpus.get(s, float("inf")) <= as_of
+        )
+    return hits / len(candidate)
+
+
+def _merge_shingles(dst: Dict[str, float], shingles: set, ts: float) -> None:
+    """Merge ``shingles`` into the earliest-ts map (keeps the earliest ts)."""
+    for s in shingles:
+        prev = dst.get(s)
+        if prev is None or ts < prev:
+            dst[s] = ts
 
 
 def _flatten_json_strings(value: Any, out: List[str]) -> None:
@@ -229,14 +284,21 @@ def _flatten_json_strings(value: Any, out: List[str]) -> None:
 # ---------------------------------------------------------------------------
 
 class _SessionTaint:
-    __slots__ = ("shingles", "entries", "corrupt", "truncated")
+    __slots__ = ("shingles", "entries", "shas", "corrupt", "truncated")
 
     def __init__(self) -> None:
-        # Union of every injected span's shingle set for the session. The
-        # union (not per-entry sets) is what containment checks against: a
-        # paraphrase may stitch material from several injections.
-        self.shingles: set = set()
+        # Union of every injected span's shingles for the session, mapped to
+        # the EARLIEST registration timestamp per shingle. The union (not
+        # per-entry sets) is what containment checks against: a paraphrase
+        # may stitch material from several injections. The per-shingle ts
+        # lets recompute paths bound the corpus at a record's own ts
+        # (``as_of``) so later injections cannot retroactively taint.
+        self.shingles: Dict[str, float] = {}
         self.entries: List[Dict[str, Any]] = []
+        # Shas already registered this session — dedup guard so the same
+        # prefetch block re-injected every turn lands once in memory and
+        # once in the sidecar (unbounded growth otherwise).
+        self.shas: set = set()
         # True when the sidecar held undecodable material — reads for
         # assistant-span admission then fail closed (see module docstring).
         self.corrupt: bool = False
@@ -338,9 +400,22 @@ class TaintRegistry:
                             state.corrupt = True
                             continue
                         text = str(rec.get("text") or "")
-                        state.shingles |= _shingles(text)
+                        sha = str(rec.get("sha") or "")
+                        if sha and sha in state.shas:
+                            # Pre-dedup sidecars can hold repeats: shingles
+                            # (earliest ts) are already merged, skip the dup.
+                            continue
+                        try:
+                            ts_val = float(rec.get("ts") or 0.0)
+                        except (TypeError, ValueError):
+                            # Unparseable ts: treat as "always present"
+                            # (epoch), the over-taint direction.
+                            ts_val = 0.0
+                        _merge_shingles(state.shingles, _shingles(text), ts_val)
+                        if sha:
+                            state.shas.add(sha)
                         state.entries.append({
-                            "sha": rec.get("sha") or "",
+                            "sha": sha,
                             "source": rec.get("source") or "",
                             "ts": rec.get("ts"),
                             "chars": len(text),
@@ -366,8 +441,12 @@ class TaintRegistry:
 
         Scrubs, shingles, updates the in-memory union synchronously (so the
         same process's WAL tagger sees it immediately) and appends the
-        scrubbed text to the sidecar asynchronously. Never raises, never
-        blocks on disk.
+        scrubbed text to the sidecar asynchronously. Identical text (by sha
+        of the scrubbed content) is registered ONCE per session — the
+        prefetch block re-injected every turn must not grow the sidecar or
+        the entry list unboundedly (its shingles are already in the union,
+        stamped with the FIRST injection's ts). Never raises, never blocks
+        on disk.
         """
         try:
             text = _scrub(text or "")
@@ -376,10 +455,18 @@ class TaintRegistry:
             session_id = session_id or ""
             shingles = _shingles(text)
             sha = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
-            ts = round(time.time(), 3)
+            # Floor, don't round: a half-up rounding can stamp the injection
+            # a fraction of a millisecond into the FUTURE, and a proposal/WAL
+            # record written inside that window would exclude it from its
+            # as_of-bounded corpus (tainted=False flake). Floored ts is always
+            # <= the actual registration time, preserving the as_of guard.
+            ts = int(time.time() * 1000) / 1000
             with self._lock:
                 state = self._session_locked(session_id)
-                state.shingles |= shingles
+                if sha in state.shas:
+                    return  # dedup: already registered this session
+                state.shas.add(sha)
+                _merge_shingles(state.shingles, shingles, ts)
                 state.entries.append(
                     {"sha": sha, "source": source, "ts": ts, "chars": len(text)}
                 )
@@ -408,7 +495,12 @@ class TaintRegistry:
 
     # -- taint computation -----------------------------------------------------------
 
-    def assistant_taint(self, session_id: str, content: str) -> Dict[str, Any]:
+    def assistant_taint(
+        self,
+        session_id: str,
+        content: str,
+        as_of: Optional[float] = None,
+    ) -> Dict[str, Any]:
         """Compute the taint block for an assistant-authored span.
 
         Returns a dict (never raises)::
@@ -418,7 +510,10 @@ class TaintRegistry:
              "method": ..., "threshold": float}
 
         ``spans`` are original-coordinate character ranges of the tainted
-        segments. On registry corruption the whole span is tainted
+        segments. ``as_of`` bounds the corpus to injections first registered
+        at or before that timestamp — pass the span's authoring/journal ts
+        so injections that postdate the span cannot taint it (they cannot
+        have caused it). On registry corruption the whole span is tainted
         (fail-closed — see module docstring).
         """
         try:
@@ -444,8 +539,8 @@ class TaintRegistry:
                 state = self._session_locked(session_id or "")
                 corrupt = state.corrupt
                 # Copy under the lock: record_injected_text mutates the
-                # union in place, and set iteration during mutation raises.
-                corpus = set(state.shingles)
+                # union in place, and dict iteration during mutation raises.
+                corpus = dict(state.shingles)
             if corrupt:
                 return {
                     **base,
@@ -470,7 +565,7 @@ class TaintRegistry:
                 seg_shingles = _shingles(content[start:end])
                 if not seg_shingles:
                     continue  # < SHINGLE_SIZE normalized chars: no verdict
-                score = _containment(seg_shingles, corpus)
+                score = _containment(seg_shingles, corpus, as_of)
                 if len(seg_shingles) < _MIN_SEGMENT_SHINGLES and score < 1.0:
                     # Too few shingles for a meaningful ratio — but a tiny
                     # segment FULLY contained in the corpus is still an echo
@@ -506,6 +601,76 @@ class TaintRegistry:
                 "spans": [[0, len(content or "")]],
                 "score": 1.0,
                 "reason": "taint computation failed (fail-closed)",
+                "registry": "corrupt",
+            }
+
+    def quote_taint(
+        self,
+        session_id: str,
+        quote: str,
+        as_of: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Taint verdict for a QUOTE string itself (ADR-004 §① admission).
+
+        Segment-level tainting can be diluted: a verbatim injected fact
+        embedded inside a longer original assistant sentence drags the
+        segment's containment below threshold, yet a quote of just the fact
+        is 100% injected text. Admission therefore also shingles the quote
+        string directly against the session's injected corpus — bounded by
+        ``as_of`` (the ts of the journal span the quote grounds in) so
+        injections that postdate the span cannot retroactively reject it.
+
+        Same threshold/tiny-candidate semantics as segments: below
+        ``_MIN_SEGMENT_SHINGLES`` shingles only full containment (1.0)
+        taints; at or above, the containment threshold applies. Fail-closed
+        on registry corruption or internal error (assistant-span quotes
+        only reach here — user-span grounding admits earlier). Never raises.
+        """
+        try:
+            quote = quote or ""
+            threshold = containment_threshold()
+            base = {"method": _TAINT_METHOD, "threshold": threshold}
+            if _FENCE_TAG_RE.search(quote):
+                return {**base, "tainted": True, "score": 1.0,
+                        "reason": "memory-context-fence", "registry": "ok"}
+            with self._lock:
+                state = self._session_locked(session_id or "")
+                corrupt = state.corrupt
+                corpus = dict(state.shingles)
+            if corrupt:
+                return {**base, "tainted": True, "score": 1.0,
+                        "reason": "registry-corrupt (fail-closed for "
+                                  "assistant spans)",
+                        "registry": "corrupt"}
+            if not corpus:
+                return {**base, "tainted": False, "score": 0.0,
+                        "reason": "no injections registered this session",
+                        "registry": "empty"}
+            quote_shingles = _shingles(quote)
+            if not quote_shingles:
+                # < SHINGLE_SIZE normalized chars: no verdict possible (and
+                # below any useful quote admissibility length).
+                return {**base, "tainted": False, "score": 0.0,
+                        "reason": "quote below shingle size",
+                        "registry": "ok"}
+            score = _containment(quote_shingles, corpus, as_of)
+            if len(quote_shingles) < _MIN_SEGMENT_SHINGLES:
+                tainted = score >= 1.0
+            else:
+                tainted = score >= threshold
+            return {**base, "tainted": tainted, "score": round(score, 3),
+                    "reason": ("quote-shingle-containment" if tainted
+                               else "below threshold"),
+                    "registry": "ok"}
+        except Exception:
+            logger.debug("quote taint computation failed (fail-closed)",
+                         exc_info=True)
+            return {
+                "method": _TAINT_METHOD,
+                "threshold": DEFAULT_CONTAINMENT_THRESHOLD,
+                "tainted": True,
+                "score": 1.0,
+                "reason": "quote taint computation failed (fail-closed)",
                 "registry": "corrupt",
             }
 
@@ -681,7 +846,9 @@ def record_injected_tool_result(
 # ---------------------------------------------------------------------------
 
 def tag_wal_turn_records(
-    session_id: str, records: List[Dict[str, Any]]
+    session_id: str,
+    records: List[Dict[str, Any]],
+    as_of: Optional[float] = None,
 ) -> None:
     """Stamp taint metadata onto a WAL turn's role records, in place.
 
@@ -695,12 +862,15 @@ def tag_wal_turn_records(
       session's injected registry crosses the threshold (or the content
       carries literal fence tags / the registry is corrupt → fail-closed).
 
-    Tagging is SPARSE: a ``taint`` key is added only when there is something
-    to say (tainted, or fail-closed registry state). Absence of the key
-    means "computed clean at record time" for post-patch records and
-    "pre-taint record" for older ones — enforcement live-recomputes in both
-    cases, which can only over-taint (later injections adding shingles),
-    the safe direction. Never raises; on failure records stay untagged.
+    Assistant records are ALWAYS stamped — a clean verdict is stamped
+    explicitly. The write-time verdict is authoritative: it was computed
+    against exactly the injections that existed when the span was authored
+    (``as_of`` = the turn-boundary ts captured on the foreground thread, so
+    a backed-up mem-sync worker journaling late cannot pick up later turns'
+    registrations). Absence of the key therefore means only "pre-taint-patch
+    record"; enforcement recomputes those bounded by the record's own ts,
+    which can never taint a span with injections that postdate it. Never
+    raises; on failure records stay untagged (recompute path applies).
     """
     try:
         registry = get_registry()
@@ -709,32 +879,32 @@ def tag_wal_turn_records(
                 continue
             if (rec.get("role") or "") != "assistant":
                 continue
-            taint = registry.assistant_taint(
-                session_id, str(rec.get("content") or "")
+            rec["taint"] = registry.assistant_taint(
+                session_id, str(rec.get("content") or ""), as_of=as_of
             )
-            if taint.get("tainted") or taint.get("registry") == "corrupt":
-                rec["taint"] = taint
     except Exception:
         logger.debug("WAL turn taint tagging failed (fail-open)", exc_info=True)
 
 
-def tag_wal_proposal_record(session_id: str, record: Dict[str, Any]) -> None:
+def tag_wal_proposal_record(
+    session_id: str,
+    record: Dict[str, Any],
+    as_of: Optional[float] = None,
+) -> None:
     """Stamp taint metadata onto a WAL proposal record, in place.
 
     ``memory_propose`` content is agent-authored text (the tool call's
     arguments are written by the assistant, whatever ``origin`` claims), so
     it gets the assistant treatment: a proposal that paraphrases injected
-    memory must not later count as independent evidence. Sparse + fail-open,
-    same contract as :func:`tag_wal_turn_records`.
+    memory must not later count as independent evidence. Always-stamped +
+    fail-open, same contract as :func:`tag_wal_turn_records`.
     """
     try:
         if not isinstance(record, dict):
             return
-        taint = get_registry().assistant_taint(
-            session_id, str(record.get("content") or "")
+        record["taint"] = get_registry().assistant_taint(
+            session_id, str(record.get("content") or ""), as_of=as_of
         )
-        if taint.get("tainted") or taint.get("registry") == "corrupt":
-            record["taint"] = taint
     except Exception:
         logger.debug("WAL proposal taint tagging failed (fail-open)",
                      exc_info=True)
@@ -774,16 +944,20 @@ def _span_quote_tainted(
     content: str,
     quote: str,
     stored_taint: Optional[Dict[str, Any]],
+    as_of: Optional[float] = None,
 ) -> bool:
     """Taint verdict for one quote occurrence-set within one journal span."""
     if role == "user":
         return False
     taint = stored_taint
     if not isinstance(taint, dict):
-        # No stored tag: pre-taint record or computed-clean at write time.
-        # Live-recompute against the (possibly grown) session registry —
-        # over-tainting relative to write time is the safe direction.
-        taint = get_registry().assistant_taint(session_id, content)
+        # No stored tag: pre-taint-patch record. Live-recompute, bounded by
+        # the record's own ts (``as_of``) so injections registered AFTER the
+        # span was authored — the agent's own memory_search surfacing this
+        # session's per-turn-ingested content, a shared-session fork's reads
+        # — can never retroactively taint it. Post-patch records always
+        # carry an explicit (possibly clean) write-time tag, which wins.
+        taint = get_registry().assistant_taint(session_id, content, as_of=as_of)
     if not taint.get("tainted"):
         return False
     spans: List[List[int]] = []
@@ -802,31 +976,54 @@ def _span_quote_tainted(
 
 def matched_quote_taint(
     session_id: str,
-    matched: List[Tuple[str, str, Optional[Dict[str, Any]]]],
+    matched: List[Tuple[str, str, Optional[Dict[str, Any]], Optional[float]]],
     quote: str,
 ) -> Optional[str]:
     """Admission check for a quote that already substring-matched journal
-    content. ``matched`` is ``[(role, content, stored_taint), ...]`` — every
-    journal span the quote was found in. Returns a rejection detail string
-    when the quote is taint-ineligible, else None.
+    content. ``matched`` is ``[(role, content, stored_taint, ts), ...]`` —
+    every journal span the quote was found in (``ts`` is the journal
+    record's timestamp, used to bound registry recomputes and the quote
+    self-check so later injections cannot retroactively reject the quote).
+    Returns a rejection detail string when the quote is taint-ineligible,
+    else None.
 
     A quote grounded in ANY user span is always admissible (user words are
-    the origin corroboration trusts); otherwise every assistant/proposal
-    occurrence must be clean. Fail-closed: an internal error while checking
-    yields a rejection, not an admission.
+    the origin corroboration trusts). Otherwise a span admits the quote only
+    when BOTH hold:
+
+    * the span check passes — at least one occurrence of the quote in the
+      span lies outside the span's tainted segments, and
+    * the quote self-check passes — the quote's OWN shingle containment
+      against injections registered at or before the span's ts stays below
+      threshold. Segment scores dilute (a verbatim injected fact inside a
+      longer original sentence keeps the segment clean), so the span check
+      alone would admit a quote that is 100% injected text.
+
+    Fail-closed: an internal error while checking yields a rejection, not
+    an admission.
     """
     if not taint_enforce_enabled():
         return None
     try:
-        if any(role == "user" for role, _c, _t in matched):
+        if any(m[0] == "user" for m in matched):
             return None
         if not matched:
             return None
-        for role, content, stored_taint in matched:
-            if not _span_quote_tainted(
-                session_id, role, content, quote, stored_taint
+        registry = get_registry()
+        for role, content, stored_taint, ts in matched:
+            try:
+                as_of = float(ts) if ts else None
+            except (TypeError, ValueError):
+                as_of = None
+            if _span_quote_tainted(
+                session_id, role, content, quote, stored_taint, as_of
             ):
-                return None
+                continue
+            if registry.quote_taint(session_id, quote, as_of=as_of).get(
+                "tainted"
+            ):
+                continue
+            return None
         return (
             "quote matches only memory-tainted assistant spans "
             "(ADR-004 §① origin-taint): the text overlaps this session's "
@@ -912,9 +1109,11 @@ def span_taint(span: Dict[str, Any]) -> bool:
     external-source evidence corroborates.
 
     Semantics: user spans are never tainted; assistant/proposal spans use
-    the stored record tag when present, else a live registry recompute;
-    indeterminate (corrupt registry / internal error) counts as TAINTED —
-    an unverifiable re-occurrence must not promote a fact.
+    the stored record tag when present, else a live registry recompute
+    bounded by the span's own ``ts`` when it carries one (injections that
+    postdate the span cannot have caused it); indeterminate (corrupt
+    registry / internal error) counts as TAINTED — an unverifiable
+    re-occurrence must not promote a fact.
     """
     try:
         if not isinstance(span, dict):
@@ -925,8 +1124,14 @@ def span_taint(span: Dict[str, Any]) -> bool:
         stored = span.get("taint") if isinstance(span.get("taint"), dict) else None
         if stored is not None:
             return bool(stored.get("tainted"))
+        try:
+            as_of: Optional[float] = float(span.get("ts")) if span.get("ts") else None
+        except (TypeError, ValueError):
+            as_of = None
         taint = get_registry().assistant_taint(
-            str(span.get("session_id") or ""), str(span.get("content") or "")
+            str(span.get("session_id") or ""),
+            str(span.get("content") or ""),
+            as_of=as_of,
         )
         return bool(taint.get("tainted"))
     except Exception:

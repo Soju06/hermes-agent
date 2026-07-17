@@ -924,6 +924,16 @@ class AIAgent(
             except Exception as e:
                 logger.warning("Memory provider on_session_end failed during shutdown: %s", e, exc_info=True)
             _quietly(lambda: self._memory_manager.shutdown_all())
+            # ADR-004 §① origin-taint (Phase 2): evict this session's in-memory injected-span
+            # registry (the durable sidecar is kept for post-session readers — curator, dream —
+            # and TTLs out via its own GC). Owner-only by construction: this branch is only
+            # reached when memory_ingest_allowed(self), so an ingest-disabled fork sharing the
+            # parent's live session can never evict the parent's registry state mid-conversation.
+            try:
+                from agent import memory_taint
+                memory_taint.end_session(self.session_id or "")
+            except Exception:
+                pass
         _notify_context_engine_session_end(self, messages)
 
     def commit_memory_session(self, messages: list | None = None) -> None:

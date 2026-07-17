@@ -508,6 +508,12 @@ class MemoryManager:
         clean_user_content, assistant_content, redacted_messages = _redact_for_provider(
             clean_user_content, assistant_content, messages)
         optional_kwargs = {"messages": redacted_messages, "turn_author": turn_author}
+        # Turn-boundary timestamp, captured HERE on the foreground thread: it becomes both
+        # journals' record ts and the taint verdict's as_of bound (ADR-004 §①). If the mem-sync
+        # worker is backed up and journals this turn minutes late, injected-span registrations
+        # from LATER turns must not taint this turn's assistant span — the span was authored
+        # before they existed.
+        turn_ts = time.time()
 
         def _sync(provider: MemoryProvider) -> bool:
             kwargs: dict[str, Any] = {"session_id": session_id}
@@ -523,7 +529,7 @@ class MemoryManager:
             # append_turn returns None on any failure and never raises.
             wal = self._pending_wal
             wal_entry_id = (
-                wal.append_turn(session_id, clean_user_content, assistant_content)
+                wal.append_turn(session_id, clean_user_content, assistant_content, ts=turn_ts)
                 if wal is not None else None
             )
             # ADR-004 Phase 0 (§② L0-mirror): mirror the outgoing episode payload locally just
@@ -535,6 +541,7 @@ class MemoryManager:
                     assistant_content,
                     provider_names=[p.name for p in providers],
                     wal_entry_id=wal_entry_id,
+                    ts=turn_ts,
                 )
             synced = self._each_provider("sync_turn failed", _sync, level=logging.WARNING, providers=providers)
             # Ack only after every provider accepted the turn (``_each_provider`` returns one entry per

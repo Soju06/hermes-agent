@@ -411,17 +411,25 @@ def memory_manager_tool_call(agent, function_name: str, args: dict) -> Any:
     memory-derived text handed back to the agent must be taint-tagged at WAL time, on BOTH
     dispatch paths — one ``_PARALLEL_SAFE_TOOLS`` allowlist edit must not silently reopen the
     echo-chamber bypass. JSON envelopes are string-flattened so ensure_ascii-escaped text is
-    registered as the text the model actually read. Read-only hook, fail-open, never raises."""
+    registered as the text the model actually read. Read-only hook, fail-open, never raises.
+
+    Gated on memory_ingest_allowed: an ingest-disabled fork (curator/background review) shares
+    the parent's LIVE session_id, so its whitelisted reads must not mutate the shared registry —
+    the shadow observer's reads would change live confirm-time admission outcomes. The fork's own
+    spans are never journaled (sync_all is gated on the same flag), so skipping registration
+    loses no taint coverage."""
     result = agent._memory_manager.handle_tool_call(
         function_name, args,
         caller_gsk=(getattr(agent, "_gateway_session_key", "") or ""),
     )
     if result:
         try:
-            from agent import memory_taint
-            memory_taint.record_injected_tool_result(
-                getattr(agent, "session_id", "") or "", str(result), source=function_name,
-            )
+            from agent.memory_manager import memory_ingest_allowed
+            if memory_ingest_allowed(agent):
+                from agent import memory_taint
+                memory_taint.record_injected_tool_result(
+                    getattr(agent, "session_id", "") or "", str(result), source=function_name,
+                )
         except Exception:
             pass
     return result
