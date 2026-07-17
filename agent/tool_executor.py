@@ -1519,6 +1519,21 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     execute=_execute,
                 )
                 _mem_result = function_result
+                # ADR-004 §① origin-taint (Phase 2): memory-provider tool
+                # results (memory_search etc.) hand memory-derived text back
+                # to the agent — register them in the session's injected-span
+                # registry so assistant paraphrases are taint-tagged at WAL
+                # time. Read-only hook, fail-open, never raises.
+                if _mem_result:
+                    try:
+                        from agent import memory_taint
+                        memory_taint.record_injected_tool_result(
+                            getattr(agent, "session_id", "") or "",
+                            str(_mem_result),
+                            source=function_name,
+                        )
+                    except Exception:
+                        pass
             except Exception as tool_error:
                 function_result = json.dumps({"error": f"Memory tool '{function_name}' failed: {tool_error}"})
                 logger.error("memory_manager.handle_tool_call raised for %s: %s", function_name, tool_error, exc_info=True)
