@@ -14,6 +14,7 @@ import re
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, wait
+from contextlib import contextmanager
 from functools import partial
 from typing import Any, Callable, Dict, List, Optional
 
@@ -57,6 +58,36 @@ _PROBE_INTERVAL_S = 60.0
 # Hard cap on calls in flight per (home, provider), orphans included: failed probes pin one more thread
 # each, so admission (probes too) stops here and a backend that stays wedged pins a bounded number.
 _MAX_INFLIGHT_CALLS = 16
+
+# Origin tag for memory READS issued by machinery rather than the live agent
+# (ADR-004 §⑤: the plugin-side retrieval ledger feeds the dream-promotion
+# "explicit memory_search hit" signal, which must exclude curator/prefetch
+# lookups or memory that gets curated gets re-promoted by its own curation —
+# the rich-get-richer loop the ADR excludes prefetch hits for). ContextVar,
+# not thread-local, so tools.thread_context.propagate_context_to_thread
+# carries it onto offloaded tool-dispatch threads.
+_retrieval_origin_var: "contextvars.ContextVar[Optional[str]]" = (
+    contextvars.ContextVar("hermes_memory_retrieval_origin", default=None)
+)
+
+
+@contextmanager
+def retrieval_origin(origin: str):
+    """Tag every ``MemoryManager.handle_tool_call`` issued from this context
+    with ``origin=<origin>`` (forwarded as a provider kwarg; the keyword filter
+    in ``handle_tool_call`` drops it for providers that declare neither
+    ``origin`` nor ``**kwargs``). The graphiti plugin's retrieval ledger
+    consumes the tag to keep non-agent lookups out of the §⑤ promotion signal."""
+    token = _retrieval_origin_var.set(str(origin))
+    try:
+        yield
+    finally:
+        _retrieval_origin_var.reset(token)
+
+
+def current_retrieval_origin() -> Optional[str]:
+    """The origin tag for the current context, or None for live-agent reads."""
+    return _retrieval_origin_var.get()
 
 
 # -- Signature introspection (providers are duck-typed; call shapes vary) -----
@@ -678,6 +709,9 @@ class MemoryManager:
         if scope is None:
             return tool_error(refused_tool_message(tool_name))
         kwargs = {**kwargs, **scope}
+        origin = _retrieval_origin_var.get()
+        if origin and "origin" not in kwargs:
+            kwargs["origin"] = origin
         # A provider written against ``handle_tool_call(tool_name, args)`` gets only what it declares.
         accepted = self._tool_call_keywords(provider)
         if accepted is not None:
