@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from hermes_state import (  # noqa: E402
     DEFAULT_DB_PATH,
+    FTS_V2_READY_KEY,
     FTS_V2_SQL,
     fts5_cjk_so_path,
     load_fts5_cjk_extension,
@@ -117,6 +118,8 @@ def main() -> int:
     # 3. verification
     print("running FTS integrity-check ...")
     conn.execute("INSERT INTO messages_fts_v2(messages_fts_v2) VALUES('integrity-check')")
+    meta_set(conn, FTS_V2_READY_KEY, "1")
+    print(f"{FTS_V2_READY_KEY}=1 (read path may now serve v2)")
     n_v2 = conn.execute("SELECT count(*) FROM messages_fts_v2").fetchone()[0]
     n_msg = conn.execute("SELECT count(*) FROM messages").fetchone()[0]
     print(f"rows: messages={n_msg} fts_v2={n_v2}")

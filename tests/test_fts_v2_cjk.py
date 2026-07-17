@@ -152,14 +152,56 @@ def test_self_heal_drops_triggers_without_tokenizer(cjk_so, tmp_path, monkeypatc
         d2.close()
 
 
-def test_v2_absent_falls_back(cjk_so, tmp_path, monkeypatch):
+def test_fresh_db_is_v2_native(cjk_so, tmp_path, monkeypatch):
+    """A fresh DB with a loadable tokenizer runs on v2 alone (no v1 tables)."""
     monkeypatch.setenv("HERMES_FTS5_CJK_SO", str(cjk_so))
-    monkeypatch.setenv("HERMES_FTS_V2_READ", "1")
+    monkeypatch.delenv("HERMES_FTS_V2_READ", raising=False)
     d = SessionDB(db_path=tmp_path / "plain.db")
     try:
-        assert not d._fts_v2_ready  # migration never ran
+        assert d._fts_v2_ready  # empty DB → ready marker set at init
+        assert not d._fts_v1_present
+        with d._lock:
+            v1 = d._conn.execute(
+                "SELECT count(*) FROM sqlite_master WHERE name IN "
+                "('messages_fts','messages_fts_trigram')"
+            ).fetchone()[0]
+        assert v1 == 0
+        d.create_session(session_id="p", source="cli", model="m")
+        d.append_message("p", role="user", content="일본 MCP 정리")
+        assert d.search_messages("일본 MCP", limit=5)  # default-on v2
+        # With no v1 fallback, the off-flag must NOT blind search.
+        monkeypatch.setenv("HERMES_FTS_V2_READ", "0")
+        assert d.search_messages("일본 MCP", limit=5)
+    finally:
+        d.close()
+
+
+def test_no_tokenizer_falls_back_to_legacy(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_FTS5_CJK_SO", str(tmp_path / "missing.so"))
+    d = SessionDB(db_path=tmp_path / "legacy.db")
+    try:
+        assert not d._fts_v2_ready
         d.create_session(session_id="p", source="cli", model="m")
         d.append_message("p", role="user", content="일본 MCP 정리")
         assert d.search_messages("일본 MCP", limit=5)  # legacy trigram/LIKE
     finally:
         d.close()
+
+
+def test_partial_backfill_not_served(cjk_so, tmp_path, monkeypatch):
+    """v2 triggers without the ready marker must not serve reads."""
+    monkeypatch.setenv("HERMES_FTS5_CJK_SO", str(tmp_path / "missing.so"))
+    d = SessionDB(db_path=tmp_path / "partial.db")
+    d.create_session(session_id="p", source="cli", model="m")
+    d.append_message("p", role="user", content="백필 전 메시지")
+    d.close()
+    # Reopen with the tokenizer: init ensures v2 table+triggers, but the DB
+    # is non-empty and unmigrated → no marker → probe must refuse.
+    monkeypatch.setenv("HERMES_FTS5_CJK_SO", str(cjk_so))
+    d2 = SessionDB(db_path=tmp_path / "partial.db")
+    try:
+        assert d2._fts_cjk_loaded
+        assert not d2._fts_v2_ready
+        assert d2.search_messages("백필", limit=5)  # legacy still answers
+    finally:
+        d2.close()
