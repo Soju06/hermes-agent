@@ -1404,6 +1404,33 @@ class TestLastPromptTokens:
         restored = SessionEntry.from_dict(d)
         assert restored.last_prompt_tokens == 42000
 
+    def test_session_entry_runtime_override_roundtrip_secret_free(self):
+        """Session-scoped runtime overrides should persist without credential fields."""
+        from gateway.session import SessionEntry
+        from datetime import datetime
+        entry = SessionEntry(
+            session_key="test",
+            session_id="s1",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            runtime_model="gpt-5.5",
+            runtime_provider="codex-nekos",
+            runtime_reasoning_effort="high",
+        )
+
+        d = entry.to_dict()
+        assert d["runtime_model"] == "gpt-5.5"
+        assert d["runtime_provider"] == "codex-nekos"
+        assert d["runtime_reasoning_effort"] == "high"
+        assert "api_key" not in d
+        assert "base_url" not in d
+        assert "api_mode" not in d
+
+        restored = SessionEntry.from_dict(d)
+        assert restored.runtime_model == "gpt-5.5"
+        assert restored.runtime_provider == "codex-nekos"
+        assert restored.runtime_reasoning_effort == "high"
+
     def test_session_entry_from_old_data(self):
         """Old session data without last_prompt_tokens should default to 0."""
         from gateway.session import SessionEntry
@@ -1419,6 +1446,38 @@ class TestLastPromptTokens:
         }
         entry = SessionEntry.from_dict(data)
         assert entry.last_prompt_tokens == 0
+        assert entry.runtime_model is None
+        assert entry.runtime_provider is None
+        assert entry.runtime_reasoning_effort is None
+
+    def test_session_store_runtime_override_update_and_clear(self, tmp_path):
+        """Runtime overrides should be updateable and clearable at session boundaries."""
+        from gateway.config import GatewayConfig, Platform
+        from gateway.session import SessionSource, SessionStore
+
+        cfg = GatewayConfig()
+        cfg.sessions_dir = tmp_path
+        store = SessionStore(sessions_dir=tmp_path, config=cfg)
+        store._db = None
+        source = SessionSource(platform=Platform.LOCAL, chat_id="cli", chat_type="dm")
+        entry = store.get_or_create_session(source)
+
+        assert store.update_runtime_override(
+            entry.session_key,
+            model="gpt-5.5",
+            provider="codex-nekos",
+            reasoning_effort="none",
+        )
+        updated = store.get_entry(entry.session_key)
+        assert updated.runtime_model == "gpt-5.5"
+        assert updated.runtime_provider == "codex-nekos"
+        assert updated.runtime_reasoning_effort == "none"
+
+        assert store.clear_runtime_overrides(entry.session_key, model=True, reasoning=True)
+        cleared = store.get_entry(entry.session_key)
+        assert cleared.runtime_model is None
+        assert cleared.runtime_provider is None
+        assert cleared.runtime_reasoning_effort is None
 
     def test_update_session_sets_last_prompt_tokens(self, tmp_path):
         """update_session should store the actual prompt token count."""
