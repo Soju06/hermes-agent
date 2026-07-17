@@ -324,10 +324,16 @@ def direct_api_call(agent, api_kwargs: dict):
 
     def _abort_active_request(reason: str) -> None:
         """Abort the inline request from cron's watchdog/interrupt thread."""
+        # Abort while still holding the holder lock: the instant it is
+        # released, the inline finally may pop + cache the client for reuse
+        # and the NEXT call check it out — a late abort would then poison
+        # the slot and shut down an innocent in-flight request's sockets
+        # (same atomicity contract as _close_request_client_once in the
+        # interruptible variants; the abort itself never blocks).
         with request_client_lock:
             request_client = request_client_holder["client"]
-        if request_client is not None:
-            agent._abort_request_openai_client(request_client, reason=reason)
+            if request_client is not None:
+                agent._abort_request_openai_client(request_client, reason=reason)
 
     def _make_client(reason: str):
         client = agent._create_request_openai_client(reason=reason, api_kwargs=api_kwargs)
@@ -336,6 +342,10 @@ def direct_api_call(agent, api_kwargs: dict):
         agent._active_request_abort = _abort_active_request
         return client
 
+    # Only a clean return may report the reuse reason (request_complete):
+    # after an error or interrupt the wire client is really closed so the
+    # retry builds a fresh pool (see _REQUEST_CLIENT_REUSE_REASONS).
+    succeeded = False
     try:
         response = _dispatch_nonstreaming_api_request(
             agent, api_kwargs, make_client=_make_client
@@ -348,6 +358,7 @@ def direct_api_call(agent, api_kwargs: dict):
         if getattr(agent, "_interrupt_requested", False):
             raise InterruptedError("Agent interrupted during API call")
         _reset_stale_streak(agent)
+        succeeded = True
         return response
     finally:
         if getattr(agent, "_active_request_abort", None) is _abort_active_request:
@@ -356,7 +367,10 @@ def direct_api_call(agent, api_kwargs: dict):
             request_client = request_client_holder["client"]
             request_client_holder["client"] = None
         if request_client is not None:
-            agent._close_request_openai_client(request_client, reason="request_complete")
+            agent._close_request_openai_client(
+                request_client,
+                reason="request_complete" if succeeded else "request_error_cleanup",
+            )
 
 
 def interruptible_api_call(agent, api_kwargs: dict):
@@ -429,15 +443,20 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 and owner_tid is not None
                 and owner_tid != threading.get_ident()
             )
-            if not stranger_thread:
-                # Owning thread (or no recorded owner) → pop and fully close.
-                request_client_holder["client"] = None
-                request_client_holder["owner_tid"] = None
-        if request_client is None:
-            return
-        if stranger_thread:
-            agent._abort_request_openai_client(request_client, reason=reason)
-        else:
+            if stranger_thread:
+                # Abort while still holding the holder lock: the instant it
+                # is released, the worker's finally may pop + cache the client
+                # for reuse and the NEXT call check it out — an abort landing
+                # after that would poison the slot and shut down an innocent
+                # in-flight request's sockets. The abort itself never blocks
+                # (socket shutdown + slot poison), so holding the lock across
+                # it only delays the racing pop, never the data path.
+                agent._abort_request_openai_client(request_client, reason=reason)
+                return
+            # Owning thread (or no recorded owner) → pop and fully close.
+            request_client_holder["client"] = None
+            request_client_holder["owner_tid"] = None
+        if request_client is not None:
             agent._close_request_openai_client(request_client, reason=reason)
 
     def _call():
@@ -469,7 +488,15 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 return
             result["error"] = e
         finally:
-            _close_request_client_once("request_complete")
+            # Reuse reason only on a clean response; any other outcome —
+            # error, or the cancel-swallow return above (which leaves both
+            # result slots None) — really closes so the next attempt builds
+            # a fresh pool (see _REQUEST_CLIENT_REUSE_REASONS).
+            _close_request_client_once(
+                "request_complete"
+                if result["response"] is not None
+                else "request_error_cleanup"
+            )
 
     # ── Stale-call timeout (mirrors streaming stale detector) ────────
     # Non-streaming calls return nothing until the full response is
@@ -2141,14 +2168,15 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 and owner_tid is not None
                 and owner_tid != threading.get_ident()
             )
-            if not stranger_thread:
-                request_client_holder["client"] = None
-                request_client_holder["owner_tid"] = None
-        if request_client is None:
-            return
-        if stranger_thread:
-            agent._abort_request_openai_client(request_client, reason=reason)
-        else:
+            if stranger_thread:
+                # Abort under the holder lock — see the non-streaming variant
+                # for why the holder read and the abort must be atomic (a late
+                # abort would otherwise hit the NEXT request's checkout).
+                agent._abort_request_openai_client(request_client, reason=reason)
+                return
+            request_client_holder["client"] = None
+            request_client_holder["owner_tid"] = None
+        if request_client is not None:
             agent._close_request_openai_client(request_client, reason=reason)
 
     first_delta_fired = {"done": False}
@@ -2356,6 +2384,23 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 pass
 
             if agent._interrupt_requested:
+                # Abandoning a half-read SSE response leaves its connection
+                # permanently checked out of the httpx pool — and the partial
+                # response built below makes the worker's finally report a
+                # reuse-reason close, which would cache the client together
+                # with the leaked connection (each interrupt leaking one more
+                # until the pool exhausts). Close the stream here, on the
+                # owning thread, so the connection is released first.
+                try:
+                    stream.close()
+                except Exception:
+                    # Connection may still be checked out — poison the slot so
+                    # the finally's close really closes the pool instead of
+                    # caching it (owner-thread abort: shutdown is safe, and the
+                    # FD release still happens in the finally below).
+                    agent._abort_request_openai_client(
+                        request_client, reason="interrupt_stream_close_failed"
+                    )
                 break
 
             if not chunk.choices:
@@ -3011,7 +3056,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             result["error"] = e
             return
         finally:
-            _close_request_client_once("stream_request_complete")
+            # Reuse reason only on a clean stream; any other outcome (error,
+            # cancel-swallow) really closes so the next attempt builds a
+            # fresh pool (see _REQUEST_CLIENT_REUSE_REASONS).
+            _close_request_client_once(
+                "stream_request_complete"
+                if result["response"] is not None
+                else "stream_error_cleanup"
+            )
 
     # Provider-configured stale timeout takes priority over env default.
     _cfg_stale = get_provider_stale_timeout(agent.provider, agent.model)
