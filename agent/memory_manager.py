@@ -943,6 +943,48 @@ class MemoryManager:
             except Exception as e:
                 logger.debug("notify_memory_tool_write failed for op %s: %s", action, e)
 
+    def sync_note_backfill(self, note_path: str, content: str, *, session_id: str = "",
+                           metadata: Optional[dict[str, Any]] = None) -> None:
+        """Backfill a notes/ write as a typed idempotent episode (ADR-004 §③ step 7 / §6.1: every
+        note write round-trips into the graph under ``source_name="hermes-notes"``,
+        ``source_id=note_path`` so memory_search stays the single read surface and a re-ingest of
+        the same note supersedes its previous episode).
+
+        The CALLER gates this on ``memory.notes_backfill_enabled`` (default OFF — the daemon-side
+        IngestRequest pass-through is merged but not yet deployed; see
+        agent.memory_pipeline.notes_backfill_enabled). Runs on the same single mem-sync worker as
+        every other external write (§③ serialization: notes writes ride the existing chain, no
+        second writer). Fail-open per provider. Like every provider fan-out it runs only from the
+        owning profile and its payload goes through the egress scrub; the background call goes
+        through the stuck-call gate like ``sync_turn``.
+        """
+        providers = [p for p in self._providers if p.name != "builtin"]
+        if not providers or not content or not self._owner_allows("note_backfill"):
+            return
+
+        content, meta = _redact_for_provider(content, {
+            "source_name": "hermes-notes",
+            "source_id": note_path,
+            "session_id": session_id,
+            **(metadata or {}),
+        })
+
+        def _write(provider: MemoryProvider) -> None:
+            metadata_mode = self._provider_memory_write_metadata_mode(provider)
+            if metadata_mode == "keyword":
+                provider.on_memory_write("add", "notes", content, metadata=dict(meta))
+            elif metadata_mode == "positional":
+                provider.on_memory_write("add", "notes", content, dict(meta))
+            else:
+                provider.on_memory_write("add", "notes", content)
+
+        def _backfill(provider: MemoryProvider) -> None:
+            self._call_unless_stalled(provider, lambda: _write(provider))
+
+        self._submit_background(
+            lambda: self._each_provider("note backfill failed", _backfill, level=logging.WARNING, providers=providers)
+        )
+
     def on_delegation(self, task: str, result: str, *, child_session_id: str = "", **kwargs) -> None:
         if self._fork_turn_hooks_suppressed() or not self._owner_allows("on_delegation"):
             return
