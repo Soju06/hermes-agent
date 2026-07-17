@@ -45,6 +45,7 @@ from agent.inline_tool_executors import (
     emit_terminal_post_tool_call,
     is_context_engine_tool,
     is_memory_provider_tool,
+    memory_manager_tool_call,
     tool_hook_ids,
 )
 from agent.message_metadata import stamp_data_use
@@ -1738,10 +1739,7 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
     if is_memory_provider_tool(agent, function_name):
         # Memory-provider tools (hindsight_retain, honcho_search, ...) are not in the registry.
         return _SequentialDispatch(
-            execute=lambda next_args: agent._memory_manager.handle_tool_call(
-                function_name, next_args,
-                caller_gsk=(getattr(agent, "_gateway_session_key", "") or ""),
-            ),
+            execute=lambda next_args: memory_manager_tool_call(agent, function_name, next_args),
             spinner=_start_quiet_tool_spinner(agent, function_name, function_args),
             error_result=lambda e: json.dumps({"error": f"Memory tool '{function_name}' failed: {e}"}),
             error_log="memory_manager.handle_tool_call raised for %s: %s",

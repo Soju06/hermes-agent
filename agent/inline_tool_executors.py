@@ -404,6 +404,29 @@ INLINE_TOOL_EXECUTORS: dict[str, InlineToolExecutor] = {
     name: _coerced(name, executor) for name, executor in _RAW_INLINE_TOOL_EXECUTORS.items()
 }
 
+
+def memory_manager_tool_call(agent, function_name: str, args: dict) -> Any:
+    """Route a memory-provider tool (memory_search etc.) through the manager and register the
+    result in the session's injected-span registry (ADR-004 §① origin-taint, Phase 2):
+    memory-derived text handed back to the agent must be taint-tagged at WAL time, on BOTH
+    dispatch paths — one ``_PARALLEL_SAFE_TOOLS`` allowlist edit must not silently reopen the
+    echo-chamber bypass. JSON envelopes are string-flattened so ensure_ascii-escaped text is
+    registered as the text the model actually read. Read-only hook, fail-open, never raises."""
+    result = agent._memory_manager.handle_tool_call(
+        function_name, args,
+        caller_gsk=(getattr(agent, "_gateway_session_key", "") or ""),
+    )
+    if result:
+        try:
+            from agent import memory_taint
+            memory_taint.record_injected_tool_result(
+                getattr(agent, "session_id", "") or "", str(result), source=function_name,
+            )
+        except Exception:
+            pass
+    return result
+
+
 # ``invoke_tool`` (concurrent path) consults the memory manager right after these
 # names (the notes tier rides with ``memory``) and before the remaining inline tools;
 # ``message_agent`` falls through to the registry there (Bot Mode DM is only injected into
@@ -422,10 +445,7 @@ def resolve_invoke_tool_executor(agent, function_name: str) -> Optional[InlineTo
     if function_name in INVOKE_TOOL_PRE_MEMORY_MANAGER_NAMES:
         return INLINE_TOOL_EXECUTORS[function_name]
     if is_memory_provider_tool(agent, function_name):
-        return lambda agent, args, ctx: agent._memory_manager.handle_tool_call(
-            function_name, args,
-            caller_gsk=(getattr(agent, "_gateway_session_key", "") or ""),
-        )
+        return lambda agent, args, ctx: memory_manager_tool_call(agent, function_name, args)
     if function_name == "message_agent":
         return None
     return INLINE_TOOL_EXECUTORS.get(function_name)

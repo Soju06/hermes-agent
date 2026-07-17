@@ -1091,6 +1091,16 @@ def _memory_turn_start_and_prefetch(
     with suppress(Exception):
         if not is_trivial_prompt(_query):
             ext_prefetch_cache = agent._memory_manager.prefetch_all(_query, session_id=agent.session_id) or ""
+    if ext_prefetch_cache:
+        # ADR-004 §① origin-taint (Phase 2): the prefetch text injected into this turn's
+        # <memory-context> fence is memory-derived — register it so the WAL tagger can mark
+        # assistant paraphrases of it as tainted. In-memory update + async disk append: never
+        # raises, never blocks.
+        with suppress(Exception):
+            from agent import memory_taint
+            memory_taint.record_injected_text(
+                getattr(agent, "session_id", "") or "", ext_prefetch_cache, source="prefetch",
+            )
     # Deterministic recall indicator via _emit_status so the model can't silently
     # drop injected memory.
     if ext_prefetch_cache:
