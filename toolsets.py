@@ -20,6 +20,8 @@ _HERMES_CORE_TOOLS = [
     "text_to_speech",
     # Planning, memory, and model/runtime introspection
     "todo_list", "memory", "model_status", "model_switch",
+    # Notes tier — declarative gist + curator proposals (ADR-004 Phase 1)
+    "notes_write", "notes_read", "memory_propose",
     "session_search",
     "clarify",
     "execute_code", "delegate_task",
@@ -123,7 +125,8 @@ TOOLSETS = {
     ),
     "tts": _ts("Text-to-speech: convert text to audio with Edge TTS (free), ElevenLabs, OpenAI, or xAI", ["text_to_speech"]),
     "todo": _ts("Task planning and tracking for multi-step work", ["todo_list"]),
-    "memory": _ts("Persistent memory across sessions (personal notes + user profile)", ["memory"]),
+    "memory": _ts("Persistent memory across sessions (personal notes + user profile)",
+                  ["memory", "notes_write", "notes_read", "memory_propose"]),
     "context_engine": _ts("Runtime tools exposed by the active context engine"),
     "runtime": _ts("Inspect and switch the current model/provider/reasoning for session scope", ["model_status", "model_switch"]),
     "session_search": _ts("Search and recall past conversations with summarization", ["session_search"]),

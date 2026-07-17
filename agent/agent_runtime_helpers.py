@@ -89,6 +89,8 @@ AGENT_RUNTIME_POST_HOOK_TOOL_NAMES = frozenset({
     "drive_preview", "annotate_preview", "read_window_below", "manage_connections", "manage_catalog", "setup_mcp",
     "gui_tour",
     "delegate_task",
+    # Notes tier (ADR-004 Phase 1) — dispatched inline like ``memory``.
+    "notes_write", "notes_read", "memory_propose",
 })
 
 _TRAJECTORY_SYSTEM_PROMPT = (

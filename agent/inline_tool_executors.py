@@ -170,6 +170,18 @@ def _memory(agent, args: dict, ctx: InlineToolContext) -> Any:
     return result
 
 
+def _notes_tool(function_name: str) -> InlineToolExecutor:
+    """Notes tier (ADR-004 Phase 1) — dispatched inline (like ``memory``) so the handler gets
+    the session id and, for the flag-gated notes→graph backfill, this agent's MemoryManager
+    (withheld from ingest-disabled forks for the same reason built-in memory writes don't fan
+    out there, Phase 0). Agent-state resolution lives in
+    ``tools.notes_tool.dispatch_notes_tool_for_agent``, shared by both executor paths."""
+    def _exec(agent, args: dict, ctx: InlineToolContext) -> Any:
+        from tools.notes_tool import dispatch_notes_tool_for_agent
+        return dispatch_notes_tool_for_agent(agent, function_name, args)
+    return _exec
+
+
 _read_preview = _callback_tool(
     "tools.read_preview_tool", "read_preview_tool", "read_preview_callback",
     ("start", "start"), ("count", "count"),
@@ -335,6 +347,9 @@ _RAW_INLINE_TOOL_EXECUTORS: dict[str, InlineToolExecutor] = {
     ),
     "session_search": _session_search,
     "memory": _memory,
+    "notes_write": _notes_tool("notes_write"),
+    "notes_read": _notes_tool("notes_read"),
+    "memory_propose": _notes_tool("memory_propose"),
     "clarify": _tool(
         "tools.clarify_tool", "clarify_tool", ("questions", "questions"),
         callback=lambda agent, ctx: agent.clarify_callback,
@@ -389,10 +404,13 @@ INLINE_TOOL_EXECUTORS: dict[str, InlineToolExecutor] = {
     name: _coerced(name, executor) for name, executor in _RAW_INLINE_TOOL_EXECUTORS.items()
 }
 
-# ``invoke_tool`` (concurrent path) consults the memory manager right after these three
-# names and before the remaining inline tools; ``message_agent`` falls through to the
-# registry there (Bot Mode DM is only injected into the sequential path's schema).
-INVOKE_TOOL_PRE_MEMORY_MANAGER_NAMES = frozenset({"todo_list", "session_search", "memory"})
+# ``invoke_tool`` (concurrent path) consults the memory manager right after these
+# names (the notes tier rides with ``memory``) and before the remaining inline tools;
+# ``message_agent`` falls through to the registry there (Bot Mode DM is only injected into
+# the sequential path's schema).
+INVOKE_TOOL_PRE_MEMORY_MANAGER_NAMES = frozenset({
+    "todo_list", "session_search", "memory", "notes_write", "notes_read", "memory_propose",
+})
 
 
 def resolve_invoke_tool_executor(agent, function_name: str) -> Optional[InlineToolExecutor]:
