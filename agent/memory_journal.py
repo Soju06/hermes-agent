@@ -275,6 +275,16 @@ class PendingTurnWAL:
                     {"role": "assistant", "content": _scrub(assistant_content)},
                 ],
             }
+            # ADR-004 §① origin-taint (Phase 2): stamp assistant spans that
+            # overlap this session's injected memory (sparse — only tainted /
+            # fail-closed states are recorded). Runs on the same scrubbed
+            # content the record persists, so span offsets always align.
+            # Lazy import breaks the journal↔taint module cycle; fail-open.
+            try:
+                from agent import memory_taint
+                memory_taint.tag_wal_turn_records(session_id, record["records"])
+            except Exception:
+                logger.debug("WAL taint tagging failed (fail-open)", exc_info=True)
             _append_jsonl(path, record)
             return entry_id
         except Exception:
@@ -310,6 +320,16 @@ class PendingTurnWAL:
                 "evidence_refs": _scrub_evidence_refs(evidence_refs),
                 "origin": str(origin or "user"),
             }
+            # ADR-004 §① origin-taint (Phase 2): proposal content is
+            # agent-authored — tag it like an assistant span (sparse,
+            # fail-open; see memory_taint.tag_wal_proposal_record).
+            try:
+                from agent import memory_taint
+                memory_taint.tag_wal_proposal_record(session_id, record)
+            except Exception:
+                logger.debug(
+                    "WAL proposal taint tagging failed (fail-open)", exc_info=True
+                )
             _append_jsonl(path, record)
             return entry_id
         except Exception:
@@ -469,7 +489,7 @@ class L0Mirror:
             return
         try:
             ts = time.time()
-            _append_jsonl(self._path_for(ts), {
+            record: Dict[str, Any] = {
                 "ts": round(ts, 3),
                 "kind": "sync_turn",
                 "session_id": session_id or "",
@@ -479,7 +499,24 @@ class L0Mirror:
                     "assistant": _scrub(assistant_content),
                 },
                 "meta": {"providers": list(provider_names)},
-            })
+            }
+            # ADR-004 §① origin-taint (Phase 2): the mirror is the long-lived
+            # journal (monthly files, no GC), so the assistant span's taint is
+            # stamped here too — the taint sidecar TTLs out after 7 days and
+            # a stored tag is then the only durable signal. Sparse: only
+            # tainted / fail-closed states are recorded. Fail-open.
+            try:
+                from agent import memory_taint
+                taint = memory_taint.get_registry().assistant_taint(
+                    session_id, record["body"]["assistant"]
+                )
+                if taint.get("tainted") or taint.get("registry") == "corrupt":
+                    record["taint"] = {"assistant": taint}
+            except Exception:
+                logger.debug(
+                    "l0-mirror taint tagging failed (fail-open)", exc_info=True
+                )
+            _append_jsonl(self._path_for(ts), record)
         except Exception:
             logger.debug("l0-mirror append_turn failed (fail-open)", exc_info=True)
 
