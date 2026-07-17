@@ -33,7 +33,7 @@ from typing import Any, Dict, List, Optional
 from agent import turn_trace
 from agent.conversation_compression import conversation_history_after_compression
 from agent.iteration_budget import IterationBudget
-from agent.memory_manager import build_memory_context_block
+from agent.memory_manager import build_memory_context_block, memory_ingest_allowed
 from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
@@ -746,7 +746,11 @@ def build_turn_context(
 
     # Notify memory providers of the new turn (BEFORE prefetch_all).  Not on
     # resume: this is the SAME turn continuing — it already announced itself.
-    if agent._memory_manager and not resume_turn:
+    # Not for ingest-disabled forks (ADR-004 Phase 0): on_turn_start feeds the
+    # provider's ingest cadence and prefetch_all logs recall queries — both
+    # leak the fork's harness turn into the user's real memory namespace.
+    _memory_writes_allowed = memory_ingest_allowed(agent)
+    if agent._memory_manager and not resume_turn and _memory_writes_allowed:
         try:
             _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
             agent._memory_manager.on_turn_start(agent._user_turn_count, _turn_msg)
@@ -757,7 +761,7 @@ def build_turn_context(
     # resume: the resumed user row replays its persisted api_content sidecar
     # (or clean content) — a fresh prefetch would diverge the request prefix.
     ext_prefetch_cache = ""
-    if agent._memory_manager and not resume_turn:
+    if agent._memory_manager and not resume_turn and _memory_writes_allowed:
         with turn_trace.span("prologue.memory_prefetch", trace=_tt) as _mp_span:
             try:
                 _query = original_user_message if isinstance(original_user_message, str) else ""

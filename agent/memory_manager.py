@@ -79,6 +79,28 @@ def normalize_tool_schema(schema: Any) -> Optional[Dict[str, Any]]:
     return schema
 
 
+def memory_ingest_allowed(agent: Any) -> bool:
+    """Return whether this agent may WRITE/ingest into memory providers.
+
+    ADR-004 Phase 0: a forked AIAgent (background review, the future ingest
+    curator) can share the parent's ``_memory_manager`` for READS
+    (``memory_search`` via ``handle_tool_call``) while setting
+    ``_memory_ingest_disabled = True`` at fork construction to block every
+    write-leak path — sync_all, queue_prefetch_all, prefetch_all,
+    on_turn_start, on_session_end, on_pre_compress, on_session_switch,
+    on_delegation, and notify_memory_tool_write call sites all gate on this
+    helper. Without it, the fork's harness prompt + review output leak into
+    the user's real memory graph as (user, assistant) turn pairs.
+
+    Every ``agent._memory_manager`` call site that can trigger a provider
+    write MUST check this helper (see tests/agent/test_memory_ingest_disabled.py
+    for the CI-level regression that keeps future hooks honest). Reads are
+    deliberately NOT gated. Default (attr missing or False) preserves live
+    agent behavior exactly.
+    """
+    return not getattr(agent, "_memory_ingest_disabled", False)
+
+
 def memory_provider_tools_enabled(enabled_toolsets: Optional[List[str]]) -> bool:
     """Return whether external memory-provider tools should be exposed."""
     if enabled_toolsets is None:

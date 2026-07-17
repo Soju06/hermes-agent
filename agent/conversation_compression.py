@@ -628,8 +628,12 @@ def compress_context(
             except Exception as _rel_err:
                 logger.debug("compression lock release failed: %s", _rel_err)
 
-    # Notify external memory provider before compression discards context
-    if agent._memory_manager:
+    # Notify external memory provider before compression discards context.
+    # Ingest-disabled forks (ADR-004 Phase 0) must not trigger provider
+    # extraction from their harness transcript (forks pin
+    # compression_enabled=False anyway; this is the systematic guarantee).
+    from agent.memory_manager import memory_ingest_allowed
+    if agent._memory_manager and memory_ingest_allowed(agent):
         try:
             agent._memory_manager.on_pre_compress(messages)
         except Exception:
@@ -950,7 +954,8 @@ def compress_context(
         # parent (the conversation didn't fork, but the buffer must still be told
         # the transcript was compacted so it doesn't double-count dropped turns).
         try:
-            if _is_boundary and agent._memory_manager:
+            from agent.memory_manager import memory_ingest_allowed as _ingest_allowed
+            if _is_boundary and agent._memory_manager and _ingest_allowed(agent):
                 agent._memory_manager.on_session_switch(
                     agent.session_id or "",
                     parent_session_id=_boundary_parent,
