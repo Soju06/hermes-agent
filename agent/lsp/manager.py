@@ -204,6 +204,7 @@ class LSPService:
         enabled = bool(lsp_cfg.get("enabled", True))
         wait_mode = lsp_cfg.get("wait_mode", "document")
         wait_timeout = float(lsp_cfg.get("wait_timeout", DIAGNOSTICS_DOCUMENT_WAIT))
+        idle_timeout = float(lsp_cfg.get("idle_timeout", DEFAULT_IDLE_TIMEOUT))
         install_strategy = lsp_cfg.get("install_strategy", "auto")
         servers_cfg = lsp_cfg.get("servers") or {}
         disabled = []
@@ -235,6 +236,7 @@ class LSPService:
             env_overrides=env_overrides,
             init_overrides=init_overrides,
             disabled_servers=disabled,
+            idle_timeout=idle_timeout,
         )
 
     # ------------------------------------------------------------------
@@ -442,6 +444,46 @@ class LSPService:
         self._loop.stop()
         clear_cache()
 
+    def _idle_clients_to_reap(self) -> List[Tuple[Tuple[str, str], LSPClient]]:
+        """Remove stale clients from service state and return them for shutdown."""
+        if not self._enabled or self._idle_timeout <= 0:
+            return []
+        now = time.time()
+        with self._state_lock:
+            stale = [
+                key
+                for key, last_used in list(self._last_used.items())
+                if now - last_used > self._idle_timeout
+            ]
+            clients: List[Tuple[Tuple[str, str], LSPClient]] = []
+            for key in stale:
+                client = self._clients.pop(key, None)
+                self._last_used.pop(key, None)
+                if client is not None:
+                    clients.append((key, client))
+            return clients
+
+    def _reap_idle_clients(self) -> None:
+        """Best-effort shutdown of clients idle past the configured timeout."""
+        for key, client in self._idle_clients_to_reap():
+            try:
+                self._loop.run(client.shutdown(), timeout=2.0)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("LSP idle reap shutdown failed for %s: %s", key, exc)
+
+    async def _reap_idle_clients_async(self) -> None:
+        """Async variant for use from the LSP background loop."""
+        clients = self._idle_clients_to_reap()
+        if not clients:
+            return
+        results = await asyncio.gather(
+            *(client.shutdown() for _, client in clients),
+            return_exceptions=True,
+        )
+        for (key, _client), result in zip(clients, results):
+            if isinstance(result, Exception):
+                logger.debug("LSP idle reap shutdown failed for %s: %s", key, result)
+
     # ------------------------------------------------------------------
     # async internals
     # ------------------------------------------------------------------
@@ -503,6 +545,11 @@ class LSPService:
             return None  # exclude marker hit, server gated off
 
         key = (srv.server_id, per_server_root)
+        if key in self._broken:
+            return None
+
+        await self._reap_idle_clients_async()
+
         if key in self._broken:
             return None
         with self._state_lock:
