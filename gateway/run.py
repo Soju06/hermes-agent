@@ -2872,6 +2872,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _session_model_overrides: Dict[str, Dict[str, str]] = {}
     _session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
     _pending_runtime_route_states: Dict[str, Dict[str, Any]] = {}
+    _pending_turn_sidecar_notes: Dict[str, List[str]] = {}
+    _session_ephemeral_pin: Dict[str, tuple] = {}
+    _session_vc_last: Dict[str, str] = {}
     _startup_restore_in_progress: bool = False
 
     def __init__(self, config: Optional[GatewayConfig] = None):
@@ -3049,6 +3052,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Consumed once by the next agent run so stale automatic routes do not
         # leak into later ordinary chat turns.
         self._pending_runtime_route_states: Dict[str, Dict[str, Any]] = {}
+        # Per-turn must-deliver notes relocated out of the ephemeral system
+        # prompt (auto-reset note, first-contact intro, voice-channel change).
+        # Staged by _handle_message_with_agent, consumed once by run_sync and
+        # delivered on the current user message (api_content sidecar).
+        self._pending_turn_sidecar_notes: Dict[str, List[str]] = {}
+        # Prompt-tail freeze: pinned session-context bytes keyed by the
+        # renderer-input change key.  Key hit → reuse pinned bytes verbatim;
+        # key miss → re-render + re-pin (a legitimate cache bust).
+        self._session_ephemeral_pin: Dict[str, tuple] = {}
+        # Last voice-channel context delivered per session — the VC note is
+        # injected only when the live state differs from this value.
+        self._session_vc_last: Dict[str, str] = {}
         self._kanban_notifier_profile = self._active_profile_name()
         # Teams meeting pipeline runtime (bound later when msgraph_webhook adapter exists).
         self._teams_pipeline_runtime = None
@@ -7850,6 +7865,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         self._set_session_reasoning_override(key, None)
                         if hasattr(self, "_pending_model_notes"):
                             self._pending_model_notes.pop(key, None)
+                        # Session keys are source-derived and REUSED by the
+                        # next conversation: a staged-but-never-consumed
+                        # sidecar note (turn aborted between staging and
+                        # run_sync) must not leak into a future session's
+                        # first user message.
+                        _psn = getattr(self, "_pending_turn_sidecar_notes", None)
+                        if isinstance(_psn, dict):
+                            _psn.pop(key, None)
                         # Clear per-session model cache so a resumed turn
                         # resolves from current config, not a stale fallback
                         # cached before the session went idle (mirrors /new
@@ -11147,10 +11170,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
-        # Build the context prompt to inject
-        context_prompt = build_session_context_prompt(context, redact_pii=_redact_pii)
-        
-        # If the previous session expired and was auto-reset, prepend a notice
+        # Build the context prompt to inject.  Prompt-tail freeze: the render
+        # is pinned per session, keyed by a hash of the exact renderer inputs
+        # (_ephemeral_change_key).  A key hit reuses the pinned bytes verbatim
+        # so the composed system prompt cannot drift turn-over-turn; a key
+        # miss (thread rename, /sethome, redact_pii flip, ...) re-renders
+        # once — the only legitimate cache busts.
+        context_prompt = self._pinned_session_context_prompt(
+            context, _redact_pii, session_key
+        )
+
+        # Per-turn must-deliver notes.  These used to be appended to
+        # context_prompt (the ephemeral system prompt), which guaranteed a
+        # turn1→turn2 system-prompt diff and a full agent rebuild.  They now
+        # ride the current user message via the api_content sidecar instead
+        # (staged below, consumed in run_sync → build_turn_context).
+        turn_sidecar_notes: List[str] = []
+
+        # If the previous session expired and was auto-reset, deliver a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).
         if _was_auto_reset:
             reset_reason = getattr(session_entry, 'auto_reset_reason', None) or 'idle'
@@ -11160,7 +11197,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 context_note = "[System note: The user's session was automatically reset by the daily schedule. This is a fresh conversation with no prior context.]"
             else:
                 context_note = "[System note: The user's previous session expired due to inactivity. This is a fresh conversation with no prior context.]"
-            context_prompt = context_note + "\n\n" + context_prompt
+            turn_sidecar_notes.append(context_note)
 
             # Send a user-facing notification explaining the reset, unless:
             # - notifications are disabled in config
@@ -11668,11 +11705,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if _trace is not None:
             _trace.add_span("gateway.hygiene", _t_span, time.time())
 
-        # First-message onboarding -- only on the very first interaction ever
+        # First-message onboarding -- only on the very first interaction ever.
+        # Delivered on the current user message (sidecar), NOT the ephemeral
+        # system prompt: present-on-turn-1/absent-on-turn-2 was a guaranteed
+        # system-prompt diff and agent rebuild.
         if not history and not await self.async_session_store.has_any_sessions():
             # Default first-contact note: a brief self-introduction.
             _intro_note = (
-                "\n\n[System note: This is the user's very first message ever. "
+                "[System note: This is the user's very first message ever. "
                 "Briefly introduce yourself and mention that /help shows available commands. "
                 "Keep the introduction concise -- one or two sentences max.]"
             )
@@ -11695,16 +11735,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     profile_build_mode(_onb_cfg) == "ask"
                     and not is_seen(_onb_cfg, PROFILE_BUILD_FLAG)
                 ):
-                    context_prompt += profile_build_directive()
+                    turn_sidecar_notes.append(profile_build_directive().strip())
                     mark_seen(_hermes_home / "config.yaml", PROFILE_BUILD_FLAG)
                 else:
-                    context_prompt += _intro_note
+                    turn_sidecar_notes.append(_intro_note)
             except Exception as _pb_err:
                 logger.debug(
                     "Profile-build onboarding directive failed, using plain intro: %s",
                     _pb_err,
                 )
-                context_prompt += _intro_note
+                turn_sidecar_notes.append(_intro_note)
         
         # One-time prompt if no home channel is set for this platform
         # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.)
@@ -11730,17 +11770,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 await self._deliver_platform_notice(source, notice)
         
         # -----------------------------------------------------------------
-        # Voice channel awareness — inject current voice channel state
-        # into context so the agent knows who is in the channel and who
-        # is speaking, without needing a separate tool call.
+        # Voice channel awareness — deliver current voice channel state so
+        # the agent knows who is in the channel and who is speaking, without
+        # needing a separate tool call.  Delivered on the current user
+        # message and ONLY when it changed since the previous turn: the
+        # member/speaking serialization differs essentially every turn, and
+        # appending it to the ephemeral system prompt forced a full agent
+        # rebuild + prompt-cache re-key per message.  The system prompt
+        # carries a static pointer line instead (gateway/session.py).
         # -----------------------------------------------------------------
-        if source.platform == Platform.DISCORD:
-            adapter = self.adapters.get(Platform.DISCORD)
-            guild_id = self._get_guild_id(event)
-            if guild_id and adapter and hasattr(adapter, "get_voice_channel_context"):
-                vc_context = adapter.get_voice_channel_context(guild_id)
-                if vc_context:
-                    context_prompt += f"\n\n{vc_context}"
+        _vc_note = self._voice_channel_sidecar_note(event, source, session_key)
+        if _vc_note:
+            turn_sidecar_notes.append(_vc_note)
 
         # -----------------------------------------------------------------
         # Auto-analyze images sent by the user
@@ -11798,6 +11839,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     message_text = _clean_message_text
         except Exception as _ts_err:
             logger.debug("Message timestamp injection failed (non-fatal): %s", _ts_err)
+
+        # Stage the collected must-deliver notes for this turn's agent run
+        # (one-shot; consumed in run_sync).  Staged AFTER the message_text
+        # early-out above so an aborted turn cannot leak its notes into the
+        # next turn's user message.
+        if turn_sidecar_notes and session_key:
+            self._set_pending_turn_sidecar_notes(session_key, turn_sidecar_notes)
 
         # Bind this gateway run generation to the adapter's active-session
         # event so deferred post-delivery callbacks can be released by the
@@ -16320,6 +16368,141 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         state = states.pop(session_key, None)
         return state if isinstance(state, dict) else None
 
+    def _set_pending_turn_sidecar_notes(self, session_key: str, notes: List[str]) -> None:
+        """Stage per-turn must-deliver notes for the next agent run (one-shot)."""
+        if not session_key or not notes:
+            return
+        if not hasattr(self, "_pending_turn_sidecar_notes"):
+            self._pending_turn_sidecar_notes = {}
+        self._pending_turn_sidecar_notes[session_key] = list(notes)
+
+    def _consume_pending_turn_sidecar_notes(self, session_key: str) -> List[str]:
+        if not session_key:
+            return []
+        notes = getattr(self, "_pending_turn_sidecar_notes", None)
+        if not isinstance(notes, dict):
+            return []
+        staged = notes.pop(session_key, None)
+        return list(staged) if isinstance(staged, list) else []
+
+    def _voice_channel_sidecar_note(self, event, source: SessionSource, session_key: str) -> Optional[str]:
+        """Return a ``[Voice channel now: ...]`` note when VC state changed.
+
+        Compares the live Discord voice-channel context against the last
+        value delivered for this session and returns a note only on change
+        (including leaving the channel).  Unchanged state returns ``None`` so
+        the per-turn member/speaking serialization cannot churn the prompt.
+        """
+        if source.platform != Platform.DISCORD:
+            return None
+        adapter = self.adapters.get(Platform.DISCORD)
+        guild_id = self._get_guild_id(event)
+        if not (guild_id and adapter and hasattr(adapter, "get_voice_channel_context")):
+            return None
+        try:
+            vc_now = adapter.get_voice_channel_context(guild_id) or ""
+        except Exception:
+            logger.debug("voice-channel context read failed", exc_info=True)
+            return None
+        if not hasattr(self, "_session_vc_last"):
+            self._session_vc_last = {}
+        vc_prev = self._session_vc_last.get(session_key) if session_key else None
+        if session_key:
+            self._session_vc_last[session_key] = vc_now
+        if vc_now == (vc_prev if vc_prev is not None else ""):
+            return None
+        if not vc_now:
+            return "[Voice channel now: not connected to a voice channel]"
+        return f"[Voice channel now: {vc_now}]"
+
+    def _pinned_session_context_prompt(
+        self, context, redact_pii: bool, session_key: Optional[str]
+    ) -> str:
+        """Return the session-context prompt, pinned per session.
+
+        Key hit → the pinned bytes are reused VERBATIM (immunizes the
+        composed system prompt against renderer nondeterminism); key miss →
+        re-render ``build_session_context_prompt`` and re-pin (a legitimate
+        cache bust: rename, topic edit, /sethome, redact_pii flip, ...).
+        """
+        if not hasattr(self, "_session_ephemeral_pin"):
+            self._session_ephemeral_pin = {}
+        _eph_key = self._ephemeral_change_key(context, redact_pii)
+        _eph_pin = self._session_ephemeral_pin.get(session_key) if session_key else None
+        if _eph_pin is not None and _eph_pin[0] == _eph_key:
+            return _eph_pin[1]
+        text = build_session_context_prompt(context, redact_pii=redact_pii)
+        if session_key:
+            self._session_ephemeral_pin[session_key] = (_eph_key, text)
+        return text
+
+    @staticmethod
+    def _ephemeral_change_key(context, redact_pii: bool) -> str:
+        """Hash the exact inputs ``build_session_context_prompt`` renders.
+
+        This key decides when the pinned per-session context-prompt bytes are
+        reused verbatim vs re-rendered.  The maintained invariant (guarded by
+        the parity test in tests/gateway/test_prompt_tail_freeze.py): any
+        input whose change alters the rendered bytes MUST appear here —
+        omission means a stale pinned prompt (cosmetic staleness); inclusion
+        of an extra field only costs a spurious re-render.
+        """
+        import hashlib
+
+        src = context.source
+        platform = src.platform.value if src.platform else ""
+
+        discord_ids: tuple = ()
+        discord_tools = ""
+        if src.platform == Platform.DISCORD:
+            from gateway.session import _discord_tools_loaded
+
+            discord_tools = "1" if _discord_tools_loaded() else "0"
+            discord_ids = (
+                str(src.guild_id or ""),
+                str(src.parent_chat_id or ""),
+                str(src.thread_id or ""),
+                str(src.chat_id or ""),
+                # Only PRESENCE is rendered (the id itself is delivered
+                # per-turn in the user message) — keying on the value would
+                # re-render every message for zero byte change.
+                "1" if src.message_id else "0",
+            )
+
+        try:
+            from hermes_constants import display_hermes_home
+
+            home_display = str(display_hermes_home())
+        except Exception:
+            home_display = ""
+
+        key_tuple = (
+            platform,
+            str(src.chat_id or ""),
+            str(src.thread_id or ""),
+            str(src.chat_type or ""),
+            str(src.chat_name or ""),
+            str(src.chat_topic or ""),
+            str(src.user_name or ""),
+            str(src.user_id or ""),
+            str(getattr(src, "profile", None) or ""),
+            bool(context.shared_multi_user_session),
+            discord_ids,
+            discord_tools,
+            tuple(p.value for p in context.connected_platforms),
+            tuple(
+                (
+                    p.value,
+                    str(getattr(hc, "name", "") or ""),
+                    str(getattr(hc, "chat_id", "") or ""),
+                )
+                for p, hc in context.home_channels.items()
+            ),
+            bool(redact_pii),
+            home_display,
+        )
+        return hashlib.sha256(repr(key_tuple).encode("utf-8")).hexdigest()
+
     def _apply_gateway_runtime_override(self, directive: dict, source: SessionSource) -> bool:
         if not isinstance(directive, dict) or source is None:
             return False
@@ -16336,6 +16519,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
 
         changed = False
+        # Effective-delta guard: evict the cached agent (a full system-prompt
+        # + prompt-cache rebuild) ONLY when the override actually moves a
+        # runtime axis.  A router that re-selects the already-active route
+        # every triggering message must not bust the cache each time.
+        # Reasoning-only overrides never require eviction: reasoning is
+        # excluded from the agent-cache signature and re-applied per turn on
+        # the cached agent (see the per-turn assignment in run_sync).
+        evict_needed = False
         if model_input or explicit_provider:
             try:
                 from hermes_cli.config import get_compatible_custom_providers
@@ -16378,6 +16569,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         result.error_message,
                     )
                     return changed
+                _prev_override_api_mode = (override or {}).get("api_mode")
+                _model_axes_changed = (
+                    str(result.new_model or "") != str(current_model or "")
+                    or str(result.target_provider or "") != str(current_provider or "")
+                    or str(result.base_url or "") != str(current_base_url or "")
+                    or (
+                        _prev_override_api_mode is not None
+                        and str(result.api_mode or "") != str(_prev_override_api_mode or "")
+                    )
+                )
                 self._session_model_overrides[session_key] = {
                     "model": result.new_model,
                     "provider": result.target_provider,
@@ -16391,8 +16592,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     provider=result.target_provider,
                     include_model=True,
                 )
-                if not hasattr(self, "_pending_model_notes"):
-                    self._pending_model_notes = {}
                 reason = str(directive.get("reason") or "pre-dispatch routing").strip()
                 self._set_pending_runtime_route_state(
                     session_key,
@@ -16404,11 +16603,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         reason=reason,
                     ),
                 )
-                self._pending_model_notes[session_key] = (
-                    f"[Note: runtime route selected before this turn: {current_model or 'default'} "
-                    f"-> {result.new_model} via {result.provider_label or result.target_provider}"
-                    f" ({reason}). Adjust your self-identification accordingly.]"
-                )
+                if _model_axes_changed:
+                    # The "X -> Y" switch note only makes sense (and is only
+                    # worth a transcript line) when the route actually moved.
+                    if not hasattr(self, "_pending_model_notes"):
+                        self._pending_model_notes = {}
+                    self._pending_model_notes[session_key] = (
+                        f"[Note: runtime route selected before this turn: {current_model or 'default'} "
+                        f"-> {result.new_model} via {result.provider_label or result.target_provider}"
+                        f" ({reason}). Adjust your self-identification accordingly.]"
+                    )
+                    evict_needed = True
                 changed = True
             except Exception as exc:
                 logger.warning(
@@ -16429,6 +16634,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 else:
                     self._set_session_reasoning_override(session_key, parsed)
+                    # Persist the reasoning half too.  Previously only the
+                    # model half survived a gateway restart: the rehydrated
+                    # session came back with the routed model but
+                    # reasoning=None, so the SAME session rendered
+                    # "reasoning=max reasoning_source=agent" before the
+                    # restart and "reasoning=unknown" after it — a
+                    # nondeterministic CurrentRuntime byte flip for one
+                    # effective route.
+                    self._persist_session_runtime_override(
+                        session_key,
+                        reasoning_config=parsed,
+                        include_reasoning=True,
+                    )
                     if not (model_input or explicit_provider):
                         reason = str(directive.get("reason") or "pre-dispatch routing").strip()
                         self._set_pending_runtime_route_state(
@@ -16448,13 +16666,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
         if changed:
-            self._evict_cached_agent(session_key)
+            if evict_needed:
+                self._evict_cached_agent(session_key)
             logger.info(
-                "Applied pre-dispatch runtime override for session %s (model=%s provider=%s reasoning=%s)",
+                "Applied pre-dispatch runtime override for session %s (model=%s provider=%s reasoning=%s rebuild=%s)",
                 session_key,
                 model_input or "<unchanged>",
                 explicit_provider or "<unchanged>",
                 reasoning_effort or "<unchanged>",
+                evict_needed,
             )
         return changed
 
@@ -16778,6 +16998,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ``_agent_cache_lock`` on slow socket teardown — mirrors the
         cap-enforcer and idle-sweeper paths.
         """
+        # Prompt-tail freeze state rides the agent-cache lifecycle: a fresh
+        # agent must re-render its session-context bytes (the pin) and re-see
+        # the current voice-channel state once.
+        _pin_store = getattr(self, "_session_ephemeral_pin", None)
+        if isinstance(_pin_store, dict):
+            _pin_store.pop(session_key, None)
+        _vc_store = getattr(self, "_session_vc_last", None)
+        if isinstance(_vc_store, dict):
+            _vc_store.pop(session_key, None)
+
         _lock = getattr(self, "_agent_cache_lock", None)
         evicted = None
         if _lock:
@@ -18960,11 +19190,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             agent.notice_clear_callback = None
             agent.event_callback = _event_callback_sync
             agent.reasoning_config = reasoning_config
+            # Reset per-agent reasoning attribution at the turn boundary.  The
+            # gateway resolve above is the source of truth each turn, but a
+            # mid-turn model_switch (or a restored snapshot) leaves a stale
+            # ``_runtime_reasoning_source`` on the CACHED agent while a
+            # rebuilt agent has none — the same effective reasoning config
+            # then rendered different CurrentRuntime bytes depending on
+            # whether the agent happened to be reused or rebuilt.  Clearing
+            # it here makes the rendered value a pure function of the
+            # effective config (dict → "agent", None → "default").
+            if hasattr(agent, "_runtime_reasoning_source"):
+                try:
+                    delattr(agent, "_runtime_reasoning_source")
+                except AttributeError:
+                    pass
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides") or {}
             # One-shot route intent for this gateway message.  Clear stale state
             # on reused cached agents when no runtime router fired this turn.
             agent._runtime_route_state = self._consume_pending_runtime_route_state(session_key)
+            # Must-deliver notes for THIS turn ride the current user message
+            # (api_content sidecar), never the system prompt: staged notes
+            # from _handle_message_with_agent (auto-reset, intro, VC change)
+            # plus the rendered routing directive when a router fired.
+            _turn_sidecar_parts = self._consume_pending_turn_sidecar_notes(session_key)
+            if agent._runtime_route_state:
+                try:
+                    from agent.system_prompt import format_routing_directive
+                    _directive_line = format_routing_directive(agent._runtime_route_state)
+                    if _directive_line:
+                        _turn_sidecar_parts.append(_directive_line)
+                except Exception:
+                    logger.debug("routing directive render failed", exc_info=True)
+            agent._gateway_turn_context_notes = (
+                "\n\n".join(_turn_sidecar_parts) if _turn_sidecar_parts else ""
+            )
 
             def _runtime_update_callback(*, scope: str, model_override=None, reasoning_config=None) -> None:
                 if scope != "session" or not session_key:
