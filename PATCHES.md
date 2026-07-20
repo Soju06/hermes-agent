@@ -417,8 +417,8 @@ no longer part of the production stack.
 ### 36. model-switch-provider-dedupe
 - **branch:** `soju/patches/model-switch-provider-dedupe`
 - **origin:** `local-author`
-- **upstream_pr:** _(none yet — upstream candidate; D1 finding from ADR-003 routing rollout)_
-- **state:** `local-only`
+- **upstream_pr:** `66128`
+- **state:** `pending-upstream`
 - **rationale:** `/model` typed-model routing built duplicate provider views for the same configured provider, so switching by bare model name could land on a stale self-duplicate entry. Dedupe the view list before selection.
 - **commit:** `c4c4398c0 fix(model_switch): dedupe self-duplicate provider views in typed-model routing`
 - **touches:** `hermes_cli/model_switch.py`, `tests/hermes_cli/test_model_switch_configured_provider_routing.py`
@@ -479,7 +479,7 @@ no longer part of the production stack.
 ### 41. cron-secret-scope-env-fallback
 - **branch:** `soju/patches/cron-secret-scope-env-fallback`
 - **origin:** `local-author`
-- **upstream_pr:** _(pending — being opened; upstream regression fdab380a1 × Workstream A)_
+- **upstream_pr:** `67827`
 - **state:** `pending-upstream`
 - **rationale:** Upstream fdab380a1 wraps every cron job in a `<home>/.env` secret scope regardless of deployment mode, and `get_secret()` treats any installed scope as authoritative. In single-profile deployments where provider keys live only in the process environment (systemd `Environment=`, `pass-cli run`/`op run` wrappers, shell exports) every cron credential read resolved empty → OpenAI client built with the `no-key-required` placeholder → every scheduled agent job 401s while interactive turns keep working (claw: vooy 모닝 브리핑 broke daily since 2026-07-07). Scope-miss reads now fall through to `os.environ` when multiplexing is OFF; multiplexed scopes stay authoritative (fail-closed semantics unchanged).
 - **commit:** `6d2e87ad8 fix(secrets): fall back to os.environ on scope miss when multiplexing is off`
