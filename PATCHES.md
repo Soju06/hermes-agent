@@ -414,6 +414,77 @@ no longer part of the production stack.
   - `acc7edd43 feat(prompt): audience-mode persona injection from personas/modes.yaml`
 - **touches:** `agent/audience_persona.py` (new), `agent/system_prompt.py`, `agent/conversation_loop.py`, `run_agent.py`, `hermes_cli/profiles.py`, `tools/threat_patterns.py`, `tests/agent/test_audience_persona.py` (new)
 
+### 36. model-switch-provider-dedupe
+- **branch:** `soju/patches/model-switch-provider-dedupe`
+- **origin:** `local-author`
+- **upstream_pr:** _(none yet — upstream candidate; D1 finding from ADR-003 routing rollout)_
+- **state:** `local-only`
+- **rationale:** `/model` typed-model routing built duplicate provider views for the same configured provider, so switching by bare model name could land on a stale self-duplicate entry. Dedupe the view list before selection.
+- **commit:** `c4c4398c0 fix(model_switch): dedupe self-duplicate provider views in typed-model routing`
+- **touches:** `hermes_cli/model_switch.py`, `tests/hermes_cli/test_model_switch_configured_provider_routing.py`
+
+### 37. memory-phase0
+- **branch:** `soju/patches/memory-phase0`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — ADR-004 dogfood; revisit after shadow soak)_
+- **state:** `local-only`
+- **rationale:** ADR-004 Phase 0 memory-redesign plumbing: `pending/` WAL (durable per-turn buffer for external memory sync), L0-mirror local evidence journal for outgoing memory payloads, `_memory_ingest_disabled` per-agent flag (read-only memory forks), MEMORY.md/USER.md char-cap defaults unified on the config SoT. Journal review fixes: atomic appends, marker-only boundary mirroring, per-directory startup scan, directories pinned at construction.
+- **commits:** (stacked on `soju/patches/model-switch-provider-dedupe` era stack tip)
+  - `4632195d7 feat(memory): _memory_ingest_disabled per-agent flag — read-only memory forks (ADR-004 Phase 0)`
+  - `3d7c28aec feat(memory): pending/ WAL — durable per-turn buffer for external memory sync (ADR-004 Phase 0)`
+  - `daa2c8a0d feat(memory): L0-mirror — local evidence journal for outgoing memory payloads (ADR-004 Phase 0)`
+  - `e37571712 fix(memory): unify MEMORY.md/USER.md char-cap defaults on config SoT (ADR-004 Phase 0)`
+  - `622fa9813 fix(memory): pin journal directories at construction, not at write time`
+  - `df56c9249 fix(memory): journal review fixes — atomic appends, marker-only boundary mirroring, per-directory startup scan`
+- **touches:** `agent/memory_journal.py` (new), `agent/agent_init.py`, `agent/agent_runtime_helpers.py`, `agent/background_review.py`, `agent/conversation_compression.py`, `agent/memory_manager.py`, `agent/tool_executor.py`, `agent/turn_context.py`, `run_agent.py`, `tools/memory_tool.py`, `tools/delegate_tool.py`, `cli-config.yaml.example`, `tests/agent/test_memory_{ingest_disabled,l0_mirror,pending_wal}.py` (new), docs/website memory pages
+
+### 38. memory-phase1
+- **branch:** `soju/patches/memory-phase1`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — ADR-004 dogfood)_
+- **state:** `local-only`
+- **rationale:** ADR-004 Phase 1 notes tier: `NotesStore` declarative notes under the citation contract, `notes_write`/`notes_read`/`memory_propose` tool family, two-step token contract with grounded admission and gated backfill seam. Review fixes close secret-scrub bypasses, add real quote grounding, non-destructive supersede, write-gate parity.
+- **commits:** (stacked on `soju/patches/memory-phase0`)
+  - `5dd082dd8 feat(memory): NotesStore — declarative notes tier under the citation contract (ADR-004 Phase 1)`
+  - `37ffc440a feat(memory): notes write pipeline — two-step token contract, grounded admission, gated backfill seam (ADR-004 §③)`
+  - `54aa639fb feat(memory): notes tool family — notes_write/notes_read/memory_propose wiring + prompt guidance (ADR-004 Phase 1)`
+  - `bc8b28c9e fix(memory): notes review fixes — close the secret-scrub bypasses, real quote grounding, non-destructive supersede, write gate parity (ADR-004 Phase 1)`
+- **touches:** `agent/notes_store.py` (new), `agent/memory_pipeline.py` (new), `tools/notes_tool.py` (new), `agent/agent_runtime_helpers.py`, `agent/memory_journal.py`, `agent/memory_manager.py`, `agent/prompt_builder.py`, `agent/system_prompt.py`, `agent/tool_executor.py`, `tools/memory_tool.py`, `tools/delegate_tool.py`, `toolsets.py`, `tests/agent/test_{memory_pipeline,notes_store}.py` (new), `tests/tools/test_notes_tool.py` (new)
+
+### 39. memory-phase2-taint
+- **branch:** `soju/patches/memory-phase2-taint`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — ADR-004 dogfood)_
+- **state:** `local-only`
+- **rationale:** ADR-004 §① Phase 2 origin-taint machinery: injected-span registry, WAL/mirror span tagging, quote-taint enforcement; spans registered at the prefetch and memory-tool result sites. Review fixes: registry singleton hygiene, WAL/mirror tag coverage, floor-not-round registration timestamps.
+- **commits:** (stacked on `soju/patches/memory-phase1`)
+  - `27c798a19 feat(memory): origin-taint machinery — injected-span registry, WAL/mirror span tagging, quote-taint enforcement (ADR-004 §① Phase 2)`
+  - `d8ce068be feat(memory): register injected memory spans at the prefetch and memory-tool result sites (ADR-004 §① Phase 2)`
+  - `923d20399 fix(memory): origin-taint review fixes — registry singleton hygiene, WAL/mirror tag coverage, floor-not-round registration ts (ADR-004 Phase 2)`
+- **touches:** `agent/memory_taint.py` (new), `agent/agent_runtime_helpers.py`, `agent/memory_journal.py`, `agent/memory_manager.py`, `agent/memory_pipeline.py`, `agent/tool_executor.py`, `agent/turn_context.py`, `run_agent.py`, `tests/agent/test_memory_taint.py` (new), `tests/agent/test_memory_{ingest_disabled,pending_wal}.py`
+
+### 40. memory-phase2-curator
+- **branch:** `soju/patches/memory-phase2-curator`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — ADR-004 dogfood; shadow-mode observation ongoing)_
+- **state:** `local-only`
+- **rationale:** ADR-004 Phase 2 ingest curator: fork recipe, verdict schema, shadow ledger, watermark; curator triggers + `curator_verdict` dispatch wiring. Review fixes: seam scrub+grounding, provenance validation, cross-lane taint interface. Runs shadow-only until the cutover gate.
+- **commits:** (stacked on `soju/patches/memory-phase1`)
+  - `ceef15701 feat(memory): ingest curator core — fork recipe, verdict schema, shadow ledger, watermark (ADR-004 Phase 2)`
+  - `6a60d22a2 feat(memory): ingest curator triggers + curator_verdict dispatch wiring (ADR-004 Phase 2)`
+  - `ab9b51bac test(memory): ingest curator Phase-2 suite — shadow invariant, fork isolation, triggers, caps (ADR-004)`
+  - `d596a0b07 fix(memory): ingest curator review fixes — seam scrub+grounding, provenance validation, cross-lane taint interface (ADR-004 Phase 2)`
+- **touches:** `agent/ingest_curator.py` (new), `agent/agent_runtime_helpers.py`, `agent/background_review.py`, `agent/codex_runtime.py`, `agent/conversation_compression.py`, `agent/memory_journal.py`, `agent/memory_manager.py`, `agent/memory_pipeline.py`, `agent/tool_executor.py`, `agent/turn_finalizer.py`, `hermes_cli/config.py`, `run_agent.py`, `tests/agent/test_ingest_curator.py` (new)
+
+### 41. cron-secret-scope-env-fallback
+- **branch:** `soju/patches/cron-secret-scope-env-fallback`
+- **origin:** `local-author`
+- **upstream_pr:** _(pending — being opened; upstream regression fdab380a1 × Workstream A)_
+- **state:** `pending-upstream`
+- **rationale:** Upstream fdab380a1 wraps every cron job in a `<home>/.env` secret scope regardless of deployment mode, and `get_secret()` treats any installed scope as authoritative. In single-profile deployments where provider keys live only in the process environment (systemd `Environment=`, `pass-cli run`/`op run` wrappers, shell exports) every cron credential read resolved empty → OpenAI client built with the `no-key-required` placeholder → every scheduled agent job 401s while interactive turns keep working (claw: vooy 모닝 브리핑 broke daily since 2026-07-07). Scope-miss reads now fall through to `os.environ` when multiplexing is OFF; multiplexed scopes stay authoritative (fail-closed semantics unchanged).
+- **commit:** `6d2e87ad8 fix(secrets): fall back to os.environ on scope miss when multiplexing is off`
+- **touches:** `agent/secret_scope.py`, `tests/agent/test_secret_scope.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
