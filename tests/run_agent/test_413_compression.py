@@ -478,10 +478,14 @@ class TestHTTP413Compression:
         assert result["completed"] is True
         assert len(request_payloads) == 2
         assert len(request_payloads[1]["messages"]) < len(request_payloads[0]["messages"])
-        assert request_payloads[1]["messages"][0] == {
-            "role": "system",
-            "content": "compressed prompt",
-        }
+        # Fork (runtime-route-awareness): the rebuilt system message is composed
+        # via compose_effective_system_prompt, which appends the ephemeral
+        # Runtime/Route State block after the cached prompt body.
+        _sys = request_payloads[1]["messages"][0]
+        assert _sys["role"] == "system"
+        assert _sys["content"].startswith("compressed prompt")
+        _extra = _sys["content"][len("compressed prompt"):]
+        assert _extra == "" or _extra.startswith("\n\n# Runtime/Route State")
         assert request_payloads[1]["messages"][1] == {
             "role": "user",
             "content": "compressed summary",
