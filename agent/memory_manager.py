@@ -33,6 +33,11 @@ import threading
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from typing import Any, Callable, Dict, List, Optional
 
+from agent.memory_journal import (
+    L0Mirror,
+    PendingTurnWAL,
+    run_pending_startup_scan_once,
+)
 from agent.memory_provider import MemoryProvider
 from agent.skill_commands import extract_user_instruction_from_skill_message
 from tools.registry import tool_error
@@ -78,6 +83,28 @@ def normalize_tool_schema(schema: Any) -> Optional[Dict[str, Any]]:
     if not name or not isinstance(name, str):
         return None
     return schema
+
+
+def memory_ingest_allowed(agent: Any) -> bool:
+    """Return whether this agent may WRITE/ingest into memory providers.
+
+    ADR-004 Phase 0: a forked AIAgent (background review, the future ingest
+    curator) can share the parent's ``_memory_manager`` for READS
+    (``memory_search`` via ``handle_tool_call``) while setting
+    ``_memory_ingest_disabled = True`` at fork construction to block every
+    write-leak path — sync_all, queue_prefetch_all, prefetch_all,
+    on_turn_start, on_session_end, on_pre_compress, on_session_switch,
+    on_delegation, and notify_memory_tool_write call sites all gate on this
+    helper. Without it, the fork's harness prompt + review output leak into
+    the user's real memory graph as (user, assistant) turn pairs.
+
+    Every ``agent._memory_manager`` call site that can trigger a provider
+    write MUST check this helper (see tests/agent/test_memory_ingest_disabled.py
+    for the CI-level regression that keeps future hooks honest). Reads are
+    deliberately NOT gated. Default (attr missing or False) preserves live
+    agent behavior exactly.
+    """
+    return not getattr(agent, "_memory_ingest_disabled", False)
 
 
 def memory_provider_tools_enabled(enabled_toolsets: Optional[List[str]]) -> bool:
@@ -388,6 +415,28 @@ class MemoryManager:
             "abandoned_prefetches": 0,
             "active_tasks": 0,
         }
+        # ADR-004 Phase 0 (§4.2): durable per-turn WAL. Turns are journaled
+        # BEFORE ingest dispatch and ack-marked after success, so buffered
+        # turns survive process restarts. Strictly fail-open — a broken
+        # journal must never affect the sync path.
+        self._pending_wal: Optional[PendingTurnWAL] = None
+        try:
+            self._pending_wal = PendingTurnWAL()
+            run_pending_startup_scan_once(self._pending_wal)
+        except Exception:  # pragma: no cover - constructor is allocation-only
+            logger.debug("memory-pending WAL unavailable (fail-open)", exc_info=True)
+            self._pending_wal = None
+        # ADR-004 Phase 0 (§② L0-mirror): local evidence journal. Every
+        # payload that leaves for external memory (per-turn sync, session-end
+        # extraction input, pre-compress extraction input) is mirrored to a
+        # monthly JSONL on this host, so the graph is no longer the only copy
+        # of the evidence. Fail-open, zero LLM calls, disk only.
+        self._l0_mirror: Optional[L0Mirror] = None
+        try:
+            self._l0_mirror = L0Mirror()
+        except Exception:  # pragma: no cover - constructor is allocation-only
+            logger.debug("l0-mirror unavailable (fail-open)", exc_info=True)
+            self._l0_mirror = None
 
     # -- Registration --------------------------------------------------------
 
@@ -660,6 +709,26 @@ class MemoryManager:
         user_content = clean_user_content
 
         def _run() -> None:
+            # ADR-004 Phase 0 (§4.2): journal the turn durably BEFORE any
+            # provider ingest is attempted. Runs on the mem-sync worker (not
+            # the hot path) and is fail-open — append_turn returns None on
+            # any failure and never raises.
+            wal = self._pending_wal
+            wal_entry_id = (
+                wal.append_turn(session_id, user_content, assistant_content)
+                if wal is not None else None
+            )
+            # ADR-004 Phase 0 (§② L0-mirror): mirror the outgoing episode
+            # payload locally just before ingest submit. Fail-open.
+            if self._l0_mirror is not None:
+                self._l0_mirror.append_turn(
+                    session_id,
+                    user_content,
+                    assistant_content,
+                    provider_names=[p.name for p in providers],
+                    wal_entry_id=wal_entry_id,
+                )
+            all_synced = True
             for provider in providers:
                 try:
                     if messages is not None and self._provider_sync_accepts_messages(provider):
@@ -676,10 +745,16 @@ class MemoryManager:
                             session_id=session_id,
                         )
                 except Exception as e:
+                    all_synced = False
                     logger.warning(
                         "Memory provider '%s' sync_turn failed: %s",
                         provider.name, e,
                     )
+            # Ack only after every provider accepted the turn — a failed
+            # ingest leaves the entry unconsumed so it survives for the
+            # Phase-2 curator's replay (and is counted by the startup scan).
+            if wal is not None and wal_entry_id and all_synced:
+                wal.ack(session_id, wal_entry_id)
 
         self._submit_background(_run)
 
@@ -838,6 +913,27 @@ class MemoryManager:
 
     # -- Lifecycle hooks -----------------------------------------------------
 
+    def _mirror_boundary(self, kind: str, messages: List[Dict[str, Any]]) -> None:
+        """Journal a boundary extraction marker to the L0-mirror, off-thread.
+
+        The marker record is derived inline (pure, content-free, cheap —
+        message dicts must not be walked later on another thread while the
+        caller keeps mutating them) and the disk append is submitted to the
+        single background worker, so boundary hooks never pay journal I/O on
+        the calling thread. Fail-open; skipped when no provider will consume
+        the payload.
+        """
+        mirror = self._l0_mirror
+        if not self._providers or mirror is None:
+            return
+        record = mirror.build_boundary_record(
+            kind,
+            messages,
+            provider_names=[p.name for p in self._providers],
+        )
+        if record is not None:
+            self._submit_background(lambda: mirror.append_record(record))
+
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         """Notify all providers of a new turn.
 
@@ -854,6 +950,14 @@ class MemoryManager:
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Notify all providers of session end."""
+        # ADR-004 Phase 0 (§② L0-mirror): record that a session-end
+        # extraction payload left for providers. The content itself is
+        # already mirrored per-turn by sync_all, so only a compact boundary
+        # MARKER is derived here (cheap, pure — see build_boundary_record)
+        # and the disk append is dispatched to the background worker: this
+        # method runs on the calling thread, and inline journal I/O on
+        # provider paths is exactly what _submit_background exists to avoid.
+        self._mirror_boundary("session_end", messages)
         for provider in self._providers:
             try:
                 provider.on_session_end(messages)
@@ -967,6 +1071,12 @@ class MemoryManager:
         Returns combined text from providers to include in the compression
         summary prompt. Empty string if no provider contributes.
         """
+        # ADR-004 Phase 0 (§② L0-mirror): record the pre-compression
+        # extraction boundary. on_pre_compress fires MID-TURN inside
+        # compress_context, so only the cheap content-free marker is derived
+        # inline; the append runs on the background worker (per-turn content
+        # is already mirrored by sync_all).
+        self._mirror_boundary("pre_compress", messages)
         parts = []
         for provider in self._providers:
             try:
