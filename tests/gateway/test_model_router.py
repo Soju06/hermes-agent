@@ -1126,7 +1126,8 @@ def test_new_command_clears_router_streak_and_flag(monkeypatch):
     )
     runner._session_model_overrides["tg:c1"] = {"model": "old"}
     runner._model_router_state["tg:c1"] = {"normal_streak": 2}
-    runner._model_router_fresh_applies = {"tg:c1"}
+    # Dict (not set): the _clear_conversation_scope funnel only pops dicts.
+    runner._model_router_fresh_applies = {"tg:c1": True}
 
     asyncio.run(runner._handle_reset_command(_event("/new")))
 
