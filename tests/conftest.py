@@ -469,6 +469,15 @@ def _hermetic_environment(tmp_path, monkeypatch):
     # custom host resolution override/delete this explicitly.
     monkeypatch.setenv("HERMES_HONCHO_HOST", "hermes")
 
+    # Dynamic model router (fork, ADR-003): unit tests must never evaluate
+    # live routing. gateway.run._hermes_home is captured at import time —
+    # before this fixture's HERMES_HOME redirect — so _load_gateway_config()
+    # can see the developer's real config.yaml; with router.mode=enforce
+    # there, _model_router_stage would fire a real classifier call from
+    # unit tests. The env escape hatch WINS over config, so pin it off;
+    # router-mode tests manage this var explicitly (setenv/delenv).
+    monkeypatch.setenv("HERMES_MODEL_ROUTER_MODE", "off")
+
     # 3. Redirect HERMES_HOME to a per-test tempdir. Code that reads
     #    ``~/.hermes/*`` via ``get_hermes_home()`` now gets the tempdir.
     #
