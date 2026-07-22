@@ -483,8 +483,8 @@ the v2026.7.20 base bump; old tip archived at `archive/pre-v20260722/prompt-cach
 ### 43. daemon-pool-py314-compat
 - **branch:** `soju/patches/daemon-pool-py314-compat`
 - **origin:** `local-author`
-- **upstream_pr:** _(opening — CPython 3.14 support gap, reproduces on pure upstream)_
-- **state:** `local-only`
+- **upstream_pr:** [#69209](https://github.com/NousResearch/hermes-agent/pull/69209)
+- **state:** `pending-upstream`
 - **rationale:** `DaemonThreadPoolExecutor` mirrors CPython 3.8–3.13 `ThreadPoolExecutor._adjust_thread_count` internals; CPython 3.14 moved per-worker state into `prepare_context()`/`WorkerContext` and changed `_worker`'s signature, so every `submit()` dies with `AttributeError: '_initializer'` (all concurrent tool batches + background memory sync). Branch on `hasattr(ThreadPoolExecutor, "prepare_context")` and pass matching worker args on both interpreter families. Hoisted from a memory-phase0 rebase collateral to a stack-root patch (2026-07-22).
 - **commit:** `e3f90d800 fix(compat): support CPython 3.14 ThreadPoolExecutor internals in DaemonThreadPoolExecutor`
 - **touches:** `tools/daemon_pool.py`
