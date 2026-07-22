@@ -27,6 +27,7 @@ import json
 import os
 from typing import Any, Dict, List, Optional
 
+from agent.audience_persona import current_speaker_user_id, persona_injection_enabled
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
@@ -194,6 +195,41 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if not _soul_loaded:
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
+
+    # Audience-mode persona — stable slot #2, immediately after the identity
+    # block.  Strict no-op unless HERMES_HOME/personas/modes.yaml exists (the
+    # loader returns None on any missing/broken input).  Mode selection is a
+    # pure function of session-constant inputs plus the current speaker, so
+    # this never threatens the per-session byte-stability the prefix cache
+    # depends on.  The selected mode is remembered on the agent and echoed
+    # into the volatile tail as an "AudienceMode:" line so the gateway's
+    # stored-prompt staleness check can detect a mode change without
+    # re-reading the persona file.
+    #
+    # Gated by persona_injection_enabled — the SAME condition as the SOUL.md
+    # identity gate above: execution modes that skip context files without
+    # opting into the persona identity (batch_runner sets
+    # skip_context_files=True) get no audience persona either.  The speaker
+    # comes from current_speaker_user_id (gateway session context first,
+    # agent._user_id fallback) so shared-thread sessions pick the CURRENT
+    # speaker, not the cached thread creator — the staleness resolver in
+    # conversation_loop uses the same two helpers, keeping build and
+    # staleness in agreement.
+    agent._audience_mode = ""
+    if persona_injection_enabled(agent):
+        _persona = _r.load_audience_persona(
+            platform=getattr(agent, "platform", "") or "",
+            chat_type=getattr(agent, "_chat_type", "") or "",
+            chat_id=getattr(agent, "_chat_id", "") or "",
+            chat_name=getattr(agent, "_chat_name", "") or "",
+            user_id=current_speaker_user_id(agent),
+            context_length=_ctx_len,
+        )
+        if _persona:
+            _audience_mode, _persona_text = _persona
+            if _audience_mode and _persona_text and _persona_text.strip():
+                stable_parts.append(_persona_text)
+                agent._audience_mode = _audience_mode
 
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
@@ -515,6 +551,16 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         timestamp_line += f"\nModel: {agent.model}"
     if agent.provider:
         timestamp_line += f"\nProvider: {agent.provider}"
+    # Present only while the audience-personas feature is active for this
+    # session (see the stable-tier injection above).  Old stored prompts and
+    # feature-off builds carry no line, and _stored_prompt_matches_runtime
+    # treats both-absent as a match — so pre-existing sessions stay
+    # byte-stable and each session rebuilds exactly once when a persona pack
+    # appears or the resolved mode changes.  The label is distinct from
+    # Model:/Provider: so the fallback model-swap rewrite
+    # (chat_completion_helpers) can never touch it.
+    if getattr(agent, "_audience_mode", ""):
+        timestamp_line += f"\nAudienceMode: {agent._audience_mode}"
     volatile_parts.append(timestamp_line)
 
     return {
