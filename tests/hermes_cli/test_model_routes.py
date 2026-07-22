@@ -210,8 +210,10 @@ def test_fallback_unknown_provider_error():
 
 @pytest.mark.parametrize(
     "effort,ok",
-    [("ultra", False), ("max", True), ("none", True), (None, True), ("xhigh", True),
-     (False, True), (True, True)],
+    # "ultra" joined VALID_REASONING_EFFORTS upstream (v2026.7.20, 7550c594c);
+    # "turbo" keeps the invalid-token negative case.
+    [("turbo", False), ("ultra", True), ("max", True), ("none", True), (None, True),
+     ("xhigh", True), (False, True), (True, True)],
 )
 def test_bad_reasoning_effort_error(effort, ok):
     entry = _route()
