@@ -28,6 +28,8 @@ EXPECTED_FIELDS = {
     "llama_cpp_grammar_retry_attempted",
     "primary_recovery_attempted",
     "has_retried_429",
+    # fork(conn-error-fail-fast): instant transport-failure streak counter.
+    "fast_transport_failures",
     "auth_failover_attempted",
     "restart_with_compressed_messages",
     "restart_with_length_continuation",
@@ -38,6 +40,10 @@ EXPECTED_FIELDS = {
 def test_all_guards_default_false():
     s = TurnRetryState()
     for name, value in s:
+        if name == "fast_transport_failures":
+            # fork(conn-error-fail-fast): streak counter, not a one-shot guard.
+            assert value == 0, f"{name} should default to 0"
+            continue
         assert value is False, f"{name} should default to False"
 
 
