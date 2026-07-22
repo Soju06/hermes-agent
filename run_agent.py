@@ -1742,6 +1742,11 @@ class AIAgent:
             self._session_messages = messages
             self._save_session_log(messages)
             self._flush_messages_to_session_db(messages, conversation_history)
+            # Drain async token-accounting deltas at every persist point (turn
+            # finalize + error exits) so a crash after this line loses at most
+            # the in-flight API call's delta. Cheap no-op when nothing queued.
+            if self._session_db is not None:
+                self._session_db.flush_token_counts()
             note_turn_persisted(self)
             return
 
@@ -1750,6 +1755,11 @@ class AIAgent:
             self._session_messages = messages
             self._save_session_log(messages)
             self._flush_messages_to_session_db(messages, conversation_history)
+            # Drain async token-accounting deltas at every persist point (turn
+            # finalize + error exits) so a crash after this line loses at most
+            # the in-flight API call's delta. Cheap no-op when nothing queued.
+            if self._session_db is not None:
+                self._session_db.flush_token_counts()
             note_turn_persisted(self)
 
     def _drop_trailing_empty_response_scaffolding(self, messages: List[Dict]) -> None:
