@@ -668,7 +668,7 @@ def run_conversation(
         return _run_conversation_impl(
             agent, user_message, system_message, conversation_history, task_id,
             stream_callback, persist_user_message, persist_user_timestamp,
-            moa_config,
+            moa_config, resume_turn=resume_turn, turn_id=turn_id,
         )
     _turn_started = time.time()
     _result = None
@@ -676,7 +676,7 @@ def run_conversation(
         _result = _run_conversation_impl(
             agent, user_message, system_message, conversation_history, task_id,
             stream_callback, persist_user_message, persist_user_timestamp,
-            moa_config,
+            moa_config, resume_turn=resume_turn, turn_id=turn_id,
         )
         return _result
     finally:
@@ -726,6 +726,8 @@ def _run_conversation_impl(
     persist_user_message: Optional[Any] = None,
     persist_user_timestamp: Optional[float] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    resume_turn: bool = False,
+    turn_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
