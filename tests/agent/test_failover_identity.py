@@ -83,10 +83,17 @@ class TestSyncFailoverSystemMessage:
         assert result == agent._cached_system_prompt
 
     def test_appends_ephemeral_system_prompt(self):
+        # Fork (runtime-route-awareness): the effective system message is
+        # composed via compose_effective_system_prompt, so the ephemeral
+        # prompt is followed by the live Runtime/Route State block — the
+        # failover resync is exactly when CurrentRuntime changes.
         agent = _agent(ephemeral="Stay terse.")
         api_messages = [{"role": "system", "content": _PROMPT}]
         _sync_failover_system_message(agent, api_messages, _PROMPT)
-        assert api_messages[0]["content"].endswith("Stay terse.")
+        content = api_messages[0]["content"]
+        assert "\n\nStay terse.\n\n# Runtime/Route State\n" in content
+        assert content.startswith(_PROMPT)
+        assert "CurrentRuntime:" in content
 
     def test_noop_without_cached_prompt(self):
         agent = _agent(prompt=None)

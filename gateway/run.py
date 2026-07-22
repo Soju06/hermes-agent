@@ -2031,6 +2031,9 @@ _CONVERSATION_SCOPED_STATE: tuple = (
     "_session_model_overrides",
     "_pending_one_turn_model_restores",
     "_session_reasoning_overrides",
+    # One-shot desired-route intent from pre_gateway_dispatch runtime routers;
+    # stale route intent must not survive a conversation reset.
+    "_pending_runtime_route_states",
     "_session_service_tier_overrides",
     "_pending_model_notes",
     "_last_resolved_model",
@@ -3056,6 +3059,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _session_model_overrides: Dict[str, Dict[str, str]] = {}
     _pending_one_turn_model_restores: Dict[str, Dict[str, Any]] = {}
     _session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
+    _pending_runtime_route_states: Dict[str, Dict[str, Any]] = {}
     _session_service_tier_overrides: Dict[str, Optional[str]] = {}
     _pending_turn_sidecar_notes: Dict[str, List[str]] = {}
     _session_ephemeral_pin: Dict[str, tuple] = {}
@@ -3266,6 +3270,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Per-session reasoning effort overrides from /reasoning.
         # Key: session_key, Value: parsed reasoning config dict.
         self._session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
+        # Per-turn desired-route metadata from pre_gateway_dispatch runtime routers.
+        # Consumed once by the next agent run so stale automatic routes do not
+        # leak into later ordinary chat turns.
+        self._pending_runtime_route_states: Dict[str, Dict[str, Any]] = {}
         # Per-session fast-mode overrides from /fast.
         # Key: session_key, Value: "priority" or None (explicit normal).
         self._session_service_tier_overrides: Dict[str, Optional[str]] = {}
@@ -17582,6 +17590,52 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             logger.debug("Failed to clear persisted session runtime override", exc_info=True)
 
+    def _build_pending_runtime_route_state(
+        self,
+        directive: dict,
+        *,
+        target_model: str = "",
+        target_provider: str = "",
+        target_reasoning_effort: str = "",
+        reason: str = "",
+    ) -> dict:
+        """Normalize a runtime-routing directive for prompt injection."""
+        label = (
+            directive.get("label")
+            or directive.get("route_label")
+            or directive.get("policy_label")
+            or directive.get("policy")
+            or "RUNTIME_OVERRIDE"
+        )
+        return {
+            "label": str(label or "RUNTIME_OVERRIDE"),
+            "target_provider": str(target_provider or directive.get("provider") or "").strip(),
+            "target_model": str(target_model or directive.get("model") or directive.get("raw_input") or "").strip(),
+            "target_reasoning_effort": str(
+                target_reasoning_effort or directive.get("reasoning_effort") or ""
+            ).strip().lower(),
+            "source": str(directive.get("source") or "pre_gateway_dispatch").strip(),
+            "strictness": str(directive.get("strictness") or "auto_reconsiderable").strip(),
+            "confidence": directive.get("confidence", "unknown"),
+            "reason": str(reason or directive.get("reason") or "pre-dispatch routing").strip(),
+        }
+
+    def _set_pending_runtime_route_state(self, session_key: str, route_state: dict) -> None:
+        if not session_key or not isinstance(route_state, dict):
+            return
+        if not hasattr(self, "_pending_runtime_route_states"):
+            self._pending_runtime_route_states = {}
+        self._pending_runtime_route_states[session_key] = route_state
+
+    def _consume_pending_runtime_route_state(self, session_key: str) -> dict | None:
+        if not session_key:
+            return None
+        states = getattr(self, "_pending_runtime_route_states", None)
+        if not isinstance(states, dict):
+            return None
+        state = states.pop(session_key, None)
+        return state if isinstance(state, dict) else None
+
     def _apply_gateway_runtime_override(self, directive: dict, source: SessionSource) -> bool:
         if not isinstance(directive, dict) or source is None:
             return False
@@ -17656,6 +17710,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if not hasattr(self, "_pending_model_notes"):
                     self._pending_model_notes = {}
                 reason = str(directive.get("reason") or "pre-dispatch routing").strip()
+                self._set_pending_runtime_route_state(
+                    session_key,
+                    self._build_pending_runtime_route_state(
+                        directive,
+                        target_model=result.new_model,
+                        target_provider=result.target_provider,
+                        target_reasoning_effort=reasoning_effort,
+                        reason=reason,
+                    ),
+                )
                 self._pending_model_notes[session_key] = (
                     f"[Note: runtime route selected before this turn: {current_model or 'default'} "
                     f"-> {result.new_model} via {result.provider_label or result.target_provider}"
@@ -17681,6 +17745,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 else:
                     self._set_session_reasoning_override(session_key, parsed)
+                    if not (model_input or explicit_provider):
+                        reason = str(directive.get("reason") or "pre-dispatch routing").strip()
+                        self._set_pending_runtime_route_state(
+                            session_key,
+                            self._build_pending_runtime_route_state(
+                                directive,
+                                target_reasoning_effort=reasoning_effort,
+                                reason=reason,
+                            ),
+                        )
                     changed = True
             except Exception as exc:
                 logger.warning(
@@ -20671,6 +20745,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             agent.reasoning_config = reasoning_config
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides") or {}
+            # One-shot route intent for this gateway message.  Clear stale state
+            # on reused cached agents when no runtime router fired this turn.
+            agent._runtime_route_state = self._consume_pending_runtime_route_state(session_key)
             # Must-deliver notes for THIS turn ride the current user message
             # (api_content sidecar), never the system prompt: staged by
             # _handle_message_with_agent (auto-reset note, first-contact
