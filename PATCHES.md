@@ -99,9 +99,12 @@ no longer part of the production stack.
 - **upstream_pr:** _(none — dogfood runtime routing correctness)_
 - **state:** `local-only`
 - **rationale:** Inject an API-call-time Runtime/Route State block so the agent sees live CurrentRuntime plus current-turn DesiredRoute without calling `model_status`. Trusted pre-dispatch `runtime_override` metadata is normalized into one-shot route state for the routed gateway turn, preserving stale-route protection while leaving post-tool rerouting and NEED_CONTEXT scout mode for later phases.
-- **commit:** `27dd6aebc feat(runtime): inject runtime route awareness prompt`
+- **commits:**
+  - `27dd6aebc feat(runtime): inject runtime route awareness prompt`
+  - `7931c4188 test(routing): expect the Runtime/Route block in post-compression system prompts`
 - **touches:** `agent/chat_completion_helpers.py`, `agent/conversation_loop.py`, `agent/system_prompt.py`, `docs/runtime-route-awareness.md`, `gateway/run.py`, `tests/agent/test_runtime_route_prompt.py`, `tests/gateway/test_pre_gateway_dispatch.py`
 - **v2026.7.20-sync:** `_pending_runtime_route_states` registered in upstream `_CONVERSATION_SCOPED_STATE` funnel; failover system message now composed via `compose_effective_system_prompt` so the Runtime/Route block refreshes on provider failover.
+- **note (07-22):** pins fork semantics onto upstream `test_413_compression` exact-equality assertion (Runtime/Route block present in post-compression system prompts; was red on the old stack too).
 
 ### 9. lsp-idle-reaper
 - **branch:** `soju/patches/lsp-idle-reaper`
@@ -406,10 +409,8 @@ the v2026.7.20 base bump; old tip archived at `archive/pre-v20260722/prompt-cach
   - `77c471b2a feat(memory): L0-mirror — local evidence journal for outgoing memory payloads (ADR-004 Phase 0)`
   - `683bdc935 fix(memory): unify MEMORY.md/USER.md char-cap defaults on config SoT (ADR-004 Phase 0)`
   - `11391d73a fix(memory): pin journal directories at construction, not at write time`
-  - `ea75b3b42 fix(memory): journal review fixes — atomic appends, marker-only boundary mirroring, per-directory startup scan`
-  - `a61e78f6d fix(compat): support CPython 3.14 ThreadPoolExecutor internals in DaemonThreadPoolExecutor`
 - **touches:** `agent/memory_journal.py` (new), `agent/agent_init.py`, `agent/agent_runtime_helpers.py`, `agent/background_review.py`, `agent/conversation_compression.py`, `agent/memory_manager.py`, `agent/tool_executor.py`, `agent/turn_context.py`, `run_agent.py`, `tools/memory_tool.py`, `tools/delegate_tool.py`, `cli-config.yaml.example`, `tests/agent/test_memory_{ingest_disabled,l0_mirror,pending_wal}.py` (new), docs/website memory pages
-- **v2026.7.20-sync:** re-stacked on memory-write-reason-gate; turn_context gates re-expressed on upstream turn_context.py (7b3dcee92); conversation_compression gate adapted to upstream memory_context capture; carries collateral commit fix(compat) for DaemonThreadPoolExecutor under CPython 3.14 (prepare_context branch) — pre-existing at the v2026.7.20 tag, hoist to stack root + upstream PR candidate.
+- **v2026.7.20-sync:** re-stacked on memory-write-reason-gate; turn_context gates re-expressed on upstream turn_context.py (7b3dcee92); conversation_compression gate adapted to upstream memory_context capture.
 
 
 ### 38. memory-phase1
@@ -420,10 +421,11 @@ the v2026.7.20 base bump; old tip archived at `archive/pre-v20260722/prompt-cach
 - **state:** `local-only`
 - **rationale:** ADR-004 Phase 1 notes tier: `NotesStore` declarative notes under the citation contract, `notes_write`/`notes_read`/`memory_propose` tool family, two-step token contract with grounded admission and gated backfill seam. Review fixes close secret-scrub bypasses, add real quote grounding, non-destructive supersede, write-gate parity.
 - **commits:**
-  - `521b07260 feat(memory): NotesStore — declarative notes tier under the citation contract (ADR-004 Phase 1)`
-  - `e13e84bbe feat(memory): notes write pipeline — two-step token contract, grounded admission, gated backfill seam (ADR-004 §③)`
-  - `d3af9587b feat(memory): notes tool family — notes_write/notes_read/memory_propose wiring + prompt guidance (ADR-004 Phase 1)`
-  - `441e1043f fix(memory): notes review fixes — close the secret-scrub bypasses, real quote grounding, non-destructive supersede, write gate parity (ADR-004 Phase 1)`
+  - `ea75b3b42 fix(memory): journal review fixes — atomic appends, marker-only boundary mirroring, per-directory startup scan`
+  - `7b6f2ddba feat(memory): NotesStore — declarative notes tier under the citation contract (ADR-004 Phase 1)`
+  - `f7b511306 feat(memory): notes write pipeline — two-step token contract, grounded admission, gated backfill seam (ADR-004 §③)`
+  - `d48950f18 feat(memory): notes tool family — notes_write/notes_read/memory_propose wiring + prompt guidance (ADR-004 Phase 1)`
+  - `e38597533 fix(memory): notes review fixes — close the secret-scrub bypasses, real quote grounding, non-destructive supersede, write gate parity (ADR-004 Phase 1)`
 - **touches:** `agent/notes_store.py` (new), `agent/memory_pipeline.py` (new), `tools/notes_tool.py` (new), `agent/agent_runtime_helpers.py`, `agent/memory_journal.py`, `agent/memory_manager.py`, `agent/prompt_builder.py`, `agent/system_prompt.py`, `agent/tool_executor.py`, `tools/memory_tool.py`, `tools/delegate_tool.py`, `toolsets.py`, `tests/agent/test_{memory_pipeline,notes_store}.py` (new), `tests/tools/test_notes_tool.py` (new)
 - **v2026.7.20-sync:** tool-name unions re-resolved against v2 parent chain (runtime-control tools union at assembly); _dispatch_notes_tool re-anchored above upstream's finalize= signature (271a9d8ec).
 
@@ -436,9 +438,9 @@ the v2026.7.20 base bump; old tip archived at `archive/pre-v20260722/prompt-cach
 - **state:** `local-only`
 - **rationale:** ADR-004 §① Phase 2 origin-taint machinery: injected-span registry, WAL/mirror span tagging, quote-taint enforcement; spans registered at the prefetch and memory-tool result sites. Review fixes: registry singleton hygiene, WAL/mirror tag coverage, floor-not-round registration timestamps.
 - **commits:**
-  - `3bb1fc21e feat(memory): origin-taint machinery — injected-span registry, WAL/mirror span tagging, quote-taint enforcement (ADR-004 §① Phase 2)`
-  - `325b19520 feat(memory): register injected memory spans at the prefetch and memory-tool result sites (ADR-004 §① Phase 2)`
-  - `b11c285e4 fix(memory): origin-taint review fixes — registry singleton hygiene, WAL/mirror tag coverage, floor-not-round registration ts (ADR-004 Phase 2)`
+  - `a94e5088b feat(memory): origin-taint machinery — injected-span registry, WAL/mirror span tagging, quote-taint enforcement (ADR-004 §① Phase 2)`
+  - `03ebd88dc feat(memory): register injected memory spans at the prefetch and memory-tool result sites (ADR-004 §① Phase 2)`
+  - `e30f99c52 fix(memory): origin-taint review fixes — registry singleton hygiene, WAL/mirror tag coverage, floor-not-round registration ts (ADR-004 Phase 2)`
 - **touches:** `agent/memory_taint.py` (new), `agent/agent_runtime_helpers.py`, `agent/memory_journal.py`, `agent/memory_manager.py`, `agent/memory_pipeline.py`, `agent/tool_executor.py`, `agent/turn_context.py`, `run_agent.py`, `tests/agent/test_memory_taint.py` (new), `tests/agent/test_memory_{ingest_disabled,pending_wal}.py`
 - **v2026.7.20-sync:** prefetch taint registration combined at assembly with durable-turns' resume guard and waterfall span (see Assembly Integration Fixes).
 
@@ -451,10 +453,10 @@ the v2026.7.20 base bump; old tip archived at `archive/pre-v20260722/prompt-cach
 - **state:** `local-only`
 - **rationale:** ADR-004 Phase 2 ingest curator: fork recipe, verdict schema, shadow ledger, watermark; curator triggers + `curator_verdict` dispatch wiring. Review fixes: seam scrub+grounding, provenance validation, cross-lane taint interface. Runs shadow-only until the cutover gate.
 - **commits:**
-  - `ec870b98b feat(memory): ingest curator core — fork recipe, verdict schema, shadow ledger, watermark (ADR-004 Phase 2)`
-  - `2121632e2 feat(memory): ingest curator triggers + curator_verdict dispatch wiring (ADR-004 Phase 2)`
-  - `3caaf4f94 test(memory): ingest curator Phase-2 suite — shadow invariant, fork isolation, triggers, caps (ADR-004)`
-  - `416eaefcb fix(memory): ingest curator review fixes — seam scrub+grounding, provenance validation, cross-lane taint interface (ADR-004 Phase 2)`
+  - `7e0472dd1 feat(memory): ingest curator core — fork recipe, verdict schema, shadow ledger, watermark (ADR-004 Phase 2)`
+  - `b4623d592 feat(memory): ingest curator triggers + curator_verdict dispatch wiring (ADR-004 Phase 2)`
+  - `80bf2978b test(memory): ingest curator Phase-2 suite — shadow invariant, fork isolation, triggers, caps (ADR-004)`
+  - `7e0bfcad3 fix(memory): ingest curator review fixes — seam scrub+grounding, provenance validation, cross-lane taint interface (ADR-004 Phase 2)`
 - **touches:** `agent/ingest_curator.py` (new), `agent/agent_runtime_helpers.py`, `agent/background_review.py`, `agent/codex_runtime.py`, `agent/conversation_compression.py`, `agent/memory_journal.py`, `agent/memory_manager.py`, `agent/memory_pipeline.py`, `agent/tool_executor.py`, `agent/turn_finalizer.py`, `hermes_cli/config.py`, `run_agent.py`, `tests/agent/test_ingest_curator.py` (new)
 
 
@@ -477,6 +479,15 @@ the v2026.7.20 base bump; old tip archived at `archive/pre-v20260722/prompt-cach
 - **rationale:** Codex CLI model picker offered Anthropic models even when Anthropic credentials are suppressed for the session; respect the suppression flag when building picker candidates. Recovered from the live deployment checkout (was deployed as an unmanifested commit on top of the old production assembly, 2026-07-22).
 - **commit:** `38695e2e2 fix(model-picker): respect Anthropic credential suppression`
 - **touches:** `hermes_cli/model_switch.py`, `tests/hermes_cli/test_codex_cli_model_picker.py`
+
+### 43. daemon-pool-py314-compat
+- **branch:** `soju/patches/daemon-pool-py314-compat`
+- **origin:** `local-author`
+- **upstream_pr:** _(opening — CPython 3.14 support gap, reproduces on pure upstream)_
+- **state:** `local-only`
+- **rationale:** `DaemonThreadPoolExecutor` mirrors CPython 3.8–3.13 `ThreadPoolExecutor._adjust_thread_count` internals; CPython 3.14 moved per-worker state into `prepare_context()`/`WorkerContext` and changed `_worker`'s signature, so every `submit()` dies with `AttributeError: '_initializer'` (all concurrent tool batches + background memory sync). Branch on `hasattr(ThreadPoolExecutor, "prepare_context")` and pass matching worker args on both interpreter families. Hoisted from a memory-phase0 rebase collateral to a stack-root patch (2026-07-22).
+- **commit:** `e3f90d800 fix(compat): support CPython 3.14 ThreadPoolExecutor internals in DaemonThreadPoolExecutor`
+- **touches:** `tools/daemon_pool.py`
 
 ## State Vocabulary
 
@@ -541,6 +552,7 @@ soju/patches/memory-phase2-taint (stacked on memory-phase1)
 soju/patches/memory-phase2-curator (stacked on memory-phase1)
 soju/patches/cron-secret-scope-env-fallback
 soju/patches/anthropic-picker-suppression
+soju/patches/daemon-pool-py314-compat
 ```
 
 ## Operating Procedures
@@ -597,3 +609,10 @@ production but absent locally, plus an unmanifested deployed commit
 onto v2026.7.20 and merged; production force-push briefly lacked them (~2h window,
 no live redeploy occurred). Lesson: `hermes-patches sync` must diff origin/production
 vs manifest-built production BEFORE force-pushing.
+
+### 2026-07-22 (later-2) — daemon-pool hoist + 413 pin
+daemon_pool CPython-3.14 fix hoisted out of memory-phase0 into stack-root patch #43
+(memory chain restacked without it; production content unchanged, `cf80b8765` still
+valid — assembly predates the branch restructure but is content-identical, verified).
+runtime-route-awareness gains the test_413_compression expectation pin; production
+re-merged (`merge: apply patch runtime-route-awareness (413-compression expectation)`).
