@@ -18341,6 +18341,98 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
+    async def _llm_activity_recap(self, agent, session_key: str):
+        """One-line LLM recap of what the running agent is doing right now.
+
+        Powers ``display.long_running_notifications: recap``. Uses the
+        auxiliary LLM route (same rail as compression summaries) with a hard
+        timeout; any failure falls back to the terse built-in heartbeat.
+        Regenerates only when the activity context actually changed — a long
+        wait on one tool reuses the cached line instead of re-billing.
+        """
+        try:
+            ctx = agent.get_activity_recap_context()
+        except Exception:
+            return None
+        cache = getattr(self, "_activity_recap_cache", None)
+        if cache is None:
+            cache = {}
+            self._activity_recap_cache = cache
+        ctx_key = hash((
+            ctx.get("goal"),
+            tuple(ctx.get("recent_tools") or ()),
+            ctx.get("current_tool"),
+            tuple(ctx.get("voice_samples") or ()),
+            bool(ctx.get("persona_snippet")),
+        ))
+        cached = cache.get(session_key)
+        if cached and cached[0] == ctx_key:
+            return cached[1]
+
+        def _generate():
+            from agent.auxiliary_client import call_llm
+
+            tools_str = "; ".join(ctx.get("recent_tools") or []) or "(none yet)"
+            current = ctx.get("current_tool") or ctx.get("last_activity_desc") or "thinking"
+            samples = ctx.get("voice_samples") or []
+            voice_block = ""
+            if samples:
+                joined = "\n".join(f"- {s}" for s in samples)
+                voice_block = (
+                    "Your recent messages in this conversation (this is YOUR "
+                    f"voice — match its language, tone, and persona exactly):\n{joined}\n"
+                )
+            elif ctx.get("persona_snippet"):
+                # Fresh session, nothing said yet: the persona definition
+                # (SOUL identity + conversation-style rules) IS the voice.
+                voice_block = (
+                    "Your persona and conversation-style definition (write "
+                    f"in this voice):\n{ctx['persona_snippet']}\n"
+                )
+            extra = ""
+            if ctx.get("last_tool_result"):
+                extra += f"Last tool result (truncated): {ctx['last_tool_result']}\n"
+            prompt = (
+                "You are the AI agent in the middle of a long-running turn. "
+                "Write YOUR OWN one-line status update to the user: what you "
+                "are doing right now and what you are waiting on. ONE line, "
+                "max 100 chars, present tense, no prefix/quotes.\n"
+                + voice_block +
+                f"Goal of this turn: {ctx.get('goal') or '(unknown)'}\n"
+                f"Your recent tool calls (oldest first): {tools_str}\n"
+                + extra +
+                f"Currently: {current} "
+                f"({int(ctx.get('seconds_since_activity') or 0)}s since last activity, "
+                f"iteration {ctx.get('iteration')}/{ctx.get('max_iterations')})"
+            )
+            response = call_llm(
+                task="activity_recap",
+                main_runtime={
+                    "model": getattr(agent, "model", None),
+                    "provider": getattr(agent, "provider", None),
+                    "base_url": getattr(agent, "base_url", None),
+                    "api_key": getattr(agent, "api_key", None),
+                    "api_mode": getattr(agent, "api_mode", None),
+                },
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=80,
+                timeout=8,
+            )
+            message = response.choices[0].message
+            content = message.get("content") if isinstance(message, dict) else getattr(message, "content", "")
+            line = str(content or "").strip().splitlines()
+            return line[0][:140].strip() if line else ""
+
+        try:
+            text = await asyncio.wait_for(asyncio.to_thread(_generate), timeout=10)
+        except Exception as exc:
+            logger.debug("activity recap generation failed: %s", exc)
+            return None
+        if not text:
+            return None
+        cache[session_key] = (ctx_key, text)
+        return text
+
     async def _interrupt_and_clear_session(
         self,
         session_key: str,
@@ -19561,6 +19653,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             default: bool = False,
             require_platform_override_for: set[Any] | None = None,
             allow_generic: bool = False,
+            allow_recap: bool = False,
         ) -> str:
             """Return off|raw|generic for a gateway visibility surface."""
             if require_platform_override_for:
@@ -19577,6 +19670,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             value = resolve_display_setting(user_config, platform_key, setting, default)
             if isinstance(value, str) and value.strip().lower() == "generic":
                 return "generic" if allow_generic else "off"
+            if isinstance(value, str) and value.strip().lower() == "recap":
+                # LLM-generated one-line activity recap (long-running
+                # notifications only). Surfaces that don't support it treat
+                # the setting as plain "on".
+                return "recap" if allow_recap else "raw"
             return "raw" if bool(value) else "off"
 
         def _generic_status_phrase(kind: str, *, tool_name: str | None = None, preview: str | None = None, args: Any = None) -> str:
@@ -22021,6 +22119,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "long_running_notifications",
             default=True,
             allow_generic=True,
+            allow_recap=True,
         )
         if _long_running_mode == "off":
             _NOTIFY_INTERVAL = None
@@ -22084,13 +22183,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _status_detail = " — " + ", ".join(_parts)
                     except Exception:
                         pass
-                _heartbeat_text = (
-                    _generic_status_phrase("status")
-                    if _long_running_mode == "generic"
-                    else f"⏳ Working — {_elapsed_mins} min{_status_detail}"
-                )
+                _recap_line = None
+                if _long_running_mode == "recap" and _agent_ref is not None:
+                    _recap_line = await self._llm_activity_recap(
+                        _agent_ref, session_key
+                    )
+                if _long_running_mode == "generic":
+                    _heartbeat_text = _generic_status_phrase("status")
+                elif _recap_line:
+                    _heartbeat_text = f"⏳ {_elapsed_mins} min — {_recap_line}"
+                else:
+                    _heartbeat_text = f"⏳ Working — {_elapsed_mins} min{_status_detail}"
                 try:
                     _notify_res = None
+                    # Recap mode keeps the bubble at the thread bottom: an
+                    # edited message buried by hours of tool traffic is
+                    # invisible, so delete-and-resend instead of edit when the
+                    # adapter supports deletion.
+                    if (
+                        _heartbeat_msg_id
+                        and _long_running_mode == "recap"
+                        and type(_notify_adapter).delete_message
+                        is not BasePlatformAdapter.delete_message
+                    ):
+                        try:
+                            await _notify_adapter.delete_message(
+                                source.chat_id, _heartbeat_msg_id
+                            )
+                        except Exception:
+                            pass
+                        _heartbeat_msg_id = None
                     if _heartbeat_msg_id:
                         try:
                             _notify_res = await _notify_adapter.edit_message(
