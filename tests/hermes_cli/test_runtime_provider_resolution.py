@@ -991,13 +991,53 @@ def test_named_custom_provider_uses_providers_dict_when_list_missing(monkeypatch
 
     resolved = rp.resolve_runtime_provider(requested="openai-direct-primary")
 
-    assert resolved["provider"] == "custom"
+    assert resolved["provider"] == "openai-direct-primary"
     assert resolved["api_mode"] == "codex_responses"
     assert resolved["base_url"] == "https://api.openai.com/v1"
     assert resolved["api_key"] == "dir-key"
     assert resolved["requested_provider"] == "openai-direct-primary"
     assert resolved["source"] == "custom_provider:OpenAI Direct (Primary)"
     assert resolved["model"] == "gpt-5-mini"
+
+
+def test_providers_dict_named_provider_preserves_runtime_label_for_session_rehydrate(monkeypatch):
+    """Session override rehydration must keep user provider slugs like codex-nekos."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setenv("CODEX_NEKOS_API_KEY", "codex-secret")
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "providers": {
+                "codex-nekos": {
+                    "base_url": "http://10.0.0.113:2455/v1",
+                    "default_model": "gpt-5.5",
+                    "key_env": "CODEX_NEKOS_API_KEY",
+                    "name": "Codex Nekos",
+                    "api_mode": "chat_completions",
+                }
+            }
+        },
+    )
+    monkeypatch.setattr(
+        rp,
+        "resolve_provider",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError(
+                "resolve_provider should not be called for named custom providers"
+            )
+        ),
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="codex-nekos")
+
+    assert resolved["provider"] == "codex-nekos"
+    assert resolved["requested_provider"] == "codex-nekos"
+    assert resolved["api_mode"] == "chat_completions"
+    assert resolved["base_url"] == "http://10.0.0.113:2455/v1"
+    assert resolved["api_key"] == "codex-secret"
+    assert resolved["model"] == "gpt-5.5"
 
 
 def test_named_custom_provider_uses_key_env_from_providers_dict(monkeypatch):
@@ -1031,7 +1071,7 @@ def test_named_custom_provider_uses_key_env_from_providers_dict(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="mycorp-proxy")
 
-    assert resolved["provider"] == "custom"
+    assert resolved["provider"] == "mycorp-proxy"
     assert resolved["api_mode"] == "chat_completions"
     assert resolved["base_url"] == "https://proxy.example.com/v1"
     assert resolved["api_key"] == "env-secret"
@@ -1334,7 +1374,10 @@ def test_resolve_runtime_provider_named_custom_with_builtin_slug(monkeypatch):
 
     resolved = rp.resolve_runtime_provider()
 
-    assert resolved["provider"] == "custom"
+    # Named custom providers surface their endpoint name as the runtime
+    # provider label (not the generic "custom") so downstream credential
+    # and status surfaces can distinguish endpoints.
+    assert resolved["provider"] == "minimax-cn"
     assert resolved["base_url"] == "https://mimimax.cn/v1"
     assert resolved["api_key"] == "proxy-secret"
     assert resolved["api_mode"] == "chat_completions"
@@ -3378,7 +3421,9 @@ def test_providers_dict_entry_surfaces_extra_headers(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="my-proxy")
 
-    assert resolved["provider"] == "custom"
+    # Named custom providers surface their endpoint name as the runtime
+    # provider label (not the generic "custom").
+    assert resolved["provider"] == "my-proxy"
     assert resolved["extra_headers"] == {"CF-Access-Client-Id": "xxxx.access"}
 
 
