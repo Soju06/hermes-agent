@@ -209,7 +209,13 @@ def test_stale_abort_is_atomic_with_holder_read(monkeypatch):
     # The atomicity contract: no owner-side close slipped in mid-abort.
     assert observed["worker_finished_during_abort"] is False
     # ...and the worker's own finally still performed its close afterwards.
-    assert worker_close_reasons == ["stream_request_complete"]
+    # Since the single-writer fence (#65991), a stale kill also cancels the
+    # stream attempt BEFORE firing the abort, so the unblocked worker's late
+    # chunks are discarded and its finally deterministically reports an error
+    # cleanup — a REAL close, never a reuse-reason cache of the aborted
+    # client (the fail-closed outcome the reuse cache wants; pre-#65991 the
+    # poisoned slot forced the same real close under a clean-finish reason).
+    assert worker_close_reasons == ["stream_error_cleanup"]
 
 
 def test_direct_api_call_abort_is_atomic_with_holder_read():
@@ -280,6 +286,74 @@ def test_direct_api_call_abort_is_atomic_with_holder_read():
     # ...and the inline finally still performed its close afterwards.
     assert close_reasons == ["request_complete"]
     assert result["response"] is not None
+
+
+def test_anthropic_stale_abort_is_atomic_and_kind_routed(monkeypatch):
+    """The anthropic-kind holder abort (#67142) shares the atomicity contract.
+
+    The stale-call detector fires ``_close_request_client_once`` from the
+    poll (stranger) thread; with ``kind="anthropic_messages"`` it must route
+    to ``_abort_request_anthropic_client`` — never the openai abort — and the
+    abort must complete under the holder lock before the worker's finally can
+    pop the client (the TOCTOU applies identically even though anthropic
+    request clients never enter the openai-wire reuse cache).
+    """
+    from agent.chat_completion_helpers import interruptible_api_call
+
+    agent = _make_agent()
+    agent.api_mode = "anthropic_messages"
+    monkeypatch.setattr(
+        agent, "_compute_non_stream_stale_timeout", lambda api_payload: 0.05
+    )
+
+    allow_finish = threading.Event()
+    close_reasons = []
+    abort_reasons = []
+    observed = {"close_during_abort": None}
+
+    anthropic_client = MagicMock()
+
+    def blocking_messages_create(api_kwargs, *, client=None):
+        assert client is anthropic_client
+        # Stall past the stale threshold, then finish the moment the abort
+        # (below) unblocks us — racing the worker toward its finally.
+        allow_finish.wait(timeout=5.0)
+        return SimpleNamespace(choices=[SimpleNamespace(message=None)])
+
+    def fake_anthropic_abort(client, *, reason):
+        abort_reasons.append(reason)
+        allow_finish.set()
+        deadline = time.time() + 0.6
+        while time.time() < deadline and not close_reasons:
+            time.sleep(0.02)
+        observed["close_during_abort"] = bool(close_reasons)
+
+    with patch.object(
+        agent, "_create_request_anthropic_client", return_value=anthropic_client
+    ), patch.object(
+        agent, "_anthropic_messages_create", side_effect=blocking_messages_create
+    ), patch.object(
+        agent, "_abort_request_anthropic_client", side_effect=fake_anthropic_abort
+    ), patch.object(
+        agent,
+        "_close_request_anthropic_client",
+        side_effect=lambda c, *, reason: close_reasons.append(reason),
+    ), patch.object(
+        agent, "_abort_request_openai_client"
+    ) as openai_abort, patch.object(
+        agent, "_close_request_openai_client"
+    ) as openai_close:
+        response = interruptible_api_call(agent, {})
+
+    assert response is not None
+    assert abort_reasons == ["stale_call_kill"]
+    # Kind routing: the openai-wire abort/close must never fire.
+    openai_abort.assert_not_called()
+    openai_close.assert_not_called()
+    # The atomicity contract: no owner-side close slipped in mid-abort.
+    assert observed["close_during_abort"] is False
+    # ...and the worker's own finally still performed the anthropic close.
+    assert close_reasons == ["request_complete"]
 
 
 class _FakeCodexEventStream:
