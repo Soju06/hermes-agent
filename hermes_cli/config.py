@@ -1172,6 +1172,15 @@ DEFAULT_CONFIG = {
         # detector instead of hanging forever. The env var
         # ``HERMES_LOCAL_STREAM_STALE_TIMEOUT`` overrides for escape-hatch use.
         "local_stream_stale_timeout": 900,
+        # Durable turns (ADR durable-turns): resume an interrupted gateway
+        # turn IN PLACE after a restart — same turn, same transcript — instead
+        # of fabricating a follow-up user turn with a recovery note.  Set to
+        # false to restore the legacy recovery behavior.
+        "gateway_turn_resume": True,
+        # Poison-turn cap: how many times the same interrupted turn may be
+        # auto-resumed before it is abandoned (with an honest notice to the
+        # thread).  0 disables same-turn resume outcomes entirely.
+        "turn_resume_max": 2,
         # How user-attached images are presented to the main model on each turn.
         #   "auto"   — attach natively when the active model reports
         #              supports_vision=True AND the user hasn't explicitly

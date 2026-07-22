@@ -599,6 +599,8 @@ def run_conversation(
     persist_user_message: Optional[Any] = None,
     persist_user_timestamp: Optional[float] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    resume_turn: bool = False,
+    turn_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Public entry — wraps ``_run_conversation_impl`` with per-turn tracing.
 
@@ -704,11 +706,18 @@ def _run_conversation_impl(
         persist_user_timestamp: Optional platform event timestamp to store
             as metadata on that persisted user message.
                 or queuing follow-up prefetch work.
+        resume_turn: Re-enter an interrupted turn on its persisted transcript
+            (same-turn resume, ADR durable-turns). ``user_message`` is ignored
+            and NO new user row is appended; ``conversation_history`` must be
+            the persisted transcript whose tail is the interrupted work.
+        turn_id: Durable turn id override.  The gateway records it before
+            dispatch so the agent-side turn identity matches the durable
+            record — and, on resume, stays stable across the restart.
 
     Returns:
         Dict: Complete conversation result with final response and message history
     """
-    if moa_config is None:
+    if moa_config is None and not resume_turn:
         try:
             from hermes_cli.moa_config import decode_moa_turn
 
@@ -720,6 +729,29 @@ def _run_conversation_impl(
                     persist_user_message = _decoded_message
         except Exception:
             pass
+
+    # ── Same-turn resume: normalize the interrupted tail up front ──
+    # Synthetic "Operation interrupted…" closers are dropped, unanswered
+    # trailing tool_calls are completed via orphan recovery, and a turn that
+    # had already composed its final answer is detected so we can deliver it
+    # without another model call.  See agent/turn_resume.py.
+    _resume_composed_final: Optional[str] = None
+    if resume_turn:
+        from agent.turn_resume import prepare_resume_history, resume_entry_reason
+
+        conversation_history, _resume_composed_final = prepare_resume_history(
+            list(conversation_history or [])
+        )
+        user_message = ""
+        persist_user_message = None
+        persist_user_timestamp = None
+        logger.info(
+            "same-turn resume: session=%s turn_id=%s tail=%s composed_final=%s",
+            agent.session_id or "none",
+            turn_id or "(new)",
+            resume_entry_reason(conversation_history),
+            _resume_composed_final is not None,
+        )
 
     # ── Per-turn setup (the prologue) ──
     # All once-per-turn setup — stdio guarding, retry-counter resets, user
@@ -748,6 +780,8 @@ def _run_conversation_impl(
         # MoA turns append per-call aggregated context to the API copy of the
         # user message, so no byte-stable api_content sidecar can be stamped.
         moa_active=bool(moa_config),
+        resume_turn=resume_turn,
+        turn_id_override=turn_id,
     )
     user_message = _ctx.user_message
     original_user_message = _ctx.original_user_message
@@ -778,6 +812,15 @@ def _run_conversation_impl(
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
     final_response = None
+    # Same-turn resume of a turn that had already finished generating: the
+    # composed answer was persisted but never delivered/finalized.  Seed it as
+    # the final response and skip the loop entirely — the normal
+    # finalize/delivery path still runs.  The transcript already ends with
+    # that assistant row, so nothing is appended twice.
+    _resume_skip_loop = False
+    if resume_turn and _resume_composed_final is not None:
+        final_response = _resume_composed_final
+        _resume_skip_loop = True
     interrupted = False
     failed = False
     codex_ack_continuations = 0
@@ -786,6 +829,8 @@ def _run_conversation_impl(
     truncated_response_parts: List[str] = []
     compression_attempts = 0
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
+    if resume_turn and _resume_composed_final is not None:
+        _turn_exit_reason = "resume_composed_final"
     # Last composed answer intentionally held back by a verification gate. If
     # that continuation consumes the remaining budget, this is the best
     # user-facing result available; it must not be confused with error or
@@ -819,7 +864,10 @@ def _run_conversation_impl(
             should_review_memory=_should_review_memory,
         )
 
-    while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+    while not _resume_skip_loop and (
+        (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0)
+        or agent._budget_grace_call
+    ):
         # Close the previous pass's `iteration` span and open the next one.
         # Retrofitted from timestamps (no context manager) because the loop
         # body exits through many continue/break/return paths.
