@@ -870,7 +870,20 @@ def build_turn_context(
             except Exception:
                 pass
             _mp_span.tag(decision="hit" if ext_prefetch_cache else "empty")
-
+    if ext_prefetch_cache:
+        # ADR-004 §① origin-taint (Phase 2): the prefetch text injected into
+        # this turn's <memory-context> fence is memory-derived — register it
+        # so the WAL tagger can mark assistant paraphrases of it as tainted.
+        # In-memory update + async disk append: never raises, never blocks.
+        try:
+            from agent import memory_taint
+            memory_taint.record_injected_text(
+                getattr(agent, "session_id", "") or "",
+                ext_prefetch_cache,
+                source="prefetch",
+            )
+        except Exception:
+            pass
 
     # ── api_content sidecar: persist what you send ──
     # The prefetch/plugin context above is injected into the API copy of this
