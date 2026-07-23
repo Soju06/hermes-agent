@@ -304,17 +304,12 @@ def _model_status(agent, args: dict, ctx: InlineToolContext) -> Any:
 
 
 def _model_switch(agent, args: dict, ctx: InlineToolContext) -> Any:
-    from agent.runtime_control import model_switch
+    # Single tool-dispatch entry point (ADR-003 Phase 3c): forwarding of the LLM-facing
+    # ``route``/``reason`` surface is defined once in agent/runtime_control.py so the
+    # sequential and concurrent executors cannot drift.
+    from agent.runtime_control import dispatch_model_switch
 
-    return model_switch(
-        agent,
-        model=args.get("model"),
-        provider=args.get("provider"),
-        reasoning_effort=args.get("reasoning_effort"),
-        route=args.get("route"),
-        scope=args.get("scope", "session"),
-        reason=args.get("reason"),
-    )
+    return dispatch_model_switch(agent, args)
 
 
 # Order is the historical if/elif order of ``execute_tool_calls_sequential``.
