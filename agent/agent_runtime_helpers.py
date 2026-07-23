@@ -3294,18 +3294,8 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         from agent.runtime_control import model_status as _model_status
         return _finish_agent_tool(_model_status(agent))
     elif function_name == "model_switch":
-        from agent.runtime_control import model_switch as _model_switch
-        return _finish_agent_tool(
-            _model_switch(
-                agent,
-                model=function_args.get("model"),
-                provider=function_args.get("provider"),
-                reasoning_effort=function_args.get("reasoning_effort"),
-                route=function_args.get("route"),
-                scope=function_args.get("scope", "session"),
-                reason=function_args.get("reason"),
-            )
-        )
+        from agent.runtime_control import dispatch_model_switch as _dispatch_model_switch
+        return _finish_agent_tool(_dispatch_model_switch(agent, function_args))
     elif function_name == "todo":
         def _execute(next_args: dict) -> Any:
             from tools.todo_tool import todo_tool as _todo_tool

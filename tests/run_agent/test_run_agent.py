@@ -2237,12 +2237,15 @@ class TestConcurrentToolExecution:
 
 
     def test_invoke_tool_handles_model_status_directly(self, agent):
-        """_invoke_tool should handle model_status without registry dispatch."""
+        """_invoke_tool should handle model_status without registry dispatch.
+
+        The payload speaks route language (ADR-003 Phase 3c): model +
+        reasoning, no raw provider/endpoint identifiers."""
         result = agent._invoke_tool("model_status", {}, "task-1")
         data = json.loads(result)
         assert data["success"] is True
         assert data["model"] == agent.model
-        assert data["provider"] == agent.provider
+        assert "provider" not in data
 
     def test_invoke_tool_blocked_returns_error_and_skips_execution(self, agent, monkeypatch):
         """_invoke_tool should return error JSON when a plugin blocks the tool."""
