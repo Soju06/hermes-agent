@@ -447,6 +447,61 @@ def _is_third_party_anthropic_endpoint(base_url: str | None) -> bool:
     return True  # Any other endpoint is a third-party proxy
 
 
+_signature_passthrough_urls_cache: Optional[frozenset] = None
+
+
+def _get_signature_passthrough_urls() -> frozenset:
+    """Base URLs of Anthropic-passthrough proxies that preserve thinking signatures.
+
+    A provider opts in with ``anthropic_signature_passthrough: true`` in
+    ``config.yaml``.  The flag asserts that the endpoint forwards message
+    content blocks to real Anthropic verbatim (no reordering, merging, or
+    block mutation), so thinking-block signatures generated through it
+    validate on replay.  Read once and cached — provider base URLs are
+    static for the process lifetime (same as the client cache).
+    """
+    global _signature_passthrough_urls_cache
+    if _signature_passthrough_urls_cache is None:
+        urls = set()
+        try:
+            from hermes_constants import get_config_path
+            from utils import fast_safe_load
+
+            config_path = get_config_path()
+            if config_path.exists():
+                cfg = fast_safe_load(config_path.read_text(encoding="utf-8")) or {}
+                providers = cfg.get("providers") or {}
+                if isinstance(providers, dict):
+                    for pcfg in providers.values():
+                        if not isinstance(pcfg, dict):
+                            continue
+                        if not pcfg.get("anthropic_signature_passthrough"):
+                            continue
+                        url = _normalize_base_url_text(pcfg.get("base_url"))
+                        if url:
+                            urls.add(url.rstrip("/").lower())
+        except Exception:
+            # Fail closed: an unreadable config means no endpoint is trusted,
+            # which preserves the pre-flag stripping behaviour.
+            logger.debug("signature-passthrough config read failed", exc_info=True)
+        _signature_passthrough_urls_cache = frozenset(urls)
+    return _signature_passthrough_urls_cache
+
+
+def _is_signature_passthrough_endpoint(base_url: str | None) -> bool:
+    """Return True when *base_url* is a trusted Anthropic signature passthrough.
+
+    Trusted endpoints keep the direct-Anthropic thinking replay contract in
+    :func:`_manage_thinking_signatures` (latest assistant turn keeps its signed
+    thinking) even though :func:`_is_third_party_anthropic_endpoint` classifies
+    them as third-party for auth purposes.
+    """
+    normalized = _normalize_base_url_text(base_url)
+    if not normalized:
+        return False
+    return normalized.rstrip("/").lower() in _get_signature_passthrough_urls()
+
+
 def _is_kimi_coding_endpoint(base_url: str | None) -> bool:
     """Return True for Kimi's /coding endpoint that requires claude-code UA."""
     normalized = _normalize_base_url_text(base_url)
@@ -2292,10 +2347,19 @@ def _manage_thinking_signatures(
     replayed assistant tool-call messages.  See hermes-agent#13848 (Kimi) and
     hermes-agent#16748 (DeepSeek).
 
+    Exception: a provider marked ``anthropic_signature_passthrough: true``
+    (a proxy that forwards content blocks to real Anthropic verbatim, e.g. a
+    self-hosted Claude LB) keeps the direct-Anthropic contract — the latest
+    assistant turn retains its signed thinking so interleaved-thinking tool
+    loops keep their reasoning continuity instead of re-planning cold on
+    every tool result.
+
     Mutates ``result`` in place.
     """
     _THINKING_TYPES = frozenset(("thinking", "redacted_thinking"))
-    _is_third_party = _is_third_party_anthropic_endpoint(base_url)
+    _is_third_party = _is_third_party_anthropic_endpoint(
+        base_url
+    ) and not _is_signature_passthrough_endpoint(base_url)
 
     last_assistant_idx = None
     for i in range(len(result) - 1, -1, -1):
