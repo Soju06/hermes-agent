@@ -23,16 +23,45 @@ def _agent(**overrides):
 
 
 def test_runtime_route_block_reports_current_runtime_without_secrets():
+    """ADR-003 Phase 3c: identity is route + model. Raw provider/endpoint/
+    api-mode identifiers are operator data and never render (they remain in
+    the cache key so runtime changes still re-render)."""
     block = build_runtime_route_block(_agent())
 
     assert "# Runtime/Route State" in block
-    assert "CurrentRuntime: provider=codex-nekos model=gpt-5.5 reasoning=high api=codex_responses endpoint=https://example.com/v1 source=pre_gateway_dispatch" in block
+    assert "model=gpt-5.5 reasoning=high source=pre_gateway_dispatch" in block
+    assert "provider=" not in block
+    assert "api=" not in block
+    assert "endpoint=" not in block
     assert "reasoning_source=pre_gateway_dispatch" in block
     assert "DesiredRoute: label=UNCLASSIFIED target=current" in block
     assert "model_status is diagnostic fallback only" in block
     assert "user:pass" not in block
     assert "api_key" not in block
     assert "secret" not in block
+    assert "example.com" not in block
+
+
+def test_runtime_route_block_renders_current_route_when_catalog_matches(monkeypatch):
+    monkeypatch.setattr(
+        "agent.runtime_control._route_status_info",
+        lambda agent: {"current": "SYSTEM_DEV", "available": []},
+    )
+
+    block = build_runtime_route_block(_agent())
+
+    assert "CurrentRuntime: route=SYSTEM_DEV model=gpt-5.5" in block
+
+
+def test_runtime_route_block_marks_off_catalog_runtime(monkeypatch):
+    monkeypatch.setattr(
+        "agent.runtime_control._route_status_info",
+        lambda agent: {"current": None, "available": [{"name": "dev"}]},
+    )
+
+    block = build_runtime_route_block(_agent())
+
+    assert "CurrentRuntime: route=off-catalog model=gpt-5.5" in block
 
 
 def test_runtime_route_block_desired_route_is_permanently_static():
