@@ -5084,6 +5084,10 @@ def _normalize_custom_provider_entry(
         "request_timeout_seconds", "stale_timeout_seconds",
         "discover_models", "extra_body", "extra_headers",
         "ssl_ca_cert", "ssl_verify",
+        # Trusted Anthropic passthrough proxy — read directly from config.yaml
+        # by agent/anthropic_adapter._get_signature_passthrough_urls (thinking
+        # signature replay trust), not from the normalized runtime entry.
+        "anthropic_signature_passthrough",
     }
     for camel, snake in _CAMEL_ALIASES.items():
         if camel in entry and snake not in entry:
