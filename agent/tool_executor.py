@@ -1288,15 +1288,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl(function_name, function_args, tool_duration, result=function_result)}")
         elif function_name == "model_switch":
-            from agent.runtime_control import model_switch as _model_switch
-            function_result = _model_switch(
-                agent,
-                model=function_args.get("model"),
-                provider=function_args.get("provider"),
-                reasoning_effort=function_args.get("reasoning_effort"),
-                scope=function_args.get("scope", "turn"),
-                reason=function_args.get("reason"),
-            )
+            from agent.runtime_control import dispatch_model_switch as _dispatch_model_switch
+            function_result = _dispatch_model_switch(agent, function_args)
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl(function_name, function_args, tool_duration, result=function_result)}")
