@@ -124,7 +124,12 @@ _KNOWN_PROVIDER_KEYS = {
     "context_length", "rate_limit_delay", "request_timeout_seconds", "stale_timeout_seconds",
     "discover_models", "extra_body", "extra_headers", "capabilities", "ssl_ca_cert", "ssl_verify",
     "catalog_provider", "session_affinity_header",
-    "gemini_api"}  # read by the gemini provider plugin (which Gemini API a model's calls use)
+    "gemini_api",  # read by the gemini provider plugin (which Gemini API a model's calls use)
+    # Trusted Anthropic passthrough proxy — read directly from config.yaml
+    # by agent/anthropic_thinking_policy._get_signature_passthrough_urls (thinking
+    # signature replay trust), not from the normalized runtime entry.
+    "anthropic_signature_passthrough",
+}
 
 
 def _pick_provider_base_url(entry: dict[str, Any], provider_key: str) -> str:
