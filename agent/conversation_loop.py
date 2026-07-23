@@ -3303,8 +3303,20 @@ def _run_conversation_impl(
                     _retry.thinking_sig_retry_attempted = True
                     _api_stripped = 0
                     for _m in api_messages:
-                        if isinstance(_m, dict) and "reasoning_details" in _m:
-                            _m.pop("reasoning_details", None)
+                        if not isinstance(_m, dict):
+                            continue
+                        # Strip BOTH thinking replay channels. The ordered
+                        # interleaved-thinking channel (anthropic_content_blocks)
+                        # takes precedence over reasoning_details in
+                        # _convert_assistant_message — popping only the latter
+                        # leaves signed thinking on the wire and the retry hits
+                        # the same 400.
+                        _had = ("reasoning_details" in _m) or (
+                            "anthropic_content_blocks" in _m
+                        )
+                        _m.pop("reasoning_details", None)
+                        _m.pop("anthropic_content_blocks", None)
+                        if _had:
                             _api_stripped += 1
                     agent._vprint(
                         f"{agent.log_prefix}⚠️  Thinking block signature invalid, "
