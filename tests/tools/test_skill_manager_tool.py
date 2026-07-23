@@ -1574,3 +1574,40 @@ def test_index_desc_limit_sets_the_skill_manage_description_budget(tmp_path, mon
     created = json.loads(skill_manage(action="create", name="market-data", content=content))
     assert created["success"] is True, created
     assert "max 160 chars" in schema_desc()
+
+
+# ---------------------------------------------------------------------------
+# Schema: structured write rationale (`reason`)
+# ---------------------------------------------------------------------------
+
+
+def test_skill_manage_schema_declares_structured_reason():
+    """The tool schema must advertise the `reason` rationale contract.
+
+    The skills admission gate (ADR-004 §② — deployed as an external plugin)
+    hard-requires a structured JSON rationale on create/edit/patch. Without
+    this property, schema-following models cannot discover the contract and
+    only learn it through blocked-call retry loops. The field list here is
+    pinned so plugin-side contract drift is at least caught as a failing
+    docs expectation on the core side.
+    """
+    from tools.skill_manager_tool import SKILL_MANAGE_SCHEMA
+
+    props = SKILL_MANAGE_SCHEMA["parameters"]["properties"]
+    assert "reason" in props
+    description = props["reason"]["description"]
+    for field in (
+        "claim_kind",
+        "execution_evidence",
+        "evidence_pointer",
+        "why_not_note",
+        "target",
+        "neighbor_skills_checked",
+    ):
+        assert field in description, field
+    # `reason` must stay OPTIONAL at the schema level: only create/edit/patch
+    # are gated, and enforcement belongs to the gate (fail-closed plugin),
+    # not to JSON-Schema `required`. Upstream's advertised call shape is the
+    # `operations` array (the flat action/name shape is accepted, not advertised).
+    assert SKILL_MANAGE_SCHEMA["parameters"]["required"] == ["operations"]
+    assert "reason" not in SKILL_MANAGE_SCHEMA["parameters"]["required"]
