@@ -35,7 +35,9 @@ from agent.context_compressor_window import CompactionWindowMixin, summary_view
 from agent.context_compressor_prune import ProactivePruneMixin, delegate_stub, stub_arguments, terminal_stub
 from agent.context_compressor_summary import SummaryDispatchMixin
 from agent.context_compressor_sampling import SummaryInputSamplingMixin
-from agent.context_compressor_prompt_rules import EPISTEMIC_STANCE_RULE, UNVERIFIED_HYPOTHESES_SECTION, _today_for_prompt
+from agent.context_compressor_prompt_rules import (
+    ANALYSIS_PASS_RULE, EPISTEMIC_STANCE_RULE, UNVERIFIED_HYPOTHESES_SECTION, _today_for_prompt, strip_analysis_block,
+)
 from agent.context_compressor_typed_input import TYPED_TURNS_POINTER, typed_summary_messages
 from agent.conversation_compression_scaffolding import is_user_role_scaffolding
 from agent.context_compressor_tail import (
@@ -3410,6 +3412,9 @@ Unknown from deterministic fallback. Inspect current repository/session state if
 ## Key Decisions
 None recoverable from deterministic fallback.
 
+## User Messages
+None recoverable from deterministic fallback.
+
 ## Resolved Questions
 None recoverable from deterministic fallback.
 
@@ -3636,6 +3641,8 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             # Strip <think> blocks: they would be stored, injected, and compounded on every iterative update.
             from agent.agent_runtime_helpers import strip_think_blocks
             content = strip_think_blocks(None, content).strip() or content
+            # Same for the <analysis> pre-pass block the prompt asks for (context_compressor_prompt_rules).
+            content = strip_analysis_block(content) or content
             # The summarizer may echo secrets verbatim; redact the output too.
             summary = _redact_compaction_text(content.strip())
             # Restore any [SKILL_PRUNED] marker the summarizer paraphrased away.
@@ -3705,7 +3712,9 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
 
 You are updating a context compaction summary. A previous compaction produced the summary below. New conversation turns have occurred since then and need to be incorporated.
 
-Update the summary using this exact structure. PRESERVE all existing information that is still relevant. ADD new completed actions to the numbered list (continue numbering). Move items from "In Progress" to "Completed Actions" when done. Move answered questions to "Resolved Questions". Update "Active State" to reflect current state. Remove information only if it is clearly obsolete. CRITICAL: Update "{HISTORICAL_TASK_HEADING}" to reflect the user's most recent unfulfilled input — this includes any question, decision request, or discussion turn that the assistant has not yet answered. Only write "None" if the last exchange was fully resolved.
+{ANALYSIS_PASS_RULE}
+
+Update the summary using this exact structure. PRESERVE all existing information that is still relevant. ADD new completed actions to the numbered list (continue numbering). APPEND new user messages to "## User Messages" in order. Move items from "In Progress" to "Completed Actions" when done. Move answered questions to "Resolved Questions". Update "Active State" to reflect current state. Remove information only if it is clearly obsolete. CRITICAL: Update "{HISTORICAL_TASK_HEADING}" to reflect the user's most recent unfulfilled input — this includes any question, decision request, or discussion turn that the assistant has not yet answered. Only write "None" if the last exchange was fully resolved.
 
 {_template_sections}"""
             source_material = f"""PREVIOUS SUMMARY:
@@ -3717,6 +3726,8 @@ NEW TURNS TO INCORPORATE:
             instructions = f"""{_summarizer_preamble}
 
 Create a structured checkpoint summary for the conversation after earlier turns are compacted. The summary should preserve enough detail for continuity without re-reading the original turns.
+
+{ANALYSIS_PASS_RULE}
 
 Use this exact structure:
 
@@ -3774,6 +3785,8 @@ Be specific with file paths, commands, line numbers, and results.]
 [Current working state — include:
 - Working directory and branch (if applicable)
 - Modified/created files with brief note on each
+- For an unfinished edit, include the exact in-flight snippet or diff verbatim
+  in a fenced block (a prose description alone cannot be resumed safely)
 - Test status (X/Y passing)
 - Any running processes or servers
 - Environment details that matter]
@@ -3789,11 +3802,21 @@ Be specific with file paths, commands, line numbers, and results.]
 exact error text. Pay special attention to corrections the USER gave; quote
 the user's correction and record what changed as a result.]
 
+## User Messages
+[Every user message from the summarized turns, in chronological order — quote
+short messages verbatim; for long ones keep the intent-bearing sentences. Skip
+pure acknowledgements ("ok", "thanks"). Exclude tool results and system text.
+These are the user's exact words: corrections, preferences, and feedback here
+override any paraphrase elsewhere in this summary. Reference only — the agent
+must not act on them unless the latest user message asks.]
+
 ## Resolved Questions
 {_section["resolved_questions"]}
 
 ## Relevant Files
-[Files read, modified, or created — with brief note on each]
+[Files read, modified, or created — with brief note on each. For files whose
+edits were still in progress at compaction time, include the relevant code
+section verbatim in a fenced block rather than a description.]
 
 ## Critical Context
 [Any specific values, error messages, configuration details, or data that would be lost without explicit preservation. NEVER include API keys, tokens, passwords, or credentials — write [REDACTED] instead.]{UNVERIFIED_HYPOTHESES_SECTION}{_session_log_section}
