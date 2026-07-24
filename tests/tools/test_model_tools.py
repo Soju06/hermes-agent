@@ -8,8 +8,47 @@ import pytest
 
 from model_tools import (
     handle_function_call,
+    get_tool_definitions,
     _AGENT_LOOP_TOOLS,
 )
+
+
+# =========================================================================
+# disabled_toolsets accepts individual tool names
+# =========================================================================
+
+class TestDisabledToolsetsAcceptsToolNames:
+    def _names(self, disabled=None):
+        return {
+            t["function"]["name"]
+            for t in get_tool_definitions(disabled_toolsets=disabled, quiet_mode=True)
+        }
+
+    def test_single_tool_name_is_removed(self):
+        base = self._names()
+        assert "text_to_speech" in base, "precondition: tts registered in default surface"
+        after = self._names(["text_to_speech"])
+        assert "text_to_speech" not in after
+        # Only that one tool leaves; everything else stays.
+        assert base - after == {"text_to_speech"}
+
+    def test_multiple_tool_names_removed(self):
+        after = self._names(["text_to_speech", "memory_propose"])
+        assert "text_to_speech" not in after
+        assert "memory_propose" not in after
+
+    def test_unknown_name_is_graceful_noop(self):
+        base = self._names()
+        after = self._names(["definitely_not_a_real_tool_or_toolset"])
+        assert after == base
+
+    def test_toolset_name_still_takes_precedence_over_tool_name(self):
+        # `memory` is BOTH a toolset and a tool. The toolset match must win,
+        # removing the whole bundle (memory + notes_write + notes_read + …),
+        # never just the single `memory` tool.
+        after = self._names(["memory"])
+        assert "memory" not in after
+        assert "notes_read" not in after, "toolset subtraction should remove the bundle"
 
 
 # =========================================================================

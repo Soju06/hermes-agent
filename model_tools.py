@@ -321,9 +321,24 @@ def _apply_toolset_selection(tools: set, names: list[str], quiet_mode: bool, *, 
         elif name in _LEGACY_TOOLSET_MAP:
             label = f"{verb} legacy toolset"
             resolved = _LEGACY_TOOLSET_MAP[name]
+        elif disable and registry.get_entry(name) is not None:
+            # Not a toolset — but a registered tool name. Subtract the single
+            # tool. This lets `disabled_toolsets` turn off an individual tool
+            # (e.g. `text_to_speech`, a browser action) without having to own
+            # a one-tool toolset. Toolset names are matched first above, so a
+            # name that is BOTH a toolset and a tool (e.g. `memory`, `todo_list`)
+            # always resolves as the toolset; disable such a tool by its
+            # toolset. Because every surface (CLI, gateway, cron, delegate
+            # children, the tool_search bridge scope) already threads
+            # `disabled_toolsets` through this one choke point, a tool
+            # disabled here can never be resurrected by tool_search.
+            tools.discard(name)
+            if not quiet_mode:
+                print(f"🚫 Disabled tool '{name}'")
+            continue
         else:
             if not quiet_mode:
-                print(f"⚠️  Unknown toolset: {name}")
+                print(f"⚠️  Unknown toolset or tool: {name}" if disable else f"⚠️  Unknown toolset: {name}")
             continue
         (tools.difference_update if disable else tools.update)(resolved)
         if not quiet_mode:
