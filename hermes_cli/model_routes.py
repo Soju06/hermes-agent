@@ -59,14 +59,14 @@ _HEALTH_ENV = "HERMES_MODEL_ROUTES_HEALTH"
 _HEALTH_TEST_ENV = "HERMES_MODEL_ROUTES_HEALTH_TEST"
 
 _SECTION_KEYS = {"routes", "health", "static_rules", "router"}
-_ROUTE_KEYS = {"description", "provider", "model", "reasoning_effort", "accepted", "fallbacks"}
+_ROUTE_KEYS = {"description", "provider", "model", "reasoning_effort", "accepted", "fallbacks", "repromote_after_turns"}
 _FALLBACK_KEYS = {"provider", "model", "reasoning_effort"}
 _HEALTH_KEYS = {"enabled", "cache_path", "ok_ttl_seconds", "fail_ttl_seconds", "probe_timeout_seconds"}
 _HEALTH_NUMERIC_KEYS = ("ok_ttl_seconds", "fail_ttl_seconds", "probe_timeout_seconds")
 _RULE_KEYS = {"name", "route", "when", "reason"}
 _ROUTER_KEYS = {
     "mode", "model", "timeout_ms", "recent_turns", "normal_downgrade_streak",
-    "chat_route", "label_routes", "decision_log",
+    "repromote_after_turns", "chat_route", "label_routes", "decision_log",
 }
 _ROUTER_MODES = ("off", "shadow", "enforce")
 # Classifier labels that may map to a route. NORMAL is not mappable — its
@@ -97,6 +97,8 @@ class RouteSpec:
     reasoning_effort: str = ""  # "" = unspecified
     accepted: Tuple[str, ...] = ()  # model ids; empty → legacy membership
     fallbacks: Tuple["FallbackSpec", ...] = ()
+    # None = inherit router.repromote_after_turns; <= 0 disables for this route.
+    repromote_after_turns: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -122,6 +124,7 @@ class RouterConfig:
     timeout_ms: float = 8000.0
     recent_turns: int = 5
     normal_downgrade_streak: int = 3
+    repromote_after_turns: int = 3  # noop turns on a non-primary member before re-promotion; <= 0 disables
     chat_route: str = ""  # NORMAL downgrade target; "" = downgrades disabled
     label_routes: Tuple[Tuple[str, str], ...] = ()  # (label, route-name) pairs
     decision_log: str = ""  # "" → get_hermes_home()/logs/model_router_decisions.jsonl
@@ -458,6 +461,24 @@ def _parse_route(
                 parsed.append(fb)
             fallbacks = tuple(parsed)
 
+    repromote_after_turns: Optional[int] = None
+    raw_repromote = entry.get("repromote_after_turns")
+    if raw_repromote is not None:
+        # Deliberately NOT the shared numeric validation: an explicit 0 is
+        # meaningful (disables re-promotion for this route) and a bad value
+        # is a warning, never an error — a tuning-key typo must not drop the
+        # whole route from the catalog.
+        if isinstance(raw_repromote, int) and not isinstance(raw_repromote, bool) and raw_repromote >= 0:
+            repromote_after_turns = raw_repromote
+        else:
+            issues.append(ConfigIssue(
+                "warning",
+                f"{prefix}: repromote_after_turns must be an integer >= 0 "
+                f"(got {raw_repromote!r}) — router default inherited",
+                "Use 0 to disable re-promotion for this route, or omit to inherit "
+                "router.repromote_after_turns",
+            ))
+
     if has_error:
         return None
     return RouteSpec(
@@ -468,6 +489,7 @@ def _parse_route(
         reasoning_effort=effort,
         accepted=accepted,
         fallbacks=fallbacks,
+        repromote_after_turns=repromote_after_turns,
     )
 
 
@@ -712,6 +734,22 @@ def _parse_router(
                 "warning",
                 f"model_routes: router.{key} must be a number > 0 ({value!r}) — default used",
                 f"Example: {key}: {getattr(RouterConfig(), key)}",
+            ))
+
+    if "repromote_after_turns" in raw:
+        value = raw["repromote_after_turns"]
+        # Not in _ROUTER_NUMERIC_KEYS: that loop requires > 0, but an explicit
+        # 0 is meaningful here (disables re-promotion) and must not silently
+        # warn+default back to enabled.
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            kwargs["repromote_after_turns"] = value
+        else:
+            issues.append(ConfigIssue(
+                "warning",
+                f"model_routes: router.repromote_after_turns must be an integer >= 0 "
+                f"({value!r}) — default used",
+                f"Example: repromote_after_turns: {RouterConfig().repromote_after_turns} "
+                "(0 disables re-promotion)",
             ))
 
     valid_names = {_norm(name) for name in routes}
