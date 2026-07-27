@@ -2016,6 +2016,10 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
                 continue
             old_model, old_provider = bound
             fb_model = agent.model  # normalized by the binder
+            # Record WHY the fallback activated so plugins (e.g. capability gates) can distinguish
+            # a refusal-driven temporary swap from any other fallback state. Only set on the
+            # success path — exhaustion and skip paths must not leave a stale reason behind.
+            agent._fallback_reason = reason.value if reason is not None else None
             rewrite_prompt_model_identity(agent, fb_model, fb_provider)
 
             notice = (
@@ -2035,6 +2039,16 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
             # The stale-call streak measured the OLD provider; carrying it over would
             # short-circuit the fresh fallback before its first stream attempt.
             _reset_stale_streak(agent)
+            # Publish the mid-turn swap on the runtime_state hook so guardrail plugins (skill-gate)
+            # see the new model/provider + fallback_reason immediately. Best-effort: activation must
+            # never fail because a plugin hook failed. Local import — runtime_control is core-owned
+            # and pulling it at module scope risks an import cycle.
+            try:
+                from agent.runtime_control import _emit_runtime_state_event, get_runtime_state
+
+                _emit_runtime_state_event(agent, event="fallback", state=get_runtime_state(agent))
+            except Exception as _hook_err:
+                logger.debug("runtime_state fallback event failed: %s", _hook_err)
             from agent.native_compaction import resolve_native_compaction_capabilities
             agent.runtime_capabilities = resolve_native_compaction_capabilities(
                 model=agent.model, base_url=agent.base_url, provider=fb_provider, is_codex_backend=fb_provider == "openai-codex")

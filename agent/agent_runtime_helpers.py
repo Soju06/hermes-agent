@@ -1031,6 +1031,15 @@ def restore_primary_runtime(agent) -> bool:
         if provider_fallback_active:
             from agent.fallback_notice import announce_primary_restored
             announce_primary_restored(agent, previous_model, previous_provider)
+        # Publish the restore on the runtime_state hook so guardrail plugins (skill-gate) drop the
+        # fallback_reason from their cache when the primary returns. Best-effort — restore must
+        # not fail on a hook.
+        try:
+            from agent.runtime_control import _emit_runtime_state_event, get_runtime_state
+
+            _emit_runtime_state_event(agent, event="restore", state=get_runtime_state(agent))
+        except Exception as _hook_err:
+            logger.debug("runtime_state restore event failed: %s", _hook_err)
         return True
     except Exception as e:
         logger.warning("Failed to restore primary runtime: %s", e)
@@ -1933,6 +1942,7 @@ def _finish_switch(agent, new_provider, old_norm, new_norm) -> None:
     agent._provider_fallback_route = None
     agent._fallback_index = 0
     agent._credential_pool_revert_id = None
+    agent._fallback_reason = None
     # On a deliberate provider swap, prune fallback entries targeting the OLD or NEW primary;
     # otherwise a failed turn silently re-activates the provider the user just rejected.
     fallback_chain = list(getattr(agent, "_fallback_chain", []) or [])

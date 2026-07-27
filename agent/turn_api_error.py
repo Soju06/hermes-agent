@@ -391,6 +391,7 @@ def settle_unrecovered_error(
             _retry.has_retried_429 = False
             agent._fallback_index = 0
             agent._fallback_activated = False
+            agent._fallback_reason = None
             return _verdict("continue")
         if agent._has_pending_fallback():
             agent._buffer_diagnostic_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
