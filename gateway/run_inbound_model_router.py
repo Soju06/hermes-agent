@@ -176,9 +176,9 @@ class GatewayInboundModelRouterMixin:
         resolution — but NEVER applies a directive. Its only writes are the runner-owned streak dict
         and the decision log, so it can soak alongside a live skill-gate plugin without interfering.
 
-        enforce: applies ``switch``/``downgrade_to_chat`` directives the same way /model does
-        (session override + store persist + agent eviction), and stamps ``applied: true/false`` on
-        every decision record.
+        enforce: applies ``switch``/``downgrade_to_chat``/``repromote_to_primary`` directives the
+        same way /model does (session override + store persist + agent eviction), and stamps
+        ``applied: true/false`` on every decision record.
         """
         from gateway import model_router as _model_router
         from gateway.config import Platform
@@ -223,7 +223,7 @@ class GatewayInboundModelRouterMixin:
                 _model_router.static_rule_decision,
                 rule=rule, rule_name=rule_name, text=raw_text,
                 session_key=_model_router._session_key(self.session_store, event),
-                runtime=runtime, cfg=cfg, catalog=catalog, mode=mode,
+                runtime=runtime, cfg=cfg, catalog=catalog, router=catalog.router, mode=mode, state=state,
             )
         else:
             # (4) The classifier is a blocking urllib call (up to timeout_ms) — keep the event loop free.
@@ -238,7 +238,11 @@ class GatewayInboundModelRouterMixin:
             # Log fidelity: every enforce-mode record carries applied true/false (false when nothing
             # was applied, switch_model failed, or the apply raised). Shadow records never carry it.
             decision.record["applied"] = False
-        if mode == "enforce" and directive and decision.outcome in ("switch", "downgrade_to_chat"):
+        if (
+            mode == "enforce"
+            and directive
+            and decision.outcome in ("switch", "downgrade_to_chat", "repromote_to_primary")
+        ):
             reasoning_effort = str(directive.get("reasoning_effort") or "")
             try:
                 applied, reasoning_applied = await self._apply_model_router_directive(
