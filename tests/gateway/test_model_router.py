@@ -465,6 +465,294 @@ def test_decision_record_schema():
 
 
 # ---------------------------------------------------------------------------
+# Re-promotion hysteresis (member → route primary)
+# ---------------------------------------------------------------------------
+
+
+def _member_cfg(*, router=None, static_rules=None):
+    """_cfg with non-primary accepted members: model-alt on dev, grok-x on chat."""
+    cfg = _cfg(router=router, static_rules=static_rules)
+    cfg["model_routes"]["routes"]["dev"]["accepted"] = ["model-a", "model-alt"]
+    cfg["model_routes"]["routes"]["chat"]["accepted"] = ["model-b", "grok-x"]
+    return cfg
+
+
+_MEMBER_RUNTIME = {"model": "model-alt", "provider": "p1"}
+
+
+def test_repromote_streak_advances_and_emits_at_threshold():
+    state = {}
+    cfg = _member_cfg()
+    outcomes = []
+    for _ in range(3):
+        decision = _evaluate(
+            complete_dev=_complete("SYSTEM_DEV"), state=state, cfg=cfg, runtime=_MEMBER_RUNTIME,
+        )
+        outcomes.append(decision.outcome)
+    assert outcomes == [
+        "noop_satisfied_repromote_1_of_3",
+        "noop_satisfied_repromote_2_of_3",
+        "repromote_to_primary",
+    ]
+    assert decision.directive["route"] == "dev"
+    assert decision.directive["model"] == "model-a"
+    assert decision.directive["reason"] == (
+        "repromote to route primary after 3 accepted-member turns (model-alt -> model-a)"
+    )
+    assert set(decision.record) == EXPECTED_RECORD_FIELDS
+    # Emission resets even in shadow (shared state, never applied) — the
+    # next member noop starts a fresh streak instead of re-emitting.
+    assert state["tg:c1"]["repromote_streak"] == 0
+    decision = _evaluate(
+        complete_dev=_complete("SYSTEM_DEV"), state=state, cfg=cfg, runtime=_MEMBER_RUNTIME,
+    )
+    assert decision.outcome == "noop_satisfied_repromote_1_of_3"
+
+
+def test_repromote_fallback_label_never_advances():
+    # Classifier-path trust gate: a regex-fallback dev label during an outage
+    # must not walk the session toward a swap (mirror of the normal_streak rule).
+    state = {}
+
+    def _boom(prompt):
+        raise TimeoutError("classifier down")
+
+    cfg = _member_cfg()
+    for _ in range(5):
+        decision = _evaluate(
+            text="gateway 고장났어 디버깅해줘", complete_dev=_boom,
+            state=state, cfg=cfg, runtime=_MEMBER_RUNTIME,
+        )
+        assert decision.outcome == "noop_satisfied"
+        assert decision.record["source"] == "fallback"
+    assert state["tg:c1"].get("repromote_streak", 0) == 0
+
+
+def test_repromote_static_noop_always_advances(monkeypatch):
+    # Static labels are deterministic — no trust gate on that path.
+    rules = [{"name": "pin", "route": "dev", "when": {"text_matches_any": ["codex-lb"]}}]
+    cfg = _member_cfg(static_rules=rules)
+    sentinel = MagicMock(side_effect=AssertionError("classifier must not run"))
+    monkeypatch.setattr(mr_mod, "_call_gemini", sentinel)
+    state = {}
+    outcomes = [
+        _evaluate(text="codex-lb 확인해줘", cfg=cfg, runtime=_MEMBER_RUNTIME, state=state).outcome
+        for _ in range(3)
+    ]
+    sentinel.assert_not_called()
+    assert outcomes == [
+        "noop_satisfied_repromote_1_of_3",
+        "noop_satisfied_repromote_2_of_3",
+        "repromote_to_primary",
+    ]
+
+
+def test_repromote_streak_shared_across_static_and_classifier_paths():
+    rules = [{"name": "pin", "route": "dev", "when": {"text_matches_any": ["codex-lb"]}}]
+    cfg = _member_cfg(static_rules=rules)
+    state = {}
+    for _ in range(2):
+        _evaluate(text="codex-lb 확인해줘", cfg=cfg, runtime=_MEMBER_RUNTIME, state=state)
+    # Same session, same route: the classifier path continues the streak.
+    decision = _evaluate(
+        complete_dev=_complete("SYSTEM_DEV"), cfg=cfg, runtime=_MEMBER_RUNTIME, state=state,
+    )
+    assert decision.outcome == "repromote_to_primary"
+
+
+def test_repromote_resets_on_primary_runtime():
+    cfg = _member_cfg()
+    state = {}
+    for _ in range(2):
+        _evaluate(complete_dev=_complete("SYSTEM_DEV"), state=state, cfg=cfg, runtime=_MEMBER_RUNTIME)
+    assert state["tg:c1"]["repromote_streak"] == 2
+    decision = _evaluate(
+        complete_dev=_complete("SYSTEM_DEV"), state=state, cfg=cfg,
+        runtime={"model": "model-a", "provider": "p1"},
+    )
+    assert decision.outcome == "noop_satisfied"  # on-primary noop stays plain
+    assert state["tg:c1"]["repromote_streak"] == 0
+    decision = _evaluate(complete_dev=_complete("SYSTEM_DEV"), state=state, cfg=cfg, runtime=_MEMBER_RUNTIME)
+    assert decision.outcome == "noop_satisfied_repromote_1_of_3"
+
+
+def test_repromote_route_change_resets_then_advances():
+    cfg = _member_cfg()
+    cfg["model_routes"]["routes"]["doc"] = {
+        "description": "doc route", "provider": "p1", "model": "model-d",
+        "accepted": ["model-alt", "model-d"],
+    }
+    cfg["model_routes"]["router"]["label_routes"] = {
+        "SYSTEM_DEV": "dev", "FRONTEND_DEV": "dev", "DOCUMENT_WORK": "doc",
+    }
+    state = {}
+    for _ in range(2):
+        _evaluate(complete_dev=_complete("SYSTEM_DEV"), state=state, cfg=cfg, runtime=_MEMBER_RUNTIME)
+    assert state["tg:c1"] == {"normal_streak": 0, "repromote_streak": 2, "repromote_route": "dev"}
+    decision = _evaluate(
+        complete_dev=_complete("DOCUMENT_WORK"), state=state, cfg=cfg, runtime=_MEMBER_RUNTIME,
+    )
+    assert decision.outcome == "noop_satisfied_repromote_1_of_3"
+    assert state["tg:c1"]["repromote_route"] == "doc"
+    assert state["tg:c1"]["repromote_streak"] == 1
+
+
+def test_repromote_resets_on_any_emission():
+    cfg = _member_cfg()
+    # switch resets: streak 2 on dev, then a dev label from a non-member runtime.
+    state = {}
+    for _ in range(2):
+        _evaluate(complete_dev=_complete("SYSTEM_DEV"), state=state, cfg=cfg, runtime=_MEMBER_RUNTIME)
+    decision = _evaluate(
+        complete_dev=_complete("SYSTEM_DEV"), state=state, cfg=cfg,
+        runtime={"model": "model-z", "provider": "p1"},
+    )
+    assert decision.outcome == "switch"
+    assert state["tg:c1"]["repromote_streak"] == 0
+    assert state["tg:c1"]["repromote_route"] == ""
+
+    # downgrade_to_chat resets too.
+    state = {}
+    for _ in range(2):
+        _evaluate(complete_dev=_complete("SYSTEM_DEV"), state=state, cfg=cfg, runtime=_MEMBER_RUNTIME)
+    for expected in ("normal_streak_1_of_3", "normal_streak_2_of_3", "downgrade_to_chat"):
+        decision = _evaluate(complete_dev=_complete("NORMAL"), state=state, cfg=cfg, runtime=_MEMBER_RUNTIME)
+        assert decision.outcome == expected
+    assert state["tg:c1"]["repromote_streak"] == 0
+
+
+def test_repromote_held_when_primary_unhealthy(monkeypatch):
+    cfg = _member_cfg()
+    state = {}
+    unhealthy = {
+        "route": "dev", "provider": "p2", "model": "model-b",
+        "reasoning_effort": "", "source": "fallback:1",
+        "reason": "failover — p1 unhealthy (HTTP 500)",
+    }
+    monkeypatch.setattr(mr_mod, "_resolve_route_directive", lambda *a, **k: dict(unhealthy))
+    outcomes = [
+        _evaluate(complete_dev=_complete("SYSTEM_DEV"), state=state, cfg=cfg, runtime=_MEMBER_RUNTIME).outcome
+        for _ in range(4)
+    ]
+    assert outcomes == [
+        "noop_satisfied_repromote_1_of_3",
+        "noop_satisfied_repromote_2_of_3",
+        "repromote_held",
+        "repromote_held",  # streak held clamped at threshold, retried per turn
+    ]
+    assert state["tg:c1"]["repromote_streak"] == 3
+
+    # Primary heals → re-promotion on the very next turn.
+    healthy = {
+        "route": "dev", "provider": "p1", "model": "model-a",
+        "reasoning_effort": "xhigh", "source": "default", "reason": "dev",
+    }
+    monkeypatch.setattr(mr_mod, "_resolve_route_directive", lambda *a, **k: dict(healthy))
+    decision = _evaluate(complete_dev=_complete("SYSTEM_DEV"), state=state, cfg=cfg, runtime=_MEMBER_RUNTIME)
+    assert decision.outcome == "repromote_to_primary"
+    assert decision.directive["model"] == "model-a"
+
+
+def test_repromote_held_when_resolution_matches_runtime(monkeypatch):
+    # A default-source resolution that lands on the runtime's own model must
+    # not emit a self-switch — held, same as an unhealthy primary.
+    cfg = _member_cfg()
+    state = {"tg:c1": {"normal_streak": 0, "repromote_streak": 2, "repromote_route": "dev"}}
+    same = {
+        "route": "dev", "provider": "p1", "model": "model-alt",
+        "reasoning_effort": "", "source": "default", "reason": "dev",
+    }
+    monkeypatch.setattr(mr_mod, "_resolve_route_directive", lambda *a, **k: dict(same))
+    decision = _evaluate(complete_dev=_complete("SYSTEM_DEV"), state=state, cfg=cfg, runtime=_MEMBER_RUNTIME)
+    assert decision.outcome == "repromote_held"
+    assert decision.directive is None
+
+
+def test_repromote_chat_member_via_noop_already_chat():
+    # CHAT parity: a session parked on a non-primary chat member re-promotes
+    # to the chat primary through the noop_already_chat branch.
+    cfg = _member_cfg()
+    state = {}
+    runtime = {"model": "grok-x", "provider": "p2"}
+    outcomes = []
+    for _ in range(3):
+        decision = _evaluate(complete_dev=_complete("NORMAL"), state=state, cfg=cfg, runtime=runtime)
+        outcomes.append(decision.outcome)
+    assert outcomes == [
+        "noop_satisfied_repromote_1_of_3",
+        "noop_satisfied_repromote_2_of_3",
+        "repromote_to_primary",
+    ]
+    assert decision.directive["route"] == "chat"
+    assert decision.directive["model"] == "model-b"
+    assert decision.directive["reason"] == (
+        "repromote to route primary after 3 accepted-member turns (grok-x -> model-b)"
+    )
+    # normal_streak advanced independently — the counters never interact.
+    assert state["tg:c1"]["normal_streak"] == 3
+    assert state["tg:c1"]["repromote_streak"] == 0
+
+
+def test_repromote_chat_plain_outcomes_untouched():
+    cfg = _member_cfg()
+    # On the chat primary: plain noop_already_chat, no streak.
+    state = {}
+    decision = _evaluate(
+        complete_dev=_complete("NORMAL"), cfg=cfg, state=state,
+        runtime={"model": "model-b", "provider": "p2"},
+    )
+    assert decision.outcome == "noop_already_chat"
+    assert state["tg:c1"].get("repromote_streak", 0) == 0
+
+    # Fallback-source NORMAL on a non-primary chat member: plain, no advance.
+    def _boom(prompt):
+        raise TimeoutError("down")
+
+    decision = _evaluate(
+        text="오늘 뭐 먹지?", complete_dev=_boom, cfg=cfg, state=state,
+        runtime={"model": "grok-x", "provider": "p2"},
+    )
+    assert decision.outcome == "noop_already_chat"
+    assert state["tg:c1"].get("repromote_streak", 0) == 0
+
+
+def test_repromote_disabled_by_zero_threshold():
+    # Route-level 0 disables regardless of the router default.
+    cfg = _member_cfg()
+    cfg["model_routes"]["routes"]["dev"]["repromote_after_turns"] = 0
+    state = {}
+    for _ in range(4):
+        decision = _evaluate(complete_dev=_complete("SYSTEM_DEV"), state=state, cfg=cfg, runtime=_MEMBER_RUNTIME)
+        assert decision.outcome == "noop_satisfied"
+    assert state["tg:c1"].get("repromote_streak", 0) == 0
+
+    # Router-level 0 disables every route without an override.
+    cfg = _member_cfg(router={"repromote_after_turns": 0})
+    state = {}
+    for _ in range(4):
+        decision = _evaluate(complete_dev=_complete("SYSTEM_DEV"), state=state, cfg=cfg, runtime=_MEMBER_RUNTIME)
+        assert decision.outcome == "noop_satisfied"
+
+
+def test_repromote_route_override_wins_over_router_value():
+    def _outcomes(cfg):
+        state = {}
+        return [
+            _evaluate(complete_dev=_complete("SYSTEM_DEV"), state=state, cfg=cfg, runtime=_MEMBER_RUNTIME).outcome
+            for _ in range(2)
+        ]
+
+    cfg = _member_cfg(router={"repromote_after_turns": 5})
+    cfg["model_routes"]["routes"]["dev"]["repromote_after_turns"] = 2
+    assert _outcomes(cfg) == ["noop_satisfied_repromote_1_of_2", "repromote_to_primary"]
+
+    # The override also re-enables under a disabled router default.
+    cfg = _member_cfg(router={"repromote_after_turns": 0})
+    cfg["model_routes"]["routes"]["dev"]["repromote_after_turns"] = 2
+    assert _outcomes(cfg) == ["noop_satisfied_repromote_1_of_2", "repromote_to_primary"]
+
+
+# ---------------------------------------------------------------------------
 # Static rules
 # ---------------------------------------------------------------------------
 
@@ -831,6 +1119,50 @@ def test_enforce_failed_switch_leaves_state_untouched(monkeypatch, tmp_path):
     assert record["outcome"] == "switch"
     assert record["applied"] is False
     assert record["reasoning_applied"] is False
+
+
+def test_enforce_mode_applies_repromote_directive(monkeypatch, tmp_path):
+    """The enforce gate applies repromote_to_primary like switch/downgrade —
+    only on the threshold turn, with pre-threshold noops left unapplied."""
+    from hermes_cli.model_switch import ModelSwitchResult
+
+    log_path = tmp_path / "decisions.jsonl"
+    monkeypatch.setenv("HERMES_MODEL_ROUTER_DECISION_LOG", str(log_path))
+    cfg = _cfg(router={"mode": "enforce"})
+    cfg["model_routes"]["routes"]["dev"]["accepted"] = ["model-a", "model-alt"]
+    runner = _make_runner(
+        monkeypatch, cfg, runtime=("model-alt", {"provider": "p1", "base_url": "https://p1.example/v1"}),
+    )
+    monkeypatch.setattr(
+        mr_mod, "_call_gemini",
+        lambda *a, **k: json.dumps({"evidence": "S5", "label": "SYSTEM_DEV", "confidence": 0.9}),
+    )
+    switch = MagicMock(return_value=ModelSwitchResult(
+        success=True,
+        new_model="model-a",
+        target_provider="p1",
+        api_key="sk-test",
+        base_url="https://p1.example/v1",
+        api_mode="chat_completions",
+    ))
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", switch)
+
+    for _ in range(3):
+        asyncio.run(
+            runner._model_router_stage(_event("gateway 버그 고쳐줘"), _source(), "tg:c1", mode="enforce")
+        )
+
+    switch.assert_called_once()  # only the threshold turn applies
+    assert runner._session_model_overrides["tg:c1"]["model"] == "model-a"
+    runner._evict_cached_agent.assert_called_once_with("tg:c1")
+    records = [json.loads(line) for line in log_path.read_text().splitlines()]
+    assert [r["outcome"] for r in records] == [
+        "noop_satisfied_repromote_1_of_3",
+        "noop_satisfied_repromote_2_of_3",
+        "repromote_to_primary",
+    ]
+    assert [r["applied"] for r in records] == [False, False, True]
+    assert set(records[-1]) == EXPECTED_RECORD_FIELDS | {"ts", "applied", "reasoning_applied"}
 
 
 def test_stage_slash_command_writes_no_log(monkeypatch, tmp_path):
