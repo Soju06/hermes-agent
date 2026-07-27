@@ -501,6 +501,31 @@ the v2026.7.20 base bump; old tip archived at `archive/pre-v20260722/prompt-cach
 - **commit:** `b1b7768f5 feat(skills): advertise the structured write rationale in the skill_manage schema`
 - **touches:** `tools/skill_manager_tool.py`, `tests/tools/test_skill_manager_tool.py`
 
+### 42. refusal-fallback-reason
+- **branch:** `soju/patches/refusal-fallback-reason`
+- **origin:** `local-author`
+- **upstream_pr:** _(none yet — pairs with the local skill-gate plugin's refusal exemption; upstreamable on its own)_
+- **state:** `local-only`
+- **rationale:** `try_activate_fallback(agent, reason)` received the `FailoverReason` but discarded it, so plugins could not distinguish a safety-refusal fallback (deterministic, content-scoped, restore-next-turn) from rate-limit/5xx failovers. Records `agent._fallback_reason` at the single activation success point, mirrors it at every `_fallback_activated` reset/copy site, exposes `fallback_activated`/`fallback_reason` in `get_runtime_state()`, emits `runtime_state` hook events at activation (`event="fallback"`) and restore (`event="restore"`), and passes the reason at the three conversation-loop refusal call sites (HTTP-200 `content_filter` branch, mid-stream content-filter stub, exception client-error branch → `classified.reason`). Enables the skill-gate refusal-fallback exemption so a refusal-driven claude-opus-5 fallback can perform dev edits for exactly that turn.
+- **commits:**
+  - `7ff801b40 feat(fallback): record activation reason and publish runtime_state events`
+  - `2154cfd8d test(fallback): cover fallback reason lifecycle and runtime_state hook`
+  - `504e77a68 test(fallback): behaviorally cover loop call-site reason forwarding and the transport-recovery reset`
+  - `4dfad5d5d fix(test): expect the content_policy_blocked reason in the codex content-filter fallback assertion`
+- **touches:** `agent/chat_completion_helpers.py`, `agent/runtime_control.py`, `agent/agent_init.py`, `agent/agent_runtime_helpers.py`, `agent/conversation_loop.py`, `tests/run_agent/test_refusal_fallback_reason.py` (new), `tests/run_agent/test_run_agent.py`
+
+### 43. route-repromote-hysteresis
+- **branch:** `soju/patches/route-repromote-hysteresis`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — depends on fork-only model-routing patch #34)_
+- **state:** `local-only`
+- **rationale:** Route `accepted` membership was absorbing: once a session landed on a non-primary accepted member (DOCUMENT_WORK on claude-opus-5, SYSTEM_DEV on gpt-5.6-sol after a health failover), every turn returned `noop_satisfied` and the route primary (claude-fable-5) was never re-promoted. Adds `repromote_after_turns` (router default 3, per-route override, ≤0 disables): after N trusted noop turns on a non-primary member, the router resolves the route and emits `repromote_to_primary` — only onto the healthy true primary (`source=="default"`), `repromote_held` otherwise with the streak clamped for fast recovery. Classifier path trust-gated to `source=="llm"` (regex-fallback labels are inert), static path always trusted; CHAT gets the same mechanism at `noop_already_chat`; `normal_streak` untouched.
+- **commits:**
+  - `e6107f471 feat(model-routes): add repromote_after_turns knob (router default + per-route override)`
+  - `1fd1ef6ea feat(gateway): re-promote sessions from accepted members to the route primary`
+  - `c4e74b3e8 test(gateway): cover route re-promotion hysteresis`
+- **touches:** `hermes_cli/model_routes.py`, `gateway/model_router.py`, `gateway/run.py`, `cli-config.yaml.example`, `tests/gateway/test_model_router.py`, `tests/hermes_cli/test_model_routes.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
