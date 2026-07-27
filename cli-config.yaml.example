@@ -274,6 +274,9 @@ model:
 #           reasoning_effort: xhigh    # (example) fallback effort is NOT inherited from the route
 #         - provider: glm-vooy
 #           model: grok-4.5
+#       repromote_after_turns: 3       # noop turns on a non-primary accepted member before the
+#                                      # session is re-promoted to the route primary; 0 disables,
+#                                      # omit to inherit router.repromote_after_turns
 #     chat:
 #       description: "Conversation, quick Q&A"
 #       provider: glm-vooy
@@ -305,6 +308,8 @@ model:
 #                                      # fallback decides (never triggers chat downgrades)
 #     recent_turns: 5                  # dialogue turns shown to the classifier
 #     normal_downgrade_streak: 3       # consecutive LLM NORMALs before the chat downgrade
+#     repromote_after_turns: 3         # noop turns on a non-primary accepted member before
+#                                      # re-promotion to the route primary; 0 disables
 #     chat_route: chat                 # NORMAL downgrade target; "" disables downgrades
 #     label_routes:                    # classifier label -> route; missing/"" = never switches
 #       SYSTEM_DEV: dev
