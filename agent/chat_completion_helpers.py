@@ -2403,6 +2403,33 @@ def _fallback_entry_key(fb: dict) -> tuple[str, str, str]:
     )
 
 
+_VALID_FALLBACK_API_MODES = (
+    "chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse",
+)
+
+
+def _declared_fallback_api_mode(fb: dict) -> str:
+    """Explicitly declared api_mode for a fallback chain entry, or "".
+
+    Checks the chain entry itself first (``hermes fallback`` stores an
+    optional ``api_mode``), then the named provider's config.yaml
+    ``providers.<name>.api_mode``. Unknown values are ignored so a config
+    typo degrades to the URL heuristics instead of a broken transport.
+    """
+    declared = str(fb.get("api_mode") or "").strip()
+    if not declared:
+        try:
+            from hermes_cli.config import load_config
+
+            providers_cfg = load_config().get("providers") or {}
+            entry = providers_cfg.get(str(fb.get("provider") or "").strip().lower())
+            if isinstance(entry, dict):
+                declared = str(entry.get("api_mode") or "").strip()
+        except Exception:
+            declared = ""
+    return declared if declared in _VALID_FALLBACK_API_MODES else ""
+
+
 def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str]:
     """Return a skip reason for fallback entries known to be unusable locally."""
     fb_provider = (fb.get("provider") or "").strip().lower()
@@ -2581,11 +2608,10 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         #
         # An explicit ``api_mode`` on the fallback entry always wins — including
         # an explicit "chat_completions" — and suppresses all re-detection below.
-        fb_api_mode_explicit = bool(str(fb.get("api_mode") or "").strip())
-        fb_api_mode = "chat_completions"
-        if fb_api_mode_explicit:
-            fb_api_mode = str(fb.get("api_mode")).strip()
-        elif fb_provider == "anthropic":
+        _declared_fb_api_mode = _declared_fallback_api_mode(fb)
+        fb_api_mode_explicit = bool(_declared_fb_api_mode)
+        fb_api_mode = _declared_fb_api_mode or "chat_completions"
+        if not fb_api_mode_explicit and fb_provider == "anthropic":
             # Provider-name check must not be gated on fb_base_url_hint:
             # an entry that names provider: anthropic without an explicit
             # base_url uses the provider's default endpoint and must still
