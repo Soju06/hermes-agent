@@ -501,7 +501,7 @@ the v2026.7.20 base bump; old tip archived at `archive/pre-v20260722/prompt-cach
 - **commit:** `b1b7768f5 feat(skills): advertise the structured write rationale in the skill_manage schema`
 - **touches:** `tools/skill_manager_tool.py`, `tests/tools/test_skill_manager_tool.py`
 
-### 42. refusal-fallback-reason
+### 45. refusal-fallback-reason
 - **branch:** `soju/patches/refusal-fallback-reason`
 - **origin:** `local-author`
 - **upstream_pr:** _(none yet — pairs with the local skill-gate plugin's refusal exemption; upstreamable on its own)_
@@ -514,7 +514,7 @@ the v2026.7.20 base bump; old tip archived at `archive/pre-v20260722/prompt-cach
   - `4dfad5d5d fix(test): expect the content_policy_blocked reason in the codex content-filter fallback assertion`
 - **touches:** `agent/chat_completion_helpers.py`, `agent/runtime_control.py`, `agent/agent_init.py`, `agent/agent_runtime_helpers.py`, `agent/conversation_loop.py`, `tests/run_agent/test_refusal_fallback_reason.py` (new), `tests/run_agent/test_run_agent.py`
 
-### 43. route-repromote-hysteresis
+### 46. route-repromote-hysteresis
 - **branch:** `soju/patches/route-repromote-hysteresis`
 - **origin:** `local-author`
 - **upstream_pr:** _(none — depends on fork-only model-routing patch #34)_
