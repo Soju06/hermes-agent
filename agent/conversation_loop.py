@@ -3645,7 +3645,7 @@ def run_conversation(
                         agent._buffer_status(
                             "⚠️ Model declined to respond (safety refusal) — trying fallback..."
                         )
-                    if agent._try_activate_fallback():
+                    if agent._try_activate_fallback(reason=FailoverReason.content_policy_blocked):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -3869,7 +3869,7 @@ def run_conversation(
                             agent._emit_status(
                                 "Content filter terminated stream; switching to fallback..."
                             )
-                            if agent._try_activate_fallback():
+                            if agent._try_activate_fallback(reason=FailoverReason.content_policy_blocked):
                                 # Roll the partial content (if any was already
                                 # appended in a prior continuation pass) back to
                                 # the last clean turn so the fallback provider
@@ -6150,7 +6150,7 @@ def run_conversation(
                             agent._buffer_status("⚠️ TLS certificate verification failed — trying fallback...")
                         else:
                             agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
-                    if agent._try_activate_fallback():
+                    if agent._try_activate_fallback(reason=classified.reason):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -6360,6 +6360,7 @@ def run_conversation(
                         _retry.has_retried_429 = False
                         agent._fallback_index = 0
                         agent._fallback_activated = False
+                        agent._fallback_reason = None
                         continue
                     # Try fallback before giving up entirely
                     if agent._has_pending_fallback():
