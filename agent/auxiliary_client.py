@@ -1371,23 +1371,92 @@ class _AnthropicCompletionsAdapter:
         # form is the documented Anthropic SDK passthrough for non-standard
         # request body keys; merge on top of whatever build_anthropic_kwargs
         # already produced (e.g. fast-mode ``speed``) so call-time settings
-        # survive. Two exclusions:
+        # survive. Three exclusions:
         #   - ``reasoning``: the OpenAI-shaped config dict is TRANSLATED into
         #     the native ``thinking`` field above (build_anthropic_kwargs);
         #     forwarding the raw field alongside would double-specify
         #     reasoning and 400 on strict gateways.
+        #   - ``response_format``: translated below into Anthropic's native
+        #     ``output_config.format`` shape when possible; never forwarded
+        #     raw because its OpenAI wrapper is rejected by Anthropic.
         #   - ``_``-prefixed keys: private Hermes plumbing (_reasoning_config
         #     et al.), never wire fields.
         caller_extra_body = kwargs.get("extra_body")
         if caller_extra_body and isinstance(caller_extra_body, dict):
             passthrough = {
                 k: v for k, v in caller_extra_body.items()
-                if k != "reasoning" and not str(k).startswith("_")
+                if k not in {"reasoning", "response_format"}
+                and not str(k).startswith("_")
             }
+
+            translated_format = None
+            if "response_format" in caller_extra_body:
+                response_format = caller_extra_body["response_format"]
+                if isinstance(response_format, dict):
+                    format_type = response_format.get("type")
+                    if format_type == "json_schema":
+                        openai_schema = response_format.get("json_schema")
+                        if (isinstance(openai_schema, dict)
+                                and isinstance(openai_schema.get("schema"), dict)):
+                            translated_format = {
+                                "type": "json_schema",
+                                "schema": openai_schema["schema"],
+                            }
+                        elif (set(response_format) == {"type", "schema"}
+                              and isinstance(response_format.get("schema"), dict)):
+                            translated_format = response_format
+                        else:
+                            logger.debug(
+                                "Dropping malformed Anthropic response_format "
+                                "with type=json_schema"
+                            )
+                    elif format_type == "json_object":
+                        if set(response_format) != {"type"}:
+                            logger.debug(
+                                "Dropping malformed Anthropic response_format "
+                                "with type=json_object"
+                            )
+                    else:
+                        logger.debug(
+                            "Dropping unsupported Anthropic response_format type: %r",
+                            format_type,
+                        )
+                else:
+                    logger.debug(
+                        "Dropping malformed Anthropic response_format: expected a dict"
+                    )
+
+            existing = anthropic_kwargs.get("extra_body") or {}
+            if not isinstance(existing, dict):
+                existing = {}
+
+            if translated_format is not None:
+                missing = object()
+                caller_output_config = passthrough.get("output_config", missing)
+                built_output_config = anthropic_kwargs.get("output_config")
+                existing_output_config = existing.get("output_config")
+                merged_output_config = {}
+                if isinstance(built_output_config, dict):
+                    merged_output_config.update(built_output_config)
+                if isinstance(existing_output_config, dict):
+                    merged_output_config.update(existing_output_config)
+                if caller_output_config is missing:
+                    pass
+                elif isinstance(caller_output_config, dict):
+                    merged_output_config.update(caller_output_config)
+                else:
+                    logger.debug(
+                        "Discarding translated response_format because caller "
+                        "output_config is not a dict"
+                    )
+                    merged_output_config = None
+                if (merged_output_config is not None
+                        and "format" not in merged_output_config):
+                    merged_output_config["format"] = translated_format
+                if merged_output_config is not None:
+                    passthrough["output_config"] = merged_output_config
+
             if passthrough:
-                existing = anthropic_kwargs.get("extra_body") or {}
-                if not isinstance(existing, dict):
-                    existing = {}
                 anthropic_kwargs["extra_body"] = {**existing, **passthrough}
 
         response = create_anthropic_message(self._client, anthropic_kwargs)
