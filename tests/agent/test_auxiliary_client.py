@@ -3428,6 +3428,81 @@ class TestAuxiliaryTaskExtraBody:
         )
         assert api_kwargs["extra_body"] == {"metadata": {"user_id": "u1"}}
 
+    def test_anthropic_aux_translates_openai_response_format(self):
+        schema = {
+            "type": "object",
+            "properties": {"title": {"type": "string"}},
+            "required": ["title"],
+        }
+        api_kwargs = self._run_anthropic_adapter(
+            call_extra_body={
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "plugin_structured_output",
+                        "schema": schema,
+                        "strict": False,
+                    },
+                },
+            },
+            bak_result={
+                "model": "claude-sonnet-4-6", "messages": [], "max_tokens": 64,
+                "output_config": {"effort": "high"},
+            },
+        )
+
+        assert api_kwargs["extra_body"]["output_config"] == {
+            "effort": "high",
+            "format": {"type": "json_schema", "schema": schema},
+        }
+        assert "response_format" not in api_kwargs
+        assert "response_format" not in api_kwargs["extra_body"]
+
+    def test_anthropic_aux_forwards_native_response_format(self):
+        native_format = {
+            "type": "json_schema",
+            "schema": {"type": "object", "properties": {}},
+        }
+        api_kwargs = self._run_anthropic_adapter(
+            call_extra_body={"response_format": native_format},
+        )
+
+        assert api_kwargs["extra_body"]["output_config"]["format"] == native_format
+        assert "response_format" not in api_kwargs
+        assert "response_format" not in api_kwargs["extra_body"]
+
+    def test_anthropic_aux_drops_json_object_response_format(self):
+        api_kwargs = self._run_anthropic_adapter(
+            call_extra_body={"response_format": {"type": "json_object"}},
+        )
+
+        assert "response_format" not in api_kwargs
+        assert "output_config" not in api_kwargs
+        assert "extra_body" not in api_kwargs
+
+    def test_anthropic_aux_explicit_output_config_format_wins(self):
+        explicit_format = {
+            "type": "json_schema",
+            "schema": {"type": "object", "required": ["explicit"]},
+        }
+        api_kwargs = self._run_anthropic_adapter(
+            call_extra_body={
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "schema": {"type": "object", "required": ["translated"]},
+                    },
+                },
+                "output_config": {"format": explicit_format, "effort": "high"},
+            },
+        )
+
+        assert api_kwargs["extra_body"]["output_config"] == {
+            "format": explicit_format, "effort": "high",
+        }
+        assert "response_format" not in api_kwargs
+        assert "response_format" not in api_kwargs["extra_body"]
+
     def test_anthropic_aux_extra_body_merges_over_existing(self):
         """Caller extra_body merges on top of what build_anthropic_kwargs
         already emitted (fast-mode speed) instead of clobbering it."""
