@@ -6359,3 +6359,194 @@ class TestLoneSurrogatePersistence:
         assert db.set_session_title("s1", "title \ud835 bad") is True
         assert db.get_session("s1")["title"] == "title \ufffd bad"
 
+
+
+# =========================================================================
+# session_model_usage PK repair (2026-07-28 version-drift outage)
+# =========================================================================
+
+
+class TestSessionModelUsagePkRepair:
+    """Shape-gated repair for schema_version drift.
+
+    A fork rebase dropped a deployed schema-bumping patch, leaving the DB
+    stamped ahead of the code: the version-gated v22 task-in-PK rebuild
+    never ran, _reconcile_columns() ADDed a plain ``task`` column, and
+    every 6-column accounting upsert failed at prepare time ("ON CONFLICT
+    clause does not match any PRIMARY KEY or UNIQUE constraint").
+    """
+
+    @staticmethod
+    def _drift(db_path):
+        """Rebuild session_model_usage with the legacy 5-column PK plus a
+        reconciler-style plain ``task`` column, and stamp the DB version
+        ahead of the code — the drifted production shape, byte for byte."""
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.executescript(
+                """
+                ALTER TABLE session_model_usage RENAME TO smu_tmp;
+                CREATE TABLE session_model_usage (
+                    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                    model TEXT NOT NULL,
+                    billing_provider TEXT NOT NULL DEFAULT '',
+                    billing_base_url TEXT NOT NULL DEFAULT '',
+                    billing_mode TEXT NOT NULL DEFAULT '',
+                    api_call_count INTEGER NOT NULL DEFAULT 0,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+                    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+                    estimated_cost_usd REAL NOT NULL DEFAULT 0,
+                    actual_cost_usd REAL NOT NULL DEFAULT 0,
+                    cost_status TEXT,
+                    cost_source TEXT,
+                    first_seen REAL,
+                    last_seen REAL,
+                    PRIMARY KEY (session_id, model, billing_provider, billing_base_url, billing_mode)
+                );
+                INSERT INTO session_model_usage (
+                    session_id, model, billing_provider, billing_base_url,
+                    billing_mode, api_call_count, input_tokens, output_tokens,
+                    cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                    estimated_cost_usd, actual_cost_usd, cost_status,
+                    cost_source, first_seen, last_seen
+                )
+                SELECT session_id, model, billing_provider, billing_base_url,
+                       billing_mode, api_call_count, input_tokens, output_tokens,
+                       cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                       estimated_cost_usd, actual_cost_usd, cost_status,
+                       cost_source, first_seen, last_seen
+                FROM smu_tmp;
+                DROP TABLE smu_tmp;
+                ALTER TABLE session_model_usage ADD COLUMN "task" TEXT DEFAULT '';
+                UPDATE schema_version SET version = 9999;
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _task_in_pk(db):
+        return db._conn.execute(
+            "SELECT COUNT(*) FROM pragma_table_info('session_model_usage') "
+            "WHERE name = 'task' AND pk > 0"
+        ).fetchone()[0]
+
+    def test_reopen_repairs_pk_and_preserves_rows(self, tmp_path, caplog):
+        db_path = tmp_path / "drifted.db"
+        db = SessionDB(db_path=db_path)
+        db.create_session(session_id="s1", source="cli", model="gpt-4o")
+        db.update_token_counts("s1", input_tokens=100, output_tokens=50,
+                               model="gpt-4o", billing_provider="openai")
+        db.close()
+        self._drift(db_path)
+
+        with caplog.at_level("WARNING", logger="hermes_state"):
+            db2 = SessionDB(db_path=db_path)
+        try:
+            assert self._task_in_pk(db2)
+            row = db2._conn.execute(
+                "SELECT input_tokens, task FROM session_model_usage "
+                "WHERE session_id = 's1'"
+            ).fetchone()
+            assert row["input_tokens"] == 100
+            assert row["task"] == ""
+            # The drifted version stamp itself is called out loudly.
+            assert any("ahead of code" in r.getMessage() for r in caplog.records)
+            # And the outage's exact failure mode is gone: both the
+            # main-loop upsert and an aux-task row land.
+            db2.update_token_counts("s1", input_tokens=10, output_tokens=5,
+                                    model="gpt-4o", billing_provider="openai")
+            db2.record_auxiliary_usage("s1", "vision", model="gemini",
+                                       input_tokens=3)
+            tasks = {
+                r["task"] for r in db2._conn.execute(
+                    "SELECT task FROM session_model_usage "
+                    "WHERE session_id = 's1'"
+                ).fetchall()
+            }
+            assert tasks == {"", "vision"}
+        finally:
+            db2.close()
+
+    def test_repair_is_idempotent_and_clamps_version(self, tmp_path):
+        db_path = tmp_path / "drifted.db"
+        SessionDB(db_path=db_path).close()
+        self._drift(db_path)
+        SessionDB(db_path=db_path).close()
+
+        # Second open after the repair: shape holds, and the future stamp
+        # was clamped so later version-gated migrations are not sealed off.
+        db = SessionDB(db_path=db_path)
+        try:
+            assert self._task_in_pk(db)
+            version = db._conn.execute(
+                "SELECT version FROM schema_version"
+            ).fetchone()[0]
+            assert version == SCHEMA_VERSION
+        finally:
+            db.close()
+
+    def test_interrupted_rebuild_salvages_legacy_rows(self, tmp_path):
+        """A crash between RENAME and DROP leaves *_legacy_pk behind; the
+        next open folds those rows into the freshly created table."""
+        db_path = tmp_path / "crashed.db"
+        db = SessionDB(db_path=db_path)
+        db.create_session(session_id="s1", source="cli", model="gpt-4o")
+        db.update_token_counts("s1", input_tokens=42, model="gpt-4o")
+        db.close()
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            "ALTER TABLE session_model_usage "
+            "RENAME TO session_model_usage_legacy_pk"
+        )
+        conn.commit()
+        conn.close()
+
+        db2 = SessionDB(db_path=db_path)
+        try:
+            row = db2._conn.execute(
+                "SELECT input_tokens FROM session_model_usage "
+                "WHERE session_id = 's1'"
+            ).fetchone()
+            assert row is not None and row["input_tokens"] == 42
+            assert not db2._conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE name = 'session_model_usage_legacy_pk'"
+            ).fetchone()
+        finally:
+            db2.close()
+
+    def test_rebuild_drops_orphaned_rows_instead_of_aborting(self, tmp_path, caplog):
+        """Production DBs carry usage rows whose parent session was deleted
+        while FK enforcement was off. With the FK pragma ON, copying them
+        raises IntegrityError — which must not escape SessionDB.__init__
+        (that would crash the gateway at boot). Orphans are dropped."""
+        db_path = tmp_path / "orphaned.db"
+        db = SessionDB(db_path=db_path)
+        db.create_session(session_id="s1", source="cli", model="gpt-4o")
+        db.update_token_counts("s1", input_tokens=100, model="gpt-4o")
+        db.close()
+        self._drift(db_path)
+        conn = sqlite3.connect(db_path)  # FK pragma off: plant an orphan
+        conn.execute(
+            "INSERT INTO session_model_usage (session_id, model, input_tokens) "
+            "VALUES ('ghost-session', 'gpt-4o', 7)"
+        )
+        conn.commit()
+        conn.close()
+
+        with caplog.at_level("WARNING", logger="hermes_state"):
+            db2 = SessionDB(db_path=db_path)
+        try:
+            assert self._task_in_pk(db2)
+            ids = [r[0] for r in db2._conn.execute(
+                "SELECT session_id FROM session_model_usage"
+            ).fetchall()]
+            assert ids == ["s1"]
+            assert any("orphaned" in r.getMessage() for r in caplog.records)
+        finally:
+            db2.close()

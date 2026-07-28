@@ -1141,6 +1141,7 @@ class SessionDB:
         self._token_writer_thread: Optional[threading.Thread] = None
         self._token_writer_stop = False
         self._token_writer_busy = False
+        self._token_apply_fail_streak = 0
         try:
             if read_only:
                 # Read-only attach for cross-profile aggregation: SELECT-only,
@@ -1786,6 +1787,166 @@ class SessionDB:
                             "reconcile %s.%s: %s", table_name, col_name, exc,
                         )
 
+    def _ensure_session_model_usage_task_pk(self, cursor: sqlite3.Cursor) -> None:
+        """Rebuild ``session_model_usage`` so ``task`` is part of the PK.
+
+        v22 of the version chain introduced task-dimension accounting
+        (issue #23270): ``update_token_counts()`` upserts with a 6-column
+        ``ON CONFLICT`` target that hard-requires ``task`` in the PRIMARY
+        KEY. On a DB whose schema_version stamp ran ahead of the code the
+        version-gated rebuild never executed — _reconcile_columns() ADDed
+        the plain ``task`` column, the PK stayed 5-column, and every
+        accounting write failed at prepare time ("ON CONFLICT clause does
+        not match any PRIMARY KEY or UNIQUE constraint"). Gating on the
+        actual table shape is idempotent and can never be sealed off by a
+        version stamp.
+        """
+        legacy = "session_model_usage_legacy_pk"
+        copy_cols = (
+            "session_id, model, billing_provider, billing_base_url, "
+            "billing_mode, task, api_call_count, input_tokens, "
+            "output_tokens, cache_read_tokens, cache_write_tokens, "
+            "reasoning_tokens, estimated_cost_usd, actual_cost_usd, "
+            "cost_status, cost_source, first_seen, last_seen"
+        )
+
+        def _select_from(table: str) -> str:
+            # Pre-v22 tables have no ``task`` column; reconciler-drifted
+            # ones have it (nullable, DEFAULT ''). Normalize either way.
+            # Skip rows whose parent session is gone (deleted while FK
+            # enforcement was off, historically): with the FK pragma ON,
+            # copying them raises IntegrityError and aborts the repair —
+            # and under ON DELETE CASCADE they should not exist anyway.
+            has_task = cursor.execute(
+                "SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = 'task'",
+                (table,),
+            ).fetchone()[0]
+            task_expr = "COALESCE(task, '')" if has_task else "''"
+            orphans = cursor.execute(
+                f"SELECT COUNT(*) FROM {table} "
+                "WHERE session_id NOT IN (SELECT id FROM sessions)"
+            ).fetchone()[0]
+            if orphans:
+                logger.warning(
+                    "session_model_usage: dropping %d orphaned rows "
+                    "(parent session deleted) during PK rebuild", orphans,
+                )
+            return (
+                "SELECT session_id, model, billing_provider, billing_base_url, "
+                f"billing_mode, {task_expr}, api_call_count, input_tokens, "
+                "output_tokens, cache_read_tokens, cache_write_tokens, "
+                "reasoning_tokens, estimated_cost_usd, actual_cost_usd, "
+                f"cost_status, cost_source, first_seen, last_seen FROM {table} "
+                "WHERE session_id IN (SELECT id FROM sessions)"
+            )
+
+        try:
+            # Salvage a leftover copy from a crash mid-rebuild: SCHEMA_SQL
+            # has already recreated the main table (correct PK) on this
+            # open, so fold the legacy rows back in and drop the leftover.
+            if cursor.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (legacy,),
+            ).fetchone():
+                cursor.execute(
+                    f"INSERT OR IGNORE INTO session_model_usage ({copy_cols}) "
+                    + _select_from(legacy)
+                )
+                salvaged = cursor.rowcount
+                cursor.execute(f"DROP TABLE {legacy}")
+                logger.warning(
+                    "session_model_usage: salvaged %d rows from an "
+                    "interrupted PK rebuild", salvaged,
+                )
+
+            cols = cursor.execute(
+                "SELECT COUNT(*) FROM pragma_table_info('session_model_usage')"
+            ).fetchone()[0]
+            if not cols:
+                return  # table absent — SCHEMA_SQL creates it with the right PK
+            task_pk = cursor.execute(
+                "SELECT COUNT(*) FROM pragma_table_info('session_model_usage') "
+                "WHERE name = 'task' AND pk > 0"
+            ).fetchone()[0]
+            if task_pk:
+                return
+            logger.warning(
+                "session_model_usage: 'task' is not part of the PRIMARY KEY "
+                "(version-drifted DB) — rebuilding so accounting upserts work"
+            )
+            cursor.execute(
+                f"ALTER TABLE session_model_usage RENAME TO {legacy}"
+            )
+            cursor.execute(
+                """CREATE TABLE session_model_usage (
+                       session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                       model TEXT NOT NULL,
+                       billing_provider TEXT NOT NULL DEFAULT '',
+                       billing_base_url TEXT NOT NULL DEFAULT '',
+                       billing_mode TEXT NOT NULL DEFAULT '',
+                       task TEXT NOT NULL DEFAULT '',
+                       api_call_count INTEGER NOT NULL DEFAULT 0,
+                       input_tokens INTEGER NOT NULL DEFAULT 0,
+                       output_tokens INTEGER NOT NULL DEFAULT 0,
+                       cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                       cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+                       reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+                       estimated_cost_usd REAL NOT NULL DEFAULT 0,
+                       actual_cost_usd REAL NOT NULL DEFAULT 0,
+                       cost_status TEXT,
+                       cost_source TEXT,
+                       first_seen REAL,
+                       last_seen REAL,
+                       PRIMARY KEY (session_id, model, billing_provider, billing_base_url, billing_mode, task)
+                   )"""
+            )
+            cursor.execute(
+                f"INSERT INTO session_model_usage ({copy_cols}) "
+                + _select_from(legacy)
+            )
+            copied = cursor.rowcount
+            cursor.execute(f"DROP TABLE {legacy}")
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_session_model_usage_session "
+                "ON session_model_usage(session_id)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_session_model_usage_model "
+                "ON session_model_usage(model)"
+            )
+            logger.warning(
+                "session_model_usage: PK rebuild complete (%d rows carried over)",
+                copied,
+            )
+        except sqlite3.Error as exc:
+            # sqlite3.Error, not just OperationalError: real-world tables
+            # also raise IntegrityError (orphaned rows vs the sessions FK),
+            # and an escaped exception here aborts SessionDB.__init__ —
+            # i.e. crashes the gateway at boot. Loud and retried on next
+            # open — a failed repair must never be silently absorbed (the
+            # original v22 swallow was logger.debug).
+            logger.warning(
+                "session_model_usage PK rebuild failed (will retry on next "
+                "open): %s", exc,
+            )
+            # If the rename went through but the rest didn't, restore the
+            # original table so accounting history stays reachable.
+            try:
+                main_present = cursor.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                    "AND name = 'session_model_usage'"
+                ).fetchone()
+                legacy_present = cursor.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                    (legacy,),
+                ).fetchone()
+                if not main_present and legacy_present:
+                    cursor.execute(
+                        f"ALTER TABLE {legacy} RENAME TO session_model_usage"
+                    )
+            except sqlite3.Error:
+                pass
+
     def _init_schema(self):
         """Create tables and FTS if they don't exist, reconcile columns.
 
@@ -2041,77 +2202,46 @@ class SessionDB:
                     )
                 except sqlite3.OperationalError:
                     pass
-            if current_version < 22:
-                # v22: task-dimension usage attribution (issue #23270).
-                # session_model_usage gains a ``task`` column ('' = main agent
-                # loop; 'vision'/'compression'/'title_generation'/... =
-                # auxiliary calls) so aux model spend is visible in analytics.
-                # The column participates in the PRIMARY KEY and SQLite cannot
-                # ALTER a PK, so rebuild the table. The reconciler will have
-                # already ADDed the plain column on legacy DBs (harmless);
-                # the rebuild bakes it into the PK properly. Existing rows are
-                # main-loop accounting by definition → task=''.
-                try:
-                    legacy_pk = cursor.execute(
-                        "SELECT COUNT(*) FROM pragma_table_info('session_model_usage') "
-                        "WHERE name = 'task' AND pk > 0"
-                    ).fetchone()[0]
-                    if not legacy_pk:
-                        cursor.execute("ALTER TABLE session_model_usage RENAME TO session_model_usage_v21")
-                        cursor.execute(
-                            """CREATE TABLE session_model_usage (
-                                   session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                                   model TEXT NOT NULL,
-                                   billing_provider TEXT NOT NULL DEFAULT '',
-                                   billing_base_url TEXT NOT NULL DEFAULT '',
-                                   billing_mode TEXT NOT NULL DEFAULT '',
-                                   task TEXT NOT NULL DEFAULT '',
-                                   api_call_count INTEGER NOT NULL DEFAULT 0,
-                                   input_tokens INTEGER NOT NULL DEFAULT 0,
-                                   output_tokens INTEGER NOT NULL DEFAULT 0,
-                                   cache_read_tokens INTEGER NOT NULL DEFAULT 0,
-                                   cache_write_tokens INTEGER NOT NULL DEFAULT 0,
-                                   reasoning_tokens INTEGER NOT NULL DEFAULT 0,
-                                   estimated_cost_usd REAL NOT NULL DEFAULT 0,
-                                   actual_cost_usd REAL NOT NULL DEFAULT 0,
-                                   cost_status TEXT,
-                                   cost_source TEXT,
-                                   first_seen REAL,
-                                   last_seen REAL,
-                                   PRIMARY KEY (session_id, model, billing_provider, billing_base_url, billing_mode, task)
-                               )"""
-                        )
-                        cursor.execute(
-                            """INSERT INTO session_model_usage (
-                                   session_id, model, billing_provider, billing_base_url,
-                                   billing_mode, task, api_call_count, input_tokens,
-                                   output_tokens, cache_read_tokens, cache_write_tokens,
-                                   reasoning_tokens, estimated_cost_usd, actual_cost_usd,
-                                   cost_status, cost_source, first_seen, last_seen
-                               )
-                               SELECT session_id, model, billing_provider, billing_base_url,
-                                      billing_mode, '', api_call_count, input_tokens,
-                                      output_tokens, cache_read_tokens, cache_write_tokens,
-                                      reasoning_tokens, estimated_cost_usd, actual_cost_usd,
-                                      cost_status, cost_source, first_seen, last_seen
-                               FROM session_model_usage_v21"""
-                        )
-                        cursor.execute("DROP TABLE session_model_usage_v21")
-                        cursor.execute(
-                            "CREATE INDEX IF NOT EXISTS idx_session_model_usage_session "
-                            "ON session_model_usage(session_id)"
-                        )
-                        cursor.execute(
-                            "CREATE INDEX IF NOT EXISTS idx_session_model_usage_model "
-                            "ON session_model_usage(model)"
-                        )
-                except sqlite3.OperationalError as exc:
-                    logger.debug("v22 session_model_usage rebuild skipped: %s", exc)
+            if current_version > SCHEMA_VERSION:
+                # DB stamped by newer (or renumbered) code: every
+                # ``current_version < N`` gate in this chain is silently
+                # skipped, now and in every future release. This is how the
+                # 2026-07-28 accounting outage happened: a deployed
+                # schema-v23 patch was dropped in a fork rebase, the code
+                # went back to 22, and the v22 task-in-PK rebuild was sealed
+                # off while its 6-column upsert shipped — every accounting
+                # write failed for 6 days. Two defenses: shape-sensitive
+                # repairs run outside the version chain (see
+                # _ensure_session_model_usage_task_pk), and the stamp is
+                # clamped back down so migrations the current code ships
+                # later under the reused numbers are not sealed off too.
+                # (Gates in THIS run still see the old ``current_version``,
+                # so historical migrations are not replayed on an
+                # up-to-date DB.)
+                logger.warning(
+                    "state DB schema_version=%s is ahead of code "
+                    "SCHEMA_VERSION=%s (renumbered or rolled-back code); "
+                    "clamping the stamp so future version-gated migrations "
+                    "are not silently skipped",
+                    current_version, SCHEMA_VERSION,
+                )
+                cursor.execute(
+                    "UPDATE schema_version SET version = ?",
+                    (SCHEMA_VERSION,),
+                )
             if current_version < SCHEMA_VERSION and fts_migrations_complete:
                 cursor.execute(
                     "UPDATE schema_version SET version = ?",
                     (SCHEMA_VERSION,),
                 )
+
+        # ── Shape-gated repairs (independent of schema_version) ────────
+        # v22's task-in-PK rebuild originally lived in the version chain
+        # above; on DBs whose version stamp ran ahead of the code it never
+        # executed, while update_token_counts()'s 6-column upsert failed on
+        # every call. The rebuild is idempotent and cheap to gate on the
+        # actual table shape, so it runs unconditionally here.
+        self._ensure_session_model_usage_task_pk(cursor)
 
         # Unique title index — always ensure it exists. Older databases may
         # contain duplicate aliases from before the constraint was enforced;
@@ -3299,12 +3429,21 @@ class SessionDB:
         for session_id, kwargs in self._coalesce_token_deltas(batch):
             try:
                 self.update_token_counts(session_id, **kwargs)
+                self._token_apply_fail_streak = 0
             except Exception as exc:
                 # Same contract as the old inline call sites: accounting
-                # loss is logged, never raised into a turn.
-                logger.warning(
-                    "async token accounting: apply failed (session=%s): %s",
-                    session_id, exc,
+                # loss is logged, never raised into a turn. A long streak
+                # means something structural (schema drift, disk) is eating
+                # EVERY delta — escalate to ERROR so it cannot sit at
+                # WARNING level for days (2026-07-28: 6 days of silent loss).
+                self._token_apply_fail_streak += 1
+                log = logger.warning
+                if self._token_apply_fail_streak % 50 == 0:
+                    log = logger.error
+                log(
+                    "async token accounting: apply failed (session=%s, "
+                    "%d consecutive): %s",
+                    session_id, self._token_apply_fail_streak, exc,
                 )
 
     def _coalesce_token_deltas(

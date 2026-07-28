@@ -562,3 +562,40 @@ class TestWriterFailure:
             db.update_token_counts = original
 
         assert _totals(db, "s-f")["input_tokens"] == 7
+
+    def test_persistent_failure_streak_escalates_to_error(self, db, caplog):
+        """Every delta failing means something structural (schema drift,
+        disk); the 50th consecutive failure logs at ERROR so the condition
+        cannot sit at WARNING level for days."""
+        db.create_session("s-esc", "test")
+
+        original = db.update_token_counts
+
+        def always_boom(session_id, **kwargs):
+            raise sqlite3.OperationalError(
+                "ON CONFLICT clause does not match any PRIMARY KEY or "
+                "UNIQUE constraint"
+            )
+
+        db.update_token_counts = always_boom
+        try:
+            with caplog.at_level("WARNING", logger="hermes_state"):
+                for i in range(50):
+                    # Alternate route fields so coalescing can't merge the
+                    # deltas into fewer apply attempts.
+                    db.queue_token_counts(
+                        "s-esc", input_tokens=1, api_call_count=1,
+                        model=f"m{i}",
+                    )
+                    assert db.flush_token_counts()
+            errors = [r for r in caplog.records if r.levelname == "ERROR"
+                      and "async token accounting" in r.getMessage()]
+            assert len(errors) == 1
+            assert "50 consecutive" in errors[0].getMessage()
+        finally:
+            db.update_token_counts = original
+
+        # A success resets the streak.
+        db.queue_token_counts("s-esc", input_tokens=1, api_call_count=1)
+        assert db.flush_token_counts()
+        assert db._token_apply_fail_streak == 0
