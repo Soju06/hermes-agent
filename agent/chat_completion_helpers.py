@@ -806,6 +806,61 @@ def _touch_stale_kill_activity(agent, elapsed: float) -> None:
         logger.debug("stale activity touch failed", exc_info=True)
 
 
+# ── Passive provider health (model_routes) ──────────────────────────────────
+#
+# Real completion traffic is the health signal for the model-routes resolver:
+# abandoning a provider for an outage-shaped reason files an unhealthy verdict
+# (so fresh route resolutions fail over without an active probe), and the next
+# live success on that provider clears it. See hermes_cli.model_routes —
+# provider_health() only probes as a recovery check on stale-unhealthy
+# verdicts.
+
+# FailoverReasons that mean "this PROVIDER cannot serve completions right
+# now" — mirrors the probe's fail-open classification (5xx, 402/429/credit,
+# connection failures). Deliberately excluded: auth (our credentials),
+# content_policy_blocked (this prompt), context/format errors (this request),
+# upstream_rate_limit (one model at an aggregator, not the provider).
+_PASSIVE_UNHEALTHY_REASONS = frozenset({
+    FailoverReason.billing,
+    FailoverReason.rate_limit,
+    FailoverReason.overloaded,
+    FailoverReason.server_error,
+    FailoverReason.timeout,
+})
+
+
+def _record_passive_provider_outcome(agent, healthy: bool, reason: str) -> None:
+    """Best-effort verdict for the agent's CURRENT runtime; never raises."""
+    try:
+        from hermes_cli.model_routes import provider_key_for_runtime, record_provider_outcome
+
+        key = provider_key_for_runtime(
+            provider=getattr(agent, "provider", "") or "",
+            base_url=getattr(agent, "base_url", "") or "",
+        )
+        if key:
+            record_provider_outcome(key, healthy, reason)
+    except Exception:
+        logger.debug("passive provider health record failed", exc_info=True)
+
+
+def _note_provider_success(agent) -> None:
+    """Completion succeeded on the current runtime — clear any unhealthy verdict.
+
+    Runs on every successful API call, so it is gated to one os.stat in
+    steady state (has_unhealthy_verdicts memo); config load + key mapping
+    only happen while some provider is actually marked unhealthy.
+    """
+    try:
+        from hermes_cli.model_routes import has_unhealthy_verdicts
+
+        if not has_unhealthy_verdicts():
+            return
+    except Exception:
+        return
+    _record_passive_provider_outcome(agent, True, "recovered (live completion succeeded)")
+
+
 def _check_stale_giveup(agent) -> None:
     """Raise immediately when the consecutive-stale streak is past the
     give-up threshold — no network attempt, no stale-timeout wait."""
@@ -1311,6 +1366,7 @@ def direct_api_call(agent, api_kwargs: dict):
         with request_client_lock:
             request_state["done"] = True
         _reset_stale_streak(agent)
+        _note_provider_success(agent)
         succeeded = True
         return response
     finally:
@@ -1818,6 +1874,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # responsive.  See the canonical comment block above ``_stale_streak()``.
     if result["response"] is not None:
         _reset_stale_streak(agent)
+        _note_provider_success(agent)
     return result["response"]
 
 
@@ -2471,6 +2528,15 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
+    if reason in _PASSIVE_UNHEALTHY_REASONS:
+        # The loop is abandoning the CURRENT runtime for an outage-shaped
+        # failure — file the passive verdict before the chain advances so
+        # fresh route resolutions fail over immediately. Recursive skip
+        # calls re-enter here with the same runtime; the recorder's burst
+        # guard dedups them.
+        _record_passive_provider_outcome(
+            agent, False, reason.value if reason is not None else "unknown"
+        )
     if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
@@ -3663,6 +3729,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # recovered provider doesn't carry a stale streak into later turns.
             if result["response"] is not None:
                 _reset_stale_streak(agent)
+                _note_provider_success(agent)
             _emit_stream_end(final_text=_stream_final_text(result["response"]), finished=True, error=None)
             return result["response"]
         except Exception as exc:
@@ -5382,12 +5449,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # the provider is demonstrably responsive — clear the circuit
             # breaker (#58962) just like the full-success return below.
             _reset_stale_streak(agent)
+            _note_provider_success(agent)
             return _stub
         raise result["error"]
     # Success — clear the circuit breaker (#58962): the provider proved
     # responsive.  See the canonical comment block above ``_stale_streak()``.
     if result["response"] is not None:
         _reset_stale_streak(agent)
+        _note_provider_success(agent)
     return result["response"]
 
 # ── Provider fallback ──────────────────────────────────────────────────
