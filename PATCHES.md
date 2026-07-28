@@ -526,6 +526,16 @@ the v2026.7.20 base bump; old tip archived at `archive/pre-v20260722/prompt-cach
   - `c4e74b3e8 test(gateway): cover route re-promotion hysteresis`
 - **touches:** `hermes_cli/model_routes.py`, `gateway/model_router.py`, `gateway/run.py`, `cli-config.yaml.example`, `tests/gateway/test_model_router.py`, `tests/hermes_cli/test_model_routes.py`
 
+### 47. passive-provider-health
+- **branch:** `soju/patches/passive-provider-health`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — depends on fork-only model-routing patch #34)_
+- **state:** `local-only`
+- **rationale:** The model-routes health probe was an active 1-token completion with a 2.5s default timeout; claude-lb's end-to-end completion floor is ~3s, so probes deterministically timed out, the primary was misjudged unhealthy, and SYSTEM_DEV sessions silently failed over to gpt-5.6-sol (2026-07-27/28 incident; 19 of 21 switches landed on the fallback). Health is now passive-first: real completion traffic files the verdicts (`record_provider_outcome` — unhealthy from `try_activate_fallback` on outage-shaped `FailoverReason`s with probe-parity classification, healthy-clear on live completion success gated to one `os.stat` via `has_unhealthy_verdicts`), `provider_key_for_runtime` maps the live agent identity (config key / display name / `custom:` slug / base_url) to the `providers:` config key with no-match→no-record, and `provider_health()` only probes as a *recovery check* on a stale unhealthy verdict — no verdict or a stale healthy one is assumed healthy with zero I/O, so steady state never probes and never burns completion tokens.
+- **commits:**
+  - `e8df44a1f feat(routing): passive-first provider health — verdicts from real traffic`
+- **touches:** `hermes_cli/model_routes.py`, `agent/chat_completion_helpers.py`, `tests/hermes_cli/test_model_routes.py`, `tests/run_agent/test_passive_provider_health.py` (new)
+
 ## State Vocabulary
 
 | state | meaning | when |
