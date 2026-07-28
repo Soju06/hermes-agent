@@ -5,12 +5,19 @@ purpose name (``dev``, ``chat``, …) to a concrete runtime (provider/model/
 reasoning_effort) plus an ordered, health-checked fallback chain.
 
 Phase 1 scope is the config schema, loader/validation, resolver, and
-provider health probing only.  Health-probe semantics are ported from the
-skill-gate plugin's ``runtime_catalog.py`` and are deliberately fail-open:
-only signals that indicate the PROVIDER cannot serve completions (credit/
-quota exhaustion, 402/429, 5xx, connection failures) count as unhealthy;
-auth-scoped 401/403 (or a malformed probe 400) are treated as healthy so a
-probe defect can never freeze routing.
+provider health tracking only.  Health is **passive-first**: verdicts come
+from real completion traffic (``record_provider_outcome``, wired into the
+agent's fallback-activation and completion-success paths), and the active
+probe survives only as a recovery check — a provider with a stale
+*unhealthy* verdict is re-probed before being trusted again.  Providers
+with no verdict (or a stale healthy one) are assumed healthy without any
+network I/O, so steady-state route resolution never probes and never
+burns a real completion against a healthy backend.  Probe/classification
+semantics stay fail-open (ported from the skill-gate plugin's
+``runtime_catalog.py``): only signals that indicate the PROVIDER cannot
+serve completions (credit/quota exhaustion, 402/429, 5xx, connection
+failures) count as unhealthy; auth-scoped 401/403 (or a malformed probe
+400) are treated as healthy so a probe defect can never freeze routing.
 
 ``static_rules`` are parsed and validated here; condition matching and
 enforcement live in the gateway pre-dispatch router (``gateway/model_router.py``,
@@ -1096,7 +1103,21 @@ def provider_health(
     cfg: Optional[Dict[str, Any]] = None,
     health: Optional[HealthConfig] = None,
 ) -> Tuple[bool, str]:
-    """Cached, fail-open health verdict for a provider (keyed by provider name)."""
+    """Cached, fail-open health verdict for a provider (keyed by provider name).
+
+    Passive-first semantics:
+
+    - fresh cache entry (within its TTL) → cached verdict, no I/O
+    - no entry, or a stale *healthy* entry → assumed healthy, no probe —
+      real traffic (``record_provider_outcome``) is the health signal
+    - stale *unhealthy* entry → one live probe as a recovery check, so a
+      session parked on a fallback can be walked back to a healed primary
+      without waiting for someone else's traffic to prove it
+
+    The recovery probe is the only active-probe path left: a healthy
+    provider is never probed, so steady state costs zero network calls and
+    zero completion tokens.
+    """
     if health is None:
         health = load_routes(cfg).health
     if not _health_checks_enabled(health):
@@ -1110,6 +1131,7 @@ def provider_health(
     now = _now()
     key = str(provider or "")
     entry = cache.get(key)
+    last_unhealthy = False
     if isinstance(entry, dict):
         try:
             ts = float(entry.get("ts") or 0.0)
@@ -1118,10 +1140,171 @@ def provider_health(
         ttl = health.ok_ttl_seconds if entry.get("healthy") else health.fail_ttl_seconds
         if now - ts < ttl:
             return bool(entry.get("healthy")), str(entry.get("reason") or "cached")
+        last_unhealthy = not bool(entry.get("healthy"))
+
+    if not last_unhealthy:
+        # No verdict, or the last one was healthy: trust it without probing.
+        # A wrong assumption self-corrects on the first real failure via
+        # record_provider_outcome; a probe here would burn a completion per
+        # ok_ttl window against a provider that real traffic already covers.
+        return True, "assumed healthy (passive; no fresh failure verdict)"
 
     healthy, reason = _probe_provider(key, str(model or ""), cfg, health)
-    _store_health_verdict(path, key, {"healthy": healthy, "reason": reason, "ts": now})
+    _store_health_verdict(path, key, {"healthy": healthy, "reason": f"recovery probe: {reason}", "ts": now})
     return healthy, reason
+
+
+# =============================================================================
+# Passive health — verdicts from real completion traffic
+# =============================================================================
+
+# Burst guard for repeated unhealthy writes: a fallback-chain walk can report
+# the same dead provider several times within one turn (recursive skip calls,
+# multi-entry chains). One verdict per provider per window is plenty — the
+# suppression is in-process only, so concurrent hermes processes still land
+# their own (idempotent) writes via the flock merge.
+_PASSIVE_WRITE_SUPPRESS_SECONDS = 5.0
+_last_passive_unhealthy_write: Dict[str, float] = {}
+
+# mtime-keyed memo for has_unhealthy_verdicts() — the completion-success hook
+# runs per API call, so it must cost one os.stat in steady state, not a JSON
+# parse.
+_unhealthy_memo: Dict[str, Any] = {"mtime": None, "value": False}
+
+
+def provider_key_for_runtime(
+    provider: str = "",
+    base_url: str = "",
+    cfg: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Map an agent's runtime identity to its ``providers:`` config key.
+
+    The health cache (and route specs) key providers by their config-entry
+    name (e.g. ``claude-lb``); the live agent may carry that key, a
+    ``custom:<name>`` menu slug, a display name (``Claude LB 114``), or only
+    a ``base_url``. Returns ``""`` when nothing matches — callers must treat
+    that as "don't record" (never guess a key: a verdict filed under the
+    wrong provider is worse than no verdict).
+    """
+    from hermes_cli.runtime_provider import _normalize_custom_provider_name
+
+    if cfg is None:
+        try:
+            cfg = load_config()
+        except Exception:
+            logger.debug("model_routes: config load failed during provider-key mapping", exc_info=True)
+            return ""
+    providers = cfg.get("providers") if isinstance(cfg, dict) else None
+    if not isinstance(providers, dict):
+        return ""
+
+    target = _normalize_custom_provider_name(str(provider or ""))
+    if target.startswith("custom:"):
+        target = target[len("custom:"):]
+    base = str(base_url or "").strip().rstrip("/").lower()
+
+    url_match = ""
+    for key, entry in providers.items():
+        if not isinstance(entry, dict):
+            continue
+        key_str = str(key)
+        names = {_normalize_custom_provider_name(key_str)}
+        raw_name = entry.get("name")
+        if isinstance(raw_name, str) and raw_name.strip():
+            names.add(_normalize_custom_provider_name(raw_name))
+        if target and target in names:
+            return key_str
+        if base and not url_match:
+            for url_key in ("base_url", "url", "api"):
+                value = entry.get(url_key)
+                if isinstance(value, str) and value.strip().rstrip("/").lower() == base:
+                    url_match = key_str
+                    break
+    return url_match
+
+
+def record_provider_outcome(
+    provider_key: str,
+    healthy: bool,
+    reason: str,
+    *,
+    health: Optional[HealthConfig] = None,
+) -> None:
+    """File a health verdict observed from a real completion attempt.
+
+    - ``healthy=False``: the agent gave up on this provider for an
+      outage-shaped reason (5xx/429/402/credit/timeout). Written (almost)
+      always — refreshing ``ts`` keeps the fail-TTL suppression alive while
+      errors keep flowing.
+    - ``healthy=True``: a live completion succeeded. Only *clears* an
+      existing unhealthy verdict; it never creates or refreshes entries, so
+      the steady-state success path stays write-free.
+
+    Best-effort by contract: never raises, never blocks routing.
+    """
+    key = str(provider_key or "").strip()
+    if not key:
+        return
+    try:
+        if health is None:
+            health = load_routes(None).health
+        if not _health_checks_enabled(health):
+            return
+        if "PYTEST_CURRENT_TEST" in os.environ and not os.environ.get(_HEALTH_TEST_ENV):
+            return  # same seam as provider_health — agent-path unit tests must not touch the real cache
+        path = health.resolved_cache_path()
+        now = _now()
+        if healthy:
+            entry = _read_health_cache(path).get(key)
+            if not (isinstance(entry, dict) and not entry.get("healthy")):
+                return  # nothing to clear
+            _last_passive_unhealthy_write.pop(key, None)
+        else:
+            last = _last_passive_unhealthy_write.get(key, 0.0)
+            if now - last < _PASSIVE_WRITE_SUPPRESS_SECONDS:
+                return
+            _last_passive_unhealthy_write[key] = now
+        _store_health_verdict(
+            path,
+            key,
+            {"healthy": bool(healthy), "reason": f"passive: {reason}", "ts": now},
+        )
+    except Exception:
+        logger.debug("model_routes: passive health record failed for %r", key, exc_info=True)
+
+
+def has_unhealthy_verdicts(health: Optional[HealthConfig] = None) -> bool:
+    """True when the health cache currently holds any unhealthy verdict.
+
+    Cheap gate for the per-completion success hook: one ``os.stat`` per call
+    in steady state (memo keyed on the cache file's mtime), a JSON parse only
+    when the file actually changed.
+    """
+    try:
+        if health is None:
+            health = load_routes(None).health
+        if not _health_checks_enabled(health):
+            return False
+        if "PYTEST_CURRENT_TEST" in os.environ and not os.environ.get(_HEALTH_TEST_ENV):
+            return False
+        path = health.resolved_cache_path()
+        try:
+            mtime = path.stat().st_mtime_ns
+        except OSError:
+            return False
+        if _unhealthy_memo["mtime"] == (str(path), mtime):
+            return bool(_unhealthy_memo["value"])
+        cache = _read_health_cache(path)
+        value = any(
+            isinstance(entry, dict) and not entry.get("healthy")
+            for entry in cache.values()
+        )
+        _unhealthy_memo["mtime"] = (str(path), mtime)
+        _unhealthy_memo["value"] = value
+        return value
+    except Exception:
+        logger.debug("model_routes: unhealthy-verdict scan failed", exc_info=True)
+        return False
 
 
 # =============================================================================
