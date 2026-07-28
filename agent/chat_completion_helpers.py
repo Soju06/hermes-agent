@@ -34,6 +34,7 @@ from agent.errors import EmptyStreamError
 from agent.chat_completion_local import _streams_llamacpp, stale_giveup
 from agent.chat_completion_headers import _chat_completion_capturing_headers
 from agent.chat_completion_stream_monitor import StreamingWaitMonitor, StreamLifetimeExceeded
+from agent import passive_provider_health as _passive_health
 from agent.transports.chat_completions import is_router_timeout_shim, router_timeout_shim_may_follow
 from agent.fast_mode import effective_request_overrides
 from agent.turn_context import substitute_api_content
@@ -1023,6 +1024,7 @@ def direct_api_call(agent, api_kwargs: dict):
         # reset undoes the bump; the finally discards the poisoned client).
         request.mark_done()
         _reset_stale_streak(agent)
+        _passive_health.note_provider_success(agent)
         succeeded = True
         return response
     finally:
@@ -1992,6 +1994,15 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
     from agent.fallback_notice import announce_fallback_switch, fallback_trigger_text
     if switch_deferred_by_reset(agent, reason, reset_at):
         return False
+    if reason in _passive_health.PASSIVE_UNHEALTHY_REASONS:
+        # The loop is abandoning the CURRENT runtime for an outage-shaped
+        # failure — file the passive verdict before the chain advances so
+        # fresh route resolutions fail over immediately. Recursive skip
+        # calls re-enter here with the same runtime; the recorder's burst
+        # guard dedups them.
+        _passive_health.record_passive_provider_outcome(
+            agent, False, reason.value if reason is not None else "unknown"
+        )
     cooldown_seconds = _arm_rate_limit_cooldown(agent, reason, reset_at=reset_at)
     while True:
         if agent._fallback_index >= len(agent._fallback_chain):
@@ -2636,6 +2647,7 @@ class _BedrockStream:
         # Success clears the cross-turn breaker (#58962).
         if self.result["response"] is not None:
             _reset_stale_streak(self.agent)
+            _passive_health.note_provider_success(self.agent)
         return self.result["response"]
 
     def run(self):
@@ -3854,6 +3866,7 @@ class _StreamingCall(StreamingWaitMonitor):
             _cls = classify_api_error(
                 error, provider=str(getattr(self.agent, "provider", "") or ""), model=str(getattr(self.agent, "model", "") or ""))
         _reset_stale_streak(self.agent)  # deltas fired => provider responsive: clear the breaker
+        _passive_health.note_provider_success(self.agent)
         # #106260: continuing after a context-overflow error re-sends a larger request into the
         # same overflow. Return an EMPTY stub marked terminal so the loop ends the turn instead.
         # Scope is context_overflow ONLY: payload_too_large (413) has its own byte-scored recovery
@@ -3921,6 +3934,7 @@ class _StreamingCall(StreamingWaitMonitor):
             raise error
         if response is not None:
             _reset_stale_streak(self.agent)  # provider proved responsive: clear the breaker
+            _passive_health.note_provider_success(self.agent)
         # Propagate first-chunk timing for the ``post_api_request`` hook.
         if isinstance(self.clients.diag, dict) and self.clients.diag.get("first_chunk_at"):
             self.agent._last_api_first_chunk_at = float(self.clients.diag["first_chunk_at"])
