@@ -12,7 +12,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from persistence.sqlite import _registry
+from persistence.sqlite import _maintenance_thread, _registry
 from persistence.sqlite._holder import StoreHolder
 from persistence.sqlite.admin import SQLiteStoreAdmin
 from persistence.sqlite.admin._maintenance import _FtsStorageOptimizer
@@ -202,10 +202,18 @@ class TestVacuumUsesPassive:
 
 
 class TestCheckpointFrequency:
-    """Checkpoint triggers every N writes."""
+    """Checkpoint runs from the maintenance thread, never the write hot path.
 
-    def test_checkpoint_triggers_at_interval(self, db):
-        """_try_wal_checkpoint is called every _CHECKPOINT_EVERY_N_WRITES writes."""
+    Inline per-Nth-write checkpointing made whichever caller crossed the
+    threshold pay for a multi-GB WAL flush while every other writer queued
+    behind self._lock (2026-07-28 event-loop stall ingredient). The write
+    path now only counts; the session-db-maintenance thread checkpoints
+    once the counter advances past _CHECKPOINT_EVERY_N_WRITES.
+    """
+
+    def test_write_path_never_checkpoints_inline(self, db):
+        # The background thread would race these counts on a slow runner; only explicit ticks here.
+        _maintenance_thread.stop_maintenance_thread(db)
         call_count = [0]
         original = db._try_wal_checkpoint
 
@@ -215,7 +223,30 @@ class TestCheckpointFrequency:
 
         db._try_wal_checkpoint = counting_checkpoint
 
-        # Write exactly _CHECKPOINT_EVERY_N_WRITES sessions to trigger one checkpoint
+        n = db._CHECKPOINT_EVERY_N_WRITES
+        import time as _time
+        for i in range(n * 2):
+            db._execute_write(lambda conn, _i=i: conn.execute(
+                "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
+                (f"sess_{_i}", "test", _time.time()),
+            ))
+
+        assert call_count[0] == 0, (
+            f"write path must not checkpoint inline, got {call_count[0]} calls"
+        )
+
+    def test_maintenance_tick_checkpoints_after_threshold(self, db):
+        # The background thread would race these counts on a slow runner; only explicit ticks here.
+        _maintenance_thread.stop_maintenance_thread(db)
+        call_count = [0]
+        original = db._try_wal_checkpoint
+
+        def counting_checkpoint():
+            call_count[0] += 1
+            original()
+
+        db._try_wal_checkpoint = counting_checkpoint
+
         n = db._CHECKPOINT_EVERY_N_WRITES
         import time as _time
         for i in range(n):
@@ -224,6 +255,41 @@ class TestCheckpointFrequency:
                 (f"sess_{_i}", "test", _time.time()),
             ))
 
+        _maintenance_thread.maintenance_tick(db)
         assert call_count[0] == 1, (
-            f"Expected 1 checkpoint after {n} writes, got {call_count[0]}"
+            f"Expected 1 checkpoint from the maintenance tick, got {call_count[0]}"
         )
+        # Below-threshold delta: the next tick is a no-op.
+        _maintenance_thread.maintenance_tick(db)
+        assert call_count[0] == 1
+
+    def test_maintenance_thread_lifecycle(self, tmp_path):
+        db = StoreHolder(tmp_path / "maint.db")
+        thread = db._maint_thread
+        assert thread is not None and thread.is_alive()
+        db.close()
+        thread.join(timeout=3.0)
+        assert not thread.is_alive()
+
+    def test_maintenance_thread_does_not_pin_unclosed_db(self, tmp_path):
+        """The maintenance thread must hold only a weakref to the holder.
+
+        Tests and short-lived callers create a store holder without close();
+        a bound-method thread target pinned every such instance and its
+        sqlite caches for the process lifetime — a full-suite run was
+        OOM-killed at 37GB RSS. Unclosed instances must stay collectable.
+        """
+        import gc
+        import weakref
+
+        db = StoreHolder(tmp_path / "leak.db")
+        thread = db._maint_thread
+        ref = weakref.ref(db)
+        del db  # no close() on purpose
+        gc.collect()
+        assert ref() is None, "an unclosed store holder must be garbage-collectable"
+        # The orphaned thread notices the dead ref on its next wake and
+        # exits on its own (daemon either way; this just proves the exit
+        # path). Waking it early via the stop event would defeat the
+        # point, so poke the weakref path directly with a short interval.
+        assert thread.daemon

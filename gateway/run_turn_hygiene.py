@@ -684,17 +684,44 @@ class GatewayTurnHygieneMixin:
         _hyg_checkpoint_required = _is_truthy(
             ((_load_cfg() or {}).get("compression") or {}).get("checkpoint_required"), default=False,
         )
-        _hyg_agent = AIAgent(
-            **_hyg_runtime, model=_hyg_model, max_iterations=4, quiet_mode=True,
-            skip_memory=not _hyg_checkpoint_required, enabled_toolsets=["memory"],
-            session_id=session_entry.session_id, persistence=_hyg_session_db,
-        )
-        _seed_hygiene_system_prompt(_hyg_agent, _hyg_session_row)
-        # The stamp only marks this agent as no real surface. Since #104414 Platform is not a
-        # restore-identity field, so it no longer forces the next live turn to rebuild; the seed's
-        # retain flag is what keeps the reduced-toolset build out of the session row (#122822).
-        _hyg_agent.platform = _GATEWAY_HYGIENE_PLATFORM
-        refresh_auto_cache_ttl(_hyg_agent)
+        _hyg_sid = session_entry.session_id
+
+        def _hyg_build_agent():
+            # AIAgent.__init__ and bind_session_state read the session's store synchronously (the
+            # writer lock on the SQLite backend). They must NEVER run on the event loop: a writer-lock
+            # convoy here freezes every platform heartbeat (2026-07-28 outage: 160s Discord stall
+            # dumped this exact stack). Build in the executor, same thread pool as the compression.
+            agent = AIAgent(
+                **_hyg_runtime, model=_hyg_model, max_iterations=4, quiet_mode=True,
+                skip_memory=not _hyg_checkpoint_required, enabled_toolsets=["memory"],
+                session_id=_hyg_sid, persistence=_hyg_session_db,
+            )
+            _seed_hygiene_system_prompt(agent, _hyg_session_row)
+            # The stamp only marks this agent as no real surface. Since #104414 Platform is not a
+            # restore-identity field, so it no longer forces the next live turn to rebuild; the seed's
+            # retain flag is what keeps the reduced-toolset build out of the session row (#122822).
+            agent.platform = _GATEWAY_HYGIENE_PLATFORM
+            refresh_auto_cache_ttl(agent)
+            # Hygiene owns the session binding, so prefer in-place compaction over minting a
+            # continuation child. Without a SessionDB this stays False.
+            agent.compression_in_place = True
+            _hyg_engine = getattr(agent, "context_compressor", None)
+            _bind_hyg_state = getattr(_hyg_engine, "bind_session_state", None)
+            if callable(_bind_hyg_state):
+                from agent.conversation_compression import context_engine_persistence, context_engine_session_db
+
+                # A plugin engine rebinds the SessionDB the agent bound it with, which the agent's close() closes.
+                _bind_hyg_state(context_engine_session_db(agent, _hyg_session_db), _hyg_sid,
+                                **context_engine_persistence(_bind_hyg_state, _hyg_session_db))
+            # Never finalize on close() — that would end the live gateway session row.
+            agent._end_session_on_close = False
+            agent._print_fn = lambda *a, **kw: None
+            return agent
+
+        # Same contextvars contract as the compression call below: under multiplex_profiles the
+        # profile secret scope / HERMES_HOME override live in ContextVars.
+        loop = asyncio.get_running_loop()
+        _hyg_agent = await loop.run_in_executor(None, copy_context().run, _hyg_build_agent)
         return _hyg_agent, _hyg_session_db
 
     async def _hmwa_hygiene_detached_attempt(
@@ -705,24 +732,11 @@ class GatewayTurnHygieneMixin:
         continue with (compressed or original) on ``attempt.history``."""
         from gateway.run import HygieneTurnHoldExceeded
         from agent.conversation_compression import CompressionCommitFence
+        # Construction AND session-state binding run in the executor (see _hmwa_hygiene_build_agent):
+        # both read the session's store synchronously and must stay off the event loop.
         _hyg_agent, _hyg_session_db = await self._hmwa_hygiene_build_agent(_hyg_model, _hyg_runtime, session_entry)
         attempt.agent = _hyg_agent
         try:
-            # Hygiene owns the session binding, so prefer in-place compaction over minting a
-            # continuation child. Without a SessionDB this stays False.
-            _hyg_agent.compression_in_place = True
-            _hyg_engine = getattr(_hyg_agent, "context_compressor", None)
-            _bind_hyg_state = getattr(_hyg_engine, "bind_session_state", None)
-            if callable(_bind_hyg_state):
-                from agent.conversation_compression import context_engine_persistence, context_engine_session_db
-
-                # A plugin engine rebinds the SessionDB the agent bound it with, which the agent's close() closes.
-                _bind_hyg_state(context_engine_session_db(_hyg_agent, _hyg_session_db), session_entry.session_id,
-                                **context_engine_persistence(_bind_hyg_state, _hyg_session_db))
-            # Never finalize on close() — that would end the live gateway session row.
-            _hyg_agent._end_session_on_close = False
-            _hyg_agent._print_fn = lambda *a, **kw: None
-
             loop = asyncio.get_running_loop()
             _hyg_commit_fence = CompressionCommitFence(total_ceiling_seconds=hs.total_ceiling_seconds)
             # Default executor (NOT self._get_executor): a hung summary must never occupy an

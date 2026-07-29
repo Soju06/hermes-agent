@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from persistence.sqlite import _schema
+from persistence.sqlite import _maintenance_thread, _schema
 from persistence.sqlite._holder import StoreHolder
 from persistence.sqlite._schema import (
     _fts_external_index_empty_with_messages,
@@ -384,8 +384,10 @@ class TestOptimizeFts:
         assert any("VALUES('usermerge', 2)" in sql for sql in statements)
         assert not any("'optimize'" in sql for sql in statements)
 
-    def test_write_path_merges_fts_only_at_cadence_boundary(self, db, monkeypatch):
-        """Routine writes use bounded merge and never full optimize."""
+    def test_maintenance_merges_fts_only_at_cadence_boundary(self, db, monkeypatch):
+        """The maintenance tick uses bounded merge, never full optimize."""
+        # The background thread would race these counts on a slow runner; only explicit ticks here.
+        _maintenance_thread.stop_maintenance_thread(db)
         db._FTS_MERGE_EVERY_N_WRITES = 5
         calls = []
 
@@ -403,11 +405,14 @@ class TestOptimizeFts:
             append_message(db, session_id="s1", role="user", content=f"needle {i}")
         assert calls == []  # Four successful writes are below the boundary.
         append_message(db, session_id="s1", role="user", content="needle 3")
+        assert calls == []  # The write hot path only advances the counter.
+        _maintenance_thread.maintenance_tick(db)
         assert calls == [500]  # The fifth write gets the production page budget.
         for i in range(4, 8):
             append_message(db, session_id="s1", role="user", content=f"needle {i}")
         assert calls == [500]
         append_message(db, session_id="s1", role="user", content="needle 8")
+        _maintenance_thread.maintenance_tick(db)
         assert calls == [500, 500]  # The tenth write is the next boundary.
         assert len(search_messages(db, "needle")) == 9
 

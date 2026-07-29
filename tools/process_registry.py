@@ -27,6 +27,7 @@ _IS_WINDOWS = platform.system() == "Windows"
 _IS_LINUX = platform.system() == "Linux"
 from tools.environments.sandbox_scope import hosted_scope, producer_fields
 from tools.environments.local import _append_dropped_path_entries, _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env, _terminal_env, routed_terminal_base
+from tools.environments.local_child_nice import _nice_argv
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, NamedTuple, Optional
@@ -1168,7 +1169,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         # hang waiting for `q` — default them to cat, honoring any pager the user set.
         pty_env.setdefault("GIT_PAGER", "cat")
         pty_env.setdefault("PAGER", "cat")
-        pty_proc = _PtyProcessCls.spawn(pty_argv, cwd=session.cwd, env=pty_env, dimensions=(30, 120))
+        pty_proc = _PtyProcessCls.spawn(_nice_argv(pty_argv), cwd=session.cwd, env=pty_env, dimensions=(30, 120))
         self._own_pty_job(session, pty_proc)
         session.pid = pty_proc.pid
         session.host_start_time = self._safe_host_start_time(session.pid)
@@ -1226,7 +1227,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         output = open_output_log(log) if log else subprocess.PIPE
         try:
             proc = self._spawn_job(
-                session, spawn_argv, persist_on_release, text=True, cwd=session.cwd, env=spawn_env,
+                session, _nice_argv(spawn_argv), persist_on_release, text=True, cwd=session.cwd, env=spawn_env,
                 encoding="utf-8", errors="replace", stdout=output, stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL, **_popen_kwargs)
         finally:
