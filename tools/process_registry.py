@@ -43,7 +43,12 @@ import uuid
 from pathlib import Path
 
 _IS_WINDOWS = platform.system() == "Windows"
-from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
+from tools.environments.local import (
+    _find_shell,
+    _nice_argv,
+    _resolve_safe_cwd,
+    _sanitize_subprocess_env,
+)
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -1103,7 +1108,7 @@ class ProcessRegistry:
                     )
 
                 pty_proc = _PtyProcessCls.spawn(
-                    pty_argv,
+                    _nice_argv(pty_argv),
                     cwd=session.cwd,
                     env=pty_env,
                     dimensions=(30, 120),
@@ -1201,7 +1206,7 @@ class ProcessRegistry:
                 )
 
         proc = subprocess.Popen(
-            spawn_argv,
+            _nice_argv(spawn_argv),
             text=True,
             cwd=session.cwd,
             env=bg_env,
