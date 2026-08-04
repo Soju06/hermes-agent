@@ -17101,8 +17101,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _router_applied:
                 _saved_override = self._session_model_overrides.get(session_key)
                 _reasoning_store = getattr(self, "_session_reasoning_overrides", None)
-                if isinstance(_reasoning_store, dict):
-                    _saved_reasoning = _reasoning_store.get(session_key)
+                if _reasoning_store is not None:
+                    try:
+                        _saved_reasoning = _reasoning_store.get(session_key)
+                    except Exception:
+                        _saved_reasoning = None
                 _notes = getattr(self, "_pending_model_notes", None)
                 if isinstance(_notes, dict):
                     _saved_note = _notes.get(session_key)
