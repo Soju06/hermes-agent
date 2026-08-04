@@ -2198,6 +2198,14 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
                 f"Move '{key}' under the appropriate section",
             ))
 
+    # Optional route catalog validation is kept in its owning module to avoid
+    # making core config parsing depend on routing internals at import time.
+    try:
+        from hermes_cli.model_routes import validate_model_routes
+        issues.extend(validate_model_routes(config))
+    except Exception:
+        pass
+
     return issues
 
 
