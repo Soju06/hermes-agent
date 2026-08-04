@@ -92,6 +92,7 @@ class TurnContext:
     persist_user_message: Optional[Any] = None
     persist_user_timestamp: Optional[float] = None
     turn_trace_obj: Any = None
+    turn_resume_marker: Optional[dict] = None
     user_config: Any = None
     enabled_toolsets: Any = None
     disabled_toolsets: Any = None
