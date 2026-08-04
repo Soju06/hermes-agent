@@ -1671,6 +1671,33 @@ def _fallback_entry_key(fb: dict) -> tuple[str, str, str]:
     )
 
 
+_VALID_FALLBACK_API_MODES = (
+    "chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse",
+)
+
+
+def _declared_fallback_api_mode(fb: dict) -> str:
+    """Explicitly declared api_mode for a fallback chain entry, or "".
+
+    Checks the chain entry itself first (``hermes fallback`` stores an
+    optional ``api_mode``), then the named provider's config.yaml
+    ``providers.<name>.api_mode``. Unknown values are ignored so a config
+    typo degrades to the URL heuristics instead of a broken transport.
+    """
+    declared = str(fb.get("api_mode") or "").strip()
+    if not declared:
+        try:
+            from hermes_cli.config import load_config
+
+            providers_cfg = load_config().get("providers") or {}
+            entry = providers_cfg.get(str(fb.get("provider") or "").strip().lower())
+            if isinstance(entry, dict):
+                declared = str(entry.get("api_mode") or "").strip()
+        except Exception:
+            declared = ""
+    return declared if declared in _VALID_FALLBACK_API_MODES else ""
+
+
 def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str]:
     """Return a skip reason for fallback entries known to be unusable locally."""
     fb_provider = (fb.get("provider") or "").strip().lower()
@@ -1820,11 +1847,19 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 fb_model, fb_provider, _norm_err,
             )
 
-        # Determine api_mode from provider / base URL / model
-        fb_api_mode = "chat_completions"
+        # Determine api_mode: an explicit declaration wins over URL
+        # heuristics.  Chain entries may carry ``api_mode`` (documented in
+        # `hermes fallback`), and config.yaml ``providers.<name>.api_mode``
+        # is authoritative for user providers — LB-style proxies
+        # (e.g. claude-lb) serve anthropic_messages on private hosts the
+        # heuristics below cannot recognize and would misroute to
+        # /v1/chat/completions.
+        fb_api_mode = _declared_fallback_api_mode(fb)
         fb_base_url = str(fb_client.base_url)
         _fb_is_azure = agent._is_azure_openai_url(fb_base_url)
-        if fb_provider == "openai-codex":
+        if fb_api_mode:
+            pass
+        elif fb_provider == "openai-codex":
             fb_api_mode = "codex_responses"
         elif fb_provider in {"nous", "nous-portal", "nousresearch"}:
             # Portal is dual-wire: anthropic/* must land on /v1/messages.
@@ -1865,6 +1900,8 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             and base_url_host_matches(fb_base_url, "amazonaws.com")
         ):
             fb_api_mode = "bedrock_converse"
+        if not fb_api_mode:
+            fb_api_mode = "chat_completions"
 
         old_model = agent.model
         old_provider = agent.provider
@@ -1881,6 +1918,11 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent._fallback_activated = True
+        # Record WHY the fallback activated so plugins (e.g. capability
+        # gates) can distinguish a refusal-driven temporary swap from any
+        # other fallback state.  Only set on the success path — exhaustion
+        # and skip paths must not leave a stale reason behind.
+        agent._fallback_reason = reason.value if reason is not None else None
 
         # Rebind the credential pool to the fallback provider when the provider
         # changes.  Keeping the primary pool attached would make downstream
@@ -2059,6 +2101,17 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # short-circuit the freshly activated fallback before it gets a
         # single stream attempt.
         _reset_stale_streak(agent)
+        # Publish the mid-turn swap on the runtime_state hook so guardrail
+        # plugins (skill-gate) see the new model/provider + fallback_reason
+        # immediately.  Best-effort: activation must never fail because a
+        # plugin hook failed.  Local import — runtime_control is core-owned
+        # and pulling it at module scope risks an import cycle.
+        try:
+            from agent.runtime_control import _emit_runtime_state_event, get_runtime_state
+
+            _emit_runtime_state_event(agent, event="fallback", state=get_runtime_state(agent))
+        except Exception as _hook_err:
+            logger.debug("runtime_state fallback event failed: %s", _hook_err)
         return True
     except Exception as e:
         if fb_provider == "nous":
