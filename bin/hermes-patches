@@ -132,6 +132,8 @@ def cmd_status(_args: argparse.Namespace) -> int:
     print("-" * 100)
     drift = False
     for p in m.patches:
+        if not p.branch or p.state not in ("local-only", "pending-upstream", "vendored"):
+            continue
         # Does the branch exist locally?
         branch_ok = "yes"
         try:
@@ -289,6 +291,8 @@ def cmd_validate(_args: argparse.Namespace) -> int:
     m = parse_manifest()
     failed = False
     for p in m.patches:
+        if not p.branch or p.state not in ("local-only", "pending-upstream", "vendored"):
+            continue
         try:
             git("rev-parse", "--verify", p.branch, check=True)
         except subprocess.CalledProcessError:
