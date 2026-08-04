@@ -131,7 +131,7 @@ def test_run_agent_prefers_session_override_over_global_runtime(monkeypatch):
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", _explode_runtime_resolution)
 
     fake_run_agent = types.ModuleType("run_agent")
-    fake_run_agent.AIAgent = _CapturingAgent
+    setattr(fake_run_agent, "AIAgent", _CapturingAgent)
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
     _CapturingAgent.last_init = None
@@ -179,7 +179,7 @@ def test_runtime_update_callback_persists_session_overrides(monkeypatch):
     )
 
     fake_run_agent = types.ModuleType("run_agent")
-    fake_run_agent.AIAgent = _RuntimeSwitchingAgent
+    setattr(fake_run_agent, "AIAgent", _RuntimeSwitchingAgent)
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
     runner = _make_runner()
@@ -250,10 +250,17 @@ def test_persisted_runtime_override_survives_gateway_restart(tmp_path, monkeypat
     runner = _make_runner()
     runner.session_store = store2
 
-    def fake_resolve_runtime_provider(*, requested=None, explicit_base_url=None, explicit_api_key=None):
+    def fake_resolve_runtime_provider(
+        *,
+        requested=None,
+        explicit_base_url=None,
+        explicit_api_key=None,
+        target_model=None,
+    ):
         assert requested == "codex-nekos"
         assert explicit_base_url is None
         assert explicit_api_key is None
+        assert target_model == "gpt-5.5"
         return {
             "api_key": "runtime-secret",
             "base_url": "https://codex.nekos.me/v1",
@@ -298,7 +305,7 @@ async def test_background_task_prefers_session_override_over_global_runtime(monk
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", _explode_runtime_resolution)
 
     fake_run_agent = types.ModuleType("run_agent")
-    fake_run_agent.AIAgent = _CapturingAgent
+    setattr(fake_run_agent, "AIAgent", _CapturingAgent)
     monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
 
     _CapturingAgent.last_init = None
