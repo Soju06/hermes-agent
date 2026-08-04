@@ -158,11 +158,14 @@ class GatewayAgentCacheMixin:
             persisted = store.get_model_override(session_key)
         except Exception:
             logger.debug("Failed to read persisted session model override", exc_info=True)
-            return
+            persisted = None
         # Defensive typing: this runs on every override read (via _get_session_model_override), so a
         # store returning a non-dict (stubbed/partial stores) must be treated as "nothing persisted"
         # instead of leaking bogus values into the override cache.
         if not persisted or not isinstance(persisted, dict):
+            # No /model write-through: the durable runtime route (agent model_switch / plugin
+            # runtime_override) persisted on the SessionEntry is the next source.
+            self._rehydrate_persisted_runtime_route(session_key)
             return
         override: dict[str, Any] = {k: persisted.get(k) for k in ("model", "provider", "base_url")}
         provider = persisted.get("provider")
@@ -224,8 +227,9 @@ class GatewayAgentCacheMixin:
             return None
 
     def _get_session_model_override(self, session_key: Optional[str]) -> Optional[Dict[str, Any]]:
-        """Effective session model override: in-memory → rehydrated /model write-through → durable
-        SessionEntry runtime_model/runtime_provider (identifiers only; credentials re-resolved)."""
+        """Effective session model override: in-memory → rehydrated /model write-through or durable
+        SessionEntry runtime route (``_rehydrate_session_model_override``; identifiers only,
+        credentials re-resolved)."""
         if not session_key:
             return None
         override = self._session_model_override(session_key)
@@ -233,20 +237,7 @@ class GatewayAgentCacheMixin:
             return dict(override)
         self._rehydrate_session_model_override(session_key)
         override = self._session_model_override(session_key)
-        if override:
-            return dict(override)
-        entry = self._get_session_entry(session_key)
-        if entry is None:
-            return None
-        runtime_model = getattr(entry, "runtime_model", None)
-        runtime_provider = getattr(entry, "runtime_provider", None)
-        if runtime_model is not None and not isinstance(runtime_model, str):
-            runtime_model = None
-        if runtime_provider is not None and not isinstance(runtime_provider, str):
-            runtime_provider = None
-        if not runtime_model and not runtime_provider:
-            return None
-        return {"model": runtime_model or "", "provider": runtime_provider or ""}
+        return dict(override) if override else None
 
     def _persist_session_runtime_override(
         self,
@@ -383,6 +374,38 @@ class GatewayAgentCacheMixin:
         if changed:
             self._evict_cached_agent(session_key)
         return changed
+
+    def _rehydrate_persisted_runtime_route(self, session_key: str) -> None:
+        """Rehydrate the durable runtime route (SessionEntry runtime_model/runtime_provider, written by
+        agent model_switch / plugin runtime_override) into the in-memory override when no /model
+        override exists. Only identifiers are persisted; credentials/endpoint are re-resolved."""
+        from gateway.run import _resolve_runtime_agent_kwargs_for_provider
+        entry = self._get_session_entry(session_key)
+        if entry is None:
+            return
+        runtime_model = getattr(entry, "runtime_model", None)
+        runtime_provider = getattr(entry, "runtime_provider", None)
+        if runtime_model is not None and not isinstance(runtime_model, str):
+            runtime_model = None
+        if runtime_provider is not None and not isinstance(runtime_provider, str):
+            runtime_provider = None
+        if not runtime_model and not runtime_provider:
+            return
+        resolved: Dict[str, Any] = {"model": runtime_model or "", "provider": runtime_provider or ""}
+        if runtime_provider:
+            # Re-resolve credentials/endpoint for the persisted provider id (never stored); on
+            # failure keep the credential-less override so env-based resolution layers on top.
+            try:
+                runtime = _resolve_runtime_agent_kwargs_for_provider(runtime_provider)
+                resolved.update(runtime)
+                resolved["model"] = runtime_model or runtime.get("model", "")
+                resolved["provider"] = runtime_provider
+            except Exception:
+                logger.debug(
+                    "Credential re-resolution failed for persisted runtime override provider=%s",
+                    runtime_provider, exc_info=True,
+                )
+        self._session_state(session_key).conversation.model_override = dict(resolved)
 
     def _apply_session_model_override(self, session_key: str, model: str, runtime_kwargs: dict) -> tuple:
         """Apply /model session overrides (precedence over config.yaml defaults; ``None`` fields skipped
