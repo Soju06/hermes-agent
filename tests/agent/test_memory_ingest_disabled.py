@@ -241,7 +241,9 @@ def _stub_runtime_main():
 def _build_prologue(agent, **overrides):
     kwargs = dict(
         agent=agent,
-        user_message="hello",
+        # Upstream skips external-memory prefetch for trivial greetings; use a
+        # substantive query so the control test still exercises that seam.
+        user_message="Summarize the project decisions we made last week",
         system_message=None,
         conversation_history=None,
         task_id=None,
