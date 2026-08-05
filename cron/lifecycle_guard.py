@@ -18,7 +18,7 @@ import stat
 import sys
 from itertools import pairwise
 from pathlib import Path
-from typing import Callable, Iterator, Optional
+from typing import Callable, Iterable, Iterator, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -744,7 +744,11 @@ def contains_launchctl_submit_command(command: str) -> bool:
 
     See #62891.
     """
-    for segment in _iter_command_segments(command):
+    return _segments_contain_launchctl_submit(_iter_command_segments(command))
+
+
+def _segments_contain_launchctl_submit(segments: Iterable[list[str]]) -> bool:
+    for segment in segments:
         index = _executed_command_index(segment)
         if index is not None and _executable_name(segment[index]) == "launchctl":
             arguments = segment[index + 1 :]
@@ -1036,11 +1040,12 @@ def _targets_gateway_pid(
     return False
 
 
-def _direct_lifecycle_scan(command: str) -> bool:
-    """Pure-string direct scans: lifecycle regex (data-exempted) + submit."""
+def _direct_lifecycle_scan(command: str, segments: Optional[Iterable[list[str]]] = None) -> bool:
+    """Pure-string direct scans: lifecycle regex (data-exempted) + submit. *segments* is
+    ``_iter_command_segments(command)`` when the caller already tokenized it."""
     return (
         _lifecycle_command_scan_with_data_exemption(command)
-        or contains_launchctl_submit_command(command)
+        or _segments_contain_launchctl_submit(_iter_command_segments(command) if segments is None else segments)
     )
 
 
@@ -1191,7 +1196,13 @@ def _iter_referenced_shell_scripts(command: str, *, cwd: Optional[str] = None) -
     """Yield scripts executed directly or through a POSIX shell. Each segment is read at the
     original token AND at the peeled wrapper target — additive on purpose: peeling must never REMOVE
     a reference (a local ``./timeout`` is a script, not the coreutils wrapper)."""
-    for segment in _iter_command_segments(command):
+    yield from _iter_referenced_shell_scripts_from_segments(_iter_command_segments(command), cwd=cwd)
+
+
+def _iter_referenced_shell_scripts_from_segments(
+    segments: Iterable[list[str]], *, cwd: Optional[str] = None
+) -> Iterator[Path]:
+    for segment in segments:
         index = _command_token_index(segment)
         if index is None:
             continue
@@ -1204,7 +1215,11 @@ def _iter_referenced_shell_scripts(command: str, *, cwd: Optional[str] = None) -
 def _iter_shell_command_payloads(command: str) -> Iterator[str]:
     """Yield code passed through ``sh|bash|... -c`` (and ``su -c`` / ``env -S``) for recursive
     scanning."""
-    for segment in _iter_command_segments(command):
+    yield from _iter_shell_command_payloads_from_segments(_iter_command_segments(command))
+
+
+def _iter_shell_command_payloads_from_segments(segments: Iterable[list[str]]) -> Iterator[str]:
+    for segment in segments:
         index = _command_token_index(segment)
         if index is None:
             continue
@@ -1264,13 +1279,17 @@ def _collect_heredoc_written_scripts(
     return written
 
 
-def _walk_candidates(command: str, walk_command: str, cwd: Optional[str], executed: bool) -> list[tuple[Path, bool]]:
+def _walk_candidates(
+    segments: list[list[str]], walk_segments: list[list[str]], cwd: Optional[str], executed: bool,
+) -> list[tuple[Path, bool]]:
     """Referenced-script candidates: executed-view paths first, then paths only mentioned in masked
-    bodies. A heredoc body written to a candidate path is that script's text (see the walk); a body
-    that is only written stays documentation (#88336)."""
-    candidates = [(path, executed) for path in _iter_referenced_shell_scripts(walk_command, cwd=cwd)]
-    if walk_command != command:
-        candidates += [(path, False) for path in _iter_referenced_shell_scripts(command, cwd=cwd)]
+    bodies. *walk_segments* are the tokens of the masked view and *segments* those of the unmasked
+    command; the walk passes the same list for both when masking changed nothing. A heredoc body
+    written to a candidate path is that script's text (see the walk); a body that is only written
+    stays documentation (#88336)."""
+    candidates = [(path, executed) for path in _iter_referenced_shell_scripts_from_segments(walk_segments, cwd=cwd)]
+    if walk_segments is not segments:
+        candidates += [(path, False) for path in _iter_referenced_shell_scripts_from_segments(segments, cwd=cwd)]
     return candidates
 
 
@@ -1455,7 +1474,12 @@ def _contains_unsafe_gateway_action(
             charge=charge, gateway_pid=gateway_pid,
         )
 
-    if _direct_lifecycle_scan(command) or (
+    # Tokenize once per nesting level: launchctl detection, payload extraction and referenced-script
+    # extraction all consume the same token stream. shlex is pure Python; tokenizing the same
+    # command three times per level is GIL time taken from the gateway event loop (part of the
+    # 2026-08-05 loop-stall incident, 4 threads mid-parse).
+    segments = list(_iter_command_segments(command))
+    if _direct_lifecycle_scan(command, segments) or (
         executed and gateway_pid is not None
         and _targets_gateway_pid(command, gateway_pid, depth=depth, rescan=lambda text: recurse(text, cwd, True))
     ):
@@ -1473,8 +1497,10 @@ def _contains_unsafe_gateway_action(
     from tools.shell_heredoc import strip_inert_heredoc_bodies
 
     walk_command = strip_inert_heredoc_bodies(command)
+    # Reuse the level's token stream when masking changed nothing (the common case).
+    walk_segments = segments if walk_command == command else list(_iter_command_segments(walk_command))
 
-    for payload in _iter_shell_command_payloads(walk_command):
+    for payload in _iter_shell_command_payloads_from_segments(walk_segments):
         if recurse(payload, cwd, executed):
             return True
 
@@ -1482,7 +1508,7 @@ def _contains_unsafe_gateway_action(
     # `/x/restart.sh` to os.system() executes it. Only the fail-closed verdicts (cloud placeholder,
     # oversized/binary, budget) stay restricted to the executed view — a mere data mention must not
     # trip them. Executed candidates come first so a mention never starves a real script's budget.
-    for script_path, candidate_executed in _walk_candidates(command, walk_command, cwd, executed):
+    for script_path, candidate_executed in _walk_candidates(segments, walk_segments, cwd, executed):
         if _scan_written_bodies(written.pop(_resolve_lenient(script_path), []), recurse, cwd, candidate_executed):
             return True
         # Do not touch a FileProvider path even to discover whether the file is hydrated.
