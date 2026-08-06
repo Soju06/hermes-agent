@@ -280,6 +280,12 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
         descriptor = os.open(path, flags)
     except OSError:
         return None, False
+    except ValueError:
+        # A NUL byte embedded in the path itself (machine code tokenized as
+        # a "path" by a caller that fed binary content into the recursion).
+        # Path.resolve tolerates it upstream (#76762); os.open must too — a
+        # guarded path must never crash the guard.
+        return None, False
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
@@ -353,6 +359,15 @@ def _contains_unsafe_gateway_action(
         if script_text is None and read_remote_script is not None:
             # Local path missing; try the remote backend if one is available.
             script_text = read_remote_script(str(script_path))
+            if script_text is not None and "\x00" in script_text:
+                # Same binary skip as the local read (#76762): a NUL in the
+                # content means machine code, not a shell script. Without
+                # this, a callback that reads the file another way (e.g.
+                # terminal_tool's local-read fallback) resurrects the binary
+                # the local read deliberately skipped, and its decoded bytes
+                # get tokenized into NUL-bearing junk paths that crash
+                # os.open with ValueError deeper in the recursion.
+                script_text = None
         if not script_text:
             continue
         # Relative references inside a script resolve against that script's
