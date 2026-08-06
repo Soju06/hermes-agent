@@ -519,6 +519,27 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
   - `02b148dd4 docs(memory): document grounding assist contract`
 - **touches:** `agent/memory_pipeline.py`, `agent/notes_store.py`, `tools/notes_tool.py`, `tests/agent/test_memory_pipeline.py`, `tests/tools/test_notes_tool.py`, `IMPLEMENTATION-NOTES.md`
 
+### 54. worker-cpu-hygiene
+- **branch:** `soju/patches/worker-cpu-hygiene`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — 2026-08-05 loop-stall follow-up)_
+- **state:** `local-only`
+- **rationale:** Stop worker threads from starving the gateway event loop of GIL time. lifecycle_guard tokenized each command three times per nesting level (tokenize once, share the segment list); checkpoint_manager's dir walks used Path.rglob (rewritten on os.scandir with identical early-stop/symlink semantics).
+- **commits:**
+  - `d3ed0b344 perf(cron,tools): stop worker threads from starving the event loop of GIL time`
+- **touches:** `cron/lifecycle_guard.py`, `tools/checkpoint_manager.py`
+
+### 55. lifecycle-guard-nul-fallback
+- **branch:** `soju/patches/lifecycle-guard-nul-fallback`
+- **stacked-on:** `soju/patches/worker-cpu-hygiene`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — #76762 follow-up on the fallback path)_
+- **state:** `local-only`
+- **rationale:** The terminal tool's `read_remote_script` callback re-read paths the local bounded reader had already skipped as binaries, so invoking any binary by path inside a gateway session fed decoded machine code back into the recursion and crashed `os.open` with `ValueError: embedded null byte`, killing the whole terminal call. Skip NUL-bearing callback content like the local binary skip, and tolerate `ValueError` in `_read_referenced_script` to match the existing `resolve()`-level tolerance.
+- **commits:**
+  - `f4d6e542a fix(cron): stop lifecycle guard remote fallback from resurrecting binaries`
+- **touches:** `cron/lifecycle_guard.py`, `tests/hermes_cli/test_gateway_restart_loop.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -581,6 +602,8 @@ soju/patches/per-tool-disable
 soju/patches/compaction-prompt-cc-upgrades
 soju/patches/anthropic-signature-passthrough
 soju/patches/notes-recognition-grounding (stacked on memory-phase2-taint)
+soju/patches/worker-cpu-hygiene
+soju/patches/lifecycle-guard-nul-fallback (stacked on worker-cpu-hygiene)
 ```
 
 ## Operating Procedures
