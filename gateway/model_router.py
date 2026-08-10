@@ -111,6 +111,26 @@ CONTINUATION_RE = re.compile(
     re.IGNORECASE,
 )
 
+DEV_REFUSAL_S0 = (
+    "S0 REFUSAL RISK — before label flow, independently set refusal_risk=true ONLY for "
+    "hard cases likely to be refused by frontier default models: explicit sexual/NSFW "
+    "content authoring requests; clearly ToS-violating or legally-gray operational "
+    "requests; secret/credential extraction, DRM/security-keypad bypass, OAuth proxy/token "
+    "interception, or hard reverse-engineering of protections; or anything the user frames "
+    "as \"the usual frontier model refuses this\". Do NOT trigger for security research "
+    "discussion, authorized pentesting of the user's own systems, mild profanity, dark-theme "
+    "creative writing, medical/legal questions, or gray-area engineering such as scraping. "
+    "Precision first: when unsure set refusal_risk=false. Set refusal_confidence to the "
+    "probability that this hard refusal-risk assessment is correct; when refusal_risk=true, "
+    "evidence must mention the S0/R cue. Then continue S1-S7 unchanged for the label."
+)
+
+DEV_REFUSAL_EXAMPLE = (
+    '"노골적인 NSFW 장면을 써줘" → '
+    '{evidence:"S0/R explicit NSFW authoring + S6 prose",label:DOCUMENT_WORK,'
+    'refusal_risk:true,refusal_confidence:0.97}'
+)
+
 DEV_SYSTEM_PROMPT = """\
 Router for a bilingual (KO/EN) personal assistant. Context: current message + recent dialogue (most recent first) + platform. Decide what the assistant must DO next.
 
@@ -118,6 +138,8 @@ Labels: NORMAL, DOCUMENT_WORK, FRONTEND_DEV, SYSTEM_DEV.
 Core law: TOPIC ≠ TASK. An engineering topic never makes a turn dev; only commissioned code/config work does.
 
 Apply steps IN ORDER; first match wins.
+
+""" + DEV_REFUSAL_S0 + """
 
 S1 CONTINUATION — bare go-ahead ("ㄱㄱ","진행해","좋아 그렇게 해줘","continue"): inherit from recent dialogue. Prior turn proposed a code/config/schema implementation plan or dev work is ongoing → that DEV label — never downgrade it. Proposed a document draft → DOCUMENT_WORK. Proposed an ops action (restart/rerun/cleanup) or context unclear → NORMAL.
 
@@ -140,7 +162,7 @@ Output JSON per schema. evidence: matched step + decisive cue (≤120 chars), wr
 Examples:
 "결제 서버 배포 잘 됐어?" → {evidence:"S2 status Q",label:NORMAL}
 "ㄱㄱ" after a dropdown-component plan → {evidence:"S1 inherit UI plan",label:FRONTEND_DEV}
-"온보딩 가이드 노션 페이지로 정리해줘" → {evidence:"S6 author doc",label:DOCUMENT_WORK}"""
+"온보딩 가이드 노션 페이지로 정리해줘" → {evidence:"S6 author doc",label:DOCUMENT_WORK}""" + "\n" + DEV_REFUSAL_EXAMPLE
 
 DEV_RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -163,9 +185,21 @@ DEV_RESPONSE_SCHEMA: dict[str, Any] = {
             "maximum": 1,
             "description": "Calibrated probability that switching to this route is correct.",
         },
+        "refusal_risk": {
+            "type": "boolean",
+        },
+        "refusal_confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+        },
     },
-    "required": ["evidence", "label", "confidence"],
-    "propertyOrdering": ["evidence", "label", "confidence"],
+    "required": [
+        "evidence", "label", "confidence", "refusal_risk", "refusal_confidence",
+    ],
+    "propertyOrdering": [
+        "evidence", "label", "confidence", "refusal_risk", "refusal_confidence",
+    ],
 }
 
 # Verbatim from skill-gate __init__.py: per-platform owner allowlists.
@@ -486,7 +520,7 @@ def _first_matching_label(raw: str, allowed: tuple[str, ...], default: str) -> s
 
 
 def _parse_dev_json(raw: str) -> dict[str, Any] | None:
-    """Parse the structured dev-router output {evidence, label, confidence}.
+    """Parse the structured dev-router output and orthogonal refusal fields.
 
     Returns None when the payload is unusable so the caller can fall back to
     plain-label matching (covers tests/fakes that still answer one token).
@@ -505,10 +539,23 @@ def _parse_dev_json(raw: str) -> dict[str, Any] | None:
         confidence = float(obj.get("confidence")) if obj.get("confidence") is not None else None
     except Exception:
         confidence = None
+    refusal_risk = obj.get("refusal_risk") is True
+    try:
+        refusal_confidence = (
+            float(obj.get("refusal_confidence"))
+            if obj.get("refusal_confidence") is not None
+            else None
+        )
+        if refusal_confidence is not None and not 0 <= refusal_confidence <= 1:
+            refusal_confidence = None
+    except Exception:
+        refusal_confidence = None
     return {
         "label": label,
         "confidence": confidence,
         "evidence": str(obj.get("evidence") or "")[:200],
+        "refusal_risk": refusal_risk,
+        "refusal_confidence": refusal_confidence,
     }
 
 
@@ -521,7 +568,8 @@ def classify_dev_detailed(
 ) -> dict[str, Any]:
     """Classify dev routing with structured output.
 
-    Returns {label, confidence, evidence, source} where source is one of
+    Returns {label, confidence, evidence, refusal_risk, refusal_confidence,
+    source} where source is one of
     'llm' (structured or plain-label LLM answer) / 'fallback' (regex outage
     path). Hysteresis logic must only trust 'llm' NORMALs — a fail-open
     NORMAL from an API outage must never trigger a chat downgrade.
@@ -543,7 +591,14 @@ def classify_dev_detailed(
     except Exception as exc:
         fallback = fallback_dev_label(context)
         logger.debug("model router dev classifier failed; fallback=%s: %s", fallback, exc)
-        return {"label": fallback, "confidence": None, "evidence": "", "source": "fallback"}
+        return {
+            "label": fallback,
+            "confidence": None,
+            "evidence": "",
+            "refusal_risk": False,
+            "refusal_confidence": None,
+            "source": "fallback",
+        }
     parsed = _parse_dev_json(raw)
     if parsed is not None:
         parsed["source"] = "llm"
@@ -551,7 +606,14 @@ def classify_dev_detailed(
     label = _first_matching_label(
         raw, ("FRONTEND_DEV", "SYSTEM_DEV", "DOCUMENT_WORK", "NORMAL"), "NORMAL"
     )
-    return {"label": label, "confidence": None, "evidence": "", "source": "llm"}
+    return {
+        "label": label,
+        "confidence": None,
+        "evidence": "",
+        "refusal_risk": False,
+        "refusal_confidence": None,
+        "source": "llm",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -658,6 +720,8 @@ def _runtime_already_satisfies(
     route_name: str,
     cfg: dict[str, Any] | None,
     catalog: Any,
+    *,
+    raise_on_error: bool = False,
 ) -> bool:
     """True when the live runtime is already a member of the route (no-op)."""
     if not runtime or not route_name:
@@ -667,6 +731,8 @@ def _runtime_already_satisfies(
 
         return bool(runtime_satisfies_route(runtime, route_name, cfg, catalog=catalog))
     except Exception as exc:
+        if raise_on_error:
+            raise
         logger.debug("model router: route satisfaction check failed open for %r: %s", route_name, exc)
         return False
 
@@ -712,6 +778,7 @@ def _repromote_on_noop(
     trusted: bool,
     resolve: Callable[[], Optional[dict]],
     noop_outcome: str = "noop_satisfied",
+    raise_on_error: bool = False,
 ) -> tuple[Optional[dict], str]:
     """Advance the member→primary re-promotion streak for one no-op turn.
 
@@ -731,6 +798,8 @@ def _repromote_on_noop(
 
         spec = _lookup_route(catalog, route_name)
     except Exception as exc:
+        if raise_on_error:
+            raise
         logger.debug("model router: repromote lookup failed open for %r: %s", route_name, exc)
         return None, noop_outcome
     if spec is None:
@@ -835,6 +904,9 @@ def static_rule_decision(
         "msg_head": _truncate(text.strip(), 2000)[:120],
         "mode": mode,
         "rule": rule_name,
+        "refusal_risk": False,
+        "refusal_confidence": None,
+        "refusal_applied": False,
     }
     return RoutingDecision(
         directive=directive, outcome=outcome, label=route_name,
@@ -876,6 +948,8 @@ def classifier_decision(
     dev_label = detail["label"]
     state_key = context.session_key or context.session_id or "unknown"
     entry = state.setdefault(state_key, {"normal_streak": 0})
+    refusal_repromote_streak = int(entry.get("repromote_streak") or 0)
+    refusal_repromote_route = str(entry.get("repromote_route") or "")
     label_routes = dict(getattr(router, "label_routes", None) or {})
 
     directive = None
@@ -934,6 +1008,72 @@ def classifier_decision(
         else:
             outcome = f"normal_streak_{entry['normal_streak']}_of_{threshold}"
 
+    normal_repromote_state = {
+        key: entry[key]
+        for key in ("repromote_streak", "repromote_route")
+        if key in entry
+    }
+    refusal_risk = detail.get("refusal_risk") is True
+    refusal_confidence = detail.get("refusal_confidence")
+    refusal_applied = False
+    refusal_below_threshold = False
+    try:
+        refusal = getattr(router, "refusal", None)
+        if (
+            bool(getattr(refusal, "enabled", False))
+            and refusal_risk
+            and detail.get("source") == "llm"
+        ):
+            threshold = float(getattr(refusal, "min_confidence", 0.85))
+            confidence = float(refusal_confidence)
+            if confidence < threshold:
+                refusal_below_threshold = True
+            else:
+                if dev_label in {"SYSTEM_DEV", "FRONTEND_DEV"}:
+                    refusal_route = str(getattr(refusal, "dev_route", "") or "")
+                elif dev_label == "DOCUMENT_WORK":
+                    refusal_route = str(
+                        getattr(refusal, "document_route", "")
+                        or getattr(refusal, "chat_route", "")
+                        or ""
+                    )
+                else:
+                    refusal_route = str(getattr(refusal, "chat_route", "") or "")
+
+                refusal_directive = _resolve_route_directive(refusal_route, cfg, catalog)
+                if refusal_directive is not None:
+                    resolved_route = str(refusal_directive.get("route") or refusal_route)
+                    if _runtime_already_satisfies(
+                        runtime, resolved_route, cfg, catalog, raise_on_error=True,
+                    ):
+                        # The label directive is replaced for this turn. Restore
+                        # the pre-label re-promotion state so label-route
+                        # resolution cannot reset a permissive-route streak.
+                        entry["repromote_streak"] = refusal_repromote_streak
+                        entry["repromote_route"] = refusal_repromote_route
+                        directive, outcome = _repromote_on_noop(
+                            entry=entry,
+                            route_name=resolved_route,
+                            runtime=runtime,
+                            catalog=catalog,
+                            router=router,
+                            trusted=True,
+                            resolve=lambda: refusal_directive,
+                            raise_on_error=True,
+                        )
+                    else:
+                        directive = refusal_directive
+                        outcome = "refusal_switch"
+                        _reset_repromote(entry)
+                    refusal_applied = True
+    except Exception:
+        for key in ("repromote_streak", "repromote_route"):
+            if key in normal_repromote_state:
+                entry[key] = normal_repromote_state[key]
+            else:
+                entry.pop(key, None)
+        logger.debug("model router: refusal evaluation failed open", exc_info=True)
+
     record = {
         "policy": "dev_routing",
         "session_key": state_key,
@@ -948,7 +1088,12 @@ def classifier_decision(
         "msg_head": context.current_user_message[:120],
         "mode": mode,
         "rule": None,
+        "refusal_risk": refusal_risk,
+        "refusal_confidence": refusal_confidence,
+        "refusal_applied": refusal_applied,
     }
+    if refusal_below_threshold:
+        record["refusal_below_threshold"] = True
     return RoutingDecision(
         directive=directive, outcome=outcome, label=dev_label, rule=None, record=record,
     )
