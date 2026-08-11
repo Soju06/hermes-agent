@@ -542,6 +542,18 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
   - `f4d6e542a fix(cron): stop lifecycle guard remote fallback from resurrecting binaries`
 - **touches:** `cron/lifecycle_guard.py`, `tests/hermes_cli/test_gateway_restart_loop.py`
 
+### 56. refusal-risk-routing
+- **branch:** `soju/patches/refusal-risk-routing`
+- **stacked-on:** `soju/patches/lifecycle-guard-nul-fallback`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — dogfood refusal-risk preemptive routing)_
+- **state:** `local-only`
+- **rationale:** Gateway model router gains an orthogonal `refusal_risk` boolean (plus confidence) so hard frontier-refusal turns are preemptively switched to low-refusal routes before the primary model contaminates context. Label flow S1–S7 stays benched and byte-compatible; S0 only sets the orthogonal flag. Config `model_routes.router.refusal` (default disabled) maps SYSTEM_DEV/FRONTEND_DEV → PERMISSIVE_DEV (kimi-k3) and NORMAL/DOCUMENT_WORK → PERMISSIVE_CHAT (grok-4.5) when confidence ≥ threshold and source is LLM. Enforce-mode applied refusal switches emit an owner-visible platform notice via existing `_deliver_platform_notice` (config-gated). Follow-up tune: S0 explicitly false for draft-edit/tone-down of existing NSFW text and own-infra audits; true only for from-scratch NSFW authoring and third-party attack intents. Bench on 300 gold cases @0.85: precision 0.992 / recall 0.928; grok subset 1.0/1.0.
+- **commits:**
+  - `9e1df96aa feat(gateway): refusal-risk preemptive routing with permissive routes`
+  - `a03a15a71 tune(gateway): narrow S0 refusal for draft-edit vs authoring`
+- **touches:** `gateway/model_router.py`, `gateway/run.py`, `hermes_cli/model_routes.py`, `tests/gateway/test_model_router.py`, `tests/hermes_cli/test_model_routes.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
