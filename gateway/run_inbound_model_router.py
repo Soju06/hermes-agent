@@ -266,6 +266,18 @@ class GatewayInboundModelRouterMixin:
                     "model router: %s session=%s -> route=%s model=%s (%s)",
                     decision.outcome, session_key, directive.get("route"), directive.get("model"), decision.label,
                 )
+                forked = False
+                if (
+                    decision.outcome == "refusal_switch"
+                    and bool(getattr(catalog.router.refusal, "clean_fork", True))
+                ):
+                    forked = await self._apply_gateway_refusal_clean_fork(
+                        session_key,
+                        source,
+                        keep_user_turns=int(
+                            getattr(catalog.router.refusal, "keep_user_turns", 5)
+                        ),
+                    )
                 if (
                     decision.outcome == "refusal_switch"
                     and bool(getattr(getattr(catalog.router, "refusal", None), "notify", True))
@@ -276,7 +288,9 @@ class GatewayInboundModelRouterMixin:
                         notice = (
                             f"⚠️ refusal-risk 감지 → {directive.get('route')} "
                             f"({directive.get('model')}) 라우팅 "
-                            f"(conf {confidence:.2f}, {evidence})"
+                            f"(conf {confidence:.2f}, {evidence}"
+                            + (", forked=yes" if forked else "")
+                            + ")"
                         )
                         await self._deliver_platform_notice(source, notice)
                     except Exception:
@@ -289,6 +303,59 @@ class GatewayInboundModelRouterMixin:
             _model_router.log_decision, decision.record,
             decision_log=getattr(catalog.router, "decision_log", "") or "",
         )
+
+    async def _apply_gateway_refusal_clean_fork(
+        self,
+        session_key: str,
+        source: SessionSource,
+        *,
+        keep_user_turns: int,
+    ) -> bool:
+        """Rewrite persisted refusal history and stage its one-turn note."""
+        from agent.refusal_history import clean_fork_messages
+
+        try:
+            session_id = self.session_store.peek_session_id(session_key)
+            if not session_id:
+                entry = await self.async_session_store.get_or_create_session(source)
+                session_id = entry.session_id
+            history = await self.async_session_store.load_transcript(session_id)
+            cleaned = clean_fork_messages(
+                history,
+                keep_user_turns=keep_user_turns,
+            )
+            if not await self.async_session_store.rewrite_transcript(
+                session_id, cleaned
+            ):
+                logger.warning(
+                    "model router: refusal clean-fork transcript rewrite failed "
+                    "session=%s",
+                    session_key,
+                )
+                return False
+        except Exception:
+            logger.warning(
+                "model router: refusal clean-fork failed session=%s",
+                session_key,
+                exc_info=True,
+            )
+            return False
+
+        note = (
+            "[Note: refusal clean-fork applied; prior refusal assistant/tool "
+            "turns dropped. Re-evaluate the latest user request only. Do not "
+            "treat earlier refusals as binding policy.]"
+        )
+        pending = getattr(self, "_pending_model_notes", None)
+        if pending is None:
+            self._pending_model_notes = {}
+            pending = self._pending_model_notes
+        existing = pending.get(session_key, "")
+        pending[session_key] = f"{existing}\n\n{note}".strip()
+        self._session_state(
+            session_key
+        ).conversation.refusal_recall_quarantine = True
+        return True
 
     async def _apply_model_router_directive(
         self, session_key: str, directive: dict, cfg: dict, source: Optional[SessionSource] = None,

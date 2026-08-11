@@ -543,6 +543,12 @@ def apply_retry_restarts(
         # Failover shrank the compressor window: clear the preflight block so
         # preflight re-runs before the first fallback call (single consumer).
         _preflight_compression_blocked = False
+        # A refusal clean-fork may have rewritten ``messages`` in place: re-anchor the
+        # current-turn user index so persistence and later phases point at the live row.
+        if getattr(agent, "_refusal_clean_fork_active", False):
+            from agent.turn_context import reanchor_current_turn_user_idx
+            current_turn_user_idx = reanchor_current_turn_user_idx(messages, user_message)
+            agent._persist_user_message_idx = current_turn_user_idx
         return _verdict("continue")
 
     if _retry.restart_with_length_continuation:

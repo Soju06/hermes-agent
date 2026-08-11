@@ -624,6 +624,10 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             _consume_route_state(ctx.session_key) if callable(_consume_route_state) else None
         ) or {}
         agent._runtime_route_state = pending_runtime_route_state or None
+        _consume_quarantine = getattr(runner, "_consume_refusal_recall_quarantine", None)
+        agent._refusal_recall_quarantine_pending = (
+            bool(_consume_quarantine(ctx.session_key)) if callable(_consume_quarantine) else False
+        )
         turn_sidecar_parts = runner._consume_pending_turn_sidecar_notes(ctx.session_key)
         if agent._runtime_route_state:
             # Routed directives ride the triggering turn's user message (one-shot) so the system

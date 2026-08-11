@@ -220,6 +220,7 @@ class _Trunc(TruncationVerdict):
     api_call_count: int
     effective_task_id: Any
     current_turn_user_idx: Any
+    api_messages: Any = None  # provider-shaped copy (refusal clean-fork rewrites it in place)
     action: str = "fallthrough"
     result: Optional[dict[str, Any]] = None
     window_filled: Optional[tuple[int, int]] = None  # (prompt_tokens, context_length)
@@ -294,6 +295,9 @@ def _content_filter_fallback(st: _Trunc, _retry: TurnRetryState) -> Optional[Tru
             if isinstance(_frag, dict):
                 _frag.pop("_length_continuation_fragment", None)
                 _frag.pop("_length_continuation_nudge", None)
+        if st.api_messages is not None:
+            from agent.refusal_history import apply_refusal_clean_fork
+            apply_refusal_clean_fork(agent, st.messages, st.api_messages)
         agent._session_messages = st.messages
         st.length_continue_retries = 0
         st.truncated_response_parts = []
@@ -458,7 +462,7 @@ def recover_from_truncation(
     messages: list[dict[str, Any]], conversation_history: Any, api_kwargs: Any, api_call_count: int,
     effective_task_id: Any, current_turn_user_idx: Any, length_continue_retries: int,
     truncated_response_parts: list[tuple[str, bool]], truncated_tool_call_retries: int, retry_count: int,
-    compression_attempts: int,
+    compression_attempts: int, api_messages: Any = None,
 ) -> TruncationVerdict:
     """Recover from a truncated response. Order is load-bearing: thinking exhaustion and
     repetition abort BEFORE any continuation; a content-filter stall escalates to the
@@ -471,7 +475,7 @@ def recover_from_truncation(
         messages=messages, length_continue_retries=length_continue_retries,
         truncated_response_parts=truncated_response_parts,
         truncated_tool_call_retries=truncated_tool_call_retries, retry_count=retry_count,
-        compression_attempts=compression_attempts,
+        compression_attempts=compression_attempts, api_messages=api_messages,
     )
     if getattr(response, "_runaway_repetition", False):
         # The streaming call cut a live repetition loop: a continuation would only re-enter it,
@@ -746,6 +750,7 @@ def handle_content_policy_refusal(
     Deterministic for the unchanged prompt — never retried: one configured-fallback try,
     else surface the refusal (explanation may live only in the reasoning channel)."""
     from agent.conversation_loop import _arm_fallback_restart, _content_policy_blocked_result
+    from agent.refusal_history import apply_refusal_clean_fork
 
     _refusal_result = normalize_response_for_agent(agent, response)
     _refusal_text = (getattr(_refusal_result, "content", None) or "").strip()
@@ -786,6 +791,7 @@ def handle_content_policy_refusal(
     # while the same refusal raised as an HTTP 400 (DeepSeek's "Content Exists Risk") says
     # "content policy blocked the request" (#124874). Not a rate-limit reason, so no cooldown is armed.
     if agent._try_activate_fallback(reason=FailoverReason.content_policy_blocked):
+        apply_refusal_clean_fork(agent, messages, api_messages)
         active_system_prompt = _arm_fallback_restart(agent, api_messages, active_system_prompt, _retry)
         return RefusalVerdict("break", None, active_system_prompt)
 
