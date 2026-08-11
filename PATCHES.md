@@ -567,6 +567,20 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
   - `904bb7c2c fix(fallback): content_policy walks generic before PERMISSIVE`
 - **touches:** `agent/chat_completion_helpers.py`, `hermes_cli/model_routes.py`, `tests/hermes_cli/test_model_routes.py`, `tests/run_agent/test_refusal_fallback_reason.py`
 
+
+### 58. refusal-hop-clean-fork
+- **branch:** `soju/patches/refusal-hop-clean-fork`
+- **stacked-on:** `soju/patches/refusal-api-fallback`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — dogfood refusal masking + auto-switch)_
+- **state:** `local-only`
+- **rationale:** When a refusal is detected (hard: `content_policy_blocked` at turn end; soft: classifier `prior_refusal` on the previous assistant turn), mask ONLY the refusal message row (`active=0`, row preserved, `compacted` untouched) and one-shot route the next turn to PERMISSIVE. Replaces the preemptive `rewrite_transcript` that hard-deleted the whole session with no refusal evidence. Mid-turn clean-fork scope cut to the current turn (completed history preserved). `prior_refusal` classifier field costs zero extra API calls (router already receives `recent_turns`). Bench 30/30 at precision 1.0 / recall 1.0 after two prompt narrowings (sub-part inability and domain deferral no longer read as refusals). New `deactivate_messages`/`reactivate_messages` are reversible; no hard deletion anywhere.
+- **commits:**
+  - `e18d67b29 feat(refusal): clean-fork history on PERMISSIVE hop`
+  - `2c3f0496d feat(refusal): mask refused turn and auto-switch instead of rewriting history`
+  - `92e05b919 tune(router): narrow prior_refusal to whole-request refusals`
+- **touches:** `agent/conversation_loop.py`, `agent/refusal_history.py`, `gateway/model_router.py`, `gateway/run.py`, `gateway/session.py`, `hermes_cli/model_routes.py`, `hermes_state.py`, `tests/`
+
 ## State Vocabulary
 
 | state | meaning | when |
