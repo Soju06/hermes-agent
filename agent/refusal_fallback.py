@@ -29,8 +29,16 @@ def is_content_policy_blocked(reason: Any) -> bool:
 
 def current_runtime_is_dev_route(agent: Any, cfg: dict, catalog: Any) -> bool:
     """Whether refusal recovery should prefer the configured dev route."""
-    provider = str(getattr(agent, "provider", "") or "").strip().lower()
-    model = str(getattr(agent, "model", "") or "").strip().lower()
+    # Prefer the pre-fallback primary identity so order stays stable across
+    # generic→PERMISSIVE hops (after opus activates, current provider is no
+    # longer claude-lb but the turn was still a dev refusal).
+    primary = getattr(agent, "_primary_runtime", None) or {}
+    provider = str(
+        primary.get("provider") or getattr(agent, "provider", "") or ""
+    ).strip().lower()
+    model = str(
+        primary.get("model") or getattr(agent, "model", "") or ""
+    ).strip().lower()
     if provider == "claude-lb" and (
         "claude-fable" in model or "claude-opus" in model
     ):
@@ -43,7 +51,9 @@ def current_runtime_is_dev_route(agent: Any, cfg: dict, catalog: Any) -> bool:
         runtime = {
             "provider": provider,
             "model": model,
-            "base_url": str(getattr(agent, "base_url", "") or ""),
+            "base_url": str(
+                primary.get("base_url") or getattr(agent, "base_url", "") or ""
+            ),
         }
         for label in ("SYSTEM_DEV", "FRONTEND_DEV"):
             route_name = str(label_routes.get(label) or "")
@@ -120,11 +130,12 @@ def build_refusal_fallback_chain(agent: Any) -> list[dict]:
 
 
 def walk_refusal_routes(agent: Any, reason: FailoverReason) -> bool:
-    """Re-enter the activator with a temporary route-derived chain.
+    """Walk the PERMISSIVE routes once the generic fallback chain is exhausted.
 
-    Its index survives successful hops within the active refusal sequence, so
-    repeated refusals progress DEV -> CHAT -> generic instead of rebuilding and
-    cycling between PERMISSIVE routes. True when a PERMISSIVE hop activated.
+    Re-enters the activator with a temporary route-derived chain. Its index
+    survives successful hops within the active refusal sequence, so repeated
+    refusals progress generic -> DEV -> CHAT instead of rebuilding and cycling
+    between PERMISSIVE routes. True when a PERMISSIVE hop activated.
     """
     if getattr(agent, "_refusal_fallback_walk_active", False):
         return False
@@ -136,6 +147,13 @@ def walk_refusal_routes(agent: Any, reason: FailoverReason) -> bool:
     if continuing_refusal:
         refusal_chain = getattr(agent, "_refusal_fallback_chain", [])
         refusal_index = int(getattr(agent, "_refusal_fallback_index", 0) or 0)
+        # First successful hop may have been generic only — build the
+        # PERMISSIVE tail lazily when we first exhaust fallback_providers.
+        if not refusal_chain:
+            refusal_chain = build_refusal_fallback_chain(agent)
+            refusal_index = 0
+            agent._refusal_fallback_chain = refusal_chain
+            agent._refusal_fallback_index = 0
     else:
         refusal_chain = build_refusal_fallback_chain(agent)
         refusal_index = 0

@@ -1997,8 +1997,6 @@ def try_activate_fallback(
         # Canonicalize compatible enum-like values before the established
         # activation path stores ``reason.value``.
         reason = FailoverReason.content_policy_blocked
-        if _refusal_fallback.walk_refusal_routes(agent, reason):
-            return True
 
     from agent.fallback_cooldown import _arm_rate_limit_cooldown, switch_deferred_by_reset
     from agent.fallback_notice import announce_fallback_switch, fallback_trigger_text
@@ -2013,6 +2011,16 @@ def try_activate_fallback(
     cooldown_seconds = _arm_rate_limit_cooldown(agent, reason, reset_at=reset_at)
     while True:
         if agent._fallback_index >= len(agent._fallback_chain):
+            # Generic chain exhausted. For content-policy refusals only, walk the
+            # configured PERMISSIVE routes AFTER the normal fallback_providers
+            # (typically opus). Owner intent: keep fable→opus as the first hop so
+            # intelligence is preserved; PERMISSIVE (k3/grok) is the last resort
+            # when frontier models refuse the same prompt.
+            if (
+                reason == FailoverReason.content_policy_blocked
+                and _refusal_fallback.walk_refusal_routes(agent, reason)
+            ):
+                return True
             return _fallback_chain_exhausted(agent, reason)
         fb = agent._fallback_chain[agent._fallback_index]
         agent._fallback_index += 1
