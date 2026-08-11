@@ -581,6 +581,19 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
   - `92e05b919 tune(router): narrow prior_refusal to whole-request refusals`
 - **touches:** `agent/conversation_loop.py`, `agent/refusal_history.py`, `gateway/model_router.py`, `gateway/run.py`, `gateway/session.py`, `hermes_cli/model_routes.py`, `hermes_state.py`, `tests/`
 
+
+### 59. refusal-soft-turnend
+- **branch:** `soju/patches/refusal-hop-clean-fork`
+- **stacked-on:** `soju/patches/refusal-hop-clean-fork` (same branch, two more commits)
+- **origin:** `local-author`
+- **upstream_pr:** _(none — dogfood soft-refusal detection + fallback hardening)_
+- **state:** `local-only`
+- **rationale:** Two gaps observed live on thread 1536678317166694441. (1) A soft refusal authored inside a turn (finish_reason=stop, no error) left no turn-end signal, so nothing masked it and no permissive hop was staged. Add `_handle_gateway_soft_refusal` probing the just-produced response through the existing `prior_refusal` classifier field, gated by length floor + config, with a `refusal_recovery_count` loop guard (`max_recovery_hops` default 2) that stops laundering repeat refusals through more models. (2) A refusal-recovery agent whose generic opus hop then died of `overloaded` never reached PERMISSIVE because the refusal walk only triggered on `content_policy_blocked`. Extend it so an active refusal recovery falls through to PERMISSIVE on ANY generic-exhaustion reason, and add logging to the previously silent `_build_refusal_fallback_chain`.
+- **commits:**
+  - `7a310d6ae feat(refusal): detect soft refusals at turn end with recovery-hop guard`
+  - `780717641 fix(fallback): extend refusal PERMISSIVE chain to generic-exhaustion on any reason`
+- **touches:** `gateway/model_router.py`, `gateway/run.py`, `hermes_cli/model_routes.py`, `agent/chat_completion_helpers.py`, `tests/gateway/test_model_router.py`, `tests/hermes_cli/test_model_routes.py`, `tests/run_agent/test_refusal_fallback_reason.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
