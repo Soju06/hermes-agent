@@ -7,12 +7,14 @@ failed-turn boundary for it (upstream a07afee37c). The gateway's
 user's message on screen (aa24f0ffb6, 6ec9d85795). The router then only stages the one-shot
 permissive hop. It must not mask anything: after the retention the newest active user row is the
 PREVIOUS turn's, so hiding the assistant rows after it would hide that completed answer and reopen
-a user-only tail.
+a user-only tail. A soft refusal (#59 refusal-soft-turnend) is a completed turn, so its reply is
+masked on the real store and the earlier answer stays.
 """
 
 import asyncio
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -75,4 +77,30 @@ def test_hard_refusal_after_upstream_retention_keeps_the_earlier_answer(monkeypa
     assert list(store.persistence.messages.active_message_ids(sid)) == [first, earlier]
     # The durable tail stays closed by the earlier answer.
     assert store.persistence.messages.latest_conversation_role(sid) == "assistant"
+    assert runner._model_router_state["tg:c1"]["force_refusal_route"] is True
+
+
+def test_soft_refusal_masks_only_the_refused_reply_on_the_real_store(monkeypatch, store):
+    import gateway.model_router as mr_mod
+
+    reply = "I won't help with that request, and here is a long explanation of why not."
+    sid = seed_session(store.persistence, "s", "telegram")
+    first, earlier, current, _ = seed_messages(
+        store.persistence, sid,
+        {"role": "user", "content": "earlier request"},
+        {"role": "assistant", "content": "earlier completed answer"},
+        {"role": "user", "content": "current request"},
+        {"role": "assistant", "content": reply},
+    )
+    monkeypatch.setattr(mr_mod, "classify_prior_refusal", MagicMock(return_value={
+        "prior_refusal": True, "prior_refusal_confidence": 0.95, "source": "llm",
+    }))
+    runner = _runner(monkeypatch, store)
+
+    masked = asyncio.run(runner._handle_gateway_soft_refusal(
+        "tg:c1", sid, SimpleNamespace(), {"final_response": reply}, "current request",
+    ))
+
+    assert masked == 1
+    assert list(store.persistence.messages.active_message_ids(sid)) == [first, earlier, current]
     assert runner._model_router_state["tg:c1"]["force_refusal_route"] is True

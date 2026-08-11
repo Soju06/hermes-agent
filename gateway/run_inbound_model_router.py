@@ -307,7 +307,6 @@ class GatewayInboundModelRouterMixin:
         ):
             return 0
 
-        from gateway import model_router as _model_router
         from gateway.run import _load_gateway_config
         from hermes_cli.model_routes import load_routes as _load_model_routes
 
@@ -325,11 +324,189 @@ class GatewayInboundModelRouterMixin:
             )
             return 0
 
+        return await self._stage_gateway_refusal_recovery(
+            session_key,
+            session_id,
+            source,
+            cfg=cfg,
+            catalog=catalog,
+            refusal=refusal,
+            kind="hard",
+        )
+
+    def _reset_gateway_refusal_recovery(self, session_key: str) -> None:
+        """Clear the consecutive-refusal guard after one clean agent turn."""
         state = getattr(self, "_model_router_state", None)
         if state is None:
             state = {}
             self._model_router_state = state
         entry = state.setdefault(session_key or "unknown", {"normal_streak": 0})
+        entry["refusal_recovery_count"] = 0
+        entry["refusal_recovery_exhausted"] = False
+
+    async def _handle_gateway_soft_refusal(
+        self,
+        session_key: str,
+        session_id: str,
+        source: SessionSource,
+        agent_result: dict,
+        event_text: str,
+    ) -> int:
+        """Probe a completed assistant response and stage permissive recovery."""
+        error = str(agent_result.get("error") or "")
+        if error.startswith("content_policy_blocked"):
+            # The hard-refusal path owns this turn, including the guard count.
+            return 0
+        if (
+            agent_result.get("interrupted")
+            or agent_result.get("failed")
+            or agent_result.get("partial")
+            or error
+        ):
+            return 0
+
+        response_text = str(agent_result.get("final_response") or "").strip()
+        if not response_text:
+            return 0
+
+        from gateway import model_router as _model_router
+        from gateway.run import _load_gateway_config
+        from hermes_cli.model_routes import load_routes as _load_model_routes
+
+        try:
+            cfg = _load_gateway_config()
+            catalog = _load_model_routes(cfg)
+            refusal = catalog.router.refusal
+        except Exception:
+            logger.warning(
+                "model router: soft-refusal config load failed session=%s",
+                session_key,
+                exc_info=True,
+            )
+            return 0
+
+        if not (
+            bool(getattr(refusal, "enabled", False))
+            and bool(getattr(refusal, "mask_on_refusal", True))
+            and bool(getattr(refusal, "soft_detect", True))
+        ):
+            self._reset_gateway_refusal_recovery(session_key)
+            return 0
+        if len(response_text) < 40:
+            self._reset_gateway_refusal_recovery(session_key)
+            return 0
+
+        detail = await asyncio.to_thread(
+            _model_router.classify_prior_refusal,
+            response_text,
+            str(event_text or ""),
+            cfg,
+            catalog,
+        )
+        try:
+            confidence = float(detail.get("prior_refusal_confidence"))
+        except (TypeError, ValueError):
+            confidence = None
+        threshold = float(getattr(refusal, "min_confidence", 0.85))
+        if (
+            detail.get("prior_refusal") is not True
+            or confidence is None
+            or confidence < threshold
+        ):
+            self._reset_gateway_refusal_recovery(session_key)
+            return 0
+
+        return await self._stage_gateway_refusal_recovery(
+            session_key,
+            session_id,
+            source,
+            cfg=cfg,
+            catalog=catalog,
+            refusal=refusal,
+            kind="soft",
+        )
+
+    async def _stage_gateway_refusal_recovery(
+        self,
+        session_key: str,
+        session_id: str,
+        source: SessionSource,
+        *,
+        cfg: dict,
+        catalog: object,
+        refusal: object,
+        kind: str,
+    ) -> int:
+        """Mask a soft-refused reply and stage a guarded permissive-route hop."""
+        from gateway import model_router as _model_router
+
+        state = getattr(self, "_model_router_state", None)
+        if state is None:
+            state = {}
+            self._model_router_state = state
+        entry = state.setdefault(session_key or "unknown", {"normal_streak": 0})
+        max_hops = max(1, int(getattr(refusal, "max_recovery_hops", 2) or 2))
+        recovery_count = int(entry.get("refusal_recovery_count") or 0)
+        if recovery_count >= max_hops:
+            if not bool(entry.get("refusal_recovery_exhausted")):
+                entry["refusal_recovery_exhausted"] = True
+                try:
+                    await self._deliver_platform_notice(
+                        source,
+                        "⚠️ 거절이 반복 — 라우팅으로 해결되는 케이스가 아님. 자동 전환을 멈춤",
+                    )
+                except Exception:
+                    logger.debug(
+                        "model router: refusal exhaustion notice send failed",
+                        exc_info=True,
+                    )
+            return 0
+
+        entry["refusal_recovery_count"] = recovery_count + 1
+        entry["refusal_recovery_exhausted"] = False
+        masked = 0
+        if kind == "soft" and bool(getattr(refusal, "mask_on_refusal", True)):
+            # A hard refusal's turn is already out of the model context (upstream's refused-turn
+            # retention, see ``_handle_gateway_hard_refusal``); only a soft refusal's reply is masked.
+            from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND
+
+            try:
+                # The store that owns the session (``SessionStore._db`` is None unless pinned).
+                store = await asyncio.to_thread(self.session_store._persistence_for_session_id, session_id)
+                rows = (
+                    [row.as_wire_row() for row in await asyncio.to_thread(store.messages.read_transcript, session_id)]
+                    if store is not None
+                    else []
+                )
+                latest_user_id = next(
+                    (
+                        int(message["id"])
+                        for message in reversed(rows)
+                        if message.get("role") == "user"
+                    ),
+                    None,
+                )
+                assistant_ids = [
+                    int(message["id"])
+                    for message in rows
+                    if latest_user_id is not None
+                    and int(message.get("id") or 0) > latest_user_id
+                    and message.get("role") == "assistant"
+                    and str(message.get("content") or "").strip()
+                    # The failed-turn boundary closes the durable tail (display-only, never
+                    # model output); hiding it would reopen the tail upstream closes (#107070).
+                    and message.get("display_kind") != FAILED_TURN_DISPLAY_KIND
+                ]
+                masked = await self.async_session_store.deactivate_messages(
+                    session_id, assistant_ids,
+                )
+            except Exception:
+                logger.warning(
+                    "model router: %s-refusal masking failed session=%s",
+                    kind, session_key,
+                    exc_info=True,
+                )
+
         entry["force_refusal_route"] = True
         entry["force_refusal_reason"] = "prior_turn_refused"
 
@@ -345,15 +522,17 @@ class GatewayInboundModelRouterMixin:
                 )
                 route = str((directive or {}).get("route") or route_name or "PERMISSIVE")
                 model = str((directive or {}).get("model") or "staged")
-                # No hidden-message count: upstream already hid the whole turn, so a "0" would mislead.
+                detected = "거절 감지" if kind == "hard" else "응답 거절 감지"
+                # Only the soft path hides messages; upstream already hid a hard refusal's whole turn.
+                hidden = f"메시지 가림({masked}) · " if kind == "soft" else ""
                 await self._deliver_platform_notice(
-                    source, f"⚠️ 거절 감지 → 다음 턴 {route}({model})",
+                    source, f"⚠️ {detected} → {hidden}다음 턴 {route}({model})",
                 )
             except Exception:
                 logger.debug(
-                    "model router: hard-refusal notice send failed", exc_info=True,
+                    "model router: %s-refusal notice send failed", kind, exc_info=True,
                 )
-        return 0
+        return masked
 
     async def _apply_model_router_directive(
         self, session_key: str, directive: dict, cfg: dict, source: Optional[SessionSource] = None,
