@@ -660,6 +660,11 @@ class GatewayTurnPersistenceMixin:
                             _user_msg_id_attached = True
                         await store.append_to_transcript(sid, entry, skip_db=agent_persisted)
 
+        # Hard provider refusals are known only after the agent turn ends. Once all agent- or
+        # gateway-owned persistence has settled (the refused turn is already retained above), stage
+        # a one-shot permissive route for the next classifiable message.
+        await self._handle_gateway_hard_refusal(session_key, sid, source, agent_result)
+
         # The agent persists token counts/model itself; keep only last_prompt_tokens for hygiene.
         await store.update_session(
             session_entry.session_key, last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),

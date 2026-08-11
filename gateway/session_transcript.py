@@ -634,6 +634,24 @@ class SessionTranscriptMixin:
         except Exception as e:
             raise TranscriptReadError(session_id) from e
 
+    def deactivate_messages(self, session_id: str, message_ids: list[int]) -> int:
+        """Reversibly hide explicit active transcript rows (the refusal mask) on the store that owns
+        the session: ``messages.deactivate_message`` flips ``active`` and leaves ``compacted`` alone,
+        so a masked row keeps the rewind/undo meaning instead of becoming a compaction archive.
+        Returns the number of rows that were active and are now hidden (0 without a DB or on failure)."""
+        store = self._persistence_for_session_id(session_id)
+        if not store or not message_ids:
+            return 0
+        try:
+            active = set(store.messages.active_message_ids(session_id))
+            return sum(
+                1 for message_id in dict.fromkeys(int(i) for i in message_ids)
+                if message_id in active and store.messages.deactivate_message(session_id, message_id)
+            )
+        except Exception as e:
+            logger.debug("Failed to deactivate transcript messages: %s", e)
+            return 0
+
     def load_transcript(self, session_id: str) -> list[dict[str, Any]]:
         """Load all messages from a session's transcript (state.db is canonical). Reads follow the
         same routing writes use — the in-memory reroute map, then the durable compression tip —

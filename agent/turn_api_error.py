@@ -372,7 +372,9 @@ def settle_unrecovered_error(
             if agent._try_activate_fallback(reason=classified.reason, reset_at=reset_at):
                 if classified.reason == FailoverReason.content_policy_blocked:
                     from agent.refusal_history import apply_refusal_clean_fork
-                    apply_refusal_clean_fork(agent, messages, api_messages)
+                    apply_refusal_clean_fork(
+                        agent, messages, api_messages, current_turn_user_idx,
+                    )
                 # Direct ``return _verdict("break")`` is load-bearing: the restart handler
                 # re-runs the pre-API preflight against the fallback's context window.
                 active_system_prompt = _arm_fallback_restart(agent, api_messages, active_system_prompt, _retry)

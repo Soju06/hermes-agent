@@ -297,7 +297,9 @@ def _content_filter_fallback(st: _Trunc, _retry: TurnRetryState) -> Optional[Tru
                 _frag.pop("_length_continuation_nudge", None)
         if st.api_messages is not None:
             from agent.refusal_history import apply_refusal_clean_fork
-            apply_refusal_clean_fork(agent, st.messages, st.api_messages)
+            apply_refusal_clean_fork(
+                agent, st.messages, st.api_messages, st.current_turn_user_idx,
+            )
         agent._session_messages = st.messages
         st.length_continue_retries = 0
         st.truncated_response_parts = []
@@ -791,7 +793,9 @@ def handle_content_policy_refusal(
     # while the same refusal raised as an HTTP 400 (DeepSeek's "Content Exists Risk") says
     # "content policy blocked the request" (#124874). Not a rate-limit reason, so no cooldown is armed.
     if agent._try_activate_fallback(reason=FailoverReason.content_policy_blocked):
-        apply_refusal_clean_fork(agent, messages, api_messages)
+        apply_refusal_clean_fork(
+            agent, messages, api_messages, current_turn_user_idx,
+        )
         active_system_prompt = _arm_fallback_restart(agent, api_messages, active_system_prompt, _retry)
         return RefusalVerdict("break", None, active_system_prompt)
 
