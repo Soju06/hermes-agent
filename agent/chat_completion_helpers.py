@@ -35,6 +35,7 @@ from agent.chat_completion_local import _streams_llamacpp, stale_giveup
 from agent.chat_completion_headers import _chat_completion_capturing_headers
 from agent.chat_completion_stream_monitor import StreamingWaitMonitor, StreamLifetimeExceeded
 from agent import passive_provider_health as _passive_health
+from agent import refusal_fallback as _refusal_fallback
 from agent.transports.chat_completions import is_router_timeout_shim, router_timeout_shim_may_follow
 from agent.fast_mode import effective_request_overrides
 from agent.turn_context import substitute_api_content
@@ -1992,6 +1993,13 @@ def try_activate_fallback(
     """Switch to the next fallback model/provider in the chain; False when exhausted. Swaps client,
     model slug and provider in place so the retry loop continues on the new backend; client
     construction goes through resolve_provider_client (no duplicated provider→key mappings)."""
+    if _refusal_fallback.is_content_policy_blocked(reason):
+        # Canonicalize compatible enum-like values before the established
+        # activation path stores ``reason.value``.
+        reason = FailoverReason.content_policy_blocked
+        if _refusal_fallback.walk_refusal_routes(agent, reason):
+            return True
+
     from agent.fallback_cooldown import _arm_rate_limit_cooldown, switch_deferred_by_reset
     from agent.fallback_notice import announce_fallback_switch, fallback_trigger_text
     if switch_deferred_by_reset(agent, reason, reset_at):
