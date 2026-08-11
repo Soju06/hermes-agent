@@ -554,6 +554,18 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
   - `a03a15a71 tune(gateway): narrow S0 refusal for draft-edit vs authoring`
 - **touches:** `gateway/model_router.py`, `gateway/run.py`, `hermes_cli/model_routes.py`, `tests/gateway/test_model_router.py`, `tests/hermes_cli/test_model_routes.py`
 
+
+### 57. refusal-api-fallback
+- **branch:** `soju/patches/refusal-api-fallback`
+- **stacked-on:** `soju/patches/refusal-risk-routing`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — dogfood reactive refusal recovery)_
+- **state:** `local-only`
+- **rationale:** When the primary model returns API-level safety refusal (`content_filter` / `FailoverReason.content_policy_blocked`), walk resolved PERMISSIVE routes (dev→chat or chat→dev by runtime membership) before the generic `fallback_providers` chain (still opus). Gated by `model_routes.router.refusal.enabled` + new `api_fallback` (default false). Preserves `_fallback_reason=content_policy_blocked` for skill-gate turn exemption. Non-refusal reasons unchanged.
+- **commits:**
+  - `87792122f feat(fallback): content_policy_blocked prefers PERMISSIVE routes`
+- **touches:** `agent/chat_completion_helpers.py`, `hermes_cli/model_routes.py`, `tests/hermes_cli/test_model_routes.py`, `tests/run_agent/test_refusal_fallback_reason.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
