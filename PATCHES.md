@@ -592,6 +592,8 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 - **commits:**
   - `7a310d6ae feat(refusal): detect soft refusals at turn end with recovery-hop guard`
   - `780717641 fix(fallback): extend refusal PERMISSIVE chain to generic-exhaustion on any reason`
+  - `2eb134996 Revert "fix(fallback): extend refusal PERMISSIVE chain to generic-exhaustion on any reason"` — owner decided an overload on the generic hop should STOP (fail the turn), not downgrade to k3; the any-reason extension is removed, restoring content_policy_blocked-only
+  - `926bd58ba fix(fallback): log empty/built refusal chain reasons` — the previously silent `_build_refusal_fallback_chain` now logs why PERMISSIVE did/did not attach (kept from the reverted commit)
 - **touches:** `gateway/model_router.py`, `gateway/run.py`, `hermes_cli/model_routes.py`, `agent/chat_completion_helpers.py`, `tests/gateway/test_model_router.py`, `tests/hermes_cli/test_model_routes.py`, `tests/run_agent/test_refusal_fallback_reason.py`
 
 ## State Vocabulary
