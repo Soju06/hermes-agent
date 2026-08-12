@@ -596,6 +596,17 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
   - `926bd58ba fix(fallback): log empty/built refusal chain reasons` — the previously silent `_build_refusal_fallback_chain` now logs why PERMISSIVE did/did not attach (kept from the reverted commit)
 - **touches:** `gateway/model_router.py`, `gateway/run.py`, `hermes_cli/model_routes.py`, `agent/chat_completion_helpers.py`, `tests/gateway/test_model_router.py`, `tests/hermes_cli/test_model_routes.py`, `tests/run_agent/test_refusal_fallback_reason.py`
 
+### 60. anthropic-structured-output
+- **branch:** `soju/patches/anthropic-structured-output`
+- **stacked-on:** `soju/patches/refusal-hop-clean-fork`
+- **origin:** `local-author`
+- **upstream_pr:** _(none yet — upstream candidate)_
+- **state:** `local-only`
+- **rationale:** Plugin structured completions (`plugin_llm.complete_structured`) build an OpenAI Chat Completions `response_format` payload in extra_body; the anthropic_messages transport forwarded it verbatim and strict Anthropic gateways (claude-lb) reject it with HTTP 400 ("use output_config.format"). Observed live: every discord-thread-autotitle rename failed for 2+ days (1,600+ errors) once the main provider became claude-lb. Fix: `_translate_anthropic_response_format` converts `json_schema`→`output_config.format={"type":"json_schema","schema":S}` and `json_object`→permissive object schema (SDK 0.87.0 has no schema-less JSON mode), merging into any existing `output_config` (adaptive-thinking `effort` coexists) and excluding `response_format` from the raw extra_body passthrough alongside `reasoning`. Async path delegates to the sync adapter via `asyncio.to_thread`, covered by test. Non-Anthropic transports unchanged.
+- **commits:**
+  - `c67b6662b fix(aux): translate response_format to output_config.format for anthropic transport`
+- **touches:** `agent/auxiliary_client.py`, `tests/agent/test_anthropic_structured_output.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -660,6 +671,7 @@ soju/patches/anthropic-signature-passthrough
 soju/patches/notes-recognition-grounding (stacked on memory-phase2-taint)
 soju/patches/worker-cpu-hygiene
 soju/patches/lifecycle-guard-nul-fallback (stacked on worker-cpu-hygiene)
+soju/patches/anthropic-structured-output (stacked on refusal-hop-clean-fork)
 ```
 
 ## Operating Procedures
