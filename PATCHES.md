@@ -664,6 +664,17 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
   - `170c8ac07 fix(tools): don't flag UTF-8 text as binary when head -c splits a multibyte char`
 - **touches:** `tools/file_operations.py`, `tests/tools/test_file_operations.py`
 
+### 66. lifecycle-guard-multiline
+- **branch:** `soju/patches/lifecycle-guard-multiline`
+- **stacked-on:** `soju/patches/lifecycle-guard-nul-fallback`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — #77131/#76762 third-generation follow-up; upstream candidate)_
+- **state:** `local-only`
+- **rationale:** The lifecycle guard split commands on newlines and shell-tokenized every line, so multiline `python3 -c "..."` / Python heredoc payloads were parsed as shell: a payload line like `sys.path.insert(0, os.path.expanduser('~/.hermes/hermes-agent'))` tokenized into a `/`-bearing token, got treated as a referenced-script path, resolved to a real directory, and `_read_referenced_script`'s non-regular fail-closed marked it unsafe — blocking benign terminal commands inside gateway sessions (29 blocked instances / 13 unique commands in request dumps; 9 of 13 were this false positive). Fix removes only syntactically proven non-shell regions before matching and tokenization: a complete quoted argument to a Python executable's `-c` (basename `python`/`pythonN`/`pythonN.M`, no `--` before payload), or the body of a complete Python heredoc (quoted/bare delimiter, `<<-` tab-strip honored). Unclosed quotes, missing heredoc terminators, shell `-c` payloads, here-strings, and non-Python interpreters stay visible (fail-closed). Preserved detections verified: `hermes gateway restart|stop`, `systemctl`/`launchctl submit|bootstrap`, `bash -c` payload recursion, nested `.sh` walking, binary/NUL skips, and lifecycle commands before/after sanitized payloads. Tokenize-once-per-level contract (patch #54) kept: sanitize once, share the segment list. Verified via TDD (3 RED → GREEN), 100-test file pass, 490-test cron+restart-loop pass, 12 adversarial cases, and historical replay (9/13 freed, 3 genuine lifecycle still blocked, 1 dump-truncation artifact correctly fail-closed).
+- **commits:**
+  - `96cd2aa2f fix(cron): stop lifecycle guard from shell-parsing python payloads`
+- **touches:** `cron/lifecycle_guard.py`, `tests/hermes_cli/test_gateway_restart_loop.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -728,6 +739,7 @@ soju/patches/anthropic-signature-passthrough
 soju/patches/notes-recognition-grounding (stacked on memory-phase2-taint)
 soju/patches/worker-cpu-hygiene
 soju/patches/lifecycle-guard-nul-fallback (stacked on worker-cpu-hygiene)
+soju/patches/lifecycle-guard-multiline (stacked on lifecycle-guard-nul-fallback)
 soju/patches/anthropic-structured-output (stacked on refusal-hop-clean-fork)
 soju/patches/hygiene-noprogress-cooldown (stacked on anthropic-structured-output)
 soju/patches/fts-v2-orphan-hardening
