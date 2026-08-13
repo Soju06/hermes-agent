@@ -618,6 +618,17 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
   - `a17d9ec4f fix(compression): record cooldown on no_progress hygiene aborts + accurate trigger/abort diagnostics`
 - **touches:** `agent/conversation_compression.py`, `gateway/run.py`, `tests/gateway/test_session_hygiene.py`, `tests/run_agent/test_compression_abort_state_reset.py`
 
+### 62. durable-bg-processes
+- **branch:** `soju/patches/durable-bg-processes`
+- **stacked-on:** `soju/patches/hygiene-noprogress-cooldown`
+- **origin:** `local-author`
+- **upstream_pr:** _(none yet — upstream candidate)_
+- **state:** `local-only`
+- **rationale:** Background tool processes died on every gateway restart via three stacked kill mechanisms: (1) shutdown `process_registry.kill_all()` global sweep in `_stop_impl`, (2) systemd `KillMode=mixed` SIGKILL on the unit cgroup after `TimeoutStopSec`, (3) `ExecStopPost=gateway.cgroup_cleanup` per-PID SIGKILL of every cgroup survivor. Checkpoint recovery (`processes.json`) only ever adopted crash survivors, and adopted them `detached` with no output. Fix (config-gated, `terminal.durable_background: false` default off, config.yaml only — no tool-schema change): durable non-PTY local spawns run inside `systemd-run --user --scope --unit=hermes-bg-<sid>` (sibling cgroup — escapes 2 and 3; readiness marker + graceful fallback to plain spawn when scopes are unavailable), write output to `$HERMES_HOME/bg-logs/<sid>.log` (0600/0700) as source of truth so post-restart `read_log`/`poll`/notification tails work, and are excluded from the shutdown sweep via `kill_all(exclude_durable=True)`. Explicit `process(action=kill)` still terminates them; scope units are `reset-failed` on completion. Review fix vs executor output: cron `#60432` interrupted-marking made unconditional again — the cron agent is a ThreadPoolExecutor thread inside the gateway process and dies with it even when its durable subprocess survives; gating on `_killed>0` would let a truncated run report success (regression test added). E2E-verified on this host: scope cgroup escape, checkpoint re-adoption in a fresh registry, and full output readback after simulated restart.
+- **commits:**
+  - `5848ae3da Add durable local background processes`
+- **touches:** `tools/process_registry.py`, `gateway/run.py`, `hermes_cli/config_defaults.py`, `tests/tools/test_process_registry.py`, `tests/gateway/test_gateway_shutdown.py`, `tests/gateway/test_cron_active_work_drain.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
