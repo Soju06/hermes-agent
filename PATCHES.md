@@ -675,6 +675,17 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
   - `96cd2aa2f fix(cron): stop lifecycle guard from shell-parsing python payloads`
 - **touches:** `cron/lifecycle_guard.py`, `tests/hermes_cli/test_gateway_restart_loop.py`
 
+### 67. scoped-exhaustion-upstream-classify
+- **branch:** `soju/patches/scoped-exhaustion-upstream-classify`
+- **stacked-on:** `soju/patches/lifecycle-guard-multiline`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — depends on claude-lb-specific message contract; fork-only)_
+- **state:** `local-only`
+- **rationale:** claude-lb returns HTTP 503 when ONE model's weekly scoped quota is exhausted across its pool while every other model it serves stays healthy (body carries the spec-locked `model-quota-exhausted` token; message shape pinned by claude-lb OpenSpec `account-load-balancing` since 2026-08-13, PR Soju06/claude-lb#127). The generic 503 branch classified this as `overloaded`, which (a) is in `_PASSIVE_UNHEALTHY_REASONS`, so one dead model marked the whole `claude-lb` provider unhealthy for fail_ttl (120s) in the model-routes passive health cache while claude-opus-5 on the same provider served fine, and (b) is transport-shaped in the retry loop, burning 2 retries against a condition whose only recovery is a scoped window reset days out. Fix classifies the token as `upstream_rate_limit` — the existing "one model at an aggregator, not the provider" reason (OpenRouter upstream-429 precedent): deliberately excluded from passive-unhealthy marking, `is_rate_limited`-eager fallback (no wasted transport retries), rotation forced off, route-aware fallback chain applies, and `error_context.upstream_provider` carries the model so the status line reads "Upstream claude-fable-5 rate-limited". Two return sites: the 503/529 status branch (after overflow guards, before the `overloaded` terminal) and `_classify_by_message` (BEFORE `_OVERLOADED_PATTERNS` and `_RATE_LIMIT_PATTERNS` — ordering pinned by test, else "Rate limit exceeded" text would enable credential rotation). 429 branch untouched (regression-pinned: scoped token on 429 stays `rate_limit`). Verified: 73-test classifier file + 134-test fallback/failover/route sweep pass; bare-503 → `overloaded` regression pin preserved verbatim (a delegate attempt to weaken it to an overload-texted message was caught in diff audit and reverted).
+- **commits:**
+  - `53bdecd55 fix(fallback): classify scoped model-exhaustion 503s as upstream_rate_limit`
+- **touches:** `agent/error_classifier.py`, `tests/agent/test_error_classifier.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
