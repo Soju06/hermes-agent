@@ -2,6 +2,7 @@
 
 from unittest.mock import MagicMock, patch
 
+from agent.chat_completion_helpers import _build_outage_route_fallback_chain
 from agent.error_classifier import FailoverReason
 from run_agent import AIAgent
 
@@ -69,6 +70,105 @@ def _routes_config(*, accepted=("claude-fable-5",), fallbacks=None):
             },
         },
     }
+
+
+def _ambiguous_routes_config():
+    return {
+        "providers": {
+            "claude-lb": {
+                "base_url": "https://claude-lb.example/v1",
+                "models": {
+                    "claude-opus-5": {},
+                    "claude-fable-5": {},
+                },
+            },
+            "codex-nekos": {
+                "base_url": "https://codex-nekos.example/v1",
+                "models": {"gpt-5.6-sol": {}},
+            },
+            "glm-vooy": {
+                "base_url": "https://glm-vooy.example/v1",
+                "models": {"kimi-k3": {}, "grok-4.5": {}},
+            },
+        },
+        "model_routes": {
+            "health": {"enabled": False},
+            "routes": {
+                "DOCUMENT_WORK": {
+                    "description": "document work",
+                    "provider": "claude-lb",
+                    "model": "claude-opus-5",
+                    "accepted": ["claude-opus-5", "claude-fable-5"],
+                    "fallbacks": [
+                        {"provider": "claude-lb", "model": "claude-fable-5"},
+                    ],
+                },
+                "SYSTEM_DEV": {
+                    "description": "system development",
+                    "provider": "claude-lb",
+                    "model": "claude-fable-5",
+                    "accepted": [
+                        "claude-fable-5",
+                        "gpt-5.6-sol",
+                        "kimi-k3",
+                        "grok-4.5",
+                    ],
+                    "fallbacks": [
+                        {"provider": "codex-nekos", "model": "gpt-5.6-sol"},
+                        {"provider": "glm-vooy", "model": "kimi-k3"},
+                        {"provider": "glm-vooy", "model": "grok-4.5"},
+                    ],
+                },
+            },
+        },
+    }
+
+
+def _route_fallback_pairs(agent):
+    with patch(
+        "hermes_cli.config.load_config", return_value=_ambiguous_routes_config()
+    ):
+        route_name, chain = _build_outage_route_fallback_chain(agent)
+    return route_name, [(entry["provider"], entry["model"]) for entry in chain]
+
+
+def test_outage_fallback_prefers_recorded_route_under_ambiguous_membership():
+    agent = _make_agent(fallback_model=[])
+    agent.provider = "claude-lb"
+    agent.model = "claude-fable-5"
+    agent.base_url = "https://claude-lb.example/v1"
+    agent._active_route_name = "SYSTEM_DEV"
+
+    assert _route_fallback_pairs(agent) == (
+        "SYSTEM_DEV",
+        [
+            ("codex-nekos", "gpt-5.6-sol"),
+            ("glm-vooy", "kimi-k3"),
+            ("glm-vooy", "grok-4.5"),
+        ],
+    )
+
+
+def test_outage_fallback_without_recorded_route_keeps_first_match_behavior():
+    agent = _make_agent(fallback_model=[])
+    agent.provider = "claude-lb"
+    agent.model = "claude-fable-5"
+    agent.base_url = "https://claude-lb.example/v1"
+
+    assert _route_fallback_pairs(agent) == ("DOCUMENT_WORK", [])
+
+
+def test_outage_fallback_ignores_recorded_route_when_runtime_no_longer_satisfies_it():
+    agent = _make_agent(fallback_model=[], model="claude-opus-5")
+    agent.provider = "claude-lb"
+    agent.model = "claude-opus-5"
+    agent.base_url = "https://claude-lb.example/v1"
+    agent._active_route_name = "SYSTEM_DEV"
+
+    assert _route_fallback_pairs(agent) == (
+        "DOCUMENT_WORK",
+        [("claude-lb", "claude-fable-5")],
+    )
 
 
 def _activate(agent, reason, cfg, resolver):

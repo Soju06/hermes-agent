@@ -2697,22 +2697,52 @@ def _build_outage_route_fallback_chain(agent: Any) -> tuple[str, list[dict]]:
             load_routes,
             provider_health,
             resolve_route,
+            runtime_satisfies_route,
         )
 
         cfg = load_config() or {}
         catalog = load_routes(cfg)
         current_model = str(getattr(agent, "model", "") or "").strip()
-        spec = next(
-            (
-                candidate
-                for candidate in catalog.routes.values()
-                if any(
-                    _model_matches(current_model, member)
-                    for member in (candidate.accepted or (candidate.model,))
+        active_route_name = str(
+            getattr(agent, "_active_route_name", "") or ""
+        ).strip()
+        spec = None
+        if active_route_name:
+            runtime = {
+                "provider": str(getattr(agent, "provider", "") or ""),
+                "model": current_model,
+                "base_url": str(getattr(agent, "base_url", "") or ""),
+            }
+            reasoning = getattr(agent, "reasoning_config", None)
+            if isinstance(reasoning, dict):
+                if reasoning.get("enabled") is False:
+                    runtime["reasoning_effort"] = "none"
+                elif reasoning.get("effort"):
+                    runtime["reasoning_effort"] = str(reasoning["effort"])
+            if runtime_satisfies_route(
+                runtime, active_route_name, cfg, catalog=catalog
+            ):
+                spec = next(
+                    (
+                        candidate
+                        for candidate in catalog.routes.values()
+                        if candidate.name.strip().lower()
+                        == active_route_name.lower()
+                    ),
+                    None,
                 )
-            ),
-            None,
-        )
+        if spec is None:
+            spec = next(
+                (
+                    candidate
+                    for candidate in catalog.routes.values()
+                    if any(
+                        _model_matches(current_model, member)
+                        for member in (candidate.accepted or (candidate.model,))
+                    )
+                ),
+                None,
+            )
         if spec is None:
             return "", []
 
