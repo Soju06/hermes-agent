@@ -607,6 +607,17 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
   - `c67b6662b fix(aux): translate response_format to output_config.format for anthropic transport`
 - **touches:** `agent/auxiliary_client.py`, `tests/agent/test_anthropic_structured_output.py`
 
+### 61. hygiene-noprogress-cooldown
+- **branch:** `soju/patches/hygiene-noprogress-cooldown`
+- **stacked-on:** `soju/patches/anthropic-structured-output`
+- **origin:** `local-author`
+- **upstream_pr:** _(none yet — upstream candidate)_
+- **state:** `local-only`
+- **rationale:** Gateway session hygiene retried compression EVERY turn on sessions where the protected tail spans the whole transcript (1M-context model → tail_token_budget 190k; `hygiene_hard_message_limit: 400` keeps re-triggering; the compressor aborts in ~60ms with `failure_class=no_progress` and no cooldown was recorded — 106 warnings over 4 log rotations, one session hit 20 consecutive retries). The gateway then mis-attributed every no-op to "#21301 no session_db on the hygiene agent" even though session_db was bound. Fix: (1) record the durable DB-backed compression-failure cooldown (600s, reason `no_progress: protected tail spans the whole transcript`) in the no_progress branch of `compress_context` — the existing hygiene cooldown check (#74136) then stops the churn; manual `/compress` (force=True) is unaffected; (2) split the #21301 warning into no_progress (INFO) / summary-abort (WARNING) / genuinely-missing-session_db (#21301 wording kept) / other (WARNING); (3) hygiene trigger log now attributes `trigger=hard_message_limit (N)` vs `token_threshold`.
+- **commits:**
+  - `a17d9ec4f fix(compression): record cooldown on no_progress hygiene aborts + accurate trigger/abort diagnostics`
+- **touches:** `agent/conversation_compression.py`, `gateway/run.py`, `tests/gateway/test_session_hygiene.py`, `tests/run_agent/test_compression_abort_state_reset.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -672,6 +683,7 @@ soju/patches/notes-recognition-grounding (stacked on memory-phase2-taint)
 soju/patches/worker-cpu-hygiene
 soju/patches/lifecycle-guard-nul-fallback (stacked on worker-cpu-hygiene)
 soju/patches/anthropic-structured-output (stacked on refusal-hop-clean-fork)
+soju/patches/hygiene-noprogress-cooldown (stacked on anthropic-structured-output)
 ```
 
 ## Operating Procedures
