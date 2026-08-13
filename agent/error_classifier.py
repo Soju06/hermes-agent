@@ -1467,6 +1467,17 @@ def _classify_by_status(
                 retryable=True,
                 should_compress=True,
             )
+        if _is_scoped_model_exhaustion_error(error_msg):
+            scoped_context = {}
+            if model:
+                scoped_context["error_context"] = {"upstream_provider": model}
+            return result_fn(
+                FailoverReason.upstream_rate_limit,
+                retryable=True,
+                should_rotate_credential=False,
+                should_fallback=True,
+                **scoped_context,
+            )
         return result_fn(FailoverReason.overloaded, retryable=True)
 
     # 408 Request Timeout — a transient timing failure the server itself flags
@@ -1884,6 +1895,14 @@ def _classify_by_message(
             retryable=True,
         )
 
+    if _is_scoped_model_exhaustion_error(error_msg):
+        return result_fn(
+            FailoverReason.upstream_rate_limit,
+            retryable=True,
+            should_rotate_credential=False,
+            should_fallback=True,
+        )
+
     # Usage-limit patterns need the same disambiguation as 402: some providers
     # surface "usage limit" errors without an HTTP status code.  A transient
     # signal ("try again", "resets at", …) means it's a periodic quota, not
@@ -2139,6 +2158,11 @@ def _extract_message(error: Exception, body: dict) -> str:
                 return reason.strip()[:500]
     # Fallback to str(error)
     return str(error)[:500]
+
+
+def _is_scoped_model_exhaustion_error(error_msg: str) -> bool:
+    """Detect scoped per-model quota exhaustion reported by load balancers."""
+    return "model-quota-exhausted" in error_msg.lower()
 
 
 def _is_openrouter_upstream_error(body: Any, provider: str) -> bool:
