@@ -216,11 +216,17 @@ class GatewayTurnHygieneMixin:
             _needs_compress = False
 
         if _needs_compress:
+            _hyg_trigger = (
+                f"hard_message_limit ({hs.hard_msg_limit})"
+                if _approx_tokens < _compress_token_threshold and _msg_count >= hs.hard_msg_limit
+                else "token_threshold"
+            )
             logger.info(
                 "Session hygiene: %s messages, ~%s tokens (%s) — auto-compressing "
-                "(threshold: %s%% of %s = %s tokens)",
+                "(threshold: %s%% of %s = %s tokens; trigger=%s)",
                 _msg_count, f"{_approx_tokens:,}", _token_source,
                 int(hs.threshold_pct * 100), f"{_hyg_context_length:,}", f"{_compress_token_threshold:,}",
+                _hyg_trigger,
             )
         return self._HygienePlan(_needs_compress, _approx_tokens, _msg_count, _warn_token_threshold)
 
@@ -566,11 +572,20 @@ class GatewayTurnHygieneMixin:
             # No rewrite happened — post-compression counts equal the pre-compression ones.
             _new_count = plan.msg_count
             _new_tokens = plan.approx_tokens
-            logger.warning(
-                "Gateway hygiene compression for session %s did not rotate or compact in place (%s) — "
-                "preserving the original transcript instead of overwriting it with the summary (#21301).",
-                session_entry.session_id, hygiene_no_commit_reason(_hyg_agent),
-            )
+            if getattr(_hyg_agent, "_last_compression_no_progress", False):
+                # A protected-tail no-op is expected, not an aborted attempt or the #21301 path; the
+                # durable cooldown it recorded stops hygiene from re-running it every turn.
+                logger.info(
+                    "Gateway hygiene compression for session %s made no progress: the protected tail "
+                    "exceeds the compressible budget. Preserving the original transcript; the "
+                    "compression-failure cooldown was recorded.", session_entry.session_id,
+                )
+            else:
+                logger.warning(
+                    "Gateway hygiene compression for session %s did not rotate or compact in place (%s) — "
+                    "preserving the original transcript instead of overwriting it with the summary (#21301).",
+                    session_entry.session_id, hygiene_no_commit_reason(_hyg_agent),
+                )
 
         logger.info(
             "Session hygiene: compressed %s → %s msgs, ~%s → ~%s tokens",

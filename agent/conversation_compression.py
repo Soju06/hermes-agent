@@ -3447,6 +3447,16 @@ def _candidate_rejected(
     if compressed == messages_before_compression or (
         _strip_marker_for_comparison(compressed) == _strip_marker_for_comparison(messages_before_compression)
     ):
+        agent._last_compression_no_progress = True
+        _no_progress_error = "no_progress: protected tail spans the whole transcript"
+        # The structural backoff below is in-memory only; the gateway hygiene path rebuilds the
+        # agent every attempt and consults the DURABLE compression-failure cooldown, so persist one
+        # too or hygiene re-runs the same no-op every turn (force=/compress still overrides).
+        with _swallow('no-progress compression cooldown persist failed', exc_info=True):
+            from agent.context_compressor import _SUMMARY_FAILURE_COOLDOWN_SECONDS
+
+            if callable(_record_cooldown := getattr(agent.context_compressor, "_record_compression_failure_cooldown", None)):
+                _record_cooldown(float(_SUMMARY_FAILURE_COOLDOWN_SECONDS), _no_progress_error)
         logger.info(
             "Compression made no progress (session=%s) — skipping boundary rewrite.", agent.session_id or "none"
         )
@@ -3871,6 +3881,7 @@ def _begin_compression_attempt(
         raise RuntimeError("a compression notification is already pending")
     agent._last_compression_attempt_recorded = True
     agent._last_compression_attempt_in_place = None
+    agent._last_compression_no_progress = False
     agent._compression_skipped_due_to_lock = None
     # Clear the lock-skip signal at the VERY TOP, before the codex route and the breaker gates below can
     # early-return (per-attempt state rule, #58630/#69853). A stale ``True``/holder value from a prior
