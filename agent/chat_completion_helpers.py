@@ -35,6 +35,7 @@ from agent.chat_completion_local import _streams_llamacpp, stale_giveup
 from agent.chat_completion_headers import _chat_completion_capturing_headers
 from agent.chat_completion_stream_monitor import StreamingWaitMonitor, StreamLifetimeExceeded
 from agent import passive_provider_health as _passive_health
+from agent import outage_route_fallback as _outage_route
 from agent import refusal_fallback as _refusal_fallback
 from agent.transports.chat_completions import is_router_timeout_shim, router_timeout_shim_may_follow
 from agent.fast_mode import effective_request_overrides
@@ -2010,7 +2011,14 @@ def try_activate_fallback(
     _passive_health.note_runtime_abandoned(agent, reason)
     cooldown_seconds = _arm_rate_limit_cooldown(agent, reason, reset_at=reset_at)
     while True:
-        if agent._fallback_index >= len(agent._fallback_chain):
+        # Route-aware outage fallback: an outage-shaped failure walks the CURRENT route's
+        # declared ``fallbacks:`` (healthy, non-self entries) before the global chain, so a
+        # dev-routed session degrades to another dev-tier member first. The cursor is
+        # transient (re-consulted on every skip) and falls into the global chain exactly once.
+        fb = None
+        if reason in _outage_route.OUTAGE_ROUTE_FALLBACK_REASONS:
+            fb = _outage_route.next_outage_route_fallback(agent)
+        if fb is None and agent._fallback_index >= len(agent._fallback_chain):
             # Generic chain exhausted. For content-policy refusals only, walk the
             # configured PERMISSIVE routes AFTER the normal fallback_providers
             # (typically opus). Owner intent: keep fable→opus as the first hop so
@@ -2021,9 +2029,11 @@ def try_activate_fallback(
                 and _refusal_fallback.walk_refusal_routes(agent, reason)
             ):
                 return True
+            agent._outage_route_fallback_walk_active = False
             return _fallback_chain_exhausted(agent, reason)
-        fb = agent._fallback_chain[agent._fallback_index]
-        agent._fallback_index += 1
+        if fb is None:
+            fb = agent._fallback_chain[agent._fallback_index]
+            agent._fallback_index += 1
         fb_key = _fallback_entry_key(fb)
         if getattr(agent, "_unavailable_fallback_keys", None) is None:
             agent._unavailable_fallback_keys = set()
@@ -2078,6 +2088,7 @@ def try_activate_fallback(
             from agent.native_compaction import resolve_native_compaction_capabilities
             agent.runtime_capabilities = resolve_native_compaction_capabilities(
                 model=agent.model, base_url=agent.base_url, provider=fb_provider, is_codex_backend=fb_provider == "openai-codex")
+            agent._outage_route_fallback_walk_active = False
             return True
         except Exception as e:
             if fb_provider == "nous":
