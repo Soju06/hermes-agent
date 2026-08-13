@@ -1068,6 +1068,10 @@ def _by_message(c: _Ctx) -> Optional[Verdict]:
     head = _first_match(c.msg, _MESSAGE_HEAD_RULES)
     if head is not None:
         return head
+    # Scoped per-model exhaustion before usage-limit/overload wording: the same message carries
+    # "limit exceeded" and often "overloaded", which would otherwise route it to billing/overloaded.
+    if _is_scoped_model_exhaustion_error(c.msg):
+        return _v(_R.upstream_rate_limit, should_rotate_credential=False, should_fallback=True)
     if _is_byte_size_limit_message(c.msg):
         return _V_PAYLOAD_TOO_LARGE
     if any(p in c.msg for p in _LONG_QUOTA_WINDOW_PATTERNS):
@@ -1304,6 +1308,22 @@ def _status_5xx(c: _Ctx) -> Verdict:
     return _first_match(c.msg, _OVERFLOW_AS_5XX_RULES) or _V_SERVER_ERROR
 
 
+def _scoped_model_exhaustion_verdict(c: _Ctx) -> Optional[Verdict]:
+    """claude-lb reports model-scoped weekly quota exhaustion as HTTP 503 carrying the
+    ``model-quota-exhausted`` token. Treating it as overloaded marked the entire provider passively
+    unhealthy and wasted transport retries against a days-long condition; ``upstream_rate_limit``
+    preserves healthy sibling models and triggers immediate route-aware fallback without credential
+    rotation (the key itself is fine)."""
+    if not _is_scoped_model_exhaustion_error(c.msg):
+        return None
+    ctx = {"upstream_provider": c.model} if c.model else {}
+    return _v(_R.upstream_rate_limit, should_rotate_credential=False, should_fallback=True, error_context=ctx)
+
+
+def _status_503_529(c: _Ctx) -> Verdict:
+    return _first_match(c.msg, _OVERFLOW_AS_5XX_RULES) or _scoped_model_exhaustion_verdict(c) or _V_OVERLOADED
+
+
 def _is_nous_route(c: _Ctx) -> bool:
     """The usage-window 402 code is Nous's: any other upstream sending it keeps main's text rules."""
     if (c.provider or "").strip().lower() == "nous":
@@ -1477,8 +1497,7 @@ _STATUS_HANDLERS: dict[int, Callable[[_Ctx], Verdict]] = {
     403: _status_403, 404: _status_404, 408: lambda c: _V_TIMEOUT, 413: lambda c: _V_PAYLOAD_TOO_LARGE,
     422: lambda c: _classify_image_tool_422(c),
     429: _status_429, 500: _status_5xx, 502: _status_5xx,
-    503: lambda c: _first_match(c.msg, _OVERFLOW_AS_5XX_RULES) or _V_OVERLOADED,
-    529: lambda c: _first_match(c.msg, _OVERFLOW_AS_5XX_RULES) or _V_OVERLOADED,
+    503: _status_503_529, 529: _status_503_529,
 }
 
 
@@ -1737,6 +1756,11 @@ def _extract_message(error: Exception, body: dict) -> str:
     """Extract the most informative error message (structured body first)."""
     msg = next((m for m in _body_message_candidates(body or {}) if isinstance(m, str) and m.strip()), None)
     return (msg.strip() if msg else str(error))[:500]
+
+
+def _is_scoped_model_exhaustion_error(error_msg: str) -> bool:
+    """Detect scoped per-model quota exhaustion reported by load balancers."""
+    return "model-quota-exhausted" in error_msg.lower()
 
 
 def _is_openrouter_upstream_error(body: Any, provider: str) -> bool:
