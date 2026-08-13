@@ -686,6 +686,41 @@ class TestReadNonUtf8IsBinary:
         # Proper UTF-8 (including non-ASCII) must still read as text.
         assert ops._is_likely_binary("notes.txt", "café résumé\nsecond\n") is False
 
+    def test_truncated_multibyte_tail_not_flagged_binary(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        data = b"a" * 999 + "한글 텍스트 파일".encode("utf-8")
+        sample = data[:1000].decode("utf-8", errors="replace")
+
+        assert sample.endswith("\ufffd")
+        assert ops._is_likely_binary(
+            "notes.txt", sample, sample_truncated=True
+        ) is False
+
+    def test_mid_sample_replacement_char_still_flagged_binary(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        sample = "a" * 10 + "\ufffd" + "valid text"
+
+        assert ops._is_likely_binary(
+            "notes.txt", sample, sample_truncated=True
+        ) is True
+
+    def test_four_trailing_replacement_chars_still_flagged_binary(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        sample = "valid text" + "\ufffd" * 4
+
+        assert ops._is_likely_binary(
+            "notes.txt", sample, sample_truncated=True
+        ) is True
+
+    def test_non_truncated_replacement_char_tail_still_flagged_binary(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        sample = "valid text\ufffd"
+
+        assert ops._is_likely_binary(
+            "notes.txt", sample, sample_truncated=False
+        ) is True
+
+
 # =========================================================================
 # Byte-layer binary detection (#80308 class: CJK/multibyte text flagged
 # binary because the byte-boundary sample manufactured U+FFFD in transit)
