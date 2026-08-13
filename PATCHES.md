@@ -640,6 +640,17 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
   - `0ff914006 feat(fallback): route-aware outage fallback prefers current route fallbacks`
 - **touches:** `agent/chat_completion_helpers.py`, `tests/run_agent/test_fallback_helpers.py`
 
+### 64. fts-v2-orphan-hardening
+- **branch:** `soju/patches/fts-v2-orphan-hardening`
+- **stacked-on:** _(none — applies directly on base)_
+- **origin:** `local-author`
+- **upstream_pr:** _(none yet — upstream candidate; needs the v2 generation present to be observable)_
+- **state:** `local-only`
+- **rationale:** `hermes sessions optimize-storage` aborted with `error in trigger messages_fts_v2_delete after rename: vtable constructor failed: messages_fts_v2`, leaving the deployed DB stuck on the pre-v23 layout at 20.0 GB for 4 GB of messages (~14 GB of duplicate index copies) — this is the operator follow-up flagged in the 2026-08-04 sync, now fixed in code rather than by hand. `messages_fts_v2` (`tokenize='cjk_unicode61'`) was superseded by `messages_fts_cjk` (`f13f845116`) but a DB that stopped mid-transition keeps the v2 vtable, its three `AFTER INSERT/UPDATE/DELETE ON messages` triggers and `fts_v2_*` markers while no code references it. Two defects made that residue fatal: (1) `_demote_legacy_fts_to_trash` collected shadows with a `messages_fts_%` LIKE glob that also matches sibling generations' shadows — renaming them re-parses the v2 triggers and the vtable cannot be constructed without the loadable `cjk_unicode61` tokenizer, rolling back the migration; (2) nothing retired the orphan, so every re-run failed identically. Fix (single shared path, sync+async callers inherit): derive the shadow set from the vtables actually being demoted using FTS5's fixed shadow suffixes and match exactly; retire `messages_fts_v2` via a **named allowlist, not a prefix scan** (a future generation must not be droppable for merely looking similar), removing trigger/vtable definitions through `writable_schema` so no tokenizer is needed and handing shadows to the existing chunked teardown. Preflight is fail-closed: messages present, live base index covering every row, integrity check clean, rowcount parity — otherwise the orphan is left untouched. Note the orphan also breaks plain `PRAGMA integrity_check` (`no such tokenizer`), so the DB could not be verified with stock sqlite3 while it existed. Verified RED/GREEN by reverting `hermes_state_search.py` alone (3 fail → 27 pass on base) and live on the affected host: 20041.3 MB → 8164.3 MB (11.9 GB reclaimed), `integrity_check` ok, no v2/trash residue, `messages` 1,268,987 = `messages_fts` 1,268,987 with rows still arriving mid-run, gateway serving throughout.
+- **commits:**
+  - `32f562255 fix(state): retire orphaned FTS v2 during storage optimize`
+- **touches:** `hermes_state_search.py`, `tests/test_fts_v2_orphan_hardening.py`, `tests/test_state_db_malformed_repair.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -706,6 +717,7 @@ soju/patches/worker-cpu-hygiene
 soju/patches/lifecycle-guard-nul-fallback (stacked on worker-cpu-hygiene)
 soju/patches/anthropic-structured-output (stacked on refusal-hop-clean-fork)
 soju/patches/hygiene-noprogress-cooldown (stacked on anthropic-structured-output)
+soju/patches/fts-v2-orphan-hardening
 ```
 
 ## Operating Procedures
@@ -777,5 +789,5 @@ Full stack rebase and drop pass across the upstream July/August refactors.
 - **Dropped with archived tips:** tool-delay-removal (`ce9f6712f`, PR #64172), request-client-reuse (`82e2c9ce4`, PR #73375), async-token-accounting (PR #73359), gateway-persist-trim (`54eafee30`, PR #76916), lsp-idle-reaper (PR #74058), cron-secret-scope-env-fallback (PR #69057), session-db-read-path-split (upstream `_read_ctx()`/per-thread `mode=ro`), fts5-cjk-bigram-index (upstream `cjk_unicode61` + `messages_fts_cjk`), search-slow-query-log (upstream equivalent `8364576e33`), fts-v2-config-authority (superseded by upstream's CJK layout), gateway-max-iterations-config-authority (equivalent per-turn config bridge), and the formerly unmanifested token-accounting-schema-repair (upstream shape-gated `_heal_session_model_usage_pk()`). Every old tip is tagged under `archive/pre-v20260804/`.
 - **Reworked:** runtime-control/gateway state rehydration followed the modular gateway helpers; model-routing followed the new session/config-validation seams; durable-turns was expressed through `TurnContext`/`TurnRunner`; event-loop-db-isolation preserved the upstream compression commit fence and current FTS layout; compaction guidance was adapted without restoring the upstream-removed Historical In-Progress section; notes recognition grounding was stacked on memory-phase2-taint to preserve mechanical rejection.
 - **Registered from live production:** event-loop-db-isolation, per-tool-disable, compaction-prompt-cc-upgrades, anthropic-signature-passthrough, and notes-recognition-grounding. token-accounting-schema-repair was registered as a merged-upstream tombstone instead of rebased.
-- **Operator follow-up:** remove legacy fork `messages_fts_v2` tables/triggers from the deployed `state.db` after rollout; this repository change deliberately does not mutate live state.
+- **Operator follow-up:** remove legacy fork `messages_fts_v2` tables/triggers from the deployed `state.db` after rollout; this repository change deliberately does not mutate live state. — **DONE 2026-08-13** via patch #64 `fts-v2-orphan-hardening` (fixed in code, not by hand: the orphan was blocking `optimize-storage` outright). Live DB 20041.3 MB → 8164.3 MB.
 - **Unreferenced working branches left untouched:** `soju/patches/runtime-control-core` and `soju/patches/runtime-control-config-sot-guard`.
