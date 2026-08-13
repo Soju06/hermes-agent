@@ -2183,6 +2183,7 @@ def compress_context(
     # boundary, so the previous flush baseline remains authoritative.
     agent._last_compression_attempt_recorded = True
     agent._last_compression_attempt_in_place = None
+    agent._last_compression_no_progress = False
     # Clear the lock-skip signal at the VERY TOP, before the codex route and
     # the breaker gates below can early-return (per-attempt state rule,
     # #58630/#69853). A stale ``True``/holder value from a prior lock-skip
@@ -2745,8 +2746,13 @@ def compress_context(
         # The provider's on_pre_compress() may return a string of insights it
         # wants surfaced inside the compression summary; capture and forward it
         # instead of silently discarding the provider's return value.
+        # Ingest-disabled forks (ADR-004 Phase 0) must not trigger provider
+        # extraction from their harness transcript (forks pin
+        # compression_enabled=False anyway; this is the systematic guarantee).
+        from agent.memory_manager import memory_ingest_allowed
+
         memory_context = ""
-        if agent._memory_manager:
+        if agent._memory_manager and memory_ingest_allowed(agent):
             try:
                 _maybe_ctx = agent._memory_manager.on_pre_compress(messages)
                 if isinstance(_maybe_ctx, str):
@@ -2778,6 +2784,20 @@ def compress_context(
                     "without provider-supplied summary context",
                     engine_name,
                 )
+
+        # Ingest-curator pre-compress boundary (ADR-004 Phase 2, SHADOW):
+        # snapshot synchronously, curation async on a daemon thread — this path
+        # runs mid-turn at context capacity, so nothing here may block (§4.3:
+        # the 10-worker pool saturation was the silent-stall incident). No-op
+        # unless curator.ingest_enabled; fail-open.
+        try:
+            from agent.ingest_curator import observe_pre_compress
+            observe_pre_compress(agent, messages)
+        except Exception:
+            logger.debug(
+                "ingest-curator pre-compress observation failed (fail-open)",
+                exc_info=True,
+            )
 
         messages_before_compression = copy.deepcopy(messages)
         _activity_heartbeat = _CompressionActivityHeartbeat(
@@ -2978,6 +2998,30 @@ def compress_context(
         if compressed == messages_before_compression:
             if messages != messages_before_compression:
                 messages[:] = copy.deepcopy(messages_before_compression)
+            agent._last_compression_no_progress = True
+            _no_progress_error = (
+                "no_progress: protected tail spans the whole transcript"
+            )
+            try:
+                from agent.context_compressor import (
+                    _SUMMARY_FAILURE_COOLDOWN_SECONDS,
+                )
+
+                _record_cooldown = getattr(
+                    agent.context_compressor,
+                    "_record_compression_failure_cooldown",
+                    None,
+                )
+                if callable(_record_cooldown):
+                    _record_cooldown(
+                        float(_SUMMARY_FAILURE_COOLDOWN_SECONDS),
+                        _no_progress_error,
+                    )
+            except Exception:
+                logger.debug(
+                    "no-progress compression cooldown persist failed",
+                    exc_info=True,
+                )
             logger.info(
                 "Compression made no progress (session=%s) — skipping boundary rewrite.",
                 agent.session_id or "none",
@@ -3383,6 +3427,40 @@ def compress_context(
                     exc_info=True,
                 )
 
+        # Publish a fresh runtime-state snapshot for the new session before
+        # later gates observe the rotated session_id.
+        try:
+            if _old_sid:
+                from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+
+                _reasoning_config = getattr(agent, "reasoning_config", None)
+                _reasoning_effort = ""
+                if isinstance(_reasoning_config, dict):
+                    if _reasoning_config.get("enabled") is False:
+                        _reasoning_effort = "none"
+                    else:
+                        _reasoning_effort = str(_reasoning_config.get("effort") or "")
+
+                _invoke_hook(
+                    "runtime_state",
+                    session_id=agent.session_id or "",
+                    task_id=_old_sid,
+                    state={
+                        "session_id": agent.session_id or "",
+                        "task_id": _old_sid,
+                        "model": getattr(agent, "model", "") or "",
+                        "provider": getattr(agent, "provider", "") or "",
+                        "base_url": getattr(agent, "base_url", "") or "",
+                        "api_mode": getattr(agent, "api_mode", "") or "",
+                        "platform": getattr(agent, "platform", "") or "",
+                        "reasoning_effort": _reasoning_effort,
+                        "parent_session_id": _old_sid,
+                        "boundary_reason": "compression",
+                    },
+                )
+        except Exception as _rt_err:
+            logger.debug("runtime_state hook after compression split failed: %s", _rt_err)
+
         # Notify the context engine that a compaction boundary occurred. Plugin
         # engines (e.g. hermes-lcm) use boundary_reason="compression" to preserve
         # DAG lineage / checkpoint per-session state across the boundary instead of
@@ -3410,7 +3488,8 @@ def compress_context(
         # parent (the conversation didn't fork, but the buffer must still be told
         # the transcript was compacted so it doesn't double-count dropped turns).
         try:
-            if _is_boundary and agent._memory_manager:
+            from agent.memory_manager import memory_ingest_allowed as _ingest_allowed
+            if _is_boundary and agent._memory_manager and _ingest_allowed(agent):
                 agent._memory_manager.on_session_switch(
                     agent.session_id or "",
                     parent_session_id=_boundary_parent,

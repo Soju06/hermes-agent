@@ -1327,6 +1327,10 @@ def _normalize_custom_provider_entry(
         "request_timeout_seconds", "stale_timeout_seconds",
         "discover_models", "extra_body", "extra_headers",
         "ssl_ca_cert", "ssl_verify",
+        # Trusted Anthropic passthrough proxy — read directly from config.yaml
+        # by agent/anthropic_adapter._get_signature_passthrough_urls (thinking
+        # signature replay trust), not from the normalized runtime entry.
+        "anthropic_signature_passthrough",
     }
     for camel, snake in _CAMEL_ALIASES.items():
         if camel in entry and snake not in entry:
@@ -2048,6 +2052,14 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
                 f"Root-level key '{key}' looks misplaced — should it be under 'model:' or inside a 'custom_providers' entry?",
                 f"Move '{key}' under the appropriate section",
             ))
+
+    # Optional route catalog validation is kept in its owning module to avoid
+    # making core config parsing depend on routing internals at import time.
+    try:
+        from hermes_cli.model_routes import validate_model_routes
+        issues.extend(validate_model_routes(config))
+    except Exception:
+        pass
 
     return issues
 

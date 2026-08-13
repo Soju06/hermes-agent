@@ -31,6 +31,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional
 
+from agent import turn_trace
 from agent.conversation_compression import (
     IDLE_COMPACTION_STATUS_TEMPLATE,
     PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
@@ -40,7 +41,7 @@ from agent.conversation_compression import (
 )
 from agent.context_engine import automatic_compaction_status_message
 from agent.iteration_budget import IterationBudget
-from agent.memory_manager import build_memory_context_block
+from agent.memory_manager import build_memory_context_block, memory_ingest_allowed
 from agent.memory_provider import is_trivial_prompt
 from agent.model_metadata import (
     estimate_messages_tokens_rough,
@@ -347,13 +348,25 @@ def build_turn_context(
     set_current_write_origin,
     ra,
     moa_active: bool = False,
+    resume_turn: bool = False,
+    turn_id_override: Optional[str] = None,
 ) -> TurnContext:
     """Run the once-per-turn setup and return the loop's input context.
 
     The callables/helpers the original prologue referenced from the
     ``conversation_loop`` module are passed in explicitly to keep this module
     free of an import cycle with ``agent.conversation_loop``.
+
+    ``resume_turn=True`` re-enters an interrupted turn on its persisted
+    transcript (same-turn resume): no new user row is appended, the user-turn
+    counters and reaction/nudge bookkeeping are not advanced, and
+    ``turn_id_override`` (the durable turn id recorded by the gateway when the
+    turn first started) keeps the turn's identity stable across the restart.
     """
+    # Per-turn trace (None when tracing is disabled).
+    _tt = turn_trace.get_bound(agent)
+    _prologue_started = time.time() if _tt is not None else None
+
     # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
     install_safe_stdio()
 
@@ -439,7 +452,11 @@ def build_turn_context(
     # Generate unique task_id if not provided to isolate VMs between tasks.
     effective_task_id = task_id or str(uuid.uuid4())
     agent._current_task_id = effective_task_id
-    turn_id = str(getattr(agent, "_relay_pending_turn_id", "") or "")
+    turn_id = str(
+        turn_id_override
+        or getattr(agent, "_relay_pending_turn_id", "")
+        or ""
+    )
     if not turn_id:
         turn_id = (
             f"{agent.session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
@@ -496,7 +513,8 @@ def build_turn_context(
     _msg_preview = (_preview_text[:80] + "...") if len(_preview_text) > 80 else _preview_text
     _msg_preview = _msg_preview.replace("\n", " ")
     logger.info(
-        "conversation turn: session=%s model=%s provider=%s platform=%s history=%d msg=%r",
+        "conversation turn%s: session=%s model=%s provider=%s platform=%s history=%d msg=%r",
+        " (resume)" if resume_turn else "",
         agent.session_id or "none", agent.model, agent.provider or "unknown",
         agent.platform or "unknown", len(conversation_history or []),
         _msg_preview,
@@ -558,12 +576,20 @@ def build_turn_context(
         if persist_user_display_metadata:
             user_msg["display_metadata"] = persist_user_display_metadata
 
-    messages.append(user_msg)
-    current_turn_user_idx = len(messages) - 1
-    agent._persist_user_message_idx = current_turn_user_idx
+    if resume_turn:
+        current_turn_user_idx = -1
+        for _i in range(len(messages) - 1, -1, -1):
+            if messages[_i].get("role") == "user":
+                current_turn_user_idx = _i
+                break
+    else:
+        messages.append(user_msg)
+        current_turn_user_idx = len(messages) - 1
+        agent._persist_user_message_idx = current_turn_user_idx
 
     # Track user turns for memory flush and periodic nudge logic.
-    agent._user_turn_count += 1
+    if not resume_turn:
+        agent._user_turn_count += 1
     # Copilot x-initiator: the first API call of this user turn is
     # user-initiated; tool-loop follow-ups revert to "agent" (#3040).
     agent._is_user_initiated_turn = True
@@ -577,12 +603,25 @@ def build_turn_context(
     if think_scrubber is not None:
         think_scrubber.reset()
 
-    # Preserve the original user message (no nudge injection).
-    original_user_message = persist_user_message if persist_user_message is not None else user_message
+    # Preserve the original user message (no nudge injection).  On resume the
+    # turn's user message is the one already in the transcript — recover it so
+    # memory prefetch/queries below still have the real question to work with.
+    if resume_turn:
+        original_user_message = ""
+        for _msg in reversed(messages):
+            if _msg.get("role") == "user":
+                _prior_content = _msg.get("content")
+                if isinstance(_prior_content, str):
+                    original_user_message = _prior_content
+                break
+    else:
+        original_user_message = persist_user_message if persist_user_message is not None else user_message
 
-    # Track memory nudge trigger (turn-based, checked here).
+    # Track memory nudge trigger (turn-based, checked here).  Skipped on
+    # resume: the interrupted turn already paid its nudge tick.
     should_review_memory = False
-    if (agent._memory_nudge_interval > 0
+    if (not resume_turn
+            and agent._memory_nudge_interval > 0
             and "memory" in agent.valid_tool_names
             and agent._memory_store):
         agent._turns_since_memory += 1
@@ -592,9 +631,10 @@ def build_turn_context(
 
     # Cosmetic side-signal: detect an affection "reaction" (ily / <3 / good bot)
     # and notify the host so it can play hearts. Token-free, never touches the
-    # conversation, and never fatal — a purely optional UI beat.
+    # conversation, and never fatal — a purely optional UI beat.  Not replayed
+    # on resume (the reaction already fired when the message first arrived).
     reaction_callback = getattr(agent, "reaction_callback", None)
-    if reaction_callback is not None:
+    if reaction_callback is not None and not resume_turn:
         try:
             from agent.reactions import detect_reaction
 
@@ -612,8 +652,10 @@ def build_turn_context(
         )
 
     # ── System prompt (cached per session for prefix caching) ──
-    if agent._cached_system_prompt is None:
-        restore_or_build_system_prompt(agent, system_message, conversation_history)
+    _sp_rebuilt = agent._cached_system_prompt is None
+    with turn_trace.span("prologue.system_prompt", trace=_tt, rebuilt=_sp_rebuilt):
+        if _sp_rebuilt:
+            restore_or_build_system_prompt(agent, system_message, conversation_history)
 
     active_system_prompt = agent._cached_system_prompt
 
@@ -629,6 +671,7 @@ def build_turn_context(
     # once with its final api_content — both steps take the same per-agent
     # persist lock as CLI close persistence.
     persist_lock = getattr(agent, "_session_persist_lock", None)
+    _persist_early_started = time.time() if _tt is not None else None
     try:
         if persist_lock is None:
             agent._ensure_db_session()
@@ -649,8 +692,11 @@ def build_turn_context(
         # fresh staged input.
         if not isinstance(pending_cli_message, dict) or pending_cli_message.get("_db_persisted"):
             agent._pending_cli_user_message = None
+    if _persist_early_started is not None:
+        _tt.add_span("prologue.persist_early", _persist_early_started, time.time())
 
     # ── Idle-triggered compaction (opt-in; ``idle_compact_after_seconds``) ──
+    _cpf_started = time.time() if _tt is not None else None
     # When a session resumes after a long idle gap, compact the accumulated
     # history up front so the rest of the conversation does not keep re-reading
     # a large stale context on every turn. This fires on elapsed wall-clock time
@@ -1048,11 +1094,18 @@ def build_turn_context(
         )
         agent._persist_user_message_idx = current_turn_user_idx
 
+    if _cpf_started is not None:
+        _tt.add_span(
+            "prologue.compression_preflight", _cpf_started, time.time(),
+            compressed=_preflight_compressed,
+        )
+
     # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
     plugin_user_context = ""
+    _hook_started = time.time() if _tt is not None else None
     try:
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-        _pre_results = _invoke_hook(
+        _pre_results = [] if resume_turn else _invoke_hook(
             "pre_llm_call",
             session_id=agent.session_id,
             task_id=effective_task_id,
@@ -1101,6 +1154,8 @@ def build_turn_context(
             plugin_user_context = "\n\n".join(_ctx_parts)
     except Exception as exc:
         logger.warning("pre_llm_call hook failed: %s", exc)
+    if _hook_started is not None:
+        _tt.add_span("prologue.pre_llm_hook", _hook_started, time.time())
 
     # Gateway must-deliver notes (auto-reset note, first-contact intro,
     # voice-channel change) ride the same user-message injection channel as
@@ -1145,7 +1200,11 @@ def build_turn_context(
         agent._interrupt_thread_signal_pending = False
 
     # Notify memory providers of the new turn (BEFORE prefetch_all).
-    if agent._memory_manager:
+    # Not for ingest-disabled forks (ADR-004 Phase 0): on_turn_start feeds the
+    # provider's ingest cadence and prefetch_all logs recall queries — both
+    # leak the fork's harness turn into the user's real memory namespace.
+    _memory_writes_allowed = memory_ingest_allowed(agent)
+    if agent._memory_manager and _memory_writes_allowed and not resume_turn:
         try:
             _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
             agent._memory_manager.on_turn_start(agent._user_turn_count, _turn_msg)
@@ -1157,11 +1216,31 @@ def build_turn_context(
     # Skip prefetch on trivial prompts (greetings, acknowledgements) to
     # prevent memory-context injection on turns that carry no semantic signal.
     ext_prefetch_cache = ""
-    if agent._memory_manager:
+    _memory_prefetch_started = time.time() if _tt is not None else None
+    if agent._memory_manager and _memory_writes_allowed and not resume_turn:
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
             if not is_trivial_prompt(_query):
                 ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
+        except Exception:
+            pass
+    if _memory_prefetch_started is not None:
+        _tt.add_span(
+            "prologue.memory_prefetch", _memory_prefetch_started, time.time(),
+            decision="hit" if ext_prefetch_cache else "empty",
+        )
+    if ext_prefetch_cache:
+        # ADR-004 §① origin-taint (Phase 2): the prefetch text injected into
+        # this turn's <memory-context> fence is memory-derived — register it
+        # so the WAL tagger can mark assistant paraphrases of it as tainted.
+        # In-memory update + async disk append: never raises, never blocks.
+        try:
+            from agent import memory_taint
+            memory_taint.record_injected_text(
+                getattr(agent, "session_id", "") or "",
+                ext_prefetch_cache,
+                source="prefetch",
+            )
         except Exception:
             pass
 
@@ -1184,6 +1263,7 @@ def build_turn_context(
     # sent bytes" (MoA keeps its pre-sidecar cache behavior).
     if (
         not moa_active
+        and not resume_turn  # resumed rows replay their persisted sidecar
         and getattr(agent, "api_mode", None) != "codex_app_server"
         and 0 <= current_turn_user_idx < len(messages)
         and messages[current_turn_user_idx].get("role") == "user"
@@ -1232,24 +1312,32 @@ def build_turn_context(
         agent._ensure_db_session()
         agent._persist_session(messages, conversation_history)
 
-    try:
-        if persist_lock is None:
-            _ensure_and_persist()
-        else:
-            with persist_lock:
+    # trace: successor of the pre-restructure crash persist that
+    # prologue.persist_early used to cover (upstream moved the user-turn
+    # persist after prefetch/pre_llm_call so the row is written once with
+    # its final api_content); measured separately from the early row create.
+    with turn_trace.span("prologue.persist_user_turn", trace=_tt):
+        try:
+            if persist_lock is None:
                 _ensure_and_persist()
-    except Exception:
-        logger.warning(
-            "Early turn-start session persistence failed for session=%s",
-            agent.session_id or "none",
-            exc_info=True,
-        )
-    finally:
-        # Keep an unmarked staged input available to a later close retry if the
-        # normal persistence attempt failed. Once the marker is present, the
-        # close path must no longer treat it as a pre-worker UI input.
-        if not isinstance(pending_cli_message, dict) or pending_cli_message.get("_db_persisted"):
-            agent._pending_cli_user_message = None
+            else:
+                with persist_lock:
+                    _ensure_and_persist()
+        except Exception:
+            logger.warning(
+                "Early turn-start session persistence failed for session=%s",
+                agent.session_id or "none",
+                exc_info=True,
+            )
+        finally:
+            # Keep an unmarked staged input available to a later close retry if the
+            # normal persistence attempt failed. Once the marker is present, the
+            # close path must no longer treat it as a pre-worker UI input.
+            if not isinstance(pending_cli_message, dict) or pending_cli_message.get("_db_persisted"):
+                agent._pending_cli_user_message = None
+
+    if _prologue_started is not None:
+        _tt.add_span("turn.prologue", _prologue_started, time.time())
 
     return TurnContext(
         user_message=user_message,

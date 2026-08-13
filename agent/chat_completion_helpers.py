@@ -331,6 +331,61 @@ def _reset_stale_streak(agent) -> None:
         pass
 
 
+# ── Passive provider health (model_routes) ──────────────────────────────────
+#
+# Real completion traffic is the health signal for the model-routes resolver:
+# abandoning a provider for an outage-shaped reason files an unhealthy verdict
+# (so fresh route resolutions fail over without an active probe), and the next
+# live success on that provider clears it. See hermes_cli.model_routes —
+# provider_health() only probes as a recovery check on stale-unhealthy
+# verdicts.
+
+# FailoverReasons that mean "this PROVIDER cannot serve completions right
+# now" — mirrors the probe's fail-open classification (5xx, 402/429/credit,
+# connection failures). Deliberately excluded: auth (our credentials),
+# content_policy_blocked (this prompt), context/format errors (this request),
+# upstream_rate_limit (one model at an aggregator, not the provider).
+_PASSIVE_UNHEALTHY_REASONS = frozenset({
+    FailoverReason.billing,
+    FailoverReason.rate_limit,
+    FailoverReason.overloaded,
+    FailoverReason.server_error,
+    FailoverReason.timeout,
+})
+
+
+def _record_passive_provider_outcome(agent, healthy: bool, reason: str) -> None:
+    """Best-effort verdict for the agent's CURRENT runtime; never raises."""
+    try:
+        from hermes_cli.model_routes import provider_key_for_runtime, record_provider_outcome
+
+        key = provider_key_for_runtime(
+            provider=getattr(agent, "provider", "") or "",
+            base_url=getattr(agent, "base_url", "") or "",
+        )
+        if key:
+            record_provider_outcome(key, healthy, reason)
+    except Exception:
+        logger.debug("passive provider health record failed", exc_info=True)
+
+
+def _note_provider_success(agent) -> None:
+    """Completion succeeded on the current runtime — clear any unhealthy verdict.
+
+    Runs on every successful API call, so it is gated to one os.stat in
+    steady state (has_unhealthy_verdicts memo); config load + key mapping
+    only happen while some provider is actually marked unhealthy.
+    """
+    try:
+        from hermes_cli.model_routes import has_unhealthy_verdicts
+
+        if not has_unhealthy_verdicts():
+            return
+    except Exception:
+        return
+    _record_passive_provider_outcome(agent, True, "recovered (live completion succeeded)")
+
+
 def _check_stale_giveup(agent) -> None:
     """Raise immediately when the consecutive-stale streak is past the
     give-up threshold — no network attempt, no stale-timeout wait."""
@@ -611,6 +666,7 @@ def direct_api_call(agent, api_kwargs: dict):
         if getattr(agent, "_interrupt_requested", False):
             raise InterruptedError("Agent interrupted during API call")
         _reset_stale_streak(agent)
+        _note_provider_success(agent)
         succeeded = True
         return response
     finally:
@@ -1116,6 +1172,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # responsive.  See the canonical comment block above ``_stale_streak()``.
     if result["response"] is not None:
         _reset_stale_streak(agent)
+        _note_provider_success(agent)
     return result["response"]
 
 
@@ -1671,6 +1728,33 @@ def _fallback_entry_key(fb: dict) -> tuple[str, str, str]:
     )
 
 
+_VALID_FALLBACK_API_MODES = (
+    "chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse",
+)
+
+
+def _declared_fallback_api_mode(fb: dict) -> str:
+    """Explicitly declared api_mode for a fallback chain entry, or "".
+
+    Checks the chain entry itself first (``hermes fallback`` stores an
+    optional ``api_mode``), then the named provider's config.yaml
+    ``providers.<name>.api_mode``. Unknown values are ignored so a config
+    typo degrades to the URL heuristics instead of a broken transport.
+    """
+    declared = str(fb.get("api_mode") or "").strip()
+    if not declared:
+        try:
+            from hermes_cli.config import load_config
+
+            providers_cfg = load_config().get("providers") or {}
+            entry = providers_cfg.get(str(fb.get("provider") or "").strip().lower())
+            if isinstance(entry, dict):
+                declared = str(entry.get("api_mode") or "").strip()
+        except Exception:
+            declared = ""
+    return declared if declared in _VALID_FALLBACK_API_MODES else ""
+
+
 def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str]:
     """Return a skip reason for fallback entries known to be unusable locally."""
     fb_provider = (fb.get("provider") or "").strip().lower()
@@ -1691,6 +1775,141 @@ def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str
     return None
 
 
+def _is_content_policy_blocked(reason: Any) -> bool:
+    """Accept the local enum and compatible reason objects from adapters."""
+    reason_value = getattr(reason, "value", None)
+    return (
+        reason == FailoverReason.content_policy_blocked
+        or reason_value == FailoverReason.content_policy_blocked
+        or reason_value == FailoverReason.content_policy_blocked.value
+    )
+
+
+def _current_runtime_is_dev_route(agent: Any, cfg: dict, catalog: Any) -> bool:
+    """Whether refusal recovery should prefer the configured dev route."""
+    # Prefer the pre-fallback primary identity so order stays stable across
+    # generic→PERMISSIVE hops (after opus activates, current provider is no
+    # longer claude-lb but the turn was still a dev refusal).
+    primary = getattr(agent, "_primary_runtime", None) or {}
+    provider = str(
+        primary.get("provider") or getattr(agent, "provider", "") or ""
+    ).strip().lower()
+    model = str(
+        primary.get("model") or getattr(agent, "model", "") or ""
+    ).strip().lower()
+    if provider == "claude-lb" and (
+        "claude-fable" in model or "claude-opus" in model
+    ):
+        return True
+
+    try:
+        from hermes_cli.model_routes import runtime_satisfies_route
+
+        label_routes = catalog.router.label_route_map()
+        runtime = {
+            "provider": provider,
+            "model": model,
+            "base_url": str(
+                primary.get("base_url") or getattr(agent, "base_url", "") or ""
+            ),
+        }
+        for label in ("SYSTEM_DEV", "FRONTEND_DEV"):
+            route_name = str(label_routes.get(label) or "")
+            if route_name and runtime_satisfies_route(
+                runtime, route_name, cfg, catalog=catalog
+            ):
+                return True
+    except Exception:
+        logger.debug(
+            "Refusal fallback: dev-route membership check failed", exc_info=True
+        )
+    return False
+
+
+def _build_refusal_fallback_chain(agent: Any) -> list[dict]:
+    """Resolve the short PERMISSIVE route chain for API-level refusals."""
+    try:
+        from agent.backend_identity import BackendIdentity, should_skip_candidate
+        from hermes_cli.config import load_config
+        from hermes_cli.model_routes import (
+            _cfg_runtime_fallback,
+            load_routes,
+            resolve_route,
+        )
+
+        cfg = load_config() or {}
+        catalog = load_routes(cfg)
+        refusal = catalog.router.refusal
+        if not (refusal.enabled and refusal.api_fallback):
+            logger.warning(
+                "Refusal fallback chain empty: refusal routing is disabled "
+                "(enabled=%s api_fallback=%s)",
+                refusal.enabled,
+                refusal.api_fallback,
+            )
+            return []
+
+        if _current_runtime_is_dev_route(agent, cfg, catalog):
+            route_names = (refusal.dev_route, refusal.chat_route)
+        else:
+            route_names = (refusal.chat_route, refusal.dev_route)
+
+        current_ident = BackendIdentity.build(
+            provider=getattr(agent, "provider", ""),
+            model=getattr(agent, "model", ""),
+            base_url=str(getattr(agent, "base_url", "") or ""),
+        )
+        chain = []
+        for route_name in route_names:
+            if not str(route_name or "").strip():
+                continue
+            entry = resolve_route(route_name, cfg, catalog=catalog)
+            if not entry:
+                continue
+            entry = dict(entry)
+            entry["base_url"] = str(
+                _cfg_runtime_fallback(entry.get("provider", ""), cfg).get(
+                    "base_url", ""
+                )
+                or ""
+            )
+            candidate_ident = BackendIdentity.build(
+                provider=entry.get("provider", ""),
+                model=entry.get("model", ""),
+                base_url=entry.get("base_url", ""),
+            )
+            if should_skip_candidate(candidate_ident, current_ident):
+                logger.warning(
+                    "Refusal fallback skip: route %s resolves to the current backend",
+                    route_name,
+                )
+                continue
+            chain.append(entry)
+        if not chain:
+            logger.warning(
+                "Refusal fallback chain empty: no usable PERMISSIVE routes "
+                "resolved from %s",
+                [name for name in route_names if str(name or "").strip()],
+            )
+        else:
+            logger.info(
+                "Refusal fallback chain built: %s",
+                " -> ".join(
+                    f"{entry.get('provider')}/{entry.get('model')}"
+                    for entry in chain
+                ),
+            )
+        return chain
+    except Exception:
+        # Refusal routing is an optional preference. Config or route-resolution
+        # failures must leave the established fallback chain available.
+        logger.warning(
+            "Refusal fallback chain empty: route resolution failed",
+            exc_info=True,
+        )
+        return []
+
+
 
 def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
     """Switch to the next fallback model/provider in the chain.
@@ -1704,6 +1923,20 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
+    if _is_content_policy_blocked(reason):
+        # Canonicalize compatible enum-like values before the established
+        # activation path stores ``reason.value``.
+        reason = FailoverReason.content_policy_blocked
+
+    if reason in _PASSIVE_UNHEALTHY_REASONS:
+        # The loop is abandoning the CURRENT runtime for an outage-shaped
+        # failure — file the passive verdict before the chain advances so
+        # fresh route resolutions fail over immediately. Recursive skip
+        # calls re-enter here with the same runtime; the recorder's burst
+        # guard dedups them.
+        _record_passive_provider_outcome(
+            agent, False, reason.value if reason is not None else "unknown"
+        )
     if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
@@ -1714,6 +1947,55 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         if (not fallback_already_active) or (primary_provider and current_provider == primary_provider):
             agent._rate_limited_until = time.monotonic() + 60
     if agent._fallback_index >= len(agent._fallback_chain):
+        # Generic chain exhausted. For content-policy refusals only, walk the
+        # configured PERMISSIVE routes AFTER the normal fallback_providers
+        # (typically opus). Owner intent: keep fable→opus as the first hop so
+        # intelligence is preserved; PERMISSIVE (k3/grok) is the last resort
+        # when frontier models refuse the same prompt.
+        if (
+            reason == FailoverReason.content_policy_blocked
+            and not getattr(agent, "_refusal_fallback_walk_active", False)
+        ):
+            continuing_refusal = (
+                bool(getattr(agent, "_fallback_activated", False))
+                and getattr(agent, "_fallback_reason", None)
+                == FailoverReason.content_policy_blocked.value
+            )
+            if continuing_refusal:
+                refusal_chain = getattr(agent, "_refusal_fallback_chain", [])
+                refusal_index = int(
+                    getattr(agent, "_refusal_fallback_index", 0) or 0
+                )
+                # First successful hop may have been generic only — build the
+                # PERMISSIVE tail lazily when we first exhaust fallback_providers.
+                if not refusal_chain:
+                    refusal_chain = _build_refusal_fallback_chain(agent)
+                    refusal_index = 0
+                    agent._refusal_fallback_chain = refusal_chain
+                    agent._refusal_fallback_index = 0
+            else:
+                refusal_chain = _build_refusal_fallback_chain(agent)
+                refusal_index = 0
+                agent._refusal_fallback_chain = refusal_chain
+                agent._refusal_fallback_index = 0
+
+            if refusal_index < len(refusal_chain):
+                normal_chain = agent._fallback_chain
+                normal_index = agent._fallback_index
+                cooldown_before = getattr(agent, "_rate_limited_until", 0)
+                agent._fallback_chain = refusal_chain
+                agent._fallback_index = refusal_index
+                agent._refusal_fallback_walk_active = True
+                try:
+                    if agent._try_activate_fallback(reason):
+                        return True
+                    agent._rate_limited_until = cooldown_before
+                finally:
+                    agent._refusal_fallback_index = agent._fallback_index
+                    agent._fallback_chain = normal_chain
+                    agent._fallback_index = normal_index
+                    agent._refusal_fallback_walk_active = False
+
         # Chain exhausted.  If we actually walked a non-empty chain and the
         # failure was NOT a rate-limit/billing event (those already armed
         # their own 60s cooldown above), arm a short cooldown so the next
@@ -1820,11 +2102,19 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 fb_model, fb_provider, _norm_err,
             )
 
-        # Determine api_mode from provider / base URL / model
-        fb_api_mode = "chat_completions"
+        # Determine api_mode: an explicit declaration wins over URL
+        # heuristics.  Chain entries may carry ``api_mode`` (documented in
+        # `hermes fallback`), and config.yaml ``providers.<name>.api_mode``
+        # is authoritative for user providers — LB-style proxies
+        # (e.g. claude-lb) serve anthropic_messages on private hosts the
+        # heuristics below cannot recognize and would misroute to
+        # /v1/chat/completions.
+        fb_api_mode = _declared_fallback_api_mode(fb)
         fb_base_url = str(fb_client.base_url)
         _fb_is_azure = agent._is_azure_openai_url(fb_base_url)
-        if fb_provider == "openai-codex":
+        if fb_api_mode:
+            pass
+        elif fb_provider == "openai-codex":
             fb_api_mode = "codex_responses"
         elif fb_provider in {"nous", "nous-portal", "nousresearch"}:
             # Portal is dual-wire: anthropic/* must land on /v1/messages.
@@ -1865,6 +2155,8 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             and base_url_host_matches(fb_base_url, "amazonaws.com")
         ):
             fb_api_mode = "bedrock_converse"
+        if not fb_api_mode:
+            fb_api_mode = "chat_completions"
 
         old_model = agent.model
         old_provider = agent.provider
@@ -1881,6 +2173,11 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent._fallback_activated = True
+        # Record WHY the fallback activated so plugins (e.g. capability
+        # gates) can distinguish a refusal-driven temporary swap from any
+        # other fallback state.  Only set on the success path — exhaustion
+        # and skip paths must not leave a stale reason behind.
+        agent._fallback_reason = reason.value if reason is not None else None
 
         # Rebind the credential pool to the fallback provider when the provider
         # changes.  Keeping the primary pool attached would make downstream
@@ -2059,6 +2356,17 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # short-circuit the freshly activated fallback before it gets a
         # single stream attempt.
         _reset_stale_streak(agent)
+        # Publish the mid-turn swap on the runtime_state hook so guardrail
+        # plugins (skill-gate) see the new model/provider + fallback_reason
+        # immediately.  Best-effort: activation must never fail because a
+        # plugin hook failed.  Local import — runtime_control is core-owned
+        # and pulling it at module scope risks an import cycle.
+        try:
+            from agent.runtime_control import _emit_runtime_state_event, get_runtime_state
+
+            _emit_runtime_state_event(agent, event="fallback", state=get_runtime_state(agent))
+        except Exception as _hook_err:
+            logger.debug("runtime_state fallback event failed: %s", _hook_err)
         return True
     except Exception as e:
         if fb_provider == "nous":
@@ -2148,9 +2456,9 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 agent._sanitize_tool_calls_for_strict_api(api_msg, model=_sanitize_model)
             api_messages.append(api_msg)
 
-        effective_system = agent._cached_system_prompt or ""
-        if agent.ephemeral_system_prompt:
-            effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
+        from agent.system_prompt import compose_effective_system_prompt
+
+        effective_system = compose_effective_system_prompt(agent, agent._cached_system_prompt or "")
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
         if agent.prefill_messages:
@@ -2740,6 +3048,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # recovered provider doesn't carry a stale streak into later turns.
         if result["response"] is not None:
             _reset_stale_streak(agent)
+            _note_provider_success(agent)
         return result["response"]
 
     result = {"response": None, "error": None, "partial_tool_names": []}
@@ -3027,6 +3336,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         usage_obj = None
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
+        agent._last_stream_diag = _diag
         _writer_token = {"value": None}
         attempt_request_client = {"value": None}
 
@@ -3522,6 +3832,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         last_chunk_time["t"] = time.time()
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
+        agent._last_stream_diag = _diag
         _writer_token = {"value": None}
         _stream_context = {"manager": None, "stream": None}
         base_final_message = None
@@ -4292,12 +4603,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # the provider is demonstrably responsive — clear the circuit
             # breaker (#58962) just like the full-success return below.
             _reset_stale_streak(agent)
+            _note_provider_success(agent)
             return _stub
         raise result["error"]
     # Success — clear the circuit breaker (#58962): the provider proved
     # responsive.  See the canonical comment block above ``_stale_streak()``.
     if result["response"] is not None:
         _reset_stale_streak(agent)
+        _note_provider_success(agent)
     return result["response"]
 
 # ── Provider fallback ──────────────────────────────────────────────────

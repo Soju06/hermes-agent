@@ -55,8 +55,11 @@ _HERMES_CORE_TOOLS = [
     "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
     # Text-to-speech
     "text_to_speech",
-    # Planning & memory
+    # Planning, memory, and model/runtime introspection
     "todo", "memory",
+    # Notes tier — declarative gist + curator proposals (ADR-004 Phase 1)
+    "notes_write", "notes_read", "memory_propose",
+    "model_status", "model_switch",
     # NOTE: the desktop Project tools (project_list/create/switch) are
     # deliberately NOT here. They only make sense where a GUI can follow the
     # move, so they live in the `project` toolset and are enabled solely by the
@@ -235,13 +238,19 @@ TOOLSETS = {
     
     "memory": {
         "description": "Persistent memory across sessions (personal notes + user profile)",
-        "tools": ["memory"],
+        "tools": ["memory", "notes_write", "notes_read", "memory_propose"],
         "includes": []
     },
 
     "context_engine": {
         "description": "Runtime tools exposed by the active context engine",
         "tools": [],
+        "includes": []
+    },
+
+    "runtime": {
+        "description": "Inspect and switch the current model/provider/reasoning for session scope",
+        "tools": ["model_status", "model_switch"],
         "includes": []
     },
     

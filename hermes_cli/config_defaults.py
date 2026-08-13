@@ -7,6 +7,8 @@ verbatim from hermes_cli/config.py. Must not import from hermes_cli.config.
 DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
+    # Model routing catalog (ADR-003). Empty keeps routing dormant.
+    "model_routes": {},
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
@@ -224,6 +226,10 @@ DEFAULT_CONFIG = {
         # detector instead of hanging forever. The env var
         # ``HERMES_LOCAL_STREAM_STALE_TIMEOUT`` overrides for escape-hatch use.
         "local_stream_stale_timeout": 900,
+        # Resume an interrupted gateway turn in place after restart.
+        "gateway_turn_resume": True,
+        # Maximum same-turn restart resumes before abandoning a poison turn.
+        "turn_resume_max": 2,
         # How user-attached images are presented to the main model on each turn.
         #   "auto"   — attach natively when the active model reports
         #              supports_vision=True AND the user hasn't explicitly
@@ -252,6 +258,10 @@ DEFAULT_CONFIG = {
         "backend": "local",
         "modal_mode": "auto",
         "cwd": ".",  # Use current directory
+        # Run non-PTY local background commands in transient user scopes and
+        # persist their output so they can survive a gateway service restart.
+        # Falls back to ordinary local spawning when systemd scopes are unavailable.
+        "durable_background": False,
         # Terminal font family for the desktop app's embedded xterm.js terminal.
         # When set (e.g. "'CaskaydiaCoveNerdFont', 'JetBrains Mono', monospace"),
         # the desktop terminal uses this as the CSS font-family value, with the
@@ -1046,6 +1056,16 @@ DEFAULT_CONFIG = {
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
         },
+        # ADR-004 ingest-curator fork. "auto" shares the main model and warm
+        # transcript; an explicit provider/model uses the cold WAL context.
+        "ingest_curator": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 300,
+            "extra_body": {},
+        },
         "moa_reference": {
             "provider": "auto",
             "model": "",
@@ -1668,6 +1688,7 @@ DEFAULT_CONFIG = {
     "delegation": {
         "model": "",       # e.g. "google/gemini-3-flash-preview" (empty = inherit parent model)
         "provider": "",    # e.g. "openrouter" (empty = inherit parent provider + credentials)
+        "default_route": "",  # optional model_routes route for unrouted delegate tasks
         "base_url": "",    # direct OpenAI-compatible endpoint for subagents
         "api_key": "",     # API key for delegation.base_url (falls back to OPENAI_API_KEY)
         "api_mode": "",    # wire protocol for delegation.base_url: "chat_completions",
@@ -1876,6 +1897,19 @@ DEFAULT_CONFIG = {
             "enabled": True,
             "keep": 5,  # retain last N regular snapshots
         },
+        # ADR-004 memory ingest curator. This is deliberately separate from
+        # the skill-maintenance `enabled` switch above and deploys inert.
+        "ingest_enabled": False,
+        "shadow_mode": True,
+        "salience": {
+            "threshold": 12,
+            "weight_proposal": 3,
+            "weight_tool_success": 2,
+            "weight_non_trivial": 1,
+            "fallback_turns": 10,
+        },
+        "idle_seconds": 600,
+        "session_end_min_turns": 3,
     },
 
     # Honcho AI-native memory -- reads ~/.honcho/config.json as single source of truth.

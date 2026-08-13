@@ -115,6 +115,7 @@ from agent.process_bootstrap import (
     _get_proxy_for_base_url,
 )
 from agent.iteration_budget import IterationBudget
+from agent import turn_trace
 from agent.interrupt_compat import request_hard_interrupt
 
 
@@ -171,6 +172,10 @@ from agent.prompt_builder import (  # noqa: F401  # re-exported via _ra() / mock
     build_environment_hints,
     build_nous_subscription_prompt,
     load_soul_md,
+)
+from agent.audience_persona import (  # noqa: F401  # re-exported via _ra() / mock.patch("run_agent.load_audience_persona")
+    load_audience_persona,
+    resolve_audience_mode,
 )
 from agent.process_bootstrap import _get_proxy_from_env  # noqa: F401
 from agent.message_sanitization import (  # noqa: F401
@@ -3990,6 +3995,139 @@ class AIAgent:
         except Exception:
             pass  # Never let header parsing break the agent loop
 
+    @staticmethod
+    def _recap_tool_label(fn: str, args: str) -> str:
+        """Semantic one-liner for a tool call — raw JSON args are noise."""
+        import json as _json
+
+        parsed = None
+        try:
+            parsed = _json.loads(args) if isinstance(args, str) else args
+        except Exception:
+            pass
+        if isinstance(parsed, dict):
+            if fn == "terminal" and parsed.get("command"):
+                return f"terminal: {str(parsed['command'])[:70]}"
+            for key in ("path", "file_path", "file"):
+                if parsed.get(key):
+                    return f"{fn}: {str(parsed[key])[:70]}"
+            if fn == "search_files" and (parsed.get("pattern") or parsed.get("query")):
+                return f"search: {str(parsed.get('pattern') or parsed.get('query'))[:60]}"
+            if parsed.get("action"):
+                return f"{fn} {parsed['action']}"
+            if parsed.get("query"):
+                return f"{fn}: {str(parsed['query'])[:60]}"
+        return f"{fn}({str(args)[:50]})"
+
+    def get_activity_recap_context(self) -> dict:
+        """Snapshot of current-turn activity for the gateway's LLM recap.
+
+        Read-only view over the live message list (GIL-consistent snapshot;
+        called from the gateway event loop while the turn runs on a worker
+        thread). Real gateway user messages are frequently wrapped in
+        bracketed note/coordination prefixes — strip those rather than skip
+        the message, and fall back to the bracketed text itself (inbox
+        threads' whole goal IS the coordinator note) so the goal is never
+        empty when any user text exists.
+        """
+        msgs = list(getattr(self, "_session_messages", None) or [])
+        goal = ""
+        goal_fallback = ""
+        for m in reversed(msgs):
+            if not isinstance(m, dict) or m.get("role") != "user":
+                continue
+            content = m.get("content")
+            if not isinstance(content, str) or not content.strip():
+                continue
+            text = content.strip()
+            if not goal_fallback:
+                goal_fallback = text[:300]
+            # Strip leading bracketed note blocks ("[Note: ...]\n\n" etc.).
+            stripped = re.sub(r"^(\[[^\]]*\]\s*)+", "", text).strip()
+            if stripped:
+                goal = stripped[:300]
+                break
+        if not goal:
+            goal = goal_fallback
+
+        recent_tools: list = []
+        for m in reversed(msgs):
+            if len(recent_tools) >= 5:
+                break
+            if not isinstance(m, dict) or m.get("role") != "assistant":
+                continue
+            for tc in m.get("tool_calls") or []:
+                try:
+                    if isinstance(tc, dict):
+                        fn = tc.get("function", {}).get("name", "?")
+                        args = tc.get("function", {}).get("arguments", "")
+                    else:
+                        fn = tc.function.name
+                        args = tc.function.arguments
+                except Exception:
+                    continue
+                recent_tools.append(self._recap_tool_label(fn, args))
+                if len(recent_tools) >= 5:
+                    break
+
+        # The agent's own recent utterances carry the strongest recap
+        # signal AND define the voice: persona, tone, and language all live
+        # in how the agent already talks in this conversation. Skip
+        # synthetic/interrupt notices — they aren't the agent's voice.
+        def _is_real_utterance(text: str) -> bool:
+            lowered = text.strip().lower()
+            return bool(lowered) and not (
+                lowered.startswith("operation interrupted")
+                or lowered.startswith("(tool call")
+                or lowered.startswith("[")
+            )
+
+        voice_samples: list = []
+        for m in reversed(msgs):
+            if len(voice_samples) >= 3:
+                break
+            if (
+                isinstance(m, dict)
+                and m.get("role") == "assistant"
+                and isinstance(m.get("content"), str)
+                and _is_real_utterance(m["content"])
+            ):
+                voice_samples.append(" ".join(m["content"].strip().split())[:180])
+        voice_samples.reverse()
+
+        last_result = ""
+        for m in reversed(msgs):
+            if (
+                isinstance(m, dict)
+                and m.get("role") == "tool"
+                and isinstance(m.get("content"), str)
+                and m["content"].strip()
+            ):
+                last_result = " ".join(m["content"].strip().split())[:150]
+                break
+
+        # First turn of a fresh session has no utterances yet — the persona
+        # definition (SOUL identity + conversation-style rules sit at the head
+        # of the cached system prompt) is the voice source of last resort.
+        persona_snippet = ""
+        _sp = getattr(self, "_cached_system_prompt", None)
+        if isinstance(_sp, str) and _sp.strip():
+            persona_snippet = _sp.strip()[:900]
+
+        summary = self.get_activity_summary()
+        return {
+            "goal": goal,
+            "recent_tools": list(reversed(recent_tools)),
+            "voice_samples": voice_samples,
+            "persona_snippet": persona_snippet,
+            "last_tool_result": last_result,
+            "current_tool": summary.get("current_tool"),
+            "seconds_since_activity": summary.get("seconds_since_activity"),
+            "last_activity_desc": summary.get("last_activity_desc"),
+            "iteration": summary.get("api_call_count"),
+            "max_iterations": summary.get("max_iterations"),
+        }
+
     def get_activity_summary(self) -> dict:
         """Return a snapshot of the agent's current activity for diagnostics.
 
@@ -4028,13 +4166,46 @@ class AIAgent:
         NOT called per-turn — only at CLI exit, /reset, gateway
         session expiry, etc.
         """
-        if self._memory_manager:
+        # Ingest-curator session-end boundary (ADR-004 Phase 2, SHADOW):
+        # ≥3-turn sessions with a dirty buffer get a cold curation run on a
+        # daemon thread. Observed BEFORE provider teardown so the fork's
+        # memory_search reads still work. No-op unless curator.ingest_enabled;
+        # internally skips ingest-disabled forks; fail-open.
+        try:
+            from agent.ingest_curator import observe_session_end
+            observe_session_end(self, messages)
+        except Exception:
+            logger.debug(
+                "ingest-curator session-end observation failed (fail-open)",
+                exc_info=True,
+            )
+        from agent.memory_manager import memory_ingest_allowed
+        if self._memory_manager and not memory_ingest_allowed(self):
+            # ADR-004 Phase 0: an ingest-disabled fork never OWNS its manager —
+            # it is rebound from the parent. on_session_end would run
+            # end-of-session extraction (a graph write) on the fork's harness
+            # transcript, and shutdown_all would tear down the parent's live
+            # provider mid-session. Skip both; the real owner cleans up.
+            pass
+        elif self._memory_manager:
             try:
                 self._memory_manager.on_session_end(messages or [])
             except Exception as e:
                 logger.warning("Memory provider on_session_end failed during shutdown: %s", e, exc_info=True)
             try:
                 self._memory_manager.shutdown_all()
+            except Exception:
+                pass
+            # ADR-004 §① origin-taint (Phase 2): evict this session's
+            # in-memory injected-span registry (the durable sidecar is kept
+            # for post-session readers — curator, dream — and TTLs out via
+            # its own GC). Owner-only by construction: this branch is only
+            # reached when memory_ingest_allowed(self), so an ingest-disabled
+            # fork sharing the parent's live session can never evict the
+            # parent's registry state mid-conversation.
+            try:
+                from agent import memory_taint
+                memory_taint.end_session(self.session_id or "")
             except Exception:
                 pass
         # Notify context engine of session end (flush DAG, close DBs, etc.)
@@ -4052,7 +4223,18 @@ class AIAgent:
         Called when session_id rotates (e.g. /new, context compression);
         providers keep their state and continue running under the old
         session_id — they just flush pending extraction now."""
-        if self._memory_manager:
+        # Ingest-curator session boundary (ADR-004 Phase 2, SHADOW) — same
+        # rationale as in shutdown_memory_provider. Fail-open.
+        try:
+            from agent.ingest_curator import observe_session_end
+            observe_session_end(self, messages)
+        except Exception:
+            logger.debug(
+                "ingest-curator session-end observation failed (fail-open)",
+                exc_info=True,
+            )
+        from agent.memory_manager import memory_ingest_allowed
+        if self._memory_manager and memory_ingest_allowed(self):
             try:
                 self._memory_manager.on_session_end(messages or [])
             except Exception:
@@ -4109,6 +4291,13 @@ class AIAgent:
         if interrupted:
             return
         if not (self._memory_manager and final_response and original_user_message):
+            return
+        # ADR-004 Phase 0: ingest-disabled forks (background review, ingest
+        # curator) share the parent's manager for reads only — this is the
+        # sync_all/queue_prefetch_all write chokepoint (turn_finalizer +
+        # codex_runtime both land here), so it must gate.
+        from agent.memory_manager import memory_ingest_allowed
+        if not memory_ingest_allowed(self):
             return
         # Multimodal turns carry content as a list of typed parts; providers
         # expect plain strings, so flatten to text first (newline-joined for
@@ -4951,6 +5140,12 @@ class AIAgent:
         return cache
 
     def _create_request_openai_client(self, *, reason: str, api_kwargs: Optional[dict] = None) -> Any:
+        with turn_trace.span("llm.client_create", obj=self):
+            return self._create_request_openai_client_impl(
+                reason=reason, api_kwargs=api_kwargs
+            )
+
+    def _create_request_openai_client_impl(self, *, reason: str, api_kwargs: Optional[dict] = None) -> Any:
         from unittest.mock import Mock
 
         primary_client = self._ensure_primary_openai_client(reason=reason)
@@ -7406,13 +7601,24 @@ class AIAgent:
         """
         tool_calls = assistant_message.tool_calls
 
+        # Per-turn trace: running tool_calls total lives in the trace tags so
+        # the run_conversation wrapper can copy it onto the root `turn` span.
+        _tt = turn_trace.get_bound(self)
+        if _tt is not None:
+            try:
+                _tt.tag(tool_calls=_tt.tags.get("tool_calls", 0) + len(tool_calls))
+            except Exception:
+                pass
+
         # Allow _vprint during tool execution even with stream consumers
         self._executing_tools = True
         try:
             if len(tool_calls) <= 1:
-                return self._execute_tool_calls_sequential(
-                    assistant_message, messages, effective_task_id, api_call_count
-                )
+                with turn_trace.span("tools.batch", trace=_tt,
+                                     count=len(tool_calls), mode="sequential"):
+                    return self._execute_tool_calls_sequential(
+                        assistant_message, messages, effective_task_id, api_call_count
+                    )
 
             from agent.tool_dispatch_helpers import _plan_tool_batch_segments
             _active_env = get_active_env(effective_task_id)
@@ -7421,19 +7627,30 @@ class AIAgent:
 
             if len(segments) == 1:
                 kind = segments[0][0]
-                if kind == "parallel":
-                    return self._execute_tool_calls_concurrent(
+                # mode tag mirrors the actual dispatch path: a homogeneous
+                # plan keeps its single-path executor.
+                _mode = "concurrent" if kind == "parallel" else "sequential"
+                with turn_trace.span("tools.batch", trace=_tt,
+                                     count=len(tool_calls), mode=_mode):
+                    if kind == "parallel":
+                        return self._execute_tool_calls_concurrent(
+                            assistant_message, messages, effective_task_id, api_call_count
+                        )
+                    return self._execute_tool_calls_sequential(
                         assistant_message, messages, effective_task_id, api_call_count
                     )
-                return self._execute_tool_calls_sequential(
-                    assistant_message, messages, effective_task_id, api_call_count
-                )
 
             from agent.tool_executor import execute_tool_calls_segmented
-            return execute_tool_calls_segmented(
-                self, assistant_message, messages, effective_task_id, api_call_count,
-                segments=segments,
-            )
+            # Mixed batch: segment-by-segment dispatch (271a9d8ec). One
+            # tools.batch span covers the whole batch; per-tool tools.call
+            # spans come from the sequential/concurrent executors that
+            # execute_tool_calls_segmented reuses per segment.
+            with turn_trace.span("tools.batch", trace=_tt, count=len(tool_calls),
+                                 mode="segmented", segments=len(segments)):
+                return execute_tool_calls_segmented(
+                    self, assistant_message, messages, effective_task_id, api_call_count,
+                    segments=segments,
+                )
         finally:
             self._executing_tools = False
 
@@ -7466,6 +7683,7 @@ class AIAgent:
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
             background=(not _is_subagent),
+            route=function_args.get("route"),
             parent_agent=self,
         )
 
@@ -7571,6 +7789,8 @@ class AIAgent:
         persist_user_display_kind: Optional[str] = None,
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        resume_turn: bool = False,
+        turn_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.aux_accounting import (
@@ -7662,6 +7882,8 @@ class AIAgent:
                     persist_user_display_kind=persist_user_display_kind,
                     persist_user_display_metadata=persist_user_display_metadata,
                     moa_config=moa_config,
+                    resume_turn=resume_turn,
+                    turn_id=turn_id,
                 )
             terminal = result if isinstance(result, dict) else {}
             if terminal.get("interrupted") is True:

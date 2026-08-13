@@ -40,7 +40,7 @@ import re
 import shlex
 import stat
 from pathlib import Path
-from typing import Callable, Iterator, Optional
+from typing import Callable, Iterable, Iterator, Optional
 
 
 class GatewayLifecycleBlocked(ValueError):
@@ -159,7 +159,11 @@ def contains_launchctl_submit_command(command: str) -> bool:
     semantics; ``bootstrap`` loads an arbitrary plist), which is never safe to
     do from inside the gateway process.
     """
-    for segment in _iter_command_segments(command):
+    return _segments_contain_launchctl_submit(_iter_command_segments(command))
+
+
+def _segments_contain_launchctl_submit(segments: Iterable[list[str]]) -> bool:
+    for segment in segments:
         index = _command_token_index(segment)
         if index is None:
             continue
@@ -183,7 +187,17 @@ def _iter_referenced_shell_scripts(
     cwd: Optional[str] = None,
 ) -> Iterator[Path]:
     """Yield scripts executed directly or through a POSIX shell."""
-    for segment in _iter_command_segments(command):
+    yield from _iter_referenced_shell_scripts_from_segments(
+        _iter_command_segments(command), cwd=cwd
+    )
+
+
+def _iter_referenced_shell_scripts_from_segments(
+    segments: Iterable[list[str]],
+    *,
+    cwd: Optional[str] = None,
+) -> Iterator[Path]:
+    for segment in segments:
         index = _command_token_index(segment)
         if index is None:
             continue
@@ -231,7 +245,13 @@ def _iter_referenced_shell_scripts(
 
 def _iter_shell_command_payloads(command: str) -> Iterator[str]:
     """Yield code passed through ``sh|bash|... -c`` for recursive scanning."""
-    for segment in _iter_command_segments(command):
+    yield from _iter_shell_command_payloads_from_segments(_iter_command_segments(command))
+
+
+def _iter_shell_command_payloads_from_segments(
+    segments: Iterable[list[str]],
+) -> Iterator[str]:
+    for segment in segments:
         index = _command_token_index(segment)
         if index is None or Path(segment[index]).name not in _SHELL_EXECUTABLES:
             continue
@@ -259,6 +279,12 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     try:
         descriptor = os.open(path, flags)
     except OSError:
+        return None, False
+    except ValueError:
+        # A NUL byte embedded in the path itself (machine code tokenized as
+        # a "path" by a caller that fed binary content into the recursion).
+        # Path.resolve tolerates it upstream (#76762); os.open must too — a
+        # guarded path must never crash the guard.
         return None, False
     try:
         metadata = os.fstat(descriptor)
@@ -293,14 +319,20 @@ def _contains_unsafe_gateway_action(
     visited: set[Path],
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
 ) -> bool:
-    if contains_gateway_lifecycle_command(command) or contains_launchctl_submit_command(
-        command
-    ):
+    if contains_gateway_lifecycle_command(command):
+        return True
+    # Tokenize once per nesting level: launchctl detection, payload
+    # extraction, and referenced-script extraction all consume the same
+    # token stream. shlex is pure Python; tokenizing the same command three
+    # times per level is GIL time taken from the gateway event loop (part
+    # of the 2026-08-05 loop-stall incident, 4 threads mid-parse).
+    segments = list(_iter_command_segments(command))
+    if _segments_contain_launchctl_submit(segments):
         return True
     if depth >= _MAX_REFERENCED_SCRIPT_DEPTH:
         return True
 
-    for payload in _iter_shell_command_payloads(command):
+    for payload in _iter_shell_command_payloads_from_segments(segments):
         if _contains_unsafe_gateway_action(
             payload,
             cwd=cwd,
@@ -310,7 +342,7 @@ def _contains_unsafe_gateway_action(
         ):
             return True
 
-    for script_path in _iter_referenced_shell_scripts(command, cwd=cwd):
+    for script_path in _iter_referenced_shell_scripts_from_segments(segments, cwd=cwd):
         try:
             resolved = script_path.resolve(strict=False)
         except (OSError, ValueError):
@@ -327,6 +359,15 @@ def _contains_unsafe_gateway_action(
         if script_text is None and read_remote_script is not None:
             # Local path missing; try the remote backend if one is available.
             script_text = read_remote_script(str(script_path))
+            if script_text is not None and "\x00" in script_text:
+                # Same binary skip as the local read (#76762): a NUL in the
+                # content means machine code, not a shell script. Without
+                # this, a callback that reads the file another way (e.g.
+                # terminal_tool's local-read fallback) resurrects the binary
+                # the local read deliberately skipped, and its decoded bytes
+                # get tokenized into NUL-bearing junk paths that crash
+                # os.open with ValueError deeper in the recursion.
+                script_text = None
         if not script_text:
             continue
         # Relative references inside a script resolve against that script's
