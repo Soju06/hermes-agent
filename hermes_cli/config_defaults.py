@@ -297,6 +297,10 @@ DEFAULT_CONFIG = {
         # after 72h) — NOT tmpfs /tmp, which is RAM-capped and fills under load. Must be an existing
         # absolute POSIX path; user-set paths are never auto-pruned.
         "temp_dir": "",
+        # Run non-PTY local background commands in transient user scopes and
+        # persist their output so they can survive a gateway service restart.
+        # Falls back to ordinary local spawning when systemd scopes are unavailable.
+        "durable_background": False,
         # CSS font-family for the desktop app's xterm.js terminal (e.g. "'CaskaydiaCoveNerdFont',
         # monospace"). Empty = built-in default ("'JetBrains Mono', 'Cascadia Code', 'SF Mono',
         # Menlo, Consolas, monospace"). Lets users use a Nerd Font without patching the app.

@@ -37,6 +37,7 @@ from hermes_cli.config import get_hermes_home
 from tools.process_registry_notifications import (
     format_process_notification, heartbeat_output_tail, is_child_process_notification, should_surface_notification)
 from tools.process_registry_checkpoint import ProcessCheckpointMixin
+from tools.process_registry_durable import ProcessDurableMixin
 from tools.process_registry_env_scope import ProcessEnvScopeMixin
 from tools.process_registry_output_log import ProcessOutputLogMixin, open_output_log, record_exit_command, worker_output_log
 from tools.process_registry_ownership import ProcessOwnershipMixin
@@ -572,6 +573,8 @@ class ProcessSession:
                                                 # sweeps), per terminal(background=true, persist_on_release=true) (#41225)
     output_log: str = ""                        # file the process writes to (worker spawns; no pipe to lose)
     pty_fallback: str = ""                      # why a pty=true local spawn runs in pipe mode instead
+    durable: bool = False                       # Survives gateway restart in a sibling systemd scope
+    log_path: Optional[str] = None              # File-backed output for durable local sessions
     # Watcher/notification routing (persisted for crash recovery)
     watcher_platform: str = ""
     watcher_chat_id: str = ""
@@ -609,6 +612,7 @@ class ProcessSession:
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _reader_finish_requested: threading.Event = field(default_factory=threading.Event, repr=False)
     _reader_selectable: bool = field(default=False, repr=False)
+    _durable_sync_generation: int = field(default=0, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (use_pty=True)
     _owned_pgid: Optional[int] = field(default=None, repr=False)  # see ProcessOwnershipMixin
 
@@ -658,7 +662,7 @@ _CHECKPOINT_FIELDS = (
     "started_at", "task_id", "owner_task_id", "session_key",
     *(f"watcher_{k}" for k in _WATCHER_ROUTE_KEYS), "watcher_interval",
     "parent_session_id", "notify_on_complete", "completion_output_chars", "watch_patterns",
-    "heartbeat_seconds", "persist_on_release", "output_log")
+    "heartbeat_seconds", "persist_on_release", "output_log", "durable", "log_path")
 _CHECKPOINT_DEFAULTS = {
     f.name: ([] if f.name == "watch_patterns" else f.default)
     for f in ProcessSession.__dataclass_fields__.values()
@@ -673,7 +677,8 @@ _WSL_CHAIN_NOTE = (
 )
 
 
-class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOutputLogMixin, ProcessOwnershipMixin, ProcessEnvScopeMixin):
+class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOutputLogMixin, ProcessOwnershipMixin,
+                      ProcessEnvScopeMixin, ProcessDurableMixin):
     """In-memory registry of running and finished background processes.
     Thread-safe: accessed from executor threads (terminal_tool, process handlers),
     the gateway asyncio loop (watchers, reset checks) and the cleanup thread."""
@@ -1008,6 +1013,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         """
         if session is None or session.exited or not session.detached or session.pid_scope != "host" or session.output_log:
             return session  # a log-backed adoption's reader collects the recorded exit itself
+        if session.durable:
+            return session  # likewise a recovered durable session: its log reader refreshes and finishes it
         fate = self._detached_host_fate(session.pid, session.host_start_time)
         if fate == "running":
             return session
@@ -1224,20 +1231,32 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         # share the foreground process group and background spawns would stop the whole
         # session (observed as dead TUIs in state T). Cgroup isolation is unaffected —
         # the scope attaches to the invoked process, not the spawning session.
-        output = open_output_log(log) if log else subprocess.PIPE
-        try:
-            proc = self._spawn_job(
-                session, _nice_argv(spawn_argv), persist_on_release, text=True, cwd=session.cwd, env=spawn_env,
-                encoding="utf-8", errors="replace", stdout=output, stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL, **_popen_kwargs)
-        finally:
-            if log:
-                os.close(output)
+        proc = None
+        if log is None and self._durable_background_enabled():
+            # Opted-in (terminal.durable_background): sibling transient scope + file-backed log so the
+            # job survives a gateway restart. A worker spawn keeps its own output log. Falls back to
+            # the ordinary spawn below when scopes are unavailable.
+            proc = self._spawn_durable_local(session, safe_command, spawn_env, dict(
+                text=True, cwd=session.cwd, encoding="utf-8", errors="replace", stdout=subprocess.PIPE,
+                # detached-spawn: ok - a durable job outlives the gateway on purpose (terminal.durable_background)
+                stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True, **_popen_kwargs))
+        if proc is None:
+            output = open_output_log(log) if log else subprocess.PIPE
+            try:
+                proc = self._spawn_job(
+                    session, _nice_argv(spawn_argv), persist_on_release, text=True, cwd=session.cwd, env=spawn_env,
+                    encoding="utf-8", errors="replace", stdout=output, stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL, **_popen_kwargs)
+            finally:
+                if log:
+                    os.close(output)
         session.process, session.output_log = proc, str(log or "")
         session.pid = proc.pid
         session.host_start_time = self._safe_host_start_time(session.pid)
+        reader_loop = self._log_reader_loop if log else (
+            self._durable_reader_loop if session.durable else self._reader_loop)
         try:
-            self._track_started(session, self._log_reader_loop if log else self._reader_loop, f"proc-reader-{session.id}")
+            self._track_started(session, reader_loop, f"proc-reader-{session.id}")
         except Exception:
             self._reap_untracked(session, proc)
             raise
@@ -1572,7 +1591,10 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
     def _publish_finished(self, session: ProcessSession, was_running: bool) -> None:
         self._release_finished_handles(session)
         self._write_checkpoint()
+        self._reset_failed_durable_scope(session)
         if was_running and session.notify_on_complete:
+            if session.durable:
+                self._read_durable_output(session)
             notification = {
                 "type": "completion",
                 "session_id": session.id,
@@ -1934,6 +1956,13 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
             return
         if rc is None:
             return  # Direct child still running — reader block is legitimate.
+        if session.durable:
+            # Durable output lives in the log file, not the (closed) launcher pipe.
+            self._read_durable_output(session)
+            with session._lock:
+                session.mark_exited(rc)
+            self._move_to_finished(session)
+            return
         reader = session._reader_thread
         if (
             not _IS_WINDOWS
@@ -1992,6 +2021,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         if session is None or self._uncollected_gone(session):
             return _not_found(session_id)
         self._reconcile_local_exit(session)  # orphaned-pipe reader guard
+        if session.durable:
+            self._read_durable_output(session)  # the preview comes from the durable log
         # Read with the preview under the lock the reader appends and exits under, so the
         # finalization check describes the output actually returned.
         with session._lock:
@@ -2010,7 +2041,9 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                 if acknowledge:
                     self._completion_consumed.add(session.id)
         if session.detached and not session.output_log:
-            result.update(detached=True, note="Process recovered after restart -- output history unavailable")
+            result.update(detached=True, note=(
+                "Process recovered after restart; output is available from its durable log"
+                if session.durable else "Process recovered after restart -- output history unavailable"))
         return result
 
     def read_log(self, session_id: str, offset: int | None = None, limit: int = 200) -> dict:
@@ -2020,8 +2053,9 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         session = self.get(session_id)
         if session is None:
             return _not_found(session_id)
+        durable_output = self._read_durable_output(session) if session.durable else None
         with session._lock:
-            full_output = strip_ansi(session.output_buffer)
+            full_output = strip_ansi(session.output_buffer if durable_output is None else durable_output)
             exited, finalizing = session.exited, self._reader_finalizing(session)
         lines = full_output.splitlines()
         total_lines = len(lines)
@@ -2139,6 +2173,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
             # cgroup and escalates to SIGKILL after TimeoutStopSec. This is additive — the PID-based kill
             # above already handled the main process; this catches stragglers.
             scope_stopped = self._stop_scope(session)
+            if session.durable:
+                self._read_durable_output(session)
             with session._lock:
                 result = self._exit_snapshot(session, "already_exited")
                 finalizing = self._reader_finalizing(session)
@@ -2193,6 +2229,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                     "process_running": not root_exited}
             # Capture output, mark consumed, THEN expose ``exited`` to watcher tasks —
             # closes the delayed-notification race without losing the transcript.
+            if session.durable:
+                self._read_durable_output(session)
             with session._lock:
                 output = _completion_output(session)
                 if consume_output:
@@ -2503,7 +2541,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
 
     def kill_all(
         self, task_id: Optional[str] = None, *, exclude_ids: frozenset = frozenset(),
-        source: str = "kill_all", consume_output: bool = False) -> int:
+        exclude_durable: bool = False, source: str = "kill_all", consume_output: bool = False) -> int:
         """Kill all running processes, optionally only those ``task_id`` spawned (its ``owner_task_id``).
         Returns how many it stopped. A session whose systemd scope did not stop is not counted
         (its descendants may live on), and a later sweep retries it even after it finished.
@@ -2513,7 +2551,8 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         timeout, or ``agent_close``): an explicitly persisted background job must survive
         session end / compression / error recovery (#41225). An explicit operator stop
         (``process.kill`` via process_manage, CLI /stop) passes its own source and still
-        reaches them, so the user can always stop a persisted process on purpose."""
+        reaches them, so the user can always stop a persisted process on purpose.
+        ``exclude_durable`` leaves restart-surviving durable sessions alone (gateway shutdown sweeps)."""
         from tools.environments.sandbox_scope import sandbox_visible
         lifecycle = source in self._LIFECYCLE_KILL_SOURCES
         # A sweep reaches only the current activity's own processes; a hosted agent's run in its
@@ -2524,6 +2563,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
                 if (task_id is None or s.owner_task_id == task_id) and sandbox_visible(s.sandbox_key)
                 and s.id not in exclude_ids and (not s.exited or s._scope_stop_pending)
                 and not (lifecycle and s.persist_on_release)
+                and not (exclude_durable and s.durable)
             ]
         results = [self.kill_process(s.id, source=source, consume_output=consume_output) for s in targets]
         return sum(

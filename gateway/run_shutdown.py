@@ -1661,19 +1661,26 @@ class GatewayShutdownMixin(GatewaySessionEndMixin, GatewayHomeShutdownNoticeMixi
             from tools.process_registry import process_registry
             # Host shutdown: kill even persist_on_release jobs or they become
             # PPID=1 orphans (#41225/#46778); an explicit source reaches them.
+            # Durable (restart-surviving) sessions are excluded from the sweep; report the skips.
+            _skipped_durable = process_registry.count_durable_running()
             _count_step(
                 "Shutdown (%s): killed %d tool subprocess(es)",
-                lambda: process_registry.kill_all(source="gateway_shutdown"))
+                lambda: process_registry.kill_all(source="gateway_shutdown", exclude_durable=True))
+            if _skipped_durable:
+                logger.info("Shutdown (%s): skipped %d durable tool subprocess(es)", phase, _skipped_durable)
 
         def _mark_cron_interrupted() -> list:
-            # kill_all() is global: a cron job mid-dispatch lost its tool subprocess and its agent thread may
-            # still emit a plausible response from truncated output — mark it interrupted, never success.
-            # Any cron job still dispatched at this instant just had its tool subprocess killed above
-            # (kill_all() has no per-job-ID targeting — it's a global sweep). No-op when no cron job is in
-            # flight. See #60432.
+            # Any cron job still dispatched at this instant is dying with this process regardless of what
+            # kill_all() did: the job's AGENT is a thread inside this gateway process
+            # (cron/scheduler.py ThreadPoolExecutor), so even when its tool subprocess survived as a
+            # durable systemd scope, the run itself is interrupted. Mark it so the scheduler can never
+            # report that run as success (#60432). Gating this on killed>0 would regress #60432 for cron
+            # jobs whose only live subprocess was durable, or that held no registered subprocess at the
+            # kill instant at all. No-op when no cron job is in flight.
             from cron.scheduler import mark_running_jobs_interrupted
             _interrupted = mark_running_jobs_interrupted(
-                f"Gateway shutdown ({phase}) killed the job's tool subprocess before the run finished."
+                f"Gateway shutdown ({phase}) interrupted the run before it finished (the job's agent "
+                "dies with the gateway process; non-durable tool subprocesses were killed)."
             )
             if _interrupted:
                 logger.warning(
