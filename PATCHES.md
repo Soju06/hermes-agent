@@ -653,6 +653,17 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
   - `32f562255 fix(state): retire orphaned FTS v2 during storage optimize`
 - **touches:** `hermes_state_search.py`, `tests/test_fts_v2_orphan_hardening.py`, `tests/test_state_db_malformed_repair.py`
 
+### 65. read-file-binary-sniff
+- **branch:** `soju/patches/read-file-binary-sniff`
+- **stacked-on:** _(none — applies directly on base)_
+- **origin:** `local-author`
+- **upstream_pr:** _(none yet — upstream candidate; the sniff path is stock upstream code)_
+- **state:** `pending-upstream`
+- **rationale:** `read_file` refused valid UTF-8 Korean text with "Binary file - cannot display as text" — intermittently, and with no relation to file content type. Root cause is a two-stage mismatch in `tools/file_operations.py`: the binary sniff samples the first 1000 **bytes** (`head -c 1000`, ~L1182) while the terminal backend decodes stdout with `errors="replace"`, so a 3-byte Hangul or 4-byte emoji straddling byte 1000 leaves 1-3 trailing U+FFFD; `_is_likely_binary` (~L901) treats any U+FFFD in the sample as binary. That FFFD check is a deliberate fail-safe (it stops a read→edit→write roundtrip from overwriting undecodable bytes with mojibake) and is preserved — only the truncation artifact is excluded. Whether a given file trips this is pure byte-boundary luck, which is why it looked unreproducible: `personas/private.md` (2686 B) hits FFFD at cuts 1000/1024/2048, while `work.md` happens to land on a character boundary and reads fine; editing a file shifts the boundary and the symptom appears or vanishes. Fix: pass `sample_truncated=(file_size > 1000)` from the read path and, only in that case, strip a trailing run of at most 3 U+FFFD before the check. Untruncated samples keep byte-identical behavior, mid-sample FFFD still flags binary (genuine mojibake is not tail-only), and a trailing run of 4+ is not a boundary artifact so it still flags. Verified RED/GREEN by reverting `tools/file_operations.py` alone against the new tests (4 fail → 70 pass), then live: the reference doc describing this very bug was itself unreadable via `read_file` before the fix.
+- **commits:**
+  - `170c8ac07 fix(tools): don't flag UTF-8 text as binary when head -c splits a multibyte char`
+- **touches:** `tools/file_operations.py`, `tests/tools/test_file_operations.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -720,6 +731,7 @@ soju/patches/lifecycle-guard-nul-fallback (stacked on worker-cpu-hygiene)
 soju/patches/anthropic-structured-output (stacked on refusal-hop-clean-fork)
 soju/patches/hygiene-noprogress-cooldown (stacked on anthropic-structured-output)
 soju/patches/fts-v2-orphan-hardening
+soju/patches/read-file-binary-sniff
 ```
 
 ## Operating Procedures
