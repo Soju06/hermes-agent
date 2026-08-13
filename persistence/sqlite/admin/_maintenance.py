@@ -12,7 +12,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 from persistence.sqlite._state.holders import foreign_state_db_holders, in_process_state_db_holders
 from persistence.sqlite._state.repair import _release_auto_maintenance_lock, _try_acquire_auto_maintenance_lock
@@ -24,8 +24,8 @@ from .._schema import (
     _ensure_fts_schema, _fts_external_index_empty_with_messages, _has_fts_trash, _meta_row, _present_fts_tables,
 )
 from .._schema_ddl import (
-    FTS_SQL, FTS_STORAGE_VERSION, FTS_TOOL_CONTENT_PREFIX_CHARS, FTS_TRIGRAM_SQL, SCHEMA_VERSION, fts_layout_current,
-    fts_layout_drift,
+    _FTS5_SHADOW_SUFFIXES, FTS_SQL, FTS_STORAGE_VERSION, FTS_TOOL_CONTENT_PREFIX_CHARS, FTS_TRIGRAM_SQL,
+    SCHEMA_VERSION, fts_layout_current, fts_layout_drift,
 )
 from ..conversation._store.search import (
     _BASE_BOUNDARY_SWEEP_SQL, _CHUNK_INSERT_SQL, _HOLDER_SCAN_INTERVAL_S, _OPTIMIZE_CHUNK_ATTEMPTS,
@@ -65,6 +65,110 @@ def _try_checkpoint(holder: StoreHolder, mode: str, fail_msg: str) -> None:
         holder._conn.execute(f"PRAGMA wal_checkpoint({mode})")
     except Exception as exc:  # health: allow BLE001 -- a failed checkpoint is logged at debug
         logger.debug(fail_msg, exc)
+
+
+def _fts5_shadow_tables(conn, vtable_names: Sequence[str]) -> list[str]:
+    """The FTS5 shadow tables of *vtable_names* present in the schema. FTS5's shadow set is fixed, so the
+    names are built exactly from the parent vtables, never matched by prefix: ``messages_fts_v2`` (or a
+    later generation) is not a child of ``messages_fts`` merely because the names share a prefix."""
+    candidates = tuple(f"{table}_{suffix}" for table in vtable_names for suffix in _FTS5_SHADOW_SUFFIXES)
+    if not candidates:
+        return []
+    return [row[0] for row in conn.execute(
+        f"SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ({','.join('?' for _ in candidates)})",
+        candidates,
+    ).fetchall()]
+
+
+# ``messages_fts_v2`` (tokenize='cjk_unicode61') was superseded by ``messages_fts_cjk`` (itself retired on open
+# now). A store that stopped mid-transition keeps the v2 vtable, its triggers on ``messages`` and its markers
+# while no code reads them. Named allowlist, never a prefix scan: a future generation is not retired for
+# merely looking similar.
+_RETIRED_V2_TRIGGERS = ("messages_fts_v2_insert", "messages_fts_v2_delete", "messages_fts_v2_update")
+_RETIRED_V2_MARKERS = ("fts_v2_ready", "fts_v2_backfill_snapshot_max", "fts_v2_backfill_next_lo")
+
+
+def _has_retired_fts_v2(conn) -> bool:
+    """True when the superseded standalone v2 generation left state (vtable, a trigger or a marker)."""
+    names = ("messages_fts_v2", *_RETIRED_V2_TRIGGERS)
+    if conn.execute(
+        f"SELECT 1 FROM sqlite_master WHERE name IN ({','.join('?' for _ in names)}) LIMIT 1", names,
+    ).fetchone():
+        return True
+    return conn.execute(
+        f"SELECT 1 FROM state_meta WHERE key IN ({','.join('?' for _ in _RETIRED_V2_MARKERS)}) LIMIT 1",
+        _RETIRED_V2_MARKERS,
+    ).fetchone() is not None
+
+
+def _check_fts_v2_retirement_safe(conn) -> None:
+    """Raise unless retiring ``messages_fts_v2`` leaves a searchable store: the stored v2 row is the known
+    FTS5 generation, ``messages`` exists, and the live base index passes FTS5's ``'integrity-check'`` and
+    covers every message (an external-content base index only once ``fts_storage_version`` is current).
+    Unlike v2 itself, both surfaces are tokenizer-independent on this connection; refuse rather than
+    discard the only remaining searchable generation."""
+    table_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts_v2'"
+    ).fetchone()
+    if table_row is not None:
+        sql = str(table_row[0] or "").lower()
+        if not (sql.startswith("create virtual table") and "using fts5" in sql
+                and all(column in sql for column in ("content", "tool_name", "tool_calls"))):
+            raise sqlite3.OperationalError(
+                "refusing to retire messages_fts_v2: its schema is not the known superseded FTS5 generation")
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages'").fetchone():
+        raise sqlite3.OperationalError("refusing to retire messages_fts_v2 without messages source")
+    base_row = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts'").fetchone()
+    if base_row is None or "using fts5" not in str(base_row[0] or "").lower():
+        raise sqlite3.OperationalError("refusing to retire messages_fts_v2 without live base FTS")
+    conn.execute("INSERT INTO messages_fts(messages_fts) VALUES('integrity-check')")
+    source_rows = int(conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0])
+    if _db_has_legacy_inline_fts(conn):
+        indexed_rows = int(conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0])
+    else:
+        ready = _meta_row(conn, "fts_storage_version")
+        if ready is None or str(ready[0]) != str(FTS_STORAGE_VERSION):
+            raise sqlite3.OperationalError(
+                "refusing to retire messages_fts_v2 before the current base FTS layout is ready")
+        indexed_rows = int(conn.execute("SELECT COUNT(*) FROM messages_fts_docsize").fetchone()[0])
+    if indexed_rows != source_rows:
+        raise sqlite3.OperationalError(
+            f"refusing to retire messages_fts_v2: live base FTS row-count mismatch ({indexed_rows} != {source_rows})")
+
+
+def _stage_retired_fts_v2(conn) -> bool:
+    """Retire ``messages_fts_v2`` inside the caller's write transaction; True when anything was retired.
+
+    A DROP constructs the virtual table and so fails without ``cjk_unicode61`` (never loaded since the CJK
+    tokenizer left core). Same writable-schema discipline as the legacy demote: after the preflight, delete
+    only the exact trigger and vtable rows, then rename the now-plain shadows into the FTS trash for the
+    chunked teardown. Crash-atomic: the live base index stays searchable throughout. Idempotent under
+    ``_execute_write``'s replay (the presence recheck)."""
+    if not _has_retired_fts_v2(conn):
+        return False
+    _check_fts_v2_retirement_safe(conn)
+    shadows = _fts5_shadow_tables(conn, ("messages_fts_v2",))
+    conn.execute("PRAGMA writable_schema=ON")
+    try:
+        conn.execute(
+            "DELETE FROM sqlite_master WHERE type = 'trigger' "
+            f"AND name IN ({','.join('?' for _ in _RETIRED_V2_TRIGGERS)})",
+            _RETIRED_V2_TRIGGERS,
+        )
+        conn.execute("DELETE FROM sqlite_master WHERE type = 'table' AND name = 'messages_fts_v2'")
+    finally:
+        conn.execute("PRAGMA writable_schema=RESET")
+    # Nothing references the shadows once the v2 triggers and vtable are gone. The modern rename re-parses
+    # every remaining trigger and fails beside an index whose tokenizer this build lacks (trigram), exactly as
+    # in drop_retired_cjk_index, so it runs with legacy_alter_table, restored afterwards.
+    conn.execute("PRAGMA legacy_alter_table=ON")
+    try:
+        for shadow in shadows:
+            conn.execute(f"ALTER TABLE {shadow} RENAME TO {_FTS_TRASH_PREFIX}{shadow}")
+    finally:
+        conn.execute("PRAGMA legacy_alter_table=OFF")
+    _delete_meta(conn, *_RETIRED_V2_MARKERS)
+    return True
 
 
 @dataclass
@@ -385,16 +489,26 @@ class _FtsStorageOptimizer:
                 self._seed_fts_rebuild_markers(conn, force=True)
         holder._execute_write(_do)
 
+    def _retire_orphaned_fts_v2(self) -> bool:
+        """Retire the superseded standalone ``messages_fts_v2`` generation (:func:`_stage_retired_fts_v2`) in
+        one write transaction; True when it was retired. A failed preflight raises and leaves it untouched."""
+        retired = bool(self._holder._execute_write(_stage_retired_fts_v2))
+        if retired:
+            logger.info("Retired orphaned messages_fts_v2 generation; shadow teardown will continue in chunks.")
+        return retired
+
     def fts_optimize_available(self) -> bool:
-        """True when `optimize_fts_storage()` has work: legacy inline FTS or a v23 trigram still
-        carrying ``tool_calls`` (``_db_needs_fts_storage_upgrade``), an interrupted optimize
-        (markers/trash), or an empty external index without markers. False when FTS5 is unavailable."""
+        """True when `optimize_fts_storage()` has work: an orphaned standalone ``messages_fts_v2``,
+        legacy inline FTS or a v23 trigram still carrying ``tool_calls``
+        (``_db_needs_fts_storage_upgrade``), an interrupted optimize (markers/trash), or an empty
+        external index without markers. False when FTS5 is unavailable."""
         holder = self._holder
         if not holder._fts_enabled or holder.read_only:
             return False
         with holder._read_ctx() as conn:
             return (
-                _db_needs_fts_storage_upgrade(conn)
+                _has_retired_fts_v2(conn)  # its unloadable-tokenizer triggers: optimize retires it
+                or _db_needs_fts_storage_upgrade(conn)
                 or _meta_row(conn, "fts_rebuild_high_water") is not None  # interrupted optimize
                 or _has_fts_trash(holder, conn)
                 or _fts_external_index_empty_with_messages(holder, conn)
@@ -411,22 +525,26 @@ class _FtsStorageOptimizer:
         def _stage(conn):
             _drop_fts_triggers(conn)
             conn.execute("DROP VIEW IF EXISTS messages_fts_trigram_src")
-            if conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name IN ('messages_fts', 'messages_fts_trigram') "
-                "AND sql LIKE 'CREATE VIRTUAL TABLE%' LIMIT 1"
-            ).fetchone():
+            legacy_vtables = [row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name IN ('messages_fts', 'messages_fts_trigram') AND sql LIKE 'CREATE VIRTUAL TABLE%'"
+            ).fetchall()]
+            if legacy_vtables:
+                # Shadow set derived EXACTLY from the demoted vtables (FTS5's fixed suffixes), never a
+                # 'messages_fts_%' prefix sweep: sibling generations share the prefix, and renaming an orphaned
+                # messages_fts_v2's shadows re-parses its unloadable-tokenizer triggers and rolls the whole
+                # migration back.
+                shadows = _fts5_shadow_tables(conn, legacy_vtables)
                 conn.execute("PRAGMA writable_schema=ON")
-                conn.execute(
-                    "DELETE FROM sqlite_master WHERE type = 'table' "
-                    "AND name IN ('messages_fts', 'messages_fts_trigram') AND sql LIKE 'CREATE VIRTUAL TABLE%'"
-                )
-                conn.execute("PRAGMA writable_schema=RESET")
-                for row in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'table' "
-                    "AND (name LIKE 'messages_fts_%' ESCAPE '\\' "
-                    "OR name LIKE 'messages_fts_trigram_%' ESCAPE '\\')"
-                ).fetchall():
-                    conn.execute(f"ALTER TABLE {row[0]} RENAME TO fts_v22_trash_{row[0]}")
+                try:
+                    conn.execute(
+                        "DELETE FROM sqlite_master WHERE type = 'table' "
+                        "AND name IN ('messages_fts', 'messages_fts_trigram') AND sql LIKE 'CREATE VIRTUAL TABLE%'"
+                    )
+                finally:
+                    conn.execute("PRAGMA writable_schema=RESET")
+                for shadow in shadows:
+                    conn.execute(f"ALTER TABLE {shadow} RENAME TO {_FTS_TRASH_PREFIX}{shadow}")
             # Claim the backfill BEFORE the empty v23 tables exist so a crash before
             # schema ensure resumes instead of stamping an empty index.
             hw = self._seed_fts_rebuild_markers(conn, force=True)
@@ -571,6 +689,10 @@ class _FtsStorageOptimizer:
 
         # Heal bookkeeping BEFORE deciding whether to demote again.
         self._repair_optimize_bookkeeping()
+        # Retire the exact, known-dead standalone v2 generation before any legacy ALTER TABLE: its
+        # unloadable-tokenizer triggers otherwise make SQLite reject unrelated schema renames. Separate from the
+        # demote on purpose: no prefix-based discovery.
+        self._retire_orphaned_fts_v2()
         with holder._lock:
             needs_storage_upgrade = _db_needs_fts_storage_upgrade(holder._conn)
         pending = holder.get_meta("fts_rebuild_high_water") is not None
