@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from agent.runtime_control import (
+    dispatch_model_switch,
     get_runtime_state,
     restore_pending_turn_runtime,
     model_status,
@@ -224,6 +225,85 @@ def _configured_provider_models_config():
             },
         }
     }
+
+
+def _ambiguous_routes_config():
+    return {
+        "providers": {
+            "claude-lb": {
+                "default_model": "claude-fable-5",
+                "models": {
+                    "claude-opus-5": {},
+                    "claude-fable-5": {},
+                },
+            },
+            "codex-nekos": {
+                "default_model": "gpt-5.6-sol",
+                "models": {"gpt-5.6-sol": {}},
+            },
+        },
+        "model_routes": {
+            "health": {"enabled": False},
+            "routes": {
+                "DOCUMENT_WORK": {
+                    "description": "document work",
+                    "provider": "claude-lb",
+                    "model": "claude-opus-5",
+                    "accepted": ["claude-opus-5", "claude-fable-5"],
+                    "fallbacks": [
+                        {"provider": "claude-lb", "model": "claude-fable-5"},
+                    ],
+                },
+                "SYSTEM_DEV": {
+                    "description": "system development",
+                    "provider": "claude-lb",
+                    "model": "claude-fable-5",
+                    "accepted": ["claude-fable-5", "gpt-5.6-sol"],
+                    "fallbacks": [
+                        {"provider": "codex-nekos", "model": "gpt-5.6-sol"},
+                    ],
+                },
+            },
+        },
+    }
+
+
+def test_dispatch_model_switch_records_route_intent_for_resolved_and_noop_outcomes():
+    cfg = _ambiguous_routes_config()
+    agent = DummyAgent()
+
+    with patch("hermes_cli.config.load_config", return_value=cfg), patch(
+        "agent.runtime_control.resolve_model_switch",
+        return_value=_switch_result("claude-fable-5", "claude-lb"),
+    ):
+        resolved = json.loads(
+            dispatch_model_switch(agent, {"route": "SYSTEM_DEV"})
+        )
+
+    assert resolved["success"] is True
+    assert resolved["route"]["name"] == "SYSTEM_DEV"
+    assert agent._active_route_name == "SYSTEM_DEV"
+
+    with patch("hermes_cli.config.load_config", return_value=cfg):
+        noop = json.loads(dispatch_model_switch(agent, {"route": "SYSTEM_DEV"}))
+
+    assert noop["success"] is True
+    assert noop["noop"] is True
+    assert agent._active_route_name == "SYSTEM_DEV"
+
+
+def test_model_status_prefers_recorded_route_under_ambiguous_membership():
+    agent = DummyAgent()
+    agent.provider = "claude-lb"
+    agent.model = "claude-fable-5"
+    agent._active_route_name = "SYSTEM_DEV"
+
+    with patch(
+        "hermes_cli.config.load_config", return_value=_ambiguous_routes_config()
+    ):
+        data = json.loads(model_status(agent))
+
+    assert data["routes"]["current"] == "SYSTEM_DEV"
 
 
 def test_model_switch_rejects_agent_free_form_provider_model_before_fuzzy_resolution():
