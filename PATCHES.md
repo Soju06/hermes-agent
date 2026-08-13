@@ -629,6 +629,17 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
   - `5848ae3da Add durable local background processes`
 - **touches:** `tools/process_registry.py`, `gateway/run.py`, `hermes_cli/config_defaults.py`, `tests/tools/test_process_registry.py`, `tests/gateway/test_gateway_shutdown.py`, `tests/gateway/test_cron_active_work_drain.py`
 
+### 63. route-aware-outage-fallback
+- **branch:** `soju/patches/route-aware-outage-fallback`
+- **stacked-on:** `soju/patches/refusal-api-fallback`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — model_routes is fork-only (#34); upstream has no route subsystem to be aware of)_
+- **state:** `local-only`
+- **rationale:** Outage-shaped failures (`rate_limit`, `billing`, `upstream_rate_limit`, `overloaded`, `server_error`) walked only the global `fallback_providers:` chain, which has no route context and lands dev-routed sessions on a chat-tier model — silently demoting them and tripping skill-gate dev_edit capability gates until the quota window resets (2026-08-13: claude-lb model-quota-exhausted, 13h window, 90 fable→opus fallbacks in one day). Fix: `try_activate_fallback` resolves the CURRENT route via `runtime_satisfies_route` and walks that route's healthy `fallbacks:` (skipping unhealthy/self/unresolvable entries) BEFORE the global chain. Content-policy refusals unchanged (still generic-then-PERMISSIVE, patch #57). Non-routed runtimes and deployments without model_routes behave exactly as before.
+- **commits:**
+  - `0ff914006 feat(fallback): route-aware outage fallback prefers current route fallbacks`
+- **touches:** `agent/chat_completion_helpers.py`, `tests/run_agent/test_fallback_helpers.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
