@@ -697,6 +697,19 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
   - `e59aa3953 fix(cron): stop lifecycle guard Branch D from spanning statement boundaries`
 - **touches:** `cron/lifecycle_guard.py`, `tests/hermes_cli/test_gateway_restart_loop.py`
 
+### 69. approval-grep-escaped-quote
+- **branch:** `soju/patches/approval-grep-escaped-quote`
+- **stacked-on:** _(none — applies directly on base)_
+- **origin:** `local-author`
+- **upstream_pr:** _(none yet — upstream candidate; all three defects reproduce on stock v0.20.0)_
+- **state:** `pending-upstream`
+- **rationale:** Started as a false positive — `grep -n "^from\|^__all__\|^    \"" file.py` was rejected as `hardline: command parser limit or malformed executable payload`, blocking a read-only grep in gateway sessions. Root cause: `detect_hardline_command` fed `_normalize_command_for_detection(command)` to the grep parser, but normalization strips backslash-escapes (`\"` → `"`), so the parser saw an odd number of quotes and reported the parse malformed, which fails closed. Investigating that exposed a far more serious defect in the same quote-state confusion: the hardline floor could be BYPASSED entirely. `_CMDPOS`-anchored hardline patterns do not match `; reboot` directly — they fire only after `_mark_command_starts` inserts a newline at each quote-aware command start. When an escaped quote is present, normalization leaves the quote open (`echo "a"b"; reboot`), the tokenizer sees one unterminated segment, no marker is inserted, and the floor never fires. Verified live on stock base and on the deployed tree: `cat "f\"n.txt"; rm -rf --no-preserve-root /` returned `approved=True` from `check_dangerous_command` — i.e. the yolo-proof floor, which is documented as unbypassable, was bypassable with one escaped quote in front of any command. Fix is three commits, additive only (variant generation is any-match, so adding variants can only tighten the floor): (1) validate grep syntax against faithful shell quote state, using `_mask_quoted_newlines(command)` rather than normalized text; (2) emit an ADDITIONAL detection variant whose command starts are marked BEFORE normalization, using a `" \n"` marker so a preceding backslash cannot swallow the inserted newline as a line continuation; (3) `_mark_command_starts` must not treat an offset inside a `${...}` parameter expansion as a command start — marking inside `${IFS}` produced `${ \nIFS}`, which defeated the IFS-collapse regex in normalization and left `echo "a\"b"; rm${IFS}-rf${IFS}--no-preserve-root${IFS}/` executable and unblocked (confirmed with the safe analogue `echo "a\"b"; echo${IFS}BYPASS_EXECUTED`, rc=0, second statement executed). A single-quote variant (`echo 'a\'b'; reboot`) was investigated and is NOT a bypass — bash rejects it with rc=2 (unterminated quote), so it cannot execute. Verified RED/GREEN per commit (1 → 5 → 4 failing tests), 266 passed across the four affected test files, mutation-killed both new code paths (reverting the param-expansion skip → 4 failures; reverting the faithful-marking variant → 88 failures), and 33 adversarial cases hand-checked against BASE to confirm zero regressions: every remaining difference from base is either fail-safe over-blocking that predates this patch or a non-executable string.
+- **commits:**
+  - `428fe1d51 fix(approval): parse raw grep quote state before hardline checks`
+  - `7855422f0 fix(approval): mark command starts from faithful quote state`
+  - `e8bbdbeb4 fix(approval): don't mark command starts inside parameter expansions`
+- **touches:** `tools/approval.py`, `tests/tools/test_execution_flag_detection.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -767,6 +780,7 @@ soju/patches/anthropic-structured-output (stacked on refusal-hop-clean-fork)
 soju/patches/hygiene-noprogress-cooldown (stacked on anthropic-structured-output)
 soju/patches/fts-v2-orphan-hardening
 soju/patches/read-file-binary-sniff
+soju/patches/approval-grep-escaped-quote
 ```
 
 ## Operating Procedures
