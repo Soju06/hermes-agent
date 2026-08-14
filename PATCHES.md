@@ -686,6 +686,17 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
   - `53bdecd55 fix(fallback): classify scoped model-exhaustion 503s as upstream_rate_limit`
 - **touches:** `agent/error_classifier.py`, `tests/agent/test_error_classifier.py`
 
+### 68. lifecycle-guard-stmt-boundary
+- **branch:** `soju/patches/lifecycle-guard-stmt-boundary`
+- **stacked-on:** `soju/patches/lifecycle-guard-multiline`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — Branch D statement-boundary false positive; upstream candidate)_
+- **state:** `local-only`
+- **rationale:** `_GATEWAY_LIFECYCLE_PATTERN` Branch D (`p?kill…hermes…gateway`, both token orders) used `[^\n]*` token gaps, so only newlines bounded a match — `;`, `&&`, `|` passed through and stitched INDEPENDENT statements on one physical line into a single "kill the gateway" match. Live reproduction: `kill -USR1 <pid> && echo …; sleep 20; systemctl --user show hermes-gateway-mymel.service -p …` — the kill is the SANCTIONED SIGUSR1 self-restart path and hermes/gateway tokens come from a read-only `systemctl show` unit name three statements later. Counterfactuals verified: newline-separated same content passed, removing the kill passed, renaming the unit passed. Same design-flaw family as #66 (statement boundaries ignored), opposite direction: #66 over-split (newline = new shell statement inside Python payloads), this one under-split (`;&|` not a boundary at all). Fix narrows both Branch D gaps to `[^\n;&|]*`; `&&`/`||` break on their first char so compound operators are covered. Branches A/B/C untouched (their gaps sit between a verb and its own arguments within one statement). Signal whitelisting (-USR1 exemption) considered and rejected as guard-weakening. Real threats preserved: `pkill -f "hermes.*gateway"`, `kill $(pgrep -f …)`/backtick substitution (no `;&|` inside), line-continuation folding, Branch C after `;` prefix. Verified: TDD RED 4→GREEN, file 113 passed, tests/cron 390 passed, 15 adversarial cases.
+- **commits:**
+  - `e59aa3953 fix(cron): stop lifecycle guard Branch D from spanning statement boundaries`
+- **touches:** `cron/lifecycle_guard.py`, `tests/hermes_cli/test_gateway_restart_loop.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -751,6 +762,7 @@ soju/patches/notes-recognition-grounding (stacked on memory-phase2-taint)
 soju/patches/worker-cpu-hygiene
 soju/patches/lifecycle-guard-nul-fallback (stacked on worker-cpu-hygiene)
 soju/patches/lifecycle-guard-multiline (stacked on lifecycle-guard-nul-fallback)
+soju/patches/lifecycle-guard-stmt-boundary (stacked on lifecycle-guard-multiline)
 soju/patches/anthropic-structured-output (stacked on refusal-hop-clean-fork)
 soju/patches/hygiene-noprogress-cooldown (stacked on anthropic-structured-output)
 soju/patches/fts-v2-orphan-hardening
