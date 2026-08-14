@@ -95,11 +95,11 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     # Branch C: systemctl ops on a hermes-gateway unit.
     r"|(?:systemctl\s+(?:-\S+\s+)*(?:restart|stop|start)\b[^\n]*\bhermes[.\-]?gateway)"
     # Branch D: pkill / kill targeting the hermes gateway process. Both
-    # token orders because real reproductions show both.
-    # Leading \b ensures we match "pkill" or "kill" as whole words, not as
-    # suffixes of other words (e.g. "skill" -> "kill").
-    r"|(?:\bp?kill\b[^\n]*\bhermes\b[^\n]*\bgateway)"
-    r"|(?:\bp?kill\b[^\n]*\bgateway\b[^\n]*\bhermes)"
+    # token orders because real reproductions show both. The token gaps
+    # exclude `;&|` so a sanctioned `kill -USR1 <pid>` cannot be stitched to
+    # a later read-only `systemctl --user show hermes-gateway` on the same line.
+    r"|(?:\bp?kill\b[^\n;&|]*\bhermes\b[^\n;&|]*\bgateway)"
+    r"|(?:\bp?kill\b[^\n;&|]*\bgateway\b[^\n;&|]*\bhermes)"
 )
 
 
