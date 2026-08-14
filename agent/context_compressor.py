@@ -1641,6 +1641,25 @@ def _retire_stale_tool_result_images(
         pruned += 1
     return pruned
 
+def _elision_marker(omitted_chars: int) -> str:
+    """Render the marker that replaces content removed by compression.
+
+    Deliberately NOT a static literal. Every marker carries the exact number
+    of omitted characters, which makes it (a) self-identifying as a
+    compression artifact rather than something the agent wrote, and (b)
+    impossible for a model to reproduce by pattern-completion, since the
+    count is unknowable for a payload it is composing fresh.
+
+    This shape is load-bearing. The previous static ``...[truncated]``
+    literal caused a measured self-propagation loop: the compressor rewrote
+    old tool_call arguments in history using that literal, and the model
+    then imitated the same literal at the tail of NEW write_file / patch /
+    terminal payloads, silently shipping cut-off content. 1,507 imitated
+    calls across 151 sessions, 84% of them triggered by the model's own
+    earlier imitation rather than by a fresh compressor rewrite.
+    """
+    return f"\u2026[hermes compressed: {omitted_chars:,} chars omitted]"
+
 
 def _truncate_tool_call_args_json(args: str, head_chars: int = 200) -> str:
     """Shrink long string values inside a tool-call arguments JSON blob while
@@ -1650,12 +1669,8 @@ def _truncate_tool_call_args_json(args: str, head_chars: int = 200) -> str:
     passed through to the LLM provider; downstream providers strictly
     validate it and return a non-retryable 400 when it is not well-formed.
     An earlier implementation sliced the raw JSON at a fixed byte offset and
-    appended ``...[truncated]`` — which routinely produced strings like::
-
-        {"path": "/foo/bar", "content": "# long markdown
-        ...[truncated]
-
-    i.e. an unterminated string and a missing closing brace. MiniMax, for
+    appended a static truncation literal — which routinely produced strings
+    like an unterminated string with a missing closing brace. MiniMax, for
     example, rejects this with ``invalid function arguments json string``
     and the session gets stuck re-sending the same broken history on every
     turn. See issue #11762 for the observed loop.
@@ -1675,7 +1690,7 @@ def _truncate_tool_call_args_json(args: str, head_chars: int = 200) -> str:
     def _shrink(obj: Any) -> Any:
         if isinstance(obj, str):
             if len(obj) > head_chars:
-                return obj[:head_chars] + "...[truncated]"
+                return obj[:head_chars] + _elision_marker(len(obj) - head_chars)
             return obj
         if isinstance(obj, dict):
             return {k: _shrink(v) for k, v in obj.items()}
@@ -1983,7 +1998,6 @@ def _summarize_tool_result_unguarded(tool_name: str, tool_args: str, tool_conten
         # " chars)" which this shape never contains), and staying strictly
         # below the floor also keeps it out of the >=200-char dedup pass.
         max_summary_chars = _PRUNE_MIN_CHARS - 1
-        truncation_marker = "...[truncated]"
 
         try:
             result = json.loads(content)
@@ -2015,10 +2029,17 @@ def _summarize_tool_result_unguarded(tool_name: str, tool_args: str, tool_conten
             )
             summary = response_prefix + serialized_response
             if len(summary) > max_summary_chars:
-                summary = (
-                    summary[: max_summary_chars - len(truncation_marker)].rstrip()
-                    + truncation_marker
-                )
+                omitted = max(len(summary) - max_summary_chars, 0)
+                marker = _elision_marker(omitted)
+                for _ in range(3):
+                    kept = max_summary_chars - len(marker)
+                    new_omitted = max(len(summary) - kept, 0)
+                    new_marker = _elision_marker(new_omitted)
+                    if len(new_marker) == len(marker):
+                        marker = new_marker
+                        break
+                    marker = new_marker
+                summary = summary[: max_summary_chars - len(marker)].rstrip() + marker
             return summary
         return "[clarify] asked user a question"
 
@@ -4213,14 +4234,14 @@ class ContextCompressor(ContextEngine):
             if role == "tool":
                 tool_id = msg.get("tool_call_id", "")
                 if len(content) > self._CONTENT_MAX:
-                    content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
+                    content = content[:self._CONTENT_HEAD] + "\n" + _elision_marker(len(content) - self._CONTENT_HEAD - self._CONTENT_TAIL) + "\n" + content[-self._CONTENT_TAIL:]
                 parts.append(f"[TOOL RESULT {tool_id}]: {content}")
                 continue
 
             # Assistant messages: include tool call names AND arguments
             if role == "assistant":
                 if len(content) > self._CONTENT_MAX:
-                    content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
+                    content = content[:self._CONTENT_HEAD] + "\n" + _elision_marker(len(content) - self._CONTENT_HEAD - self._CONTENT_TAIL) + "\n" + content[-self._CONTENT_TAIL:]
                 tool_calls = msg.get("tool_calls", [])
                 if tool_calls:
                     tc_parts = []
@@ -4243,7 +4264,7 @@ class ContextCompressor(ContextEngine):
 
             # User and other roles
             if len(content) > self._CONTENT_MAX:
-                content = content[:self._CONTENT_HEAD] + "\n...[truncated]...\n" + content[-self._CONTENT_TAIL:]
+                content = content[:self._CONTENT_HEAD] + "\n" + _elision_marker(len(content) - self._CONTENT_HEAD - self._CONTENT_TAIL) + "\n" + content[-self._CONTENT_TAIL:]
             parts.append(f"[{role.upper()}]: {content}")
 
         return "\n\n".join(parts)
@@ -4275,7 +4296,8 @@ class ContextCompressor(ContextEngine):
             text = re.sub(r"\bgh[pousr]_[A-Za-z0-9_]{8,}\b", "[REDACTED]", text)
             text = re.sub(r"\s+", " ", text).strip()
             if len(text) > _FALLBACK_TURN_MAX_CHARS:
-                text = text[: _FALLBACK_TURN_MAX_CHARS - 15].rstrip() + " ...[truncated]"
+                _kept = _FALLBACK_TURN_MAX_CHARS - 15
+                text = text[:_kept].rstrip() + " " + _elision_marker(len(text) - _kept)
             return re.sub(r"\bgh[pousr]_[A-Za-z0-9_.-]+", "[REDACTED]", text)
 
         def _remember_dropped_turn(label: str, text: str, *, limit: int = 8) -> None:
@@ -5567,7 +5589,8 @@ This compaction should PRIORITISE preserving all information related to the focu
                 continue
             text = re.sub(r"\s+", " ", text)
             if len(text) > _ACTIVE_TASK_MAX_CHARS:
-                text = text[: _ACTIVE_TASK_MAX_CHARS - 15].rstrip() + " ...[truncated]"
+                _kept = _ACTIVE_TASK_MAX_CHARS - 15
+                text = text[:_kept].rstrip() + " " + _elision_marker(len(text) - _kept)
             return (
                 f"User asked (deterministic, from compacted turns): {text!r}\n"
                 "Historical only; newer protected-tail messages after this summary win."

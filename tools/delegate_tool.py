@@ -2150,7 +2150,9 @@ def _dump_subagent_timeout_diagnostic(
         _w("## Goal")
         _goal_preview = (goal or "").strip()
         if len(_goal_preview) > 1000:
-            _goal_preview = _goal_preview[:1000] + " ...[truncated]"
+            # Self-identifying marker (carries the omitted count); a static
+            # literal here gets imitated by the subagent in fresh payloads.
+            _goal_preview = _goal_preview[:1000] + f" \u2026[hermes compressed: {len(_goal_preview) - 1000:,} chars omitted]"
         _w(_goal_preview or "(empty)")
         _w("")
 
