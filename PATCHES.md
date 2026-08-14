@@ -710,6 +710,17 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
   - `e8bbdbeb4 fix(approval): don't mark command starts inside parameter expansions`
 - **touches:** `tools/approval.py`, `tests/tools/test_execution_flag_detection.py`
 
+### 70. elision-marker-imitation
+- **branch:** `soju/patches/elision-marker-imitation`
+- **stacked-on:** `soju/patches/approval-grep-escaped-quote`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — pending dogfood soak before proposing)_
+- **state:** `local-only`
+- **rationale:** The compressor rewrote old tool_call arguments and oversized message bodies using the static literal `...[truncated]`. Because that literal is identical at every emission site and always terminates the truncated string, a long session's context accumulates dozens of `string value → marker → close JSON` examples and the model pattern-completes the same shape onto NEW tool calls — `write_file`, `patch`, `terminal`, `execute_code` payloads shipped silently cut off mid-word, producing broken files and unterminated here-docs. The failure is self-propagating: measured on live `state.db` (2026-07-01..08-14), 1,507 fresh imitated calls across 151 sessions (terminal 881, write_file 291, execute_code 217, patch 207, skill_manage 48), and **84% were preceded by the model's own earlier imitation** rather than a fresh compressor rewrite. Disproved the competing hypothesis that payloads are truncated at the tool boundary: 3,019 fresh `write_file` calls parsed with **0** malformed arguments and a 105,084-char `content` was delivered intact, so pre-truncating a payload is never correct. Root cause is shape, not policy — the marker is a constant a model can reproduce. Fix replaces it with `_elision_marker(n)` embedding the exact omitted-character count, which a model composing a fresh payload cannot know, making the marker unreproducible by pattern completion and self-identifying as a compression artifact. Converted every emission site reaching main-model context: `context_compressor` (pass-3 tool_call args shrink, summarizer serialization for tool/assistant/user bodies, deterministic fallback turn, active-task line), `skill_preprocessing` inline-shell output, `trajectory_compressor` summary input, `delegate_tool` goal preview. `hermes_cli/auth.py` deliberately untouched — it renders CLI error text for a human terminal, not model context. JSON-validity contract from upstream `3128d9fcd2` (`_truncate_tool_call_args_json`, shrink inside the parsed structure so strict providers do not 400) is preserved and re-asserted by tests. Verified: 12 new tests + 141 passed across the three affected suites, plus a loop simulation confirming markers differ by payload size.
+- **commits:**
+  - `58fb6b920 fix(compression): make elision markers non-imitable by the model`
+- **touches:** `agent/context_compressor.py`, `agent/skill_preprocessing.py`, `trajectory_compressor.py`, `tools/delegate_tool.py`, `tests/agent/test_elision_marker_guard.py` (new), `tests/agent/test_context_compressor.py`, `tests/test_trajectory_compressor.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
