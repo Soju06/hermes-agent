@@ -60,12 +60,13 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     # Branch C: systemctl ops on a hermes-gateway unit.
     r"|(?:systemctl\s+(?:-\S+\s+)*(?:restart|stop|start)\b[^\n]*\bhermes[.\-]?gateway)"
     # Branch D: pkill/kill of the gateway process, both token orders. Leading \b keeps "skill" from
-    # matching as "kill".
+    # matching as "kill". The token gaps exclude `;&|` so a sanctioned `kill -USR1 <pid>` cannot be
+    # stitched to a later read-only `systemctl --user show hermes-gateway` on the same line.
     # `taskkill` / `Stop-Process` are the Windows spellings of the same operation; `\bp?kill\b`
     # cannot reach inside `taskkill`, so they are named outright. Service-control forms (`net stop`,
     # `sc stop`) presuppose a service install this guard has no evidence of and stay uncovered.
-    r"|(?:\b(?:p?kill|taskkill|stop-process)\b[^\n]*\bhermes\b[^\n]*\bgateway)"
-    r"|(?:\b(?:p?kill|taskkill|stop-process)\b[^\n]*\bgateway\b[^\n]*\bhermes)"
+    r"|(?:\b(?:p?kill|taskkill|stop-process)\b[^\n;&|]*\bhermes\b[^\n;&|]*\bgateway)"
+    r"|(?:\b(?:p?kill|taskkill|stop-process)\b[^\n;&|]*\bgateway\b[^\n;&|]*\bhermes)"
 )
 
 # Branch E: process killers whose TARGET is the interpreter image hosting the gateway. A supervised
