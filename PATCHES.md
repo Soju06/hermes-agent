@@ -743,6 +743,28 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
   - `0b48702d5 fix(kanban): honor explicit board over env pins`
 - **touches:** `hermes_cli/kanban_db.py`, `tests/gateway/test_kanban_notifier.py`, `tests/gateway/test_kanban_notifier_apiserver_wake.py`, `tests/hermes_cli/test_kanban_boards.py`
 
+### 73. kanban-goal-judge-unavailable
+- **branch:** `soju/patches/kanban-goal-judge-unavailable`
+- **stacked-on:** _(none — applies directly on base; `hermes_cli/goals.py` untouched by other fork patches, merge-base verified `3c27eb6234`)_
+- **origin:** `local-author` (implemented by kanban goal worker t_126b9f1e per runtime-patches-scope §D)
+- **upstream_pr:** _(none yet — upstream-eligible)_
+- **state:** `local-only`
+- **rationale:** `run_kanban_goal_loop` discarded the judge's `transport_failed` signal: with an unreachable/misconfigured judge the loop fed "continue" every turn until the goal-turn budget exhausted, then auto-blocked with a generic budget message. Observed live twice on 2026-08-17/18 (board comm-improve): 15/15 turns burned in 8 seconds, worker never ran a single tool call, block reason said "budget exhausted" instead of the actual cause (judge 401). The CLI `/goal` path already auto-pauses on judge transport failure — this patch brings the kanban goal path to parity: N consecutive judge transport failures (default 3, config `kanban.judge_failure_limit`) → `kanban_block` with typed reason `judge_unavailable`, preserving worker session state for resume instead of burning budget.
+- **commits:**
+  - `b4600a0c5 fix(kanban): block goal tasks on consecutive judge transport failures instead of burning the turn budget`
+- **touches:** `hermes_cli/goals.py`, `tests/hermes_cli/test_kanban_goal_mode.py` (new)
+
+### 74. hygiene-diag-and-lock-offload
+- **branch:** `soju/patches/hygiene-diag-and-lock-offload`
+- **stacked-on:** `soju/patches/hygiene-noprogress-cooldown` (#61 — same hygiene block and diagnostic line)
+- **origin:** `local-author` (implemented by kanban goal worker t_a06bd1a3 per runtime-patches-scope §C)
+- **upstream_pr:** _(none yet)_
+- **state:** `local-only`
+- **rationale:** Three hygiene-block fixes from the 2026-08-13 incident forensics. (1) `Session hygiene auto-compress failed: %s` logged empty for `asyncio.TimeoutError` (empty `str()`), which made the incident's 41 failure lines carry no cause — switch to `%r` + exception class name. (2) The cancelled-compression lock release ends in a synchronous SQLite DELETE that appeared in event-loop stall stack dumps — offload via `asyncio.to_thread` (cancellation path; nothing orders against the release, commit already fenced). (3) Expose the hardcoded 0.85 hygiene trigger as `compression.hygiene_threshold` (config.yaml per repo rubric, range-validated, default preserved) with a deduplicated warning-only layering check: `compression.threshold >= hygiene_threshold` means the safety net fires before the primary compressor — the exact inversion that amplified the 08-13 compress storm.
+- **commits:**
+  - `6f019e332 fix(gateway): hygiene failure diagnostics + off-loop lock release + hygiene_threshold config`
+- **touches:** `gateway/run.py`, `tests/gateway/test_session_hygiene.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
