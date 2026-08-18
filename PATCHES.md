@@ -732,6 +732,17 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
   - `84cf492bb fix(delegation): stop delegated-child marker and kanban identity latching across turns`
 - **touches:** `tools/environments/base.py`, `tools/thread_context.py`, `agent/delegation_context.py`, `agent/ingest_curator.py`, `run_agent.py`, `tools/async_delegation.py`, `tests/tools/test_delegated_child_marker_latch.py` (new)
 
+### 72. kanban-board-env-precedence
+- **branch:** `soju/patches/kanban-board-env-precedence`
+- **stacked-on:** _(none — applies directly on base; verified `git diff --stat base..production -- hermes_cli/kanban_db.py` empty before this patch)_
+- **origin:** `local-author` (implementation delegated to codex; design proposal by kanban goal worker t_231c8f71)
+- **upstream_pr:** _(none yet — upstream-eligible: file untouched by other fork patches)_
+- **state:** `local-only`
+- **rationale:** `HERMES_KANBAN_DB` env pin outranked an explicit `board=` argument / `--board` flag in `hermes_cli/kanban_db.py` path resolution, so any process inheriting a worker's env silently wrote to the wrong board's DB while the CLI printed success. Observed live 2026-08-16: `notify-subscribe --board comm-improve` stored its subscription in the default board DB → task-completion notifications never delivered → owner fell back to manual polling (the exact scheduling-crank pattern the comm-improve track exists to remove). Same defect class hit `create`. Diagnostic key: sibling env `HERMES_KANBAN_BOARD` was correctly overridden by `--board`; only `HERMES_KANBAN_DB` had inverted precedence. Fix reorders resolution to explicit-arg → env pin → current-board pointer, preserving the dispatcher→worker handoff contract (argument-less calls still follow the env pin, so workers keep their own board). Verified: isolated repro matrix FAIL→PASS on the patch and FAIL re-confirmed on base; 3 worker-selfboard contracts PASS; kanban suites green with pre-existing failures reproduced on base.
+- **commits:**
+  - `0b48702d5 fix(kanban): honor explicit board over env pins`
+- **touches:** `hermes_cli/kanban_db.py`, `tests/gateway/test_kanban_notifier.py`, `tests/gateway/test_kanban_notifier_apiserver_wake.py`, `tests/hermes_cli/test_kanban_boards.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
