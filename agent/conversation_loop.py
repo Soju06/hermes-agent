@@ -37,7 +37,7 @@ from agent.surface_switch import (
 )
 from agent import audience_persona, turn_trace
 from agent.turn_context import PRE_LLM_BLOCK_EXIT_REASON, PreflightCompressionTimedOut, build_turn_context
-from agent.turn_trace_loop import IterationSpans, conversation_trace, trace_llm_call
+from agent.turn_trace_loop import IterationSpans, conversation_trace, tag_exit, trace_llm_call
 from hermes_cli.observability.shared_metrics_efficiency import record_cache_break, record_prompt_rebuild
 from hermes_cli.plugins_dispatch import held_stream_transforms
 from agent.turn_retry_state import TurnRetryState
@@ -1622,6 +1622,7 @@ def _turn_without_loop(agent: Any, s: _LoopState, block_message: str) -> Optiona
     (agent/transports/codex_app_server_session.py)."""
     if block_message:
         s.final_response, s._turn_exit_reason = block_message, PRE_LLM_BLOCK_EXIT_REASON
+        tag_exit(PRE_LLM_BLOCK_EXIT_REASON, agent)
         return _finalize_from_state(agent, s)
     return _codex_app_server_turn(agent, s) if agent.api_mode == "codex_app_server" else None
 
@@ -1636,6 +1637,7 @@ def _codex_app_server_turn(agent: Any, s: Any) -> Optional[dict[str, Any]]:
     )
     from agent.turn_recovery import activate_codex_app_server_fallback
     if not activate_codex_app_server_fallback(agent, codex_result):
+        tag_exit("codex_app_server_turn", agent)
         return codex_result
     # Fallback activation rewrote provider/model/api_mode: retry this same user turn on the generic
     # loop below, keeping codex's projected rows and its failed API call in the turn's accounting.
@@ -1717,6 +1719,7 @@ def _run_conversation_turn(
             title_user_message=title_user_message,
         )
     except PreflightCompressionTimedOut as _preflight_timeout_exc:
+        tag_exit("preflight_compression_timeout", agent)
         return _preflight_timeout_result(agent, _preflight_timeout_exc, conversation_history)
     # Voice turns may run on auxiliary.voice_chat: bound after the prompt/row/compaction were settled
     # against the main model, undone in finalize_turn (and run_conversation's finally on early exits).

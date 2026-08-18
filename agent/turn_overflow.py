@@ -29,6 +29,7 @@ from agent.model_metadata import (
 from agent.process_transport import is_local_server
 from agent.turn_failure_copy import site_copy, stamp_failure
 from agent.turn_retry_state import TurnRetryState
+from agent.turn_trace_loop import tag_exit
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -88,10 +89,11 @@ class _Recovery(OverflowVerdict):
     def fail_turn(
         self, final_response: str, *, notices: tuple = (), log: Optional[tuple] = None,
         compression_exhausted: bool = True, reason: str = "context_overflow",
-        retryable: bool = False, **extra: Any,
+        retryable: bool = False, exit_reason: Optional[str] = None, **extra: Any,
     ) -> OverflowVerdict:
         """End the turn as failed/partial. ``notices`` flush the buffered retry trace
-        first so the user sees what compression attempts were made."""
+        first so the user sees what compression attempts were made. ``exit_reason`` is the
+        waterfall-trace tag for this early exit (falls back to a ``turn_exit_reason`` extra)."""
         agent = self.agent
         if notices:
             agent._flush_status_buffer()
@@ -115,10 +117,14 @@ class _Recovery(OverflowVerdict):
             # replaying the summarize-timeout loop.
             result["compression_exhausted"] = True
         result.update(extra)
+        tag_exit(exit_reason or extra.get("turn_exit_reason") or "overflow_unrecoverable")
         return self.done("return", result)
 
-    def count_attempt(self, *, payload_too_large: bool = False) -> Optional[OverflowVerdict]:
-        """Bump ``compression_attempts``; the terminal verdict once the cap is exceeded."""
+    def count_attempt(
+        self, *, payload_too_large: bool = False, exit_reason: Optional[str] = None,
+    ) -> Optional[OverflowVerdict]:
+        """Bump ``compression_attempts``; the terminal verdict once the cap is exceeded.
+        ``exit_reason`` overrides the trace tag of that terminal verdict (output-cap retries)."""
         self.compression_attempts += 1
         cap = self.max_compression_attempts
         if self.compression_attempts <= cap:
@@ -131,11 +137,13 @@ class _Recovery(OverflowVerdict):
                     _RETRY_HINT,
                 ),
                 log=("%s413 compression failed after %d attempts.", self.agent.log_prefix, cap),
+                exit_reason=exit_reason or "payload_too_large(compression_attempts_exhausted)",
             )
         return self.fail_turn(
             site_copy("context_overflow", model=self.agent.model),
             notices=(f"❌ Max compression attempts ({cap}) reached.", _RETRY_HINT),
             log=("%sContext compression failed after %d attempts.", self.agent.log_prefix, cap),
+            exit_reason=exit_reason or "context_overflow(compression_attempts_exhausted)",
         )
 
     def compress(self, request_tokens: int, *, fail_on_timeout: bool = False) -> Optional[OverflowVerdict]:
@@ -159,15 +167,19 @@ class _Recovery(OverflowVerdict):
         )
         if self.messages is before:
             deferred = None
+            _defer_reason = None
             if compression_skipped_due_to_lock(agent):
                 deferred = _compression_deferred_result(agent, self.messages, self.api_call_count)
+                _defer_reason = "compression_deferred(lock_held)"
             elif compression_blocked_transiently(agent):
                 deferred = _compression_deferred_result(
                     agent, self.messages, self.api_call_count, reason="transient_block",
                 )
+                _defer_reason = "compression_deferred(transient_block)"
             if deferred is not None:
                 self.compression_attempts -= 1
                 agent._persist_session(self.messages, self.conversation_history)
+                tag_exit(_defer_reason)
                 return self.done("return", deferred)
         if fail_on_timeout and context_compression_timed_out(agent):
             return self.fail_turn(
@@ -273,6 +285,7 @@ def _recover_payload_too_large(st: _Recovery, _retry: TurnRetryState) -> Overflo
         site_copy("payload_too_large", model=agent.model),
         notices=("❌ Payload too large and cannot compress further.", _RETRY_HINT),
         log=("%s413 payload too large. Cannot compress further.", agent.log_prefix),
+        exit_reason="payload_too_large(cannot_compress_further)",
     )
 
 
@@ -295,7 +308,7 @@ def _clamp_output_cap(st: _Recovery, _retry: TurnRetryState, available_out: int,
         f"context_length unchanged at {old_ctx:,})"
     )
     # Still count against compression_attempts so a recurring error can't loop forever.
-    exhausted = st.count_attempt()
+    exhausted = st.count_attempt(exit_reason="output_cap_retry(compression_attempts_exhausted)")
     if exhausted is not None:
         return exhausted
     # Also compress history so the retry doesn't spin on max_tokens alone; dropping the
@@ -386,6 +399,7 @@ def _recover_context_length(st: _Recovery, _retry: TurnRetryState, error_msg: st
                 f"(max_tokens over provider cap): {error_msg[:200]}",
             ),
             compression_exhausted=False,
+            exit_reason="output_cap_over_provider_limit",
         )
 
     new_ctx = _adopt_provider_context_limit(st, error_msg, old_ctx)
@@ -420,6 +434,7 @@ def _recover_context_length(st: _Recovery, _retry: TurnRetryState, error_msg: st
                 "skipping compression: %s", agent.log_prefix, f"{request_tokens:,}", f"{window:,}", error_msg[:200],
             ),
             compression_exhausted=False, reason=FailoverReason.server_error.value, retryable=True,
+            exit_reason="server_context_rejection",
         )
 
     exhausted = st.count_attempt()
@@ -449,6 +464,7 @@ def _recover_context_length(st: _Recovery, _retry: TurnRetryState, error_msg: st
             _RETRY_HINT,
         ),
         log=("%sContext length exceeded: %s tokens. Cannot compress further.", agent.log_prefix, f"{new_tokens:,}"),
+        exit_reason="context_overflow(cannot_compress_further)",
     )
 
 

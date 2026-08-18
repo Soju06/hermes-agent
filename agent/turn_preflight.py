@@ -25,6 +25,7 @@ from agent.turn_context_compaction import (
     _apply_grown_window, _blocked_compress_reason, _clear_overflow_warn, _refund_api_call,
     _reanchor, _reset_retry_state_after_compaction,
 )
+from agent.turn_trace_loop import tag_exit
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -195,12 +196,14 @@ def run_preflight_compression(
         # Provider proved the request cannot fit and the compressor is unavailable:
         # don't resend; let the next user turn retry after cooldown.
         agent._persist_session(v.messages, v.conversation_history)
+        tag_exit("compression_deferred(transient_block)")
         return _done("return", _compression_deferred_result(
             agent, v.messages, v.api_call_count, reason="transient_block"
         ))
     elif provider_overflow_preflight and v.compression_attempts >= max_compression_attempts:
         # All recovery passes consumed and still over threshold: fail closed —
         # llama.cpp may silently truncate an oversized retry.
+        tag_exit("provider_overflow_exhausted(compression_attempts_exhausted)")
         return _done("return", _exhausted_result())
     elif _eligible and not defer_preflight(request_pressure_tokens) and _compression_cooldown:
         # Summary-LLM cooldown blocks compression: deduped warning only when over
@@ -223,6 +226,7 @@ def run_preflight_compression(
     if provider_overflow_preflight:
         # Any other gate blocking the forced preflight (e.g. uncompressible one-
         # message request) must fail closed: the request is proven not to fit.
+        tag_exit("provider_overflow_exhausted(preflight_blocked)")
         return _done("return", _exhausted_result())
     return _done("fallthrough")
 

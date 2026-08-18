@@ -20,6 +20,7 @@ from agent.message_metadata import append_message
 from agent.message_sanitization import _sanitize_surrogates
 from agent.turn_context_compaction import _refund_api_call
 from agent.turn_recovery import interruptible_backoff_sleep
+from agent.turn_trace_loop import tag_exit
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -150,6 +151,7 @@ def _retry_empty(
         activity_label=f"empty response retry backoff ({n}/{budget})",
     )
     if _interrupted is not None:
+        tag_exit("interrupted_during_empty_response_retry")
         return "return", _interrupted, deterministic
     return "continue", None, deterministic
 

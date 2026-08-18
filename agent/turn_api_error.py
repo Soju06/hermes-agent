@@ -27,7 +27,8 @@ from agent.turn_recovery import (
     max_retries_exhausted_result, nonretryable_client_error_result, recover_after_classification,
     recover_before_classification, route_classified_error, settle_delivered_partial,
 )
-from agent.turn_recovery_fail_fast import _tag_exit, fast_transport_failure_result, track_instant_transport_failure
+from agent.turn_recovery_fail_fast import fast_transport_failure_result, track_instant_transport_failure
+from agent.turn_trace_loop import tag_exit
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -175,6 +176,7 @@ def handle_api_error(
         if agent.clear_interrupt(preserve_redirect=True):
             _retry.restart_with_redirected_messages = True
             return _verdict("break")
+        tag_exit("interrupted_during_error_handling")
         return _verdict("return", abort_turn_on_interrupt(
             agent, messages, conversation_history, api_call_count,
             abort_message="Interrupt detected during error handling, aborting retries.",
@@ -213,7 +215,7 @@ def handle_api_error(
         api_call_count=api_call_count, current_turn_user_idx=current_turn_user_idx,
     )
     if _fast_fail is not None:
-        _tag_exit(f"fast_transport_failure_streak({classified.reason.value})")
+        tag_exit(f"fast_transport_failure_streak({classified.reason.value})")
         return _verdict("return", _fast_fail)
 
     _ov = recover_from_overflow(
@@ -381,6 +383,11 @@ def settle_unrecovered_error(
                 return _verdict("break")
         # Terminal from here: collapse the continuation trail once, before the persist.
         _delivered = settle_delivered_partial(agent, messages, current_turn_user_idx)
+        tag_exit(
+            "content_policy_blocked(nonretryable)"
+            if classified.reason == FailoverReason.content_policy_blocked
+            else f"nonretryable_api_error({classified.reason.value})"
+        )
         return _verdict("return", nonretryable_client_error_result(
             agent, api_error, classified, status_code=status_code, api_kwargs=api_kwargs,
             api_messages=api_messages, messages=messages, conversation_history=conversation_history,
@@ -431,6 +438,7 @@ def settle_unrecovered_error(
                 retry_count = 0
             return _verdict(_ladder["action"], _ladder.get("result"))
         _delivered = settle_delivered_partial(agent, messages, current_turn_user_idx)
+        tag_exit(f"all_retries_exhausted({classified.reason.value})")
         return _verdict("return", max_retries_exhausted_result(
             agent, api_error, classified, attempts=attempts_made, is_rate_limited=is_rate_limited,
             error_msg=error_msg, api_kwargs=api_kwargs, api_messages=api_messages,
@@ -454,6 +462,7 @@ def settle_unrecovered_error(
         activity_label=f"error retry backoff ({retry_count}/{max_retries})",
     )
     if _interrupted is not None:
+        tag_exit("interrupted_during_backoff")
         return _verdict("return", _interrupted)
     if _retry.restart_with_redirected_messages:
         # Leave the retry loop — the caller rebuilds this iteration from the correction

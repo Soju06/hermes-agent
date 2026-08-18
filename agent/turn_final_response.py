@@ -22,6 +22,7 @@ from agent.turn_empty_response import (
     housekeeping_reply_line, recover_empty_response, take_housekeeping_reply_line,
 )
 from agent.turn_stop_gates import apply_stop_gates
+from agent.turn_trace_loop import tag_exit
 from agent.turn_truncation import partial_result, repetition_copy
 
 _REPETITION_STOPPED = repetition_copy(
@@ -318,6 +319,7 @@ def finish_text_response(
         agent._vprint(f"{agent.log_prefix}{line}", force=True, diagnostic=True)
         agent._cleanup_task_resources(effective_task_id)
         agent._persist_session(messages, conversation_history)
+        tag_exit("repetition_dominated_response")
         return _verdict("return", stamp_failure(
             partial_result(messages, api_call_count, user_response, error), "truncated", True,
         ))

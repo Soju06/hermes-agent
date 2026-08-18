@@ -37,6 +37,7 @@ from agent.turn_failure_copy import (
 from agent.route_verdicts import route_visit
 from agent.turn_retry_state import TurnRetryState
 from agent.turn_recovery_codex import _codex_soft_failure_error, _is_codex_token_expired, _recover_stale_codex_reasoning
+from agent.turn_trace_loop import tag_exit
 from hermes_constants import display_hermes_home
 from utils import base_url_host_matches
 
@@ -1888,6 +1889,7 @@ def route_classified_error(
         )
         agent._persist_session(messages, conversation_history)
         _final_response = site_copy("compression_disabled", model=agent.model)
+        tag_exit(f"context_overflow_compaction_disabled({classified.reason.value})")
         return _verdict("return", stamp_failure({
             "final_response": _final_response, "messages": messages, "completed": False,
             "api_calls": api_call_count, "error": _final_response, "partial": True, "failed": True,

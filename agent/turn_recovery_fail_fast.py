@@ -56,15 +56,6 @@ def track_instant_transport_failure(agent: Any, retry: TurnRetryState, classifie
         retry.fast_transport_failures = 0
 
 
-def _tag_exit(_reason: str) -> None:
-    """No-op compatibility hook when exit-reason tracing is not stacked.
-
-    The turn-exit-reason-tagging patch replaces this with the helper that records the real
-    trace tag at the fail-fast exit in ``turn_api_error.handle_api_error``; on its own this
-    topic keeps the fail-fast control flow observation-only.
-    """
-
-
 def _fast_fail_limit() -> int:
     try:
         return int(os.environ.get("HERMES_FAST_CONN_FAIL_LIMIT", "3") or 3)

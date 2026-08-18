@@ -2,8 +2,9 @@
 
 The loop only marks phase boundaries; this module owns the rest: trace ownership around
 ``run_conversation`` (adopt the gateway's bound trace, or own one for direct callers), the root
-``turn`` span, per-iteration ``iteration`` spans, the ``llm.call`` retrofit and the per-tool
-``tools.call`` spans of ``agent/tool_executor.py``. Every helper is a no-op when no trace is bound
+``turn`` span, per-iteration ``iteration`` spans, the ``llm.call`` retrofit, the per-tool
+``tools.call`` spans of ``agent/tool_executor.py`` and the exit reason of turns that end early
+(:func:`tag_exit`). Every helper is a no-op when no trace is bound
 (``HERMES_TURN_TRACE`` unset), see ``agent/turn_trace.py``.
 """
 
@@ -82,6 +83,32 @@ def _close_pending_iteration(trace: turn_trace.TurnTrace, now: float) -> None:
     trace._pending_iteration = None
 
 
+def tag_exit(reason: str, agent: Any = None) -> None:
+    """Record why this turn is ending, from an early-exit site.
+
+    The loop's post-loop epilogue tags ``_turn_exit_reason`` onto the trace
+    (:meth:`IterationSpans.close`) and forwards it to ``finalize_turn``, but the early ``"return"``
+    verdicts in the phase modules (``turn_api_error``, ``turn_recovery``, ``turn_truncation``,
+    ``turn_overflow``, ``turn_preflight``, ``turn_response_check``, ...) bypass both, so those turns
+    would land in the trace as the catch-all fallback of :func:`conversation_trace`. Tag the trace
+    here instead: an early exit keeps its own reason and the fallback stays reserved for genuinely
+    untagged paths (``early_return(untagged)``).
+
+    Call it right before building the terminal verdict. The trace is resolved from ``agent`` when
+    given, else from the thread-local current trace :func:`conversation_trace` adopted (phases run
+    on the loop's thread). Observation only: never touches the returned dict, the user-facing
+    response or control flow, and never raises into the turn.
+    """
+    try:
+        trace = turn_trace.get_bound(agent) if agent is not None else None
+        if trace is None:
+            trace = turn_trace.current()
+        if trace is not None:
+            trace.tag(exit_reason=reason)
+    except Exception:
+        pass
+
+
 @contextmanager
 def conversation_trace(agent: Any) -> Iterator[None]:
     """Waterfall trace ownership around one ``run_conversation`` call, plus its root ``turn`` span.
@@ -120,7 +147,9 @@ def _record_turn_span(agent: Any, trace: turn_trace.TurnTrace, started: float, r
     try:
         _close_pending_iteration(trace, time.time())
         if "exit_reason" not in trace.tags:
-            trace.tag(exit_reason="early_return" if returned else "exception")
+            # ``early_return(untagged)`` marks a return site that forgot to call ``tag_exit``,
+            # distinct from tagged early exits, which carry their own reason.
+            trace.tag(exit_reason="early_return(untagged)" if returned else "exception")
         tags = {
             "model": agent.model,
             "iterations": getattr(agent, "_api_call_count", 0),

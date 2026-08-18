@@ -18,6 +18,7 @@ from agent.message_metadata import append_message
 from agent.message_sanitization import close_interrupted_tool_sequence, normalize_provider_tool_call_ids
 from session_rules.turns import coalesce_tool_call_id
 from agent.turn_failure_copy import site_copy, stamp_failure
+from agent.turn_trace_loop import tag_exit
 from hermes_constants import FINISH_REASON_LENGTH
 
 logger = logging.getLogger("agent.conversation_loop")
@@ -168,6 +169,7 @@ def validate_tool_calls(
             agent._flush_status_buffer()
             agent._vprint(f"{agent.log_prefix}❌ Max retries (3) for invalid tool calls exceeded. Stopping as partial.", force=True, diagnostic=True)
             agent._invalid_tool_retries = 0
+            tag_exit("invalid_tool_call_retries_exhausted")
             return _verdict("return", _partial_exit(
                 agent, messages, conversation_history, api_call_count,
                 f"Model generated invalid tool call: {invalid_preview}",
@@ -231,6 +233,7 @@ def validate_tool_calls(
                 site_copy("truncated") if finish_reason == FINISH_REASON_LENGTH
                 else site_copy("truncated_unreported")
             )
+            tag_exit("truncated_tool_call_arguments")
             return _verdict("return", _partial_exit(
                 agent, messages, conversation_history, api_call_count, _copy,
             ))

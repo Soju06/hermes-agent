@@ -18,6 +18,7 @@ from agent.error_classifier import FailoverReason
 from agent.prompt_cache_lifecycle import start_prompt_cache_warming
 from agent.turn_api_call import stop_thinking_spinner
 from agent.turn_failure_copy import invalid_response_failure_reason, provider_label_for, site_copy, stamp_failure
+from agent.turn_trace_loop import tag_exit
 from agent.turn_truncation import handle_content_policy_refusal, recover_from_truncation
 from agent.turn_usage import record_response_usage
 
@@ -356,6 +357,7 @@ def retry_invalid_response(
         _final_response = site_copy(
             "invalid_response", label=_label, attempts=max_retries, detail=_failure_hint,
         )
+        tag_exit("invalid_response_retries_exhausted")
         return _verdict("return", stamp_failure({
             "final_response": _final_response,
             "messages": messages,
@@ -379,6 +381,7 @@ def retry_invalid_response(
         activity_label=f"retry backoff ({retry_count}/{max_retries})",
     )
     if _interrupted is not None:
+        tag_exit("interrupted_during_retry_wait")
         return _verdict("return", _interrupted)
     if _retry.restart_with_redirected_messages:
         return _verdict("break")  # rebuild this iteration from the correction

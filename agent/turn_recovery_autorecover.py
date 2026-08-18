@@ -17,6 +17,7 @@ import logging
 from typing import Any, Dict, Optional
 
 from agent.error_classifier import TRANSIENT_REASONS
+from agent.turn_trace_loop import tag_exit
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -106,6 +107,7 @@ def auto_recover_after_exhaustion(
         activity_label=f"auto-recovery wait ({cycle}/{total})",
     )
     if interrupted is not None:
+        tag_exit("interrupted_during_auto_recovery_wait")
         return {"action": "return", "result": interrupted}
     if _retry.restart_with_redirected_messages:
         return {"action": "break"}
