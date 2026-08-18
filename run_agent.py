@@ -1927,7 +1927,6 @@ class AIAgent:
             spawn_background_review_thread,
         )
         from tools.thread_context import propagate_context_to_thread
-
         review_run = prepare_background_review_run(self)
         if review_run is None:
             return
@@ -1944,7 +1943,9 @@ class AIAgent:
             # Carry the active profile into the review thread so MEMORY.md /
             # skill review writes land in the right profile (#54937).
             t = threading.Thread(
-                target=propagate_context_to_thread(target),
+                target=propagate_context_to_thread(
+                    target, inherit_delegated_child=False
+                ),
                 daemon=True,
                 name="bg-review",
             )
