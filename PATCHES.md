@@ -721,6 +721,17 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
   - `58fb6b920 fix(compression): make elision markers non-imitable by the model`
 - **touches:** `agent/context_compressor.py`, `agent/skill_preprocessing.py`, `trajectory_compressor.py`, `tools/delegate_tool.py`, `tests/agent/test_elision_marker_guard.py` (new), `tests/agent/test_context_compressor.py`, `tests/test_trajectory_compressor.py`
 
+### 71. delegated-child-marker-latch
+- **branch:** `soju/patches/delegated-child-marker-latch`
+- **stacked-on:** `soju/patches/memory-phase2-curator` (patch B opts ingest-curator's detached spawn out of delegated-flag inheritance, so it edits `agent/ingest_curator.py` owned by that patch)
+- **origin:** `local-author`
+- **upstream_pr:** _(none yet — proposal artifacts ready under `~/work/comm-improve/latch-bug/`; open after dogfood soak)_
+- **state:** `local-only`
+- **rationale:** A normal gateway session (never called `delegate_task`) got permanently classified as a delegate child — kanban mutations refused, `model_tools` tool-definition cache key poisoned. Primary carrier is the shared bash session snapshot (`/tmp/hermes-snap-<id>.sh`): `_resolve_container_task_id` collapses subagent task ids to `"default"` so parent/child share one snapshot, and `_wrap_command`'s trailing `export -p` write-through persisted the child's `HERMES_DELEGATED_CHILD_CONTEXT=1` into the parent's next turns (D1). Same mechanism defeated `scrub_kanban_env()` on the terminal path: sourcing the snapshot re-exported the dispatcher's `HERMES_KANBAN_*` over the scrubbed Popen env (D2). Secondary: detached daemons (ingest-curator, bg-review, async delegation) copy the delegated-child ContextVar and keep it for the process lifetime (D4); `KANBAN_ENV_KEYS` allowlist drifted to 7 of the dispatcher's 10 injected vars (D6). All four reproduced deterministically without a gateway (`~/work/comm-improve/latch-bug/repro*.py`). Fix: unset both families inside the snapshot dump subshell (same audited mechanism as `HERMES_SESSION_*`; no line-based filtering per #71296); scope-correct ContextVar propagation via keyword-only `inherit_delegated_child=True` with the three detached sites opting out (blanket clear measured to regress: in-turn workers lose the flag and a delegated child can mutate board state — fail-closed default kept); once-per-process latch fingerprint diagnostic; prefix-based kanban env scrub. Snapshot fix covers all environment backends (`_wrap_command` lives on `BaseEnvironment`).
+- **commits:**
+  - `84cf492bb fix(delegation): stop delegated-child marker and kanban identity latching across turns`
+- **touches:** `tools/environments/base.py`, `tools/thread_context.py`, `agent/delegation_context.py`, `agent/ingest_curator.py`, `run_agent.py`, `tools/async_delegation.py`, `tests/tools/test_delegated_child_marker_latch.py` (new)
+
 ## State Vocabulary
 
 | state | meaning | when |
