@@ -70,14 +70,49 @@ def capture_thread_callbacks() -> tuple:
         return ()
 
 
-def propagate_context_to_thread(target: Callable) -> Callable:
+def propagate_context_to_thread(
+    target: Callable,
+    *,
+    inherit_delegated_child: bool = True,
+) -> Callable:
     """Wrap *target* to run with the *current* thread's ContextVars and per-thread prompt callbacks
     (approval, sudo, password-manager unlock).
 
     Fail-closed: if callback installation raises they stay ``None`` — dangerous commands are then
     denied by ``prompt_dangerous_approval`` and the gateway approval queue blocks.
+
+    ``inherit_delegated_child`` controls whether the delegated-child lineage
+    marker (``agent.delegation_context``) crosses into the worker.
+
+    * Default ``True`` — correct for **in-turn** workers that run on behalf of
+      the current turn and finish inside it (the concurrent tool fan-out in
+      ``agent.tool_executor``, ``execute_code`` RPC loops, MoA references,
+      async-tool bridges). When the current turn IS a ``delegate_task`` child,
+      those workers dispatch the child's own tool calls and must stay inside
+      the child's guards — dropping the flag would let a child mutate Kanban
+      board state through ``tools.kanban_tools``.
+    * ``False`` — required for **detached daemons** wrapped during a turn but
+      designed to outlive it (``ingest-curator``, ``bg-review``, the
+      ``async_delegation`` executor workers). The marker is a *scope*, not an
+      identity; a detached thread that inherits it keeps behaving as a
+      delegated child for the rest of the process lifetime, which suppresses
+      the Kanban lifecycle toolset and poisons the tool-definition cache key
+      (``model_tools._is_delegated_child_context`` is part of it). The
+      ``async_delegation`` workers re-enter ``delegated_child_context()``
+      themselves for the actual child run, so nothing that genuinely IS a
+      child loses the flag.
     """
     ctx = contextvars.copy_context()
+    if not inherit_delegated_child:
+        try:
+            from agent.delegation_context import reset_delegated_child_context_in
+
+            reset_delegated_child_context_in(ctx)
+        except Exception:
+            logger.debug(
+                "Could not clear delegated-child marker for detached worker thread",
+                exc_info=True,
+            )
     # (setter, parent callback) pairs; None when the callback API could not be captured.
     installs = None
     try:

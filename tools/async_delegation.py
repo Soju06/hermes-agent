@@ -883,7 +883,10 @@ def _dispatch_admitted(
     # reservation too: the stall monitor may finalize its registry record before it really exits.
     retirement.acquire()
     try:
-        future = executor.submit(propagate_context_to_thread(_worker))
+        # The delegated-child marker is NOT propagated: this worker outlives the dispatching turn, and
+        # ``_run_single_child`` re-enters ``delegated_child_context()`` around the actual child run,
+        # so the child's own guards stay intact.
+        future = executor.submit(propagate_context_to_thread(_worker, inherit_delegated_child=False))
         def worker_done(completed):
             try:
                 lease.release()
