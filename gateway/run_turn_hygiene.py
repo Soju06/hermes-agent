@@ -38,6 +38,47 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
+# Dedup latch for _warn_hygiene_threshold_inversion (per-process; the
+# hygiene config read runs once per incoming gateway message).
+_last_hygiene_inversion_warned = None
+
+
+def _warn_hygiene_threshold_inversion(hygiene_pct, configured_threshold) -> None:
+    """Warn (never reject) when the hygiene/compressor layering is inverted.
+
+    Session hygiene is a pre-agent SAFETY NET and must trigger at a higher
+    context ratio than the agent's own compressor (``compression.threshold``).
+    If a config sets ``compression.threshold`` at or above
+    ``compression.hygiene_threshold``, the safety net starts firing before
+    the primary mechanism — hygiene compresses every turn while the agent's
+    compressor never gets a chance. Warning-only so existing deployments
+    keep working; unparsable values are ignored (the numeric validation of
+    each key happens at its own read site).
+
+    The hygiene block re-reads config on every incoming message, so the
+    warning is deduplicated per value pair — one line per misconfiguration,
+    not one per turn (it re-fires if the values change).
+    """
+    if configured_threshold is None:
+        return
+    try:
+        _threshold = float(configured_threshold)
+    except (TypeError, ValueError):
+        return
+    if _threshold >= hygiene_pct:
+        global _last_hygiene_inversion_warned
+        _pair = (_threshold, hygiene_pct)
+        if _last_hygiene_inversion_warned == _pair:
+            return
+        _last_hygiene_inversion_warned = _pair
+        logger.warning(
+            "compression.threshold (%.2f) >= compression.hygiene_threshold "
+            "(%.2f): the gateway hygiene safety net will fire before the "
+            "agent's own compressor. Set hygiene_threshold above "
+            "compression.threshold to restore the intended layering.",
+            _threshold, hygiene_pct,
+        )
+
 
 class GatewayTurnHygieneMixin:
     @dataclasses.dataclass
@@ -65,7 +106,9 @@ class GatewayTurnHygieneMixin:
             hs.provider = _model_cfg.get("provider") or None
             hs.base_url = _model_cfg.get("base_url") or None
 
-        # Only the enabled flag is shared with the agent's compression config (hygiene runs higher).
+        # Shared with the agent's compression config: the enabled flag and (optionally) the hygiene
+        # trigger ratio via compression.hygiene_threshold — a separate key from compression.threshold
+        # because hygiene runs higher.
         _comp_cfg = data.get("compression", {})
         if not isinstance(_comp_cfg, dict):
             return
@@ -90,6 +133,13 @@ class GatewayTurnHygieneMixin:
         hs.failure_cooldown_seconds = _knob(
             "hygiene_failure_cooldown_seconds", hs.failure_cooldown_seconds, float, allow_zero=True,
         )
+        # compression.hygiene_threshold: config exposure of the previously hardcoded 0.85 trigger
+        # ratio. Out-of-range (not in (0, 1]) or unparsable values keep the default. Hygiene is the
+        # safety net and must run HIGHER than the agent's compression.threshold (layering warned below).
+        _hyg_threshold = _knob("hygiene_threshold", hs.threshold_pct, float)
+        if _hyg_threshold <= 1.0:
+            hs.threshold_pct = _hyg_threshold
+        _warn_hygiene_threshold_inversion(hs.threshold_pct, _comp_cfg.get("threshold"))
 
     async def _hmwa_hygiene_settings(self, source, session_key):
         """Resolve model/provider/context-length + hygiene knobs (fail-soft: errors keep defaults).
@@ -300,7 +350,12 @@ class GatewayTurnHygieneMixin:
             if cancelled is None:
                 await asyncio.sleep(0.025)
             elif cancelled:
-                fence.release_cancelled_compression_lock()
+                # Off-loop: the hook (the lease's release_holder_only) ends in a synchronous SQLite DELETE
+                # (the coordination store's release_compression_lock) that showed up in event-loop stall
+                # stack dumps when run inline. This is the cancellation
+                # path — nothing downstream orders against the release and the fence already blocks any
+                # future commit.
+                await asyncio.to_thread(fence.release_cancelled_compression_lock)
                 self._hmwa_hygiene_defer_cleanup(attempt, context)
                 return None
             else:
@@ -826,7 +881,10 @@ class GatewayTurnHygieneMixin:
             # deployments read as permanently broken (#97963; surfaced by @686f6c61 in PR #99657).
             pass
         except Exception as e:
-            logger.warning("Session hygiene auto-compress failed: %s", e)
+            # %r plus the class name, NOT %s: the most common escapee here is asyncio.TimeoutError,
+            # whose str() is empty — "auto-compress failed: " with no cause made recurring hygiene
+            # failures undiagnosable.
+            logger.warning("Session hygiene auto-compress failed: %r (%s)", e, type(e).__name__)
         # A landed compression published a NEW transcript on attempt.history: leave it byte-identical.
         # Anything else (turn-hold, timeout, unwind, codex path) left the FULL uncompressed transcript
         # there — that is the fail-closed case (#111988).
