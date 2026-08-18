@@ -877,8 +877,13 @@ def dispatch_async_delegation(
 
     try:
         # Propagate the dispatching profile so the detached child resolves
-        # get_hermes_home() under the right profile.
-        executor.submit(propagate_context_to_thread(_worker))
+        # get_hermes_home() under the right profile.  The delegated-child marker
+        # is NOT propagated: this worker outlives the dispatching turn, and
+        # ``_run_single_child`` re-enters ``delegated_child_context()`` around
+        # the actual child run, so the child's own guards stay intact.
+        executor.submit(
+            propagate_context_to_thread(_worker, inherit_delegated_child=False)
+        )
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
         with _records_lock:
             _records.pop(delegation_id, None)
@@ -1126,7 +1131,11 @@ def dispatch_async_delegation_batch(
 
     try:
         # Propagate the dispatching profile to the detached batch children.
-        executor.submit(propagate_context_to_thread(_worker))
+        # Same reasoning as the single-child path: no delegated-child marker on
+        # the detached worker; each child re-enters the context itself.
+        executor.submit(
+            propagate_context_to_thread(_worker, inherit_delegated_child=False)
+        )
     except Exception as exc:  # pragma: no cover
         with _records_lock:
             _records.pop(delegation_id, None)
