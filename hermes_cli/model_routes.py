@@ -129,11 +129,16 @@ class HealthConfig:
 
 @dataclass(frozen=True)
 class RefusalConfig:
-    """Orthogonal refusal-risk routing under ``model_routes.router.refusal``."""
+    """Orthogonal refusal-risk routing under ``model_routes.router.refusal``.
+
+    ``clean_fork`` applies only to natural-language soft refusals accepted by
+    the router classifier at ``min_confidence``. API structured refusals and
+    provider/stream output filters may still fallback but never remove context.
+    """
 
     enabled: bool = False
     api_fallback: bool = False
-    clean_fork: bool = True
+    clean_fork: bool = True  # router-classified soft-refusal context only
     keep_user_turns: int = 5
     mask_on_refusal: bool = True
     soft_detect: bool = True

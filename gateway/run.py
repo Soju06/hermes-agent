@@ -50,6 +50,7 @@ from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union,
 
 from agent import turn_trace
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
+from agent.refusal_history import RefusalSource, should_apply_clean_fork
 from agent.conversation_compression import (
     COMPACTION_STATUS,
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
@@ -17519,7 +17520,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: SessionSource,
         agent_result: dict,
     ) -> int:
-        """Mask this hard-refused turn and stage one permissive next-turn hop."""
+        """Preserve a hard-refused turn and stage one permissive next-turn hop."""
         if not str(agent_result.get("error") or "").startswith(
             "content_policy_blocked"
         ):
@@ -17603,7 +17604,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if not (
             bool(getattr(refusal, "enabled", False))
-            and bool(getattr(refusal, "mask_on_refusal", True))
             and bool(getattr(refusal, "soft_detect", True))
         ):
             self._reset_gateway_refusal_recovery(session_key)
@@ -17653,7 +17653,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         refusal: object,
         kind: str,
     ) -> int:
-        """Mask one refused turn and stage a guarded permissive-route hop."""
+        """Stage recovery, masking only router-classified soft refusals."""
         from gateway import model_router as _model_router
 
         state = getattr(self, "_model_router_state", None)
@@ -17681,7 +17681,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         entry["refusal_recovery_count"] = recovery_count + 1
         entry["refusal_recovery_exhausted"] = False
         masked = 0
-        if bool(getattr(refusal, "mask_on_refusal", True)):
+        clean_fork = (
+            kind == "soft"
+            and should_apply_clean_fork(
+                RefusalSource.ROUTER_SOFT_REFUSAL,
+                configured=(
+                    bool(getattr(refusal, "clean_fork", True))
+                    and bool(getattr(refusal, "mask_on_refusal", True))
+                ),
+            )
+        )
+        if clean_fork:
             try:
                 db = getattr(self.session_store, "_db", None)
                 rows = (
