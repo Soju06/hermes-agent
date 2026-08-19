@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from agent.error_classifier import FailoverReason
 from agent.message_metadata import append_message
 from agent.message_sanitization import close_interrupted_tool_sequence
+from agent.refusal_history import RefusalSource, should_apply_clean_fork
 from agent.repetition_guard import is_repetition_dominated
 from agent.turn_api_call import stop_thinking_spinner
 from agent.turn_failure_copy import content_policy_copy, provider_label_for, site_copy, stamp_failure
@@ -285,6 +286,9 @@ def _content_filter_fallback(st: _Trunc, _retry: TurnRetryState) -> Optional[Tru
         force=True, diagnostic=True,
     )
     agent._emit_diagnostic_status("Content filter terminated stream; switching to fallback...")
+    # A stream-level output filter is a fallback signal only: it does not prove the
+    # current tool progress is contaminated, so the fallback keeps the full prompt.
+    should_apply_clean_fork(RefusalSource.STREAM_FILTER_ERROR)
     if agent._try_activate_fallback(reason=FailoverReason.content_policy_blocked):
         logger.warning("%sContent filter terminated the stream — switched to fallback", agent.log_prefix)
         # Roll partial content back to the last clean turn so the fallback gets a
@@ -295,11 +299,6 @@ def _content_filter_fallback(st: _Trunc, _retry: TurnRetryState) -> Optional[Tru
             if isinstance(_frag, dict):
                 _frag.pop("_length_continuation_fragment", None)
                 _frag.pop("_length_continuation_nudge", None)
-        if st.api_messages is not None:
-            from agent.refusal_history import apply_refusal_clean_fork
-            apply_refusal_clean_fork(
-                agent, st.messages, st.api_messages, st.current_turn_user_idx,
-            )
         agent._session_messages = st.messages
         st.length_continue_retries = 0
         st.truncated_response_parts = []
@@ -752,9 +751,21 @@ def handle_content_policy_refusal(
     Deterministic for the unchanged prompt — never retried: one configured-fallback try,
     else surface the refusal (explanation may live only in the reasoning channel)."""
     from agent.conversation_loop import _arm_fallback_restart, _content_policy_blocked_result
-    from agent.refusal_history import apply_refusal_clean_fork
 
     _refusal_result = normalize_response_for_agent(agent, response)
+    _refusal_provider_data = getattr(_refusal_result, "provider_data", None) or {}
+    _refusal_source = (
+        RefusalSource.API_STRUCTURED_REFUSAL
+        if (
+            getattr(response, "stop_reason", None) == "refusal"
+            or bool(_refusal_provider_data.get("refusal"))
+        )
+        else RefusalSource.PROVIDER_OUTPUT_FILTER
+    )
+    # Structured API refusals and provider output filters are fallback signals only.
+    # Neither proves that current tool progress is contaminated, so clean_fork must
+    # preserve the complete prompt assembled for the fallback.
+    should_apply_clean_fork(_refusal_source)
     _refusal_text = (getattr(_refusal_result, "content", None) or "").strip()
     if not _refusal_text:
         _refusal_text = (agent._extract_reasoning(_refusal_result) or "").strip()
@@ -793,9 +804,6 @@ def handle_content_policy_refusal(
     # while the same refusal raised as an HTTP 400 (DeepSeek's "Content Exists Risk") says
     # "content policy blocked the request" (#124874). Not a rate-limit reason, so no cooldown is armed.
     if agent._try_activate_fallback(reason=FailoverReason.content_policy_blocked):
-        apply_refusal_clean_fork(
-            agent, messages, api_messages, current_turn_user_idx,
-        )
         active_system_prompt = _arm_fallback_restart(agent, api_messages, active_system_prompt, _retry)
         return RefusalVerdict("break", None, active_system_prompt)
 

@@ -18,6 +18,7 @@ from typing import Any, Dict, Optional
 
 from agent.api_error_summary import is_provider_stream_parse_error
 from agent.error_classifier import RETRYABLE_CLIENT_REASONS, FailoverReason, classify_api_error
+from agent.refusal_history import RefusalSource, should_apply_clean_fork
 from agent.route_verdicts import route_visit
 from agent.turn_overflow import recover_from_overflow
 from agent.turn_recovery import (
@@ -335,6 +336,9 @@ def settle_unrecovered_error(
     ) and not is_context_length_error
 
     if is_client_error:
+        if classified.reason == FailoverReason.content_policy_blocked:
+            # Fallback signal only — an exception-shaped policy block never removes context.
+            should_apply_clean_fork(RefusalSource.EXCEPTION_CONTENT_POLICY)
         # A Codex ChatGPT-account entitlement 400 names the model: with nothing to rotate the
         # slug is dead for this account, so record it before the fallback walk runs (#106475).
         from agent.fallback_cooldown import _mark_entitlement_rejected_model
@@ -370,11 +374,6 @@ def settle_unrecovered_error(
                 agent._buffer_diagnostic_status(f"⚠️ {_label} — trying fallback...")
             reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
             if agent._try_activate_fallback(reason=classified.reason, reset_at=reset_at):
-                if classified.reason == FailoverReason.content_policy_blocked:
-                    from agent.refusal_history import apply_refusal_clean_fork
-                    apply_refusal_clean_fork(
-                        agent, messages, api_messages, current_turn_user_idx,
-                    )
                 # Direct ``return _verdict("break")`` is load-bearing: the restart handler
                 # re-runs the pre-API preflight against the fallback's context window.
                 active_system_prompt = _arm_fallback_restart(agent, api_messages, active_system_prompt, _retry)

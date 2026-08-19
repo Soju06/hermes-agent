@@ -1,11 +1,52 @@
-"""History anchoring for refusal-driven model hops."""
+"""Refusal-source policy and history anchoring for model hops."""
 
 from __future__ import annotations
 
+from enum import Enum
 import logging
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+class RefusalSource(str, Enum):
+    """Origin of a refusal-shaped signal.
+
+    Only router-classified natural-language refusals are allowed to remove
+    context. Provider/API policy signals still qualify for fallback, but they
+    are not evidence that the current turn's tool context is contaminated.
+    """
+
+    ROUTER_SOFT_REFUSAL = "router_soft_refusal"
+    API_STRUCTURED_REFUSAL = "api_structured_refusal"
+    PROVIDER_OUTPUT_FILTER = "provider_output_filter"
+    STREAM_FILTER_ERROR = "stream_filter_error"
+    EXCEPTION_CONTENT_POLICY = "exception_content_policy"
+
+
+def should_apply_clean_fork(
+    source: RefusalSource,
+    *,
+    configured: bool = True,
+) -> bool:
+    """Return whether ``source`` may remove refusal-contaminated context.
+
+    ``model_routes.router.refusal.clean_fork`` is intentionally consulted
+    only for the router soft-refusal source. Structured API refusals and
+    provider/stream policy filters may trigger fallback, but always preserve
+    the complete conversation and current tool progress.
+    """
+
+    apply = bool(
+        configured and source is RefusalSource.ROUTER_SOFT_REFUSAL
+    )
+    logger.info(
+        "Refusal clean_fork decision source=%s configured=%s apply=%s",
+        source.value,
+        bool(configured),
+        apply,
+    )
+    return apply
 
 
 def begin_refusal_turn(agent: Any) -> None:
@@ -76,56 +117,3 @@ def user_anchor_from_tail(
                 return index
     return None
 
-
-def apply_refusal_clean_fork(
-    agent, messages, api_messages, current_turn_user_idx: int,
-) -> int:
-    """Clean both durable and in-flight history after a refusal fallback.
-
-    ``api_messages`` is a provider-shaped copy built before the retry loop, so
-    cleaning only ``messages`` would still resend the refusal-contaminated
-    request on an in-block ``continue``. Keep every completed earlier turn and
-    truncate only rows generated after this turn's real user anchor.
-
-    Returns the number of durable messages dropped, or zero when disabled.
-    """
-    try:
-        from hermes_cli.config import load_config
-        from hermes_cli.model_routes import load_routes
-
-        refusal = load_routes(load_config() or {}).router.refusal
-        clean_fork = bool(refusal.clean_fork)
-        keep_user_turns = int(refusal.keep_user_turns)
-    except Exception:
-        logger.debug("Refusal clean-fork config load failed; using defaults", exc_info=True)
-        clean_fork = True
-        keep_user_turns = 5
-
-    if not clean_fork:
-        return 0
-
-    user_from_tail = current_user_ordinal_from_tail(
-        messages,
-        current_turn_user_idx,
-        keep_user_turns=keep_user_turns,
-    )
-    if user_from_tail is None:
-        return 0
-    api_anchor = user_anchor_from_tail(
-        api_messages,
-        user_from_tail,
-        keep_user_turns=keep_user_turns,
-    )
-    if api_anchor is None:
-        return 0
-
-    original_count = len(messages)
-    messages[:] = messages[: current_turn_user_idx + 1]
-    api_messages[:] = api_messages[: api_anchor + 1]
-
-    agent._session_messages = messages
-    agent._refusal_clean_fork_active = True
-    agent._refusal_recall_quarantine = True
-    dropped = original_count - len(messages)
-    agent._buffer_status(f"⚠️ Refusal fallback clean_fork=yes dropped={dropped}")
-    return dropped

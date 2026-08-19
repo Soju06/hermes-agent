@@ -16,6 +16,7 @@ import logging
 import os
 from typing import TYPE_CHECKING, Optional
 
+from agent.refusal_history import RefusalSource, should_apply_clean_fork
 from gateway.session import SessionSource
 
 if TYPE_CHECKING:  # string annotations only
@@ -387,7 +388,6 @@ class GatewayInboundModelRouterMixin:
 
         if not (
             bool(getattr(refusal, "enabled", False))
-            and bool(getattr(refusal, "mask_on_refusal", True))
             and bool(getattr(refusal, "soft_detect", True))
         ):
             self._reset_gateway_refusal_recovery(session_key)
@@ -437,7 +437,7 @@ class GatewayInboundModelRouterMixin:
         refusal: object,
         kind: str,
     ) -> int:
-        """Mask a soft-refused reply and stage a guarded permissive-route hop."""
+        """Stage recovery, masking only router-classified soft refusals."""
         from gateway import model_router as _model_router
 
         state = getattr(self, "_model_router_state", None)
@@ -465,9 +465,19 @@ class GatewayInboundModelRouterMixin:
         entry["refusal_recovery_count"] = recovery_count + 1
         entry["refusal_recovery_exhausted"] = False
         masked = 0
-        if kind == "soft" and bool(getattr(refusal, "mask_on_refusal", True)):
-            # A hard refusal's turn is already out of the model context (upstream's refused-turn
-            # retention, see ``_handle_gateway_hard_refusal``); only a soft refusal's reply is masked.
+        # A hard refusal's turn is already out of the model context (upstream's refused-turn
+        # retention, see ``_handle_gateway_hard_refusal``); only a soft refusal's reply is masked.
+        clean_fork = (
+            kind == "soft"
+            and should_apply_clean_fork(
+                RefusalSource.ROUTER_SOFT_REFUSAL,
+                configured=(
+                    bool(getattr(refusal, "clean_fork", True))
+                    and bool(getattr(refusal, "mask_on_refusal", True))
+                ),
+            )
+        )
+        if clean_fork:
             from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND
 
             try:

@@ -8,7 +8,10 @@ user's message on screen (aa24f0ffb6, 6ec9d85795). The router then only stages t
 permissive hop. It must not mask anything: after the retention the newest active user row is the
 PREVIOUS turn's, so hiding the assistant rows after it would hide that completed answer and reopen
 a user-only tail. A soft refusal (#59 refusal-soft-turnend) is a completed turn, so its reply is
-masked on the real store and the earlier answer stays.
+masked on the real store and the earlier answer stays. Only router-classified soft refusals may
+remove context (#76 clean-fork-soft-refusal-only), and that mask must still leave a failed-turn
+boundary row (``display_kind="failed_turn"``, upstream #107070) active: hiding it would reopen a
+user-only tail that alternation repair merges into the next message.
 """
 
 import asyncio
@@ -18,6 +21,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND, FAILED_TURN_NOTICE
 from gateway.config import GatewayConfig
 from gateway.session import SessionStore
 from tests.fixtures.storage_seed import seed_messages, seed_session
@@ -103,4 +107,33 @@ def test_soft_refusal_masks_only_the_refused_reply_on_the_real_store(monkeypatch
 
     assert masked == 1
     assert list(store.persistence.messages.active_message_ids(sid)) == [first, earlier, current]
+    assert runner._model_router_state["tg:c1"]["force_refusal_route"] is True
+
+
+def test_soft_refusal_mask_skips_the_failed_turn_boundary(monkeypatch, store):
+    from hermes_cli.model_routes import load_routes
+
+    sid = seed_session(store.persistence, "s", "telegram")
+    _, earlier, _, refusal, boundary = seed_messages(
+        store.persistence, sid,
+        {"role": "user", "content": "earlier request"},
+        {"role": "assistant", "content": "earlier completed answer"},
+        {"role": "user", "content": "current request"},
+        {"role": "assistant", "content": "I can't help with that."},
+        {"role": "assistant", "content": FAILED_TURN_NOTICE, "display_kind": FAILED_TURN_DISPLAY_KIND},
+    )
+    runner = _runner(monkeypatch, store)
+    cfg = _cfg()
+    catalog = load_routes(cfg)
+
+    masked = asyncio.run(runner._stage_gateway_refusal_recovery(
+        "tg:c1", sid, SimpleNamespace(),
+        cfg=cfg, catalog=catalog, refusal=catalog.router.refusal, kind="soft",
+    ))
+
+    active_ids = set(store.persistence.messages.active_message_ids(sid))
+    assert masked == 1
+    assert refusal not in active_ids
+    assert {earlier, boundary} <= active_ids
+    assert store.persistence.messages.latest_conversation_role(sid) == "assistant"
     assert runner._model_router_state["tg:c1"]["force_refusal_route"] is True
