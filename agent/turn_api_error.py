@@ -26,7 +26,7 @@ from agent.turn_recovery import (
     max_retries_exhausted_result, nonretryable_client_error_result, recover_after_classification,
     recover_before_classification, route_classified_error, settle_delivered_partial,
 )
-from agent.turn_recovery_fail_fast import fast_transport_failure_result, track_instant_transport_failure
+from agent.turn_recovery_fail_fast import _tag_exit, fast_transport_failure_result, track_instant_transport_failure
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -212,6 +212,7 @@ def handle_api_error(
         conversation_history=conversation_history, api_call_count=api_call_count,
     )
     if _fast_fail is not None:
+        _tag_exit(f"fast_transport_failure_streak({classified.reason.value})")
         return _verdict("return", _fast_fail)
 
     _ov = recover_from_overflow(
