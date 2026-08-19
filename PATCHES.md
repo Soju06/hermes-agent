@@ -210,7 +210,9 @@ Salvaged as `54eafee30` via PR #76916; old tip archived at `archive/pre-v2026080
 - **upstream_pr:** _(none yet — upstream candidate after burn-in)_
 - **state:** `local-only`
 - **rationale:** Consecutive sub-2s transport failures (connection refused/reset before any bytes) mean the endpoint is down, not congested; with no fallback available the retry loop burned a dozen attempts with growing backoff (observed 13 attempts / 170-250s of user-visible silence per turn against a briefly-down codex-lb). Track the instant-failure streak on TurnRetryState and end the turn with an actionable error after `HERMES_FAST_CONN_FAIL_LIMIT` (default 3, 0 disables) once the fallback chain has had its chance; slow timeouts keep the full retry budget.
-- **commit:** `c412e9ad1 fix(agent): fail fast on instant transport-failure streaks`
+- **commits:**
+  - `623055209 fix(agent): fail fast on instant transport-failure streaks`
+  - `6bfa8c52e fix(telemetry): tag instant transport fail-fast exits`
 - **touches:** `agent/conversation_loop.py`, `agent/turn_retry_state.py`, `tests/agent/test_fast_transport_fail_fast.py` _(new)_
 
 ### 24. background-first-waits
@@ -765,7 +767,29 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
   - `6f019e332 fix(gateway): hygiene failure diagnostics + off-loop lock release + hygiene_threshold config`
 - **touches:** `gateway/run.py`, `tests/gateway/test_session_hygiene.py`
 
-### 75. sync-20260819-test-seams
+### 75. turn-exit-reason-tagging
+- **branch:** `soju/patches/turn-exit-reason-tagging`
+- **stacked-on:** `soju/patches/turn-waterfall-tracing` (#15 — same conversation-loop telemetry seam)
+- **origin:** `local-author` (implemented by kanban goal worker t_9c855d47; last worker-implemented patch before the 2026-08-18 methodology rollback — see mistakes.db #1099)
+- **upstream_pr:** _(none yet)_
+- **state:** `local-only`
+- **rationale:** Early conversation-loop exits (compression lock, 413, stream truncation, rate guard, ~16 paths) returned silently with no log line, making "the agent just stopped" incidents unattributable (comm-improve M5 diagnostics). Tag every early exit via a `_tag_exit()` helper; the pre-existing fallback is renamed `early_return(untagged)` so any future untagged site self-surfaces. Observability-only: no control-flow or return-shape change, tagging failures are swallowed.
+- **commits:**
+  - `98cea2b12 feat(telemetry): tag every early conversation-loop exit with its reason`
+- **touches:** `agent/conversation_loop.py`, `tests/agent/test_turn_exit_reason_tagging.py`
+
+### 76. clean-fork-soft-refusal-only
+- **branch:** `soju/patches/clean-fork-soft-refusal-only`
+- **stacked-on:** `soju/patches/conn-error-fail-fast` (#23 — owns gateway/model_router.py, gateway/run.py, hermes_cli/model_routes.py, tests/run_agent/test_refusal_fallback_reason.py)
+- **origin:** `local-author` (implemented by codex per /tmp/clean-fork-task.md; design verdict by owner 2026-08-19)
+- **upstream_pr:** _(none yet)_
+- **state:** `local-only`
+- **rationale:** clean_fork (context truncation on refusal fallback) was firing on ALL refusal-shaped signals, including Anthropic structured `stop_reason=refusal` — a contaminated signal claude-fable-5 emits during normal work. Mid-task it cut tool progress from the fallback model's context, causing re-scoping + announce-and-stop early turn ends (2026-08-19 03:23 incident, session 20260813_031938_3171f671). Owner design verdict: clean_fork exists for ROUTER-CLASSIFIED soft refusals (natural-language decline text contaminating context) ONLY; API/provider/stream policy signals still fall back but must preserve full conversation and tool progress. Adds `RefusalSource` enum (5 sources) + `should_apply_clean_fork()` gate with per-decision INFO log; removes the dead auth-path content_policy branch (is_auth and content_policy are mutually exclusive in error_classifier). Incident-replay test asserts tool results survive into the fallback model's input.
+- **commits:**
+  - `05ff9595f fix(refusal): reserve clean fork for router soft refusals`
+- **touches:** `agent/conversation_loop.py`, `agent/refusal_history.py`, `agent/transports/anthropic.py`, `gateway/model_router.py`, `gateway/run.py`, `hermes_cli/model_routes.py`, `tests/agent/test_refusal_history.py`, `tests/gateway/test_model_router.py`, `tests/run_agent/test_refusal_fallback_reason.py`
+
+### 77. sync-20260819-test-seams
 - **branch:** `soju/patches/sync-20260819-test-seams`
 - **stacked-on:** `soju/patches/runtime-control`
 - **origin:** `local-author`
