@@ -371,6 +371,16 @@ def _moa_reference_metrics_for_hook(agent: Any) -> Any:
         return None
 
 
+def _tag_exit(_reason: str) -> None:
+    """No-op compatibility hook when exit-reason tracing is not stacked.
+
+    The turn-exit-reason-tagging patch defines a same-named closure inside
+    ``_run_conversation_impl``.  When both patches are assembled, that local
+    helper shadows this fallback and records the real trace tag; this topic
+    branch on its own keeps the fail-fast control flow observation-only.
+    """
+
+
 def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text: str) -> None:
     """Append a provider-safe checkpoint and correction to the live turn.
 
@@ -5696,6 +5706,7 @@ def _run_conversation_impl(
                         messages, f"[System: API call aborted — {_msg}]"
                     )
                     agent._persist_session(messages, conversation_history)
+                    _tag_exit(f"fast_transport_failure_streak({classified.reason.value})")
                     return {
                         "final_response": _msg,
                         "messages": messages,
