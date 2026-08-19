@@ -765,6 +765,17 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
   - `6f019e332 fix(gateway): hygiene failure diagnostics + off-loop lock release + hygiene_threshold config`
 - **touches:** `gateway/run.py`, `tests/gateway/test_session_hygiene.py`
 
+### 75. sync-20260819-test-seams
+- **branch:** `soju/patches/sync-20260819-test-seams`
+- **stacked-on:** `soju/patches/runtime-control`
+- **origin:** `local-author`
+- **upstream_pr:** _(none — sync-only test maintenance)_
+- **state:** `local-only`
+- **rationale:** The 2026-08-19 upstream seam refactor moved pre-tool plugin blocking from `resolve_pre_tool_block` to `_dispatch_pre_tool_call_hooks`, leaving two runtime-control tests monkeypatching a bypassed seam. Upstream now carries equivalent integration coverage for both agent-level and registry-dispatched blocked tools, so this sync patch deletes the stale duplicates instead of re-anchoring redundant tests.
+- **commits:**
+  - `3a302aba9 test(runtime): re-anchor pre-tool block tests to _dispatch_pre_tool_call_hooks seam (2026-08-19 sync)`
+- **touches:** `tests/run_agent/test_run_agent.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
