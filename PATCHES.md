@@ -13,10 +13,10 @@ Every runtime patch must live in a `soju/patches/<name>` topic branch and be lis
 ```
 upstream: NousResearch/hermes-agent
 base_ref: upstream/main
-base_commit:   3c27eb6234bf91b8ceee9e9071591b31e9b148cb
-base_tag:      v2026.8.3
-base_describe: v2026.8.3
-pinned_at:    2026-08-04
+base_commit:   5dd15872a6878a19b9b5478b6968b38f48dd311f
+base_tag:      v2026.8.18-173-g5dd15872a
+base_describe: v2026.8.18-173-g5dd15872a
+pinned_at:    2026-08-19
 ```
 
 Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must rebase all `soju/patches/*` topics on top of the new base and verify the production stack rebuilds clean.
@@ -601,7 +601,7 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 - **stacked-on:** `soju/patches/refusal-hop-clean-fork`
 - **origin:** `local-author`
 - **upstream_pr:** _(none yet — upstream candidate)_
-- **state:** `local-only`
+- **state:** `merged-upstream`
 - **rationale:** Plugin structured completions (`plugin_llm.complete_structured`) build an OpenAI Chat Completions `response_format` payload in extra_body; the anthropic_messages transport forwarded it verbatim and strict Anthropic gateways (claude-lb) reject it with HTTP 400 ("use output_config.format"). Observed live: every discord-thread-autotitle rename failed for 2+ days (1,600+ errors) once the main provider became claude-lb. Fix: `_translate_anthropic_response_format` converts `json_schema`→`output_config.format={"type":"json_schema","schema":S}` and `json_object`→permissive object schema (SDK 0.87.0 has no schema-less JSON mode), merging into any existing `output_config` (adaptive-thinking `effort` coexists) and excluding `response_format` from the raw extra_body passthrough alongside `reasoning`. Async path delegates to the sync adapter via `asyncio.to_thread`, covered by test. Non-Anthropic transports unchanged.
 - **commits:**
   - `c67b6662b fix(aux): translate response_format to output_config.format for anthropic transport`
