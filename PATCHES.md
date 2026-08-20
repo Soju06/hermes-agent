@@ -811,6 +811,17 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
   - `eb373e359 feat(prompt): optional shared base persona prefix for audience modes`
 - **touches:** `agent/audience_persona.py`, `tests/agent/test_audience_persona.py`
 
+### 79. gemini-classifier-thinking-compat
+- **branch:** `soju/patches/gemini-classifier-thinking-compat`
+- **stacked-on:** `soju/patches/base-persona` (#78 — stack tip at authoring time; no file overlap)
+- **origin:** `local-author` (implemented by codex per /tmp/gemini-thinking-gateway-prompt.md)
+- **upstream_pr:** _(none — `gateway/model_router.py` router is fork-only)_
+- **state:** `local-only`
+- **rationale:** `_call_gemini` hardcoded `thinkingConfig: {thinkingBudget: 0}`, which Gemini 3.5+ rejects with HTTP 400 INVALID_ARGUMENT (live smoke 2026-08-20), so any router model upgrade past 3.1 silently drops every turn to the regex fallback. New `_thinking_config(model)` parses the family from the model id: <3.5 keeps `thinkingBudget: 0`, 3.5+ (and unparseable ids) send `thinkingLevel: "low"` (thoughts=0 on 3.5/3.6; 3.7 cannot disable thinking at all and `minimal` is rejected — one reason 3.7 was not adopted). Unblocks the config-side router model change to `gemini-3.5-flash-lite` (gold-set rebench 2026-08-20, 350 cases: acc .983 vs .969, false switches 6→2, p50 -347ms, cost -36%; raw at /mnt/scratch/bench/gemini-router-upgrade/2026-08-20/). Prompts/schemas/regexes untouched — skill-gate byte-identity parity tests unaffected.
+- **commits:**
+  - `5f0904d8b fix(gateway): model-family-aware thinkingConfig for Gemini classifier`
+- **touches:** `gateway/model_router.py`, `tests/gateway/test_model_router.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
