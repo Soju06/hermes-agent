@@ -800,6 +800,17 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
   - `3a302aba9 test(runtime): re-anchor pre-tool block tests to _dispatch_pre_tool_call_hooks seam (2026-08-19 sync)`
 - **touches:** `tests/run_agent/test_run_agent.py`
 
+### 78. base-persona
+- **branch:** `soju/patches/base-persona`
+- **stacked-on:** `soju/patches/audience-personas` (#35 — owns `agent/audience_persona.py`)
+- **origin:** `local-author` (implemented by codex per /tmp/base-persona-prompt.md)
+- **upstream_pr:** _(none — extends the not-yet-upstreamed #35; travels with it if #35 is ever proposed)_
+- **state:** `local-only`
+- **rationale:** modes.yaml gains an optional top-level `base_persona: <file>` key: a personas-dir-relative markdown file prepended (`base + "\n\n" + mode`) to every selected mode persona inside `load_audience_persona`, so shared style/identity rules live in ONE file instead of being duplicated per mode (immediate consumer: fluent-korean Korean-output guideline shared across modes). Injection gating is untouched — the base never changes WHETHER injection happens, only content, so `resolve_audience_mode`/`_persona_stat_ok` (per-turn staleness resolver) stay byte-identical and loader/resolver agreement is preserved. Base file resolves through the same personas-dir containment as mode personas (factored into `_contained_persona_path`) and passes the same `_scan_context_content` + `_truncate_content` pipeline with its own label/read_path. Fail-open: missing/empty/escaping/unreadable base → DEBUG log, mode persona alone; base path == mode path → no self-duplication; key absent → byte-identical to pre-patch behavior.
+- **commits:**
+  - `eb373e359 feat(prompt): optional shared base persona prefix for audience modes`
+- **touches:** `agent/audience_persona.py`, `tests/agent/test_audience_persona.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -846,6 +857,7 @@ soju/patches/hook-prepend-command-safety (stacked on durable-turns + runtime-con
 soju/patches/slow-tool-perf-advisor
 soju/patches/model-routing
 soju/patches/audience-personas (stacked on model-routing)
+soju/patches/base-persona (stacked on audience-personas)
 soju/patches/model-switch-provider-dedupe
 soju/patches/memory-phase0 (stacked on memory-write-reason-gate)
 soju/patches/memory-phase1 (stacked on memory-phase0)
