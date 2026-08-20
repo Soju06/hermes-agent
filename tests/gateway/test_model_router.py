@@ -351,6 +351,51 @@ def test_call_gemini_request_shape(monkeypatch):
     }
 
 
+def test_thinking_config_by_model_family():
+    expected = {
+        "gemini-3-flash-preview": {"thinkingBudget": 0},
+        "gemini-3.1-flash-lite": {"thinkingBudget": 0},
+        "gemini-2.5-flash": {"thinkingBudget": 0},
+        "gemini-3.5-flash-lite": {"thinkingLevel": "low"},
+        "gemini-3.6-flash": {"thinkingLevel": "low"},
+        "gemini-3.7-flash": {"thinkingLevel": "low"},
+        "weird-model": {"thinkingLevel": "low"},
+    }
+    for model, config in expected.items():
+        assert mr_mod._thinking_config(model) == config
+
+
+def test_call_gemini_uses_thinking_level_for_3_5(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    captured = {}
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps({
+                "candidates": [{"content": {"parts": [{"text": "NORMAL"}]}}]
+            }).encode()
+
+    def fake_urlopen(req, timeout=None):
+        captured["body"] = json.loads(req.data.decode())
+        return _Resp()
+
+    monkeypatch.setattr(mr_mod, "_urlopen", fake_urlopen)
+    mr_mod._call_gemini(
+        "Context JSON:\n{}",
+        model="gemini-3.5-flash-lite",
+        timeout=8.0,
+    )
+    assert captured["body"]["generationConfig"]["thinkingConfig"] == {
+        "thinkingLevel": "low"
+    }
+
+
 def test_parse_dev_json_plain_token_fallback():
     assert mr_mod._parse_dev_json("FRONTEND_DEV") is None
     detail = mr_mod.classify_dev_detailed(
