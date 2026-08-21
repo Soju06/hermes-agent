@@ -358,7 +358,8 @@ Fork `messages_fts_v2` never shipped upstream; v2026.8.3 owns `messages_fts_cjk`
   - `ecb661a82 feat(memory): notes tool family — notes_write/notes_read/memory_propose wiring + prompt guidance (ADR-004 Phase 1)`
   - `c9d31e1eb fix(memory): notes review fixes — close the secret-scrub bypasses, real quote grounding, non-destructive supersede, write gate parity (ADR-004 Phase 1)`
   - `fa3e886848 fix(memory): unwrap _ManagedToolResult at notes/memory_propose middleware sites` — v2026.8.3 NeMo Relay refactor changed the middleware return type; the fork call sites kept the old 2-tuple unpack and crashed the outer loop on every notes_write/notes_read/memory_propose call
-- **touches:** `agent/notes_store.py` (new), `agent/memory_pipeline.py` (new), `tools/notes_tool.py` (new), `agent/agent_runtime_helpers.py`, `agent/memory_journal.py`, `agent/memory_manager.py`, `agent/prompt_builder.py`, `agent/system_prompt.py`, `agent/tool_executor.py`, `tools/memory_tool.py`, `tools/delegate_tool.py`, `toolsets.py`, `tests/agent/test_{memory_pipeline,notes_store}.py` (new), `tests/tools/test_notes_tool.py` (new)
+  - `56ea17eb1b fix(memory): unpack the middleware 5-tuple at notes/memory_propose sites` — current base widened _managed_values to a 5-tuple (adds dispatched); the 4-tuple unpacks crashed the notes lane on the assembled stack (2026-08-21 incident). Adds tests/agent/test_managed_values_arity.py: AST invariant that every _managed_values() unpack matches the function's return arity, assembled-tree-wide
+- **touches:** `agent/notes_store.py` (new), `agent/memory_pipeline.py` (new), `tools/notes_tool.py` (new), `agent/agent_runtime_helpers.py`, `agent/memory_journal.py`, `agent/memory_manager.py`, `agent/prompt_builder.py`, `agent/system_prompt.py`, `agent/tool_executor.py`, `tools/memory_tool.py`, `tools/delegate_tool.py`, `toolsets.py`, `tests/agent/test_{memory_pipeline,notes_store,managed_values_arity}.py` (new), `tests/tools/test_notes_tool.py` (new)
 - **v2026.7.20-sync:** tool-name unions re-resolved against v2 parent chain (runtime-control tools union at assembly); _dispatch_notes_tool re-anchored above upstream's finalize= signature (271a9d8ec).
 
 
@@ -390,6 +391,7 @@ Fork `messages_fts_v2` never shipped upstream; v2026.8.3 owns `messages_fts_cjk`
   - `3a7a16670 test(memory): ingest curator Phase-2 suite — shadow invariant, fork isolation, triggers, caps (ADR-004)`
   - `7aea03d82 fix(memory): ingest curator review fixes — seam scrub+grounding, provenance validation, cross-lane taint interface (ADR-004 Phase 2)`
   - `9993e1723e fix(memory): unwrap _ManagedToolResult at curator_verdict middleware site` — same class as the memory-phase1 unpack fix (v2026.8.3 Relay refactor)
+  - `9902587f11 fix(memory): unpack the middleware 5-tuple at the curator_verdict site` — same class as the memory-phase1 5-tuple fix; covered by the assembled-tree arity invariant test added there
 - **touches:** `agent/ingest_curator.py` (new), `agent/agent_runtime_helpers.py`, `agent/background_review.py`, `agent/codex_runtime.py`, `agent/conversation_compression.py`, `agent/memory_journal.py`, `agent/memory_manager.py`, `agent/memory_pipeline.py`, `agent/tool_executor.py`, `agent/turn_finalizer.py`, `hermes_cli/config.py`, `run_agent.py`, `tests/agent/test_ingest_curator.py` (new)
 
 
