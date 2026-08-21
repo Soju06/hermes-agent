@@ -8,6 +8,83 @@ during error recovery.
 import pytest
 from unittest.mock import MagicMock, patch
 
+from run_agent import AIAgent
+
+
+def _make_routed_agent():
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            model="primary-model",
+            provider="openrouter",
+            api_key="primary-key",
+            base_url="https://openrouter.ai/api/v1",
+            reasoning_config={"enabled": True, "effort": "xhigh"},
+            fallback_model=[
+                {"provider": "anthropic", "model": "claude-sonnet-4-6"}
+            ],
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+    agent.client = MagicMock()
+    return agent
+
+
+@pytest.mark.parametrize(
+    "loaded_config",
+    [
+        {},
+        {"agent": {"reasoning_effort": "low"}},
+    ],
+)
+def test_fallback_preserves_active_session_reasoning(loaded_config):
+    """The routed/session value wins over fallback global re-resolution.
+
+    Transport adapters still receive the unchanged effort and own any
+    model-specific wire downgrade (for example xhigh -> max on Claude 4.6).
+    """
+    agent = _make_routed_agent()
+    fallback_client = MagicMock()
+    fallback_client.base_url = "https://api.anthropic.com"
+    fallback_client.api_key = "fallback-key"
+
+    with (
+        patch(
+            "agent.chat_completion_helpers._fallback_entry_unavailable_without_network",
+            return_value=None,
+        ),
+        patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(fallback_client, "claude-sonnet-4-6"),
+        ),
+        patch(
+            "hermes_cli.model_normalize.normalize_model_for_provider",
+            side_effect=lambda model, provider: model,
+        ),
+        patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()),
+        patch("agent.model_metadata.get_model_context_length", return_value=200_000),
+        patch("hermes_cli.config.load_config", return_value=loaded_config),
+    ):
+        assert agent._try_activate_fallback() is True
+
+    assert agent.reasoning_config == {"enabled": True, "effort": "xhigh"}
+
+    from agent.anthropic_adapter import build_anthropic_kwargs
+
+    kwargs = build_anthropic_kwargs(
+        model=agent.model,
+        messages=[{"role": "user", "content": "hello"}],
+        tools=None,
+        max_tokens=4096,
+        reasoning_config=agent.reasoning_config,
+    )
+    assert agent.reasoning_config["effort"] == "xhigh"
+    assert kwargs["output_config"] == {"effort": "max"}
+
 
 class TestFallbackReasoningOverride:
     """Test try_activate_fallback re-resolves reasoning_config."""

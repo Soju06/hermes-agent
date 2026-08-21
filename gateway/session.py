@@ -750,15 +750,16 @@ def build_session_context_prompt(
     return "\n".join(lines)
 
 
-# Keys of a /model session override that are safe to persist to disk.
-# ``api_key`` (and anything else, e.g. ``api_mode`` which is re-derived from
-# provider resolution) is intentionally excluded: credentials must NEVER be
-# written to sessions.json.  On rehydration after a gateway restart the
-# runner re-resolves credentials via the normal runtime provider resolution.
+# Scalar keys of a /model session override that are safe to persist to disk.
+# A validated, non-secret router ``reasoning_config`` may also travel in the
+# record so the routed model and effort restart atomically. ``api_key`` (and
+# anything else, e.g. ``api_mode`` which is re-derived from provider
+# resolution) is intentionally excluded: credentials must NEVER be written to
+# sessions.json. On rehydration the runner re-resolves credentials normally.
 PERSISTABLE_MODEL_OVERRIDE_KEYS = ("model", "provider", "base_url")
 
 
-def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]:
+def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Return a copy of *override* containing only persistable, non-secret keys.
 
     Returns ``None`` when the input is empty/not a dict or no persistable
@@ -772,6 +773,19 @@ def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict
         for k, v in override.items()
         if k in PERSISTABLE_MODEL_OVERRIDE_KEYS and v not in (None, "")
     }
+    reasoning = override.get("reasoning_config")
+    if isinstance(reasoning, dict):
+        cleaned_reasoning = None
+        if reasoning.get("enabled") is False:
+            cleaned_reasoning = {"enabled": False}
+        elif reasoning.get("enabled") is True:
+            from hermes_constants import parse_reasoning_effort
+
+            parsed = parse_reasoning_effort(reasoning.get("effort"))
+            if parsed is not None and parsed.get("enabled") is True:
+                cleaned_reasoning = parsed
+        if cleaned_reasoning:
+            cleaned["reasoning_config"] = cleaned_reasoning
     return cleaned or None
 
 
@@ -884,7 +898,7 @@ class SessionEntry:
     # re-resolved through the normal runtime provider resolution when the
     # override is rehydrated after a restart and are never written to disk
     # (see sanitize_model_override / SessionStore.set_model_override).
-    model_override: Optional[Dict[str, str]] = None
+    model_override: Optional[Dict[str, Any]] = None
 
     # Session-scoped runtime overrides. These are durable session metadata,
     # unlike per-process GatewayRunner caches. Only stable identifiers are
@@ -3121,11 +3135,11 @@ class SessionStore:
     ) -> None:
         """Persist (or clear) the session-scoped /model override.
 
-        Only non-secret keys (model/provider/base_url — see
-        ``sanitize_model_override``) are written; ``api_key``/``api_mode``
-        are re-resolved at rehydration time via the normal runtime provider
-        resolution.  Pass ``None`` (or a dict with no persistable values)
-        to clear the persisted override, e.g. on /new.
+        Only non-secret keys (model/provider/base_url and validated
+        router-applied reasoning_config — see ``sanitize_model_override``)
+        are written; ``api_key``/``api_mode`` are re-resolved at rehydration
+        time via the normal runtime provider resolution. Pass ``None`` (or a
+        dict with no persistable values) to clear the record, e.g. on /new.
         """
         with self._lock:
             self._ensure_loaded_locked()
@@ -3144,7 +3158,7 @@ class SessionStore:
                 entry.runtime_provider = None
             self._save()
 
-    def get_model_override(self, session_key: str) -> Optional[Dict[str, str]]:
+    def get_model_override(self, session_key: str) -> Optional[Dict[str, Any]]:
         """Return the persisted /model override for *session_key*, if any."""
         with self._lock:
             self._ensure_loaded_locked()

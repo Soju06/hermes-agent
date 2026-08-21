@@ -6103,11 +6103,25 @@ class TurnRunner:
                 delattr(agent, "_runtime_reasoning_source")
             except AttributeError:
                 pass
+        pending_runtime_route_state = (
+            self._runner._consume_pending_runtime_route_state(ctx.session_key) or {}
+        )
+        active_route_name = str(
+            pending_runtime_route_state.pop("active_route_name", "") or ""
+        ).strip()
+        if active_route_name:
+            agent._active_route_name = active_route_name
+        # run_conversation restores the primary runtime in its turn prologue
+        # before building provider kwargs.  Keep that snapshot's per-turn
+        # reasoning value in sync so a cached agent cannot restore a stale
+        # config over a routed (or explicit session) override.
+        if isinstance(getattr(agent, "_primary_runtime", None), dict):
+            agent._primary_runtime["reasoning_config"] = (
+                dict(reasoning_config) if isinstance(reasoning_config, dict) else None
+            )
         agent.service_tier = self._runner._service_tier
         agent.request_overrides = turn_route.get("request_overrides") or {}
-        agent._runtime_route_state = self._runner._consume_pending_runtime_route_state(
-            ctx.session_key
-        )
+        agent._runtime_route_state = pending_runtime_route_state or None
         agent._refusal_recall_quarantine_pending = (
             self._runner._consume_refusal_recall_quarantine(ctx.session_key)
         )
@@ -17861,16 +17875,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not hasattr(self, "_model_router_fresh_applies"):
             self._model_router_fresh_applies = {}
         self._model_router_fresh_applies[session_key] = True
-        # Write-through the non-secret parts so the override survives a
-        # gateway restart (same as the /model path).
-        try:
-            await self.async_session_store.set_model_override(
-                session_key,
-                self._session_model_overrides[session_key],
-            )
-        except Exception:
-            logger.debug("model router: persist session override failed", exc_info=True)
-
         reasoning_applied = False
         effort = str(directive.get("reasoning_effort") or "")
         if effort:
@@ -17879,6 +17883,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if parsed is not None:
                 self._set_session_reasoning_override(session_key, parsed)
                 reasoning_applied = True
+
+        # Write-through the non-secret parts so the override survives a
+        # gateway restart (same as the /model path).  Router-applied reasoning
+        # is non-secret and travels with the model route so both rehydrate (and
+        # clear at conversation boundaries) as one record.
+        persisted_override = dict(self._session_model_overrides[session_key])
+        if reasoning_applied:
+            persisted_override["reasoning_config"] = dict(parsed)
+        try:
+            await self.async_session_store.set_model_override(
+                session_key,
+                persisted_override,
+            )
+        except Exception:
+            logger.debug("model router: persist session override failed", exc_info=True)
 
         # Evict cached agent so the next turn creates a fresh agent from the
         # override (same invalidation the /model path performs).
@@ -17919,6 +17938,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _saved_override = None
             _saved_reasoning = None
             _saved_note = None
+            _saved_route_state = None
             if _router_applied:
                 _saved_override = self._session_model_overrides.get(session_key)
                 _reasoning_store = getattr(self, "_session_reasoning_overrides", None)
@@ -17930,6 +17950,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _notes = getattr(self, "_pending_model_notes", None)
                 if isinstance(_notes, dict):
                     _saved_note = _notes.get(session_key)
+                _route_states = getattr(self, "_pending_runtime_route_states", None)
+                if isinstance(_route_states, dict):
+                    _saved_route_state = _route_states.get(session_key)
             # Treat auto-reset as a full conversation boundary — one funnel
             # call clears every conversation-scoped per-session dict
             # (model/reasoning overrides, pending model notes, last-resolved
@@ -17949,10 +17972,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if not hasattr(self, "_pending_model_notes"):
                         self._pending_model_notes = {}
                     self._pending_model_notes[session_key] = _saved_note
+                if _saved_route_state:
+                    self._set_pending_runtime_route_state(session_key, _saved_route_state)
+                _persisted_override = dict(
+                    self._session_model_overrides[session_key]
+                )
+                if _saved_reasoning is not None:
+                    _persisted_override["reasoning_config"] = dict(
+                        _saved_reasoning
+                    )
                 try:
                     await self.async_session_store.set_model_override(
                         session_key,
-                        self._session_model_overrides[session_key],
+                        _persisted_override,
                     )
                 except Exception:
                     logger.debug(
@@ -28044,10 +28076,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         ``_session_model_overrides`` is in-memory only, so before persistence
         a restart silently reverted every session to the global default model.
-        The non-secret parts (model/provider/base_url) are written through to
-        the session store when /model runs (and cleared on /new); here we read
-        them back on first use and re-resolve credentials via the normal
-        runtime provider resolution — api_key is never persisted to disk.
+        The non-secret parts (model/provider/base_url, plus router-applied
+        reasoning_config when present) are written through to the session
+        store and cleared together on /new. Here we read them back on first
+        use and re-resolve credentials via the normal runtime provider
+        resolution — api_key is never persisted to disk.
 
         No-op when an in-memory override already exists (live state wins) or
         when the store has nothing persisted (e.g. the user ran /new, which
@@ -28133,6 +28166,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     provider, exc_info=True,
                 )
         self._session_state(session_key).conversation.model_override = override
+        persisted_reasoning = persisted.get("reasoning_config")
+        reasoning_state = self._session_state(session_key).conversation
+        if (
+            reasoning_state.reasoning_override is None
+            and isinstance(persisted_reasoning, dict)
+        ):
+            reasoning_state.reasoning_override = dict(persisted_reasoning)
         logger.info(
             "Rehydrated persisted /model override for session=%s: model=%s provider=%s",
             session_key, override.get("model"), provider or "",
