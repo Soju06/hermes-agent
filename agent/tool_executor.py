@@ -2237,7 +2237,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             # don't fan out there, Phase 0).
             def _execute(next_args: dict) -> Any:
                 return _dispatch_notes_tool(agent, "notes_write", next_args)
-            function_result, function_args, middleware_trace, _execution_blocked = _managed_values(_run_agent_tool_execution_middleware(
+            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
                 agent,
                 function_name=function_name,
                 function_args=function_args,
@@ -2253,7 +2253,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         elif function_name == "notes_read":
             def _execute(next_args: dict) -> Any:
                 return _dispatch_notes_tool(agent, "notes_read", next_args)
-            function_result, function_args, middleware_trace, _execution_blocked = _managed_values(_run_agent_tool_execution_middleware(
+            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
                 agent,
                 function_name=function_name,
                 function_args=function_args,
@@ -2269,7 +2269,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         elif function_name == "memory_propose":
             def _execute(next_args: dict) -> Any:
                 return _dispatch_notes_tool(agent, "memory_propose", next_args)
-            function_result, function_args, middleware_trace, _execution_blocked = _managed_values(_run_agent_tool_execution_middleware(
+            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
                 agent,
                 function_name=function_name,
                 function_args=function_args,
