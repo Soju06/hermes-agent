@@ -2289,7 +2289,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             def _execute(next_args: dict) -> Any:
                 from agent.ingest_curator import dispatch_curator_verdict_for_agent
                 return dispatch_curator_verdict_for_agent(agent, next_args)
-            function_result, function_args, middleware_trace, _execution_blocked = _managed_values(_run_agent_tool_execution_middleware(
+            function_result, function_args, middleware_trace, _execution_blocked, _execution_dispatched = _managed_values(_run_agent_tool_execution_middleware(
                 agent,
                 function_name=function_name,
                 function_args=function_args,
