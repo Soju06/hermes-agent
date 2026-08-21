@@ -822,6 +822,17 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
   - `5f0904d8b fix(gateway): model-family-aware thinkingConfig for Gemini classifier`
 - **touches:** `gateway/model_router.py`, `tests/gateway/test_model_router.py`
 
+### 80. reasoning-route-wire
+- **branch:** `soju/patches/reasoning-route-wire`
+- **stacked-on:** `soju/patches/gemini-classifier-thinking-compat` (#79 — stack tip at authoring time)
+- **origin:** `local-author` (implemented by codex per /tmp/reasoning-route-fix-prompt.md; diagnosis at /tmp/reasoning-route-wire-diagnosis.md)
+- **upstream_pr:** _(none — router/session-override persistence seam is fork-only)_
+- **state:** `local-only`
+- **rationale:** Probe-verified diagnosis (2026-08-20) confirmed the routed reasoning happy path is correct but found three robustness gaps that silently drop routed `reasoning_effort`: (1) router-applied reasoning lived only in in-memory SessionState — a gateway restart rehydrated the routed model but not the effort, and `noop_satisfied` never re-stamps it; now persisted (sanitized, non-secret, nested in the existing session model-override record) and rehydrated unless a live explicit session override exists; (2) `try_activate_fallback()` re-resolved reasoning from global config only, overwriting a non-None session/routed config (None with global unset); now preserves the active value and resolves config only when absent — model-specific downgrade stays in the adapter; (3) cached prior-fallback agents let `restore_primary_runtime()` restore a stale non-None snapshot over the freshly assigned per-turn config; TurnRunner now syncs `_primary_runtime.reasoning_config` at assignment. RED reverse-verified: fixes reverted with tests kept → exactly 5 failures. 81 tests green across 8 suites at commit.
+- **commits:**
+  - `80438f9d6 fix(gateway): persist routed reasoning across restart and fallback`
+- **touches:** `gateway/run.py`, `gateway/session.py`, `agent/chat_completion_helpers.py`, `tests/gateway/test_model_router.py`, `tests/gateway/test_session_model_override_persistence.py`, `tests/gateway/test_reasoning_primary_runtime_sync.py`, `tests/run_agent/test_fallback_reasoning_override.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
