@@ -479,7 +479,9 @@ def build_session_context_prompt(context: SessionContext, *, redact_pii: bool = 
     return "\n".join(lines)
 
 
-# /model override keys safe to persist; ``api_key``/``api_mode`` must NEVER reach sessions.json.
+# Scalar /model override keys safe to persist; ``api_key``/``api_mode`` must NEVER reach
+# sessions.json. A validated, non-secret router ``reasoning_config`` may also travel in the record
+# so the routed model and effort restart atomically (see sanitize_model_override).
 PERSISTABLE_MODEL_OVERRIDE_KEYS = ("model", "provider", "base_url")
 
 
@@ -494,6 +496,19 @@ def sanitize_model_override(override: Optional[dict[str, Any]]) -> Optional[dict
         k: str(v) for k, v in override.items()
         if k in PERSISTABLE_MODEL_OVERRIDE_KEYS and v not in (None, "")
     }
+    reasoning = override.get("reasoning_config")
+    if isinstance(reasoning, dict):
+        cleaned_reasoning = None
+        if reasoning.get("enabled") is False:
+            cleaned_reasoning = {"enabled": False}
+        elif reasoning.get("enabled") is True:
+            from hermes_constants import parse_reasoning_effort
+
+            parsed = parse_reasoning_effort(reasoning.get("effort"))
+            if parsed is not None and parsed.get("enabled") is True:
+                cleaned_reasoning = parsed
+        if cleaned_reasoning:
+            cleaned["reasoning_config"] = cleaned_reasoning
     if cleaned and override.get("router_applied") is True:
         cleaned["router_applied"] = True
     return cleaned or None
@@ -548,8 +563,9 @@ class SessionEntry:
     # SIGKILL/OOM so unclean startup recovers the exact session instead of guessing.
     active_turn_token: Optional[str] = None
     active_turn_started_at: Optional[datetime] = None
-    # Session-scoped /model override (model/provider/base_url ONLY — never credentials, see
-    # sanitize_model_override). Persisted so a restart keeps the chosen model.
+    # Session-scoped /model override (model/provider/base_url plus a validated router
+    # reasoning_config and the router's router_applied mark ONLY — never credentials, see
+    # sanitize_model_override). Persisted so a restart keeps the chosen model and routed effort.
     model_override: Optional[dict[str, Any]] = None
     # Profile owning the bot that received this lane's traffic (``RoutingIdentity.transport_profile``,
     # "default" spelled out). The key namespace only says where the turn RUNS; after a restart this is
@@ -1191,7 +1207,8 @@ class SessionStore(
         return self._update_entry(session_key, lambda e: e.metadata.__setitem__(key, value))
 
     def set_model_override(self, session_key: str, override: Optional[dict[str, Any]]) -> None:
-        """Persist (or clear, with ``None``) the /model override; non-secret keys only."""
+        """Persist (or clear, with ``None``) the /model override; non-secret keys only
+        (model/provider/base_url and validated router-applied reasoning_config)."""
         from dataclasses import replace
 
         cleaned = sanitize_model_override(override)

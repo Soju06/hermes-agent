@@ -646,12 +646,6 @@ class GatewayInboundModelRouterMixin:
         if not hasattr(self, "_model_router_fresh_applies"):
             self._model_router_fresh_applies = {}
         self._model_router_fresh_applies[session_key] = True
-        # Write-through the non-secret parts so the override survives a gateway restart (same as
-        # the /model path).
-        try:
-            await self.async_session_store.set_model_override(session_key, self._session_model_overrides[session_key])
-        except Exception:
-            logger.debug("model router: persist session override failed", exc_info=True)
 
         reasoning_applied = False
         effort = str(directive.get("reasoning_effort") or "")
@@ -661,6 +655,17 @@ class GatewayInboundModelRouterMixin:
             if parsed is not None:
                 self._set_session_reasoning_override(session_key, parsed)
                 reasoning_applied = True
+
+        # Write-through the non-secret parts so the override survives a gateway restart (same as
+        # the /model path). Router-applied reasoning is non-secret and travels with the model route
+        # so both rehydrate (and clear at conversation boundaries) as one record.
+        persisted_override = dict(self._session_model_overrides[session_key])
+        if reasoning_applied:
+            persisted_override["reasoning_config"] = dict(parsed)
+        try:
+            await self.async_session_store.set_model_override(session_key, persisted_override)
+        except Exception:
+            logger.debug("model router: persist session override failed", exc_info=True)
 
         # Evict cached agent so the next turn creates a fresh agent from the override (same
         # invalidation the /model path performs).

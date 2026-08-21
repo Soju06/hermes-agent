@@ -148,8 +148,9 @@ class GatewayAgentCacheMixin:
 
     def _rehydrate_session_model_override(self, session_key: str) -> None:
         """Lazily restore a persisted /model override after a gateway restart: non-secret parts
-        (model/provider/base_url) are written through on /model and read back on first use; api_key
-        is never persisted and is re-resolved. No-op when an in-memory override or nothing exists."""
+        (model/provider/base_url, plus router-applied reasoning_config when present) are written
+        through on /model and read back on first use; api_key is never persisted and is re-resolved.
+        No-op when an in-memory override or nothing exists."""
         from gateway.run import _resolve_runtime_agent_kwargs_for_provider
         store = getattr(self, "session_store", None)
         if self._session_model_override(session_key) is not None or store is None:
@@ -199,6 +200,12 @@ class GatewayAgentCacheMixin:
                     "(provider=%s); using credential-less override", provider, exc_info=True,
                 )
         self._session_state(session_key).conversation.model_override = override
+        # Router-applied reasoning travels with the model route (see sanitize_model_override);
+        # live state wins when a /reasoning override already exists in memory.
+        persisted_reasoning = persisted.get("reasoning_config")
+        reasoning_state = self._session_state(session_key).conversation
+        if reasoning_state.reasoning_override is None and isinstance(persisted_reasoning, dict):
+            reasoning_state.reasoning_override = dict(persisted_reasoning)
         logger.info(
             "Rehydrated persisted /model override for session=%s: model=%s provider=%s",
             session_key, override.get("model"), provider or "",

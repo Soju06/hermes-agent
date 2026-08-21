@@ -601,6 +601,7 @@ class GatewayTurnPrepareMixin:
             _saved_override = None
             _saved_reasoning = None
             _saved_note = None
+            _saved_route_state = None
             if _router_applied:
                 _saved_override = self._session_model_overrides.get(session_key)
                 # The reasoning override lives on SessionState (``_set_session_reasoning_override``).
@@ -610,6 +611,9 @@ class GatewayTurnPrepareMixin:
                 _notes = getattr(self, "_pending_model_notes", None)
                 if isinstance(_notes, dict):
                     _saved_note = _notes.get(session_key)
+                _route_states = getattr(self, "_pending_runtime_route_states", None)
+                if isinstance(_route_states, dict):
+                    _saved_route_state = _route_states.get(session_key)
             # Treat auto-reset as a full conversation boundary — one funnel call clears every
             # conversation-scoped per-session dict (model/reasoning overrides, pending model notes,
             # last-resolved cache, router hysteresis streak, …) plus boundary security state
@@ -627,10 +631,13 @@ class GatewayTurnPrepareMixin:
                     if not hasattr(self, "_pending_model_notes"):
                         self._pending_model_notes = {}
                     self._pending_model_notes[session_key] = _saved_note
+                if _saved_route_state:
+                    self._set_pending_runtime_route_state(session_key, _saved_route_state)
+                _persisted_override = dict(self._session_model_overrides[session_key])
+                if _saved_reasoning is not None:
+                    _persisted_override["reasoning_config"] = dict(_saved_reasoning)
                 try:
-                    await self.async_session_store.set_model_override(
-                        session_key, self._session_model_overrides[session_key],
-                    )
+                    await self.async_session_store.set_model_override(session_key, _persisted_override)
                 except Exception:
                     logger.debug("model router: re-persist override after auto-reset failed", exc_info=True)
             # Evict the cached agent so the fresh session does not inherit the previous

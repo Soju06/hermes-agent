@@ -623,6 +623,16 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         pending_runtime_route_state = (
             _consume_route_state(ctx.session_key) if callable(_consume_route_state) else None
         ) or {}
+        active_route_name = str(pending_runtime_route_state.pop("active_route_name", "") or "").strip()
+        if active_route_name:
+            agent._active_route_name = active_route_name
+        # run_conversation restores the primary runtime in its turn prologue before building
+        # provider kwargs. Keep that snapshot's per-turn reasoning value in sync so a cached agent
+        # cannot restore a stale config over a routed (or explicit session) override.
+        if isinstance(getattr(agent, "_primary_runtime", None), dict):
+            agent._primary_runtime["reasoning_config"] = (
+                dict(reasoning_config) if isinstance(reasoning_config, dict) else None
+            )
         agent._runtime_route_state = pending_runtime_route_state or None
         turn_sidecar_parts = runner._consume_pending_turn_sidecar_notes(ctx.session_key)
         if agent._runtime_route_state:

@@ -1951,11 +1951,19 @@ def _update_fallback_context_compressor(agent) -> None:
 
 
 def _reresolve_fallback_reasoning_config(agent) -> None:
-    """Per-model override > global reasoning_effort (YAML False = disabled); a config load
-    failure keeps the current reasoning_config rather than killing the swap."""
+    """Preserve the already session-resolved value (gateway /reasoning or routed effort) across
+    fallback activation. Only an absent active value falls through to fallback-model config
+    resolution (Closes #21256): per-model override > global reasoning_effort (YAML False =
+    disabled). Provider adapters still own model-specific wire adaptation such as xhigh -> max;
+    this layer must not pre-downgrade the session preference. A config load failure keeps the
+    current reasoning_config rather than killing the swap."""
+    if getattr(agent, "reasoning_config", None) is not None:
+        logger.info(
+            "Fallback %s: preserving active session reasoning_config: %s",
+            agent.model, agent.reasoning_config,
+        )
+        return
     try:
-        # Re-resolve reasoning_config for the new fallback model (Closes #21256). Wrapped in try/except
-        # because a config load failure must not kill the swap.
         from hermes_cli.config import load_config
         from hermes_constants import resolve_reasoning_config
         agent.reasoning_config = resolve_reasoning_config(load_config() or {}, agent.model)
