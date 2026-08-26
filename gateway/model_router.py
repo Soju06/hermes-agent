@@ -66,6 +66,13 @@ DEV_LABELS = ("NORMAL", "DOCUMENT_WORK", "FRONTEND_DEV", "SYSTEM_DEV")
 # the session model constantly. Upgrades (chat→dev) stay immediate.
 DEFAULT_NORMAL_DOWNGRADE_STREAK = 3
 
+# Member→primary re-promotion hysteresis: route membership is absorbing (any
+# ``accepted`` member no-ops forever), so a session parked on a non-primary
+# member is walked back to the route primary after this many consecutive
+# member no-op turns. Config: router.repromote_after_turns, per-route
+# repromote_after_turns overrides; <= 0 disables.
+DEFAULT_REPROMOTE_AFTER_TURNS = 3
+
 _DECISION_LOG_ENV = "HERMES_MODEL_ROUTER_DECISION_LOG"
 _DECISION_LOG_FILENAME = "model_router_decisions.jsonl"
 
@@ -690,6 +697,86 @@ def _resolve_route_directive(
     return directive
 
 
+def _reset_repromote(entry: dict[str, Any]) -> None:
+    entry["repromote_streak"] = 0
+    entry["repromote_route"] = ""
+
+
+def _repromote_on_noop(
+    *,
+    entry: dict[str, Any],
+    route_name: str,
+    runtime: dict[str, Any] | None,
+    catalog: Any,
+    router: Any,  # hermes_cli.model_routes.RouterConfig
+    trusted: bool,
+    resolve: Callable[[], Optional[dict]],
+    noop_outcome: str = "noop_satisfied",
+) -> tuple[Optional[dict], str]:
+    """Advance the member→primary re-promotion streak for one no-op turn.
+
+    Called only when the runtime already satisfies ``route_name``. Returns
+    (directive, outcome): the directive is non-None only for a
+    ``repromote_to_primary`` emission. ``resolve`` is invoked once the streak
+    reaches the threshold (never per-turn — route resolution health-probes),
+    and the emitted directive must be the true primary (``source ==
+    "default"``): a session is never re-promoted onto a health-fallback
+    member. ``trusted`` mirrors the normal_streak rule — a regex-fallback
+    label during a classifier outage must not walk a session toward a swap.
+    ``entry`` is the per-session hysteresis dict; ``normal_streak`` and
+    ``repromote_streak`` are separate counters and never interact.
+    """
+    try:
+        from hermes_cli.model_routes import _lookup_route, _model_matches
+
+        spec = _lookup_route(catalog, route_name)
+    except Exception as exc:
+        logger.debug("model router: repromote lookup failed open for %r: %s", route_name, exc)
+        return None, noop_outcome
+    if spec is None:
+        return None, noop_outcome
+    override = getattr(spec, "repromote_after_turns", None)
+    threshold = (
+        int(override) if override is not None
+        else int(getattr(router, "repromote_after_turns", DEFAULT_REPROMOTE_AFTER_TURNS))
+    )
+    if threshold <= 0:
+        return None, noop_outcome
+    runtime_model = (runtime or {}).get("model")
+    if _model_matches(runtime_model, spec.model):
+        entry["repromote_streak"] = 0
+        return None, noop_outcome
+    if not trusted:
+        return None, noop_outcome
+    if str(entry.get("repromote_route") or "") != route_name:
+        # Route changed under the streak: reset-then-advance for the new route.
+        entry["repromote_streak"] = 0
+        entry["repromote_route"] = route_name
+    streak = min(int(entry.get("repromote_streak") or 0) + 1, threshold)
+    entry["repromote_streak"] = streak
+    if streak < threshold:
+        return None, f"noop_satisfied_repromote_{streak}_of_{threshold}"
+    directive = resolve()
+    if (
+        directive is not None
+        and directive.get("source") == "default"
+        and not _model_matches(runtime_model, directive.get("model"))
+    ):
+        directive = dict(directive)
+        directive["reason"] = (
+            f"repromote to route primary after {streak} accepted-member turns "
+            f"({runtime_model} -> {directive['model']})"
+        )
+        # Emission resets in shadow too: shadow shares the state dict and
+        # never applies, so without this it would re-emit every turn.
+        _reset_repromote(entry)
+        return directive, "repromote_to_primary"
+    # Unhealthy primary (fallback-source or same-as-runtime resolution):
+    # hold the streak clamped at threshold and retry next turn, so the
+    # session re-promotes on the first turn after the primary heals.
+    return None, "repromote_held"
+
+
 def static_rule_decision(
     *,
     rule: dict[str, Any],
@@ -699,19 +786,33 @@ def static_rule_decision(
     runtime: dict[str, Any] | None,
     cfg: dict[str, Any] | None,
     catalog: Any,
+    router: Any,  # hermes_cli.model_routes.RouterConfig
     mode: str,
+    state: dict[str, Any],
 ) -> RoutingDecision:
     """Build the decision for an already-matched static rule.
 
     ``text`` is the raw event text (used for the log ``msg_head`` only —
     matching already happened in :func:`match_static_rule`). The runtime
     snapshot is only needed from this point on, so callers can defer taking
-    it until a rule actually matched.
+    it until a rule actually matched. ``state`` is the same per-session
+    hysteresis dict the classifier path threads (re-promotion streaks are
+    shared across both paths).
     """
     route_name = str(rule.get("route") or "")
+    entry = state.setdefault(session_key or "unknown", {"normal_streak": 0})
     directive: Optional[dict] = None
     if _runtime_already_satisfies(runtime, route_name, cfg, catalog):
-        outcome = "noop_satisfied"
+        # Static labels are deterministic — no llm-source trust gate here.
+        directive, outcome = _repromote_on_noop(
+            entry=entry,
+            route_name=route_name,
+            runtime=runtime,
+            catalog=catalog,
+            router=router,
+            trusted=True,
+            resolve=lambda: _resolve_route_directive(route_name, cfg, catalog),
+        )
     else:
         directive = _resolve_route_directive(route_name, cfg, catalog)
         if directive is None:
@@ -719,6 +820,7 @@ def static_rule_decision(
             outcome = "none"
         else:
             outcome = "switch"
+            _reset_repromote(entry)
     record = {
         "policy": "static_rule",
         "session_key": session_key or "unknown",
@@ -756,9 +858,10 @@ def classifier_decision(
     skill-gate ``_apply_dev_routing``.
 
     ``state`` is the GatewayRunner-owned per-session hysteresis dict
-    ({session_key: {"normal_streak": int}}); shadow and enforce share it.
-    Contains the blocking classifier HTTP call — gateway callers run this
-    off the event loop.
+    ({session_key: {"normal_streak": int, "repromote_streak": int,
+    "repromote_route": str}}); shadow and enforce share it. Contains the
+    blocking classifier HTTP call — gateway callers run this off the event
+    loop.
     """
     context = build_context(
         event=event,
@@ -782,9 +885,19 @@ def classifier_decision(
         entry["normal_streak"] = 0
         directive = _resolve_route_directive(str(label_routes.get(dev_label) or ""), cfg, catalog)
         if directive and _runtime_already_satisfies(runtime, str(directive.get("route") or ""), cfg, catalog):
-            directive, outcome = None, "noop_satisfied"
+            resolved = directive
+            directive, outcome = _repromote_on_noop(
+                entry=entry,
+                route_name=str(resolved.get("route") or ""),
+                runtime=runtime,
+                catalog=catalog,
+                router=router,
+                trusted=detail.get("source") == "llm",
+                resolve=lambda: resolved,  # already resolved this turn — no extra probes
+            )
         elif directive:
             outcome = "switch"
+            _reset_repromote(entry)
     else:  # NORMAL
         # Only LLM-sourced NORMALs advance the downgrade streak. A fail-open
         # NORMAL from an outage must never walk a session toward CHAT.
@@ -796,7 +909,16 @@ def classifier_decision(
         if chat_directive is None:
             outcome = "normal_no_chat_route"
         elif _runtime_already_satisfies(runtime, str(chat_directive.get("route") or ""), cfg, catalog):
-            outcome = "noop_already_chat"
+            directive, outcome = _repromote_on_noop(
+                entry=entry,
+                route_name=str(chat_directive.get("route") or ""),
+                runtime=runtime,
+                catalog=catalog,
+                router=router,
+                trusted=detail.get("source") == "llm",
+                resolve=lambda: chat_directive,
+                noop_outcome="noop_already_chat",
+            )
         elif not runtime:
             outcome = "normal_unknown_runtime"
         elif detail.get("source") != "llm":
@@ -808,6 +930,7 @@ def classifier_decision(
                 f"chat handoff after {entry['normal_streak']} consecutive NORMAL turns"
             )
             outcome = "downgrade_to_chat"
+            _reset_repromote(entry)
         else:
             outcome = f"normal_streak_{entry['normal_streak']}_of_{threshold}"
 
@@ -880,7 +1003,9 @@ def evaluate_event(
             runtime=runtime,
             cfg=cfg,
             catalog=catalog,
+            router=router,
             mode=mode,
+            state=state,
         )
     if text.startswith("/"):
         return None
