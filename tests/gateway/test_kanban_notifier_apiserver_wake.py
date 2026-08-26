@@ -72,6 +72,14 @@ def _make_runner(adapters):
     return runner
 
 
+def _init_isolated_kanban(tmp_path, monkeypatch):
+    """Initialize the default board through the board-aware path chain."""
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+
+
 def _create_completed_subscription(platform, chat_id, session_id=None):
     conn = kb.connect()
     try:
@@ -216,4 +224,3 @@ def test_apiserver_wake_failure_rewinds_then_retries_destination(
     assert attempted_sessions == ["origin-session", "origin-session"]
     assert "worker-session" not in attempted_sessions
     assert _unseen_terminal_events(tid, "api_server", "origin-session") == []
-

@@ -55,6 +55,14 @@ def _make_runner(adapter):
     return runner
 
 
+def _init_isolated_kanban(tmp_path, monkeypatch):
+    """Initialize the default board through the board-aware path chain."""
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+
+
 def _create_completed_subscription(summary="done once"):
     conn = kb.connect()
     try:
@@ -82,9 +90,7 @@ def _unseen_terminal_events(tid):
 
 
 def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, monkeypatch):
-    db_path = tmp_path / "dm-topic-metadata.db"
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
-    kb.init_db()
+    _init_isolated_kanban(tmp_path, monkeypatch)
 
     conn = kb.connect()
     try:
@@ -138,9 +144,7 @@ def test_active_named_profile_subscription_is_delivered(tmp_path, monkeypatch):
     multiplex secondary, find no _profile_adapters entry, fail closed, and
     rewind the claim forever — silent zero-delivery.
     """
-    db_path = tmp_path / "actionable-block.db"
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
-    kb.init_db()
+    _init_isolated_kanban(tmp_path, monkeypatch)
     reason = "AGE-39 — https://linear.example/AGE-39 — publishing verified."
     conn = kb.connect()
     try:
@@ -172,9 +176,7 @@ def test_non_dispatch_gateway_claims_only_its_profile_subscriptions(
     tmp_path, monkeypatch,
 ):
     """A profile gateway delivers its events while another gateway dispatches."""
-    db_path = tmp_path / "cross-profile-notifier.db"
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
-    kb.init_db()
+    _init_isolated_kanban(tmp_path, monkeypatch)
     conn = kb.connect()
     try:
         foreign_tid = kb.create_task(
@@ -219,9 +221,7 @@ def test_legacy_subscription_requires_confirmed_dispatcher_lock_owner(
     tmp_path, monkeypatch,
 ):
     """Startup and lock-losing gateways cannot claim legacy notifications."""
-    db_path = tmp_path / "legacy-lock-owner.db"
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
-    kb.init_db()
+    _init_isolated_kanban(tmp_path, monkeypatch)
     conn = kb.connect()
     try:
         task_id = kb.create_task(conn, title="legacy", assignee="worker")
@@ -304,9 +304,7 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
     Two crashes ten seconds apart on the same task — both should land on
     the adapter.
     """
-    db_path = tmp_path / "redeliver-cycle.db"
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
-    kb.init_db()
+    _init_isolated_kanban(tmp_path, monkeypatch)
 
     conn = kb.connect()
     try:
@@ -459,9 +457,7 @@ def test_notifier_subscription_survives_done_reopen_until_archive(
 
 
 def test_notifier_wakeup_uses_subscription_chat_type(tmp_path, monkeypatch):
-    db_path = tmp_path / "chat-type-wakeup.db"
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
-    kb.init_db()
+    _init_isolated_kanban(tmp_path, monkeypatch)
 
     conn = kb.connect()
     try:
@@ -523,9 +519,7 @@ def test_kanban_notifier_isolates_per_subscription_failure(tmp_path, monkeypatch
     subscription, the entire notifier tick used to abort — silently blocking
     delivery for every other subscription.
     """
-    db_path = tmp_path / "isolation.db"
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
-    kb.init_db()
+    _init_isolated_kanban(tmp_path, monkeypatch)
 
     # Create two tasks with subscriptions and complete both. The BAD task is
     # created first: list_notify_subs() has no ORDER BY, so SQLite's natural
@@ -586,9 +580,7 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
     attention) produced zero notification and the task stalled in triage
     silently.
     """
-    db_path = tmp_path / "block-loop.db"
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
-    kb.init_db()
+    _init_isolated_kanban(tmp_path, monkeypatch)
 
     conn = kb.connect()
     try:
