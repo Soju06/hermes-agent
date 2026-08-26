@@ -955,6 +955,12 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
         # guarded read must never crash the guard, so treat either as
         # "nothing to scan" (mirrors the resolve() ValueError guard below).
         return None, False
+    except ValueError:
+        # A NUL byte embedded in the path itself (machine code tokenized as
+        # a "path" by a caller that fed binary content into the recursion).
+        # Path.resolve tolerates it upstream (#76762); os.open must too — a
+        # guarded path must never crash the guard.
+        return None, False
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
