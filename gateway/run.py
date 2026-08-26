@@ -17327,9 +17327,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Its only writes are the runner-owned streak dict and the decision log,
         so it can soak alongside a live skill-gate plugin without interfering.
 
-        enforce: applies ``switch``/``downgrade_to_chat`` directives the same
-        way /model does (session override + store persist + agent eviction),
-        and stamps ``applied: true/false`` on every decision record.
+        enforce: applies ``switch``/``downgrade_to_chat``/
+        ``repromote_to_primary`` directives the same way /model does (session
+        override + store persist + agent eviction), and stamps
+        ``applied: true/false`` on every decision record.
         """
         from gateway import model_router as _model_router
         from hermes_cli.model_routes import load_routes as _load_model_routes
@@ -17378,7 +17379,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 runtime=runtime,
                 cfg=cfg,
                 catalog=catalog,
+                router=catalog.router,
                 mode=mode,
+                state=state,
             )
         else:
             # (4) The classifier is a blocking urllib call (up to
@@ -17405,7 +17408,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if (
             mode == "enforce"
             and directive
-            and decision.outcome in ("switch", "downgrade_to_chat")
+            and decision.outcome in ("switch", "downgrade_to_chat", "repromote_to_primary")
         ):
             reasoning_effort = str(directive.get("reasoning_effort") or "")
             try:
