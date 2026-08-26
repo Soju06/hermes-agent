@@ -270,6 +270,13 @@ class ChatCompletionsTransport(ProviderTransport):
         - Codex Responses API fields: ``codex_reasoning_items`` /
           ``codex_message_items`` on the message, ``call_id`` /
           ``response_item_id`` on ``tool_calls`` entries.
+        - ``reasoning`` and ``reasoning_details`` on assistant messages —
+          Hermes trajectory text and structured thinking replay state used by
+          Anthropic/OpenRouter-style providers. They are not part of the
+          OpenAI Chat Completions message schema, and strict OpenAI-compatible
+          endpoints (GLM Vooy, Fireworks, Mistral, etc.) reject them with
+          ``Extra inputs are not permitted`` errors. Keep them in persisted
+          history, but never send them on the chat_completions wire path.
         - ``extra_content`` on ``tool_calls`` (Gemini thought_signature) —
           stripped unless the outgoing ``model`` is itself Gemini-family.
           Gemini 3 thinking models attach it for replay, but strict providers
@@ -306,6 +313,8 @@ class ChatCompletionsTransport(ProviderTransport):
             if (
                 "codex_reasoning_items" in msg
                 or "codex_message_items" in msg
+                or "reasoning" in msg
+                or "reasoning_details" in msg
                 or "tool_name" in msg
                 or "effect_disposition" in msg
                 or "timestamp" in msg  # #47868 — strict providers reject this
@@ -364,7 +373,6 @@ class ChatCompletionsTransport(ProviderTransport):
         for msg_idx, msg in enumerate(messages):
             if not isinstance(msg, dict):
                 continue
-
             copied_msg: dict[str, Any] | None = None
 
             def mutable_msg() -> dict[str, Any]:
@@ -377,6 +385,8 @@ class ChatCompletionsTransport(ProviderTransport):
             if (
                 "codex_reasoning_items" in msg
                 or "codex_message_items" in msg
+                or "reasoning" in msg
+                or "reasoning_details" in msg
                 or "tool_name" in msg
                 or "effect_disposition" in msg
                 or "timestamp" in msg  # #47868 — leak into strict providers
@@ -385,11 +395,12 @@ class ChatCompletionsTransport(ProviderTransport):
                 out_msg = mutable_msg()
                 out_msg.pop("codex_reasoning_items", None)
                 out_msg.pop("codex_message_items", None)
+                out_msg.pop("reasoning", None)
+                out_msg.pop("reasoning_details", None)
                 out_msg.pop("tool_name", None)
                 out_msg.pop("effect_disposition", None)
                 out_msg.pop("timestamp", None)  # #47868 — leak into strict providers
                 out_msg.pop("api_content", None)  # persist-what-you-send sidecar
-
 
             # Drop all Hermes-internal scaffolding markers (``_``-prefixed).
             # OpenAI's message schema has no ``_``-prefixed fields, so this
