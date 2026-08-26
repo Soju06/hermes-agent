@@ -14,7 +14,7 @@ worker would otherwise inherit that worker's dispatcher identity.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from contextvars import ContextVar, Token
+from contextvars import Context, ContextVar, Token
 from typing import Iterator, Mapping, MutableMapping
 
 _DELEGATED_CHILD_CONTEXT: ContextVar[bool] = ContextVar(
@@ -34,6 +34,14 @@ _NON_DISPATCHER_OWNED_CONTEXT: ContextVar[bool] = ContextVar(
 
 DELEGATED_CHILD_ENV_MARKER = "HERMES_DELEGATED_CHILD_CONTEXT"
 
+KANBAN_ENV_PREFIX = "HERMES_KANBAN_"
+
+# Enumerated for documentation/tests only. Do NOT use this tuple to decide what
+# to strip: the dispatcher (``hermes_cli/kanban_db.py``) grows its worker env
+# over time (HERMES_KANBAN_BRANCH, _GOAL_MODE, _GOAL_MAX_TURNS were all added
+# after this list was written and silently escaped the scrub for that whole
+# window). ``scrub_kanban_env`` strips by prefix so a new dispatcher variable is
+# covered on the day it is introduced instead of the day someone notices.
 KANBAN_ENV_KEYS: tuple[str, ...] = (
     "HERMES_KANBAN_TASK",
     "HERMES_KANBAN_RUN_ID",
@@ -42,6 +50,9 @@ KANBAN_ENV_KEYS: tuple[str, ...] = (
     "HERMES_KANBAN_CLAIM_LOCK",
     "HERMES_KANBAN_BOARD",
     "HERMES_KANBAN_DB",
+    "HERMES_KANBAN_BRANCH",
+    "HERMES_KANBAN_GOAL_MODE",
+    "HERMES_KANBAN_GOAL_MAX_TURNS",
 )
 
 
@@ -121,20 +132,88 @@ def exit_non_dispatcher_owned_context(token: Token[bool]) -> None:
     _NON_DISPATCHER_OWNED_CONTEXT.reset(token)
 
 
+def reset_delegated_child_context_in(ctx: Context) -> None:
+    """Clear the delegated-child marker inside a *copied* Context.
+
+    ``contextvars.Context`` cannot be written from the outside, but a value set
+    while running inside it persists in that object — so this is the supported
+    way to hand a worker thread a context that is otherwise identical to its
+    parent's but is NOT flagged as delegated-child. Used by
+    ``tools.thread_context.propagate_context_to_thread``: the marker is a scope
+    around one synchronous child run, not an inheritable identity, and detached
+    daemon threads (ingest-curator, bg-review, async delegation, execute_code
+    RPC loops) outlive that scope.
+    """
+    ctx.run(_DELEGATED_CHILD_CONTEXT.set, False)
+
+
 def is_delegated_child_process_context() -> bool:
-    """Return True in this process or a subprocess spawned by a child."""
+    """Return True in this process or a subprocess spawned by a child.
+
+    The env marker is the cross-process half of the signal: a subprocess a
+    delegated child spawns has no ContextVar, so ``scrub_kanban_env`` stamps
+    ``HERMES_DELEGATED_CHILD_CONTEXT`` into its environment instead.
+
+    A mismatch — marker present in ``os.environ`` while the ContextVar is
+    unset — means this process inherited the marker rather than being scoped by
+    it. That is normal and correct for a genuine grandchild subprocess, but it
+    is also exactly what a *latched* marker looks like: a long-lived gateway
+    that once picked the marker up (e.g. from a poisoned bash session snapshot)
+    will fail every Kanban mutation for the rest of its life with no visible
+    cause. Emit one debug line per process so the state is diagnosable from
+    logs without changing behavior.
+    """
     import os
 
-    return bool(_DELEGATED_CHILD_CONTEXT.get()) or bool(
-        os.environ.get(DELEGATED_CHILD_ENV_MARKER)
-    )
+    ctx_flag = bool(_DELEGATED_CHILD_CONTEXT.get())
+    env_flag = bool(os.environ.get(DELEGATED_CHILD_ENV_MARKER))
+    if env_flag and not ctx_flag:
+        _warn_marker_without_context_once()
+    return ctx_flag or env_flag
+
+
+_MARKER_MISMATCH_WARNED = False
+
+
+def _warn_marker_without_context_once() -> None:
+    """Log the env-marker-without-ContextVar state once per process."""
+    global _MARKER_MISMATCH_WARNED
+    if _MARKER_MISMATCH_WARNED:
+        return
+    _MARKER_MISMATCH_WARNED = True
+    try:
+        import logging
+        import os
+
+        logging.getLogger(__name__).debug(
+            "%s is set in os.environ but no delegated-child ContextVar is "
+            "active (pid=%s). Expected for a subprocess spawned by a "
+            "delegate_task child; in a long-lived gateway process it means the "
+            "marker was inherited or latched, and every Kanban mutation will "
+            "be refused. Check the bash session snapshot "
+            "(/tmp/hermes-snap-*.sh) and the parent process environment.",
+            DELEGATED_CHILD_ENV_MARKER,
+            os.getpid(),
+        )
+    except Exception:
+        pass
 
 
 def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[str, str]:
-    """Return *env* with dispatcher-only Kanban variables removed."""
-    cleaned = dict(env)
-    for key in KANBAN_ENV_KEYS:
-        cleaned.pop(key, None)
+    """Return *env* with dispatcher-only Kanban variables removed.
+
+    Strips by ``KANBAN_ENV_PREFIX`` rather than by the enumerated
+    ``KANBAN_ENV_KEYS``. The dispatcher's worker-env builder is the growing
+    side of this contract; an allowlist here means every variable it adds
+    leaks into delegated children until someone edits this file. Nothing
+    outside the dispatcher sets ``HERMES_KANBAN_*``, so a prefix strip has no
+    false positives.
+    """
+    cleaned = {
+        key: value
+        for key, value in dict(env).items()
+        if not key.startswith(KANBAN_ENV_PREFIX)
+    }
     cleaned[DELEGATED_CHILD_ENV_MARKER] = "1"
     return cleaned
 
