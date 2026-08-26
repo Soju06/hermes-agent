@@ -7,11 +7,50 @@ from unittest.mock import ANY, call, patch
 from model_tools import (
     handle_function_call,
     get_all_tool_names,
+    get_tool_definitions,
     get_toolset_for_tool,
     _AGENT_LOOP_TOOLS,
     _LEGACY_TOOLSET_MAP,
     TOOL_TO_TOOLSET_MAP,
 )
+
+
+# =========================================================================
+# disabled_toolsets accepts individual tool names
+# =========================================================================
+
+class TestDisabledToolsetsAcceptsToolNames:
+    def _names(self, disabled=None):
+        return {
+            t["function"]["name"]
+            for t in get_tool_definitions(disabled_toolsets=disabled, quiet_mode=True)
+        }
+
+    def test_single_tool_name_is_removed(self):
+        base = self._names()
+        assert "write_file" in base, "precondition: core file tool is registered"
+        after = self._names(["write_file"])
+        assert "write_file" not in after
+        # Only that one tool leaves; everything else stays.
+        assert base - after == {"write_file"}
+
+    def test_multiple_tool_names_removed(self):
+        after = self._names(["write_file", "web_search"])
+        assert "write_file" not in after
+        assert "web_search" not in after
+
+    def test_unknown_name_is_graceful_noop(self):
+        base = self._names()
+        after = self._names(["definitely_not_a_real_tool_or_toolset"])
+        assert after == base
+
+    def test_toolset_name_still_takes_precedence_over_tool_name(self):
+        # `memory` is BOTH a toolset and a tool. The toolset match must win,
+        # removing the whole bundle (memory + notes_write + notes_read + …),
+        # never just the single `memory` tool.
+        after = self._names(["memory"])
+        assert "memory" not in after
+        assert "notes_read" not in after, "toolset subtraction should remove the bundle"
 
 
 # =========================================================================
