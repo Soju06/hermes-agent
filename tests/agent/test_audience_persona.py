@@ -281,119 +281,6 @@ class TestLoadAudiencePersona:
             chat_name="general", user_id="U0B03PB973M",
         ) == "work"
 
-    def test_base_persona_prefixes_selected_mode(self, persona_home):
-        modes_yaml = persona_home / "personas" / "modes.yaml"
-        modes_yaml.write_text(
-            "base_persona: base.md\n" + _MODES_YAML,
-            encoding="utf-8",
-        )
-        (persona_home / "personas" / "base.md").write_text(
-            "SHARED BASE PERSONA", encoding="utf-8",
-        )
-        assert load_audience_persona(platform="slack") == (
-            "work", "SHARED BASE PERSONA\n\nWORK PERSONA BODY",
-        )
-
-    def test_base_persona_key_absent_keeps_mode_only(self, persona_home):
-        # This is the pre-feature expectation: without the optional key the
-        # selected mode remains the complete injected content.
-        assert load_audience_persona(platform="slack") == (
-            "work", "WORK PERSONA BODY",
-        )
-
-    def test_missing_base_persona_keeps_mode_only(self, persona_home):
-        (persona_home / "personas" / "modes.yaml").write_text(
-            "base_persona: missing.md\n" + _MODES_YAML,
-            encoding="utf-8",
-        )
-        assert load_audience_persona(platform="slack") == (
-            "work", "WORK PERSONA BODY",
-        )
-
-    @pytest.mark.parametrize("base_content", ["", " \n\t"])
-    def test_empty_or_whitespace_base_persona_keeps_mode_only(
-        self, persona_home, base_content,
-    ):
-        (persona_home / "personas" / "modes.yaml").write_text(
-            "base_persona: base.md\n" + _MODES_YAML,
-            encoding="utf-8",
-        )
-        (persona_home / "personas" / "base.md").write_text(
-            base_content, encoding="utf-8",
-        )
-        assert load_audience_persona(platform="slack") == (
-            "work", "WORK PERSONA BODY",
-        )
-
-    def test_base_persona_traversal_keeps_mode_only(self, persona_home):
-        (persona_home / "personas" / "modes.yaml").write_text(
-            "base_persona: ../evil.md\n" + _MODES_YAML,
-            encoding="utf-8",
-        )
-        (persona_home / "evil.md").write_text("ESCAPED BASE", encoding="utf-8")
-        assert load_audience_persona(platform="slack") == (
-            "work", "WORK PERSONA BODY",
-        )
-
-    def test_base_persona_same_as_mode_is_not_duplicated(self, persona_home):
-        (persona_home / "personas" / "modes.yaml").write_text(
-            "base_persona: work.md\n" + _MODES_YAML,
-            encoding="utf-8",
-        )
-        assert load_audience_persona(platform="slack") == (
-            "work", "WORK PERSONA BODY",
-        )
-
-    def test_missing_mode_with_base_keeps_loader_resolver_off(self, persona_home):
-        (persona_home / "personas" / "modes.yaml").write_text(
-            "base_persona: base.md\n" + _MODES_YAML,
-            encoding="utf-8",
-        )
-        (persona_home / "personas" / "base.md").write_text(
-            "SHARED BASE PERSONA", encoding="utf-8",
-        )
-        (persona_home / "personas" / "work.md").unlink()
-        assert load_audience_persona(platform="slack") is None
-        assert resolve_audience_mode(platform="slack") is None
-
-    def test_base_persona_uses_protection_pipeline(self, persona_home):
-        (persona_home / "personas" / "modes.yaml").write_text(
-            "base_persona: base.md\n" + _MODES_YAML,
-            encoding="utf-8",
-        )
-        (persona_home / "personas" / "base.md").write_text(
-            "BASE RAW", encoding="utf-8",
-        )
-        scan_calls = []
-        truncate_calls = []
-
-        def fake_scan(content, label):
-            scan_calls.append((content, label))
-            return f"SCANNED {content}"
-
-        def fake_truncate(content, label, **kwargs):
-            truncate_calls.append((content, label, kwargs))
-            return f"TRUNCATED {content}"
-
-        with (
-            patch("agent.prompt_builder._scan_context_content", side_effect=fake_scan),
-            patch("agent.prompt_builder._truncate_content", side_effect=fake_truncate),
-        ):
-            result = load_audience_persona(platform="slack")
-
-        assert result == (
-            "work", "TRUNCATED SCANNED BASE RAW\n\nTRUNCATED SCANNED WORK PERSONA BODY",
-        )
-        assert {label for _, label in scan_calls} == {
-            "personas/base.md", "personas/work.md",
-        }
-        assert {label for _, label, _ in truncate_calls} == {
-            "personas/base.md", "personas/work.md",
-        }
-        paths_by_label = {label: kwargs["read_path"] for _, label, kwargs in truncate_calls}
-        assert paths_by_label["personas/base.md"].endswith("/personas/base.md")
-        assert paths_by_label["personas/work.md"].endswith("/personas/work.md")
-
     def test_owner_discord_dm_gets_private(self, persona_home):
         result = load_audience_persona(
             platform="discord", chat_type="dm", user_id="370452451406381057",
@@ -530,7 +417,7 @@ def _make_agent(**overrides):
     base = dict(
         load_soul_identity=True,
         skip_context_files=True,
-        valid_tool_names=[],
+        valid_tool_names=["skill_view"],
         _task_completion_guidance=False,
         _tool_use_enforcement=False,
         _environment_probe=False,
@@ -554,7 +441,6 @@ def _make_agent(**overrides):
 def _build_parts(agent, persona_result):
     with (
         patch("run_agent.load_soul_md", return_value=""),
-        patch("run_agent.build_nous_subscription_prompt", return_value=""),
         patch("run_agent.build_environment_hints", return_value=""),
         patch("run_agent.build_context_files_prompt", return_value=""),
         patch("run_agent.load_audience_persona", return_value=persona_result) as loader,
@@ -742,7 +628,6 @@ class TestCurrentSpeakerUserId:
         agent = _make_agent(_user_id=_OWNER)  # discord dm, owner-cached
         with (
             patch("run_agent.load_soul_md", return_value=""),
-            patch("run_agent.build_nous_subscription_prompt", return_value=""),
             patch("run_agent.build_environment_hints", return_value=""),
             patch("run_agent.build_context_files_prompt", return_value=""),
         ):
@@ -758,7 +643,6 @@ class TestCurrentSpeakerUserId:
         agent = _make_agent(_user_id=_OWNER)
         with (
             patch("run_agent.load_soul_md", return_value=""),
-            patch("run_agent.build_nous_subscription_prompt", return_value=""),
             patch("run_agent.build_environment_hints", return_value=""),
             patch("run_agent.build_context_files_prompt", return_value=""),
         ):
