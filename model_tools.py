@@ -497,8 +497,22 @@ def _compute_tool_definitions(
                 tools_to_include.difference_update(legacy_tools)
                 if not quiet_mode:
                     print(f"🚫 Disabled legacy toolset '{toolset_name}': {', '.join(legacy_tools)}")
+            elif registry.get_entry(toolset_name) is not None:
+                # Not a toolset — but a registered tool name. Subtract the single
+                # tool. This lets `disabled_toolsets` turn off an individual tool
+                # (e.g. `text_to_speech`, a browser action) without having to own
+                # a one-tool toolset. Toolset names are matched first above, so a
+                # name that is BOTH a toolset and a tool (e.g. `memory`, `todo`)
+                # always resolves as the toolset; disable such a tool by its
+                # toolset. Because every surface (CLI, gateway, cron, delegate
+                # children, the tool_search bridge scope) already threads
+                # `disabled_toolsets` through this one choke point, a tool
+                # disabled here can never be resurrected by tool_search.
+                tools_to_include.discard(toolset_name)
+                if not quiet_mode:
+                    print(f"🚫 Disabled tool '{toolset_name}'")
             elif not quiet_mode:
-                print(f"⚠️  Unknown toolset: {toolset_name}")
+                print(f"⚠️  Unknown toolset or tool: {toolset_name}")
 
     # Plugin-registered tools are now resolved through the normal toolset
     # path — validate_toolset() / resolve_toolset() / get_all_toolsets()
