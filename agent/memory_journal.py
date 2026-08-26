@@ -13,10 +13,14 @@ a turn is dispatched to external memory providers:
   buffer-hit metric) and GCs fully-acked files, but never replays.
 
 * **L0-mirror** (``~/.hermes/memory/l0-mirror/{YYYY-MM}.jsonl``, ADR-004 §②)
-  — local co-primary evidence journal. Every payload that leaves for the
-  graph (per-turn sync, end-of-session extraction input, pre-compression
-  extraction input) is mirrored to a monthly file on this host, so a total
-  graph loss can be rebuilt from local disk. Zero LLM calls, disk only.
+  — local co-primary evidence journal. Every per-turn sync payload that
+  leaves for the graph is mirrored (full scrubbed content) to a monthly file
+  on this host, so a total graph loss can be rebuilt from local disk; the
+  boundary extraction inputs (end-of-session, pre-compression) re-send
+  content already mirrored per-turn, so they are recorded as compact MARKER
+  records (role sequence + tool-call names, no content) instead of
+  re-mirroring the whole transcript on every compaction. Zero LLM calls,
+  disk only.
 
 Contract (both journals):
 
@@ -90,22 +94,95 @@ def _safe_session_filename(session_id: str) -> str:
     return (name or "_no_session") + ".jsonl"
 
 
+def _scrub_evidence_refs(refs: Any) -> List[Dict[str, Any]]:
+    """Recursively scrub every string value in a list of evidence-ref dicts.
+
+    The WAL must never hold secrets (ADR-004 §4.2 triple-scrub rule (a) —
+    the prefetch buffer-scan is a third reader), and an evidence ref's
+    ``quote`` field is caller-supplied free text just like ``content``.
+    Refs are flat dicts by contract, but the tool schema only enforces
+    ``type: object``, so nested structure is scrubbed too rather than
+    trusted. Non-dict items are coerced to scrubbed strings rather than
+    dropped so the curator can still see that something malformed was cited.
+    """
+
+    def _scrub_value(value: Any) -> Any:
+        if isinstance(value, str):
+            return _scrub(value)
+        if isinstance(value, dict):
+            return {str(k): _scrub_value(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_scrub_value(v) for v in value]
+        return value
+
+    out: List[Dict[str, Any]] = []
+    for ref in refs or []:
+        if isinstance(ref, dict):
+            out.append(_scrub_value(ref))
+        else:
+            out.append({"malformed": _scrub(str(ref))})
+    return out
+
+
+# One lock per journal file, module-level so it is shared across every
+# WAL/mirror INSTANCE in the process: the gateway builds many MemoryManagers
+# whose mem-sync workers all append to the same monthly mirror file, and each
+# instance holding its own lock would serialize nothing. Keyed by str(path);
+# journal paths are a small bounded set (one per session + one per month), so
+# the map never needs eviction.
+_path_locks: Dict[str, threading.Lock] = {}
+_path_locks_guard = threading.Lock()
+
+
+def _lock_for(path: Path) -> threading.Lock:
+    key = str(path)
+    with _path_locks_guard:
+        lock = _path_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _path_locks[key] = lock
+        return lock
+
+
 def _append_jsonl(path: Path, record: Dict[str, Any]) -> None:
-    """Append one JSON line. Single write() on an O_APPEND handle so
-    concurrent writers interleave at line granularity."""
+    """Append one JSON line atomically with respect to concurrent appenders.
+
+    The complete line is built first and written with a single ``os.write``
+    on a raw ``O_APPEND`` fd. A buffered handle is NOT safe here: it may
+    flush the heal-newline and the record as separate write() syscalls, and a
+    record larger than the io buffer is flushed as several raw writes — a
+    concurrent writer then interleaves mid-record and both lines come out
+    corrupt (which the scanner silently skips: evidence loss). The per-path
+    module lock additionally serializes the tail-heal check-then-act among
+    in-process writers; O_APPEND positioning covers the write itself even
+    against out-of-process appenders.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
-    with open(path, "a+b") as f:
-        # Heal a truncated tail left by a crash mid-append: if the file does
-        # not end with a newline, start this record on a fresh line so the
-        # corrupt fragment stays confined to its own (scanner-skipped) line
-        # instead of merging with — and corrupting — this record too.
-        f.seek(0, os.SEEK_END)
-        if f.tell() > 0:
-            f.seek(-1, os.SEEK_END)
-            if f.read(1) != b"\n":
-                f.write(b"\n")
-        f.write((line + "\n").encode("utf-8"))
+    payload = (
+        json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    with _lock_for(path):
+        fd = os.open(str(path), os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+        try:
+            # Heal a truncated tail left by a crash mid-append: if the file
+            # does not end with a newline, start this record on a fresh line
+            # so the corrupt fragment stays confined to its own
+            # (scanner-skipped) line instead of merging with — and
+            # corrupting — this record too.
+            if os.fstat(fd).st_size > 0:
+                with open(path, "rb") as probe:
+                    probe.seek(-1, os.SEEK_END)
+                    if probe.read(1) != b"\n":
+                        os.write(fd, b"\n")
+            # Single syscall in the overwhelmingly common case; the loop only
+            # exists for the (regular-file-rare) partial-write return, where
+            # finishing the line beats leaving a truncated record.
+            view = memoryview(payload)
+            while view:
+                written = os.write(fd, view)
+                view = view[written:]
+        finally:
+            os.close(fd)
 
 
 # ---------------------------------------------------------------------------
@@ -115,16 +192,22 @@ def _append_jsonl(path: Path, record: Dict[str, Any]) -> None:
 class PendingTurnWAL:
     """Durable per-turn buffer for the external-memory sync path.
 
-    One JSONL file per session under ``state/memory-pending/``. Two record
+    One JSONL file per session under ``state/memory-pending/``. Three record
     shapes::
 
         {"type": "turn", "id": ..., "ts": ..., "session_id": ..., "seq": n,
          "records": [{"role": "user", "content": ...},
                      {"role": "assistant", "content": ...}]}
-        {"type": "ack", "id": <turn entry id>, "ts": ...}
+        {"type": "proposal", "id": ..., "ts": ..., "session_id": ...,
+         "kind": "proposal", "content": ..., "kind_hint": ...,
+         "evidence_refs": [...], "origin": ...}
+        {"type": "ack", "id": <turn/proposal entry id>, "ts": ...}
 
-    A turn whose id has a matching ack was successfully ingested; anything
-    else is unconsumed and survives restarts for the Phase-2 curator.
+    A turn/proposal whose id has a matching ack was successfully consumed;
+    anything else is unconsumed and survives restarts for the Phase-2
+    curator. Proposals are the ``memory_propose`` writer's records (ADR-004
+    §③ writer list): 0 LLM calls, non-blocking, drained by the curator
+    (salience accumulator weight +3 per proposal, §4.3).
     """
 
     def __init__(self, base_dir: Optional[Path] = None):
@@ -198,6 +281,44 @@ class PendingTurnWAL:
             logger.debug("memory-pending WAL append failed (fail-open)", exc_info=True)
             return None
 
+    def append_proposal(
+        self,
+        session_id: str,
+        content: str,
+        *,
+        kind_hint: str = "",
+        evidence_refs: Optional[List[Dict[str, Any]]] = None,
+        origin: str = "user",
+    ) -> Optional[str]:
+        """Durably queue a ``memory_propose`` record (ADR-004 §③ writer list,
+        Phase 1). Zero LLM calls, append-only, fail-open — the Phase-2
+        curator is the consumer. Returns the entry id, or None when
+        disabled/failed."""
+        if journals_disabled():
+            return None
+        try:
+            path = self._path_for(session_id)
+            entry_id = uuid.uuid4().hex[:12]
+            record = {
+                "type": "proposal",
+                "id": entry_id,
+                "ts": round(time.time(), 3),
+                "session_id": session_id or "",
+                "kind": "proposal",
+                "content": _scrub(content),
+                "kind_hint": str(kind_hint or ""),
+                "evidence_refs": _scrub_evidence_refs(evidence_refs),
+                "origin": str(origin or "user"),
+            }
+            _append_jsonl(path, record)
+            return entry_id
+        except Exception:
+            logger.debug(
+                "memory-pending WAL proposal append failed (fail-open)",
+                exc_info=True,
+            )
+            return None
+
     def ack(self, session_id: str, entry_id: str) -> None:
         """Mark a turn entry as consumed (all provider ingests succeeded)."""
         if journals_disabled() or not entry_id:
@@ -237,7 +358,11 @@ class PendingTurnWAL:
                         rec_id = rec.get("id")
                         if not rec_id:
                             continue
-                        if rec_type == "turn":
+                        if rec_type in ("turn", "proposal"):
+                            # Proposals are unconsumed until a curator ack,
+                            # exactly like turns — a proposals-only file must
+                            # not look "fully acked" and get GC'd (that would
+                            # silently drop queued memory_propose records).
                             turn_ids.add(rec_id)
                         elif rec_type == "ack":
                             acked_ids.add(rec_id)
@@ -308,6 +433,10 @@ class L0Mirror:
     rebuild evidence episodes after a total graph loss: the role-tagged body,
     the session id (group hint), the WAL entry id (join key to pending/), the
     payload kind, and the destination provider names (source metadata).
+
+    Per-turn sync payloads carry full (scrubbed) content. Boundary payloads
+    (``session_end`` / ``pre_compress``) are content-free markers — see
+    :meth:`build_boundary_record`.
     """
 
     def __init__(self, base_dir: Optional[Path] = None):
@@ -354,6 +483,73 @@ class L0Mirror:
         except Exception:
             logger.debug("l0-mirror append_turn failed (fail-open)", exc_info=True)
 
+    def build_boundary_record(
+        self,
+        kind: str,
+        messages: Optional[List[Dict[str, Any]]],
+        *,
+        session_id: str = "",
+        provider_names: Iterable[str] = (),
+    ) -> Optional[Dict[str, Any]]:
+        """Derive a compact boundary MARKER record for a ``session_end`` /
+        ``pre_compress`` extraction payload: the role sequence, tool-call
+        names, and per-message content sizes — but no message content.
+
+        The transcript handed to boundary extraction is content the per-turn
+        mirror already holds; re-mirroring it wholesale made the mirror grow
+        superlinearly under repeated compaction (every ``pre_compress``
+        re-wrote the entire window). The marker keeps the evidence that a
+        boundary extraction happened — including the tool-call sequence that
+        per-turn records lack — at tens of bytes per message.
+
+        Pure derivation, no I/O, never raises: safe to call inline on the
+        hot path, with the returned record handed to :meth:`append_record`
+        on a background worker. Returns None when disabled or on failure.
+        """
+        if journals_disabled():
+            return None
+        try:
+            skeleton = []
+            for msg in messages or []:
+                if not isinstance(msg, dict):
+                    continue
+                entry: Dict[str, Any] = {
+                    "role": msg.get("role") or "",
+                    "chars": len(_flatten_message_text(msg.get("content"))),
+                }
+                tool_calls = msg.get("tool_calls") or []
+                if tool_calls:
+                    entry["tool_calls"] = [
+                        (tc.get("function") or {}).get("name", "?")
+                        for tc in tool_calls if isinstance(tc, dict)
+                    ]
+                skeleton.append(entry)
+            return {
+                "ts": round(time.time(), 3),
+                "kind": kind,
+                "session_id": session_id or "",
+                "skeleton": skeleton,
+                "meta": {
+                    "providers": list(provider_names),
+                    "message_count": len(skeleton),
+                },
+            }
+        except Exception:
+            logger.debug(
+                "l0-mirror boundary record build failed (fail-open)", exc_info=True
+            )
+            return None
+
+    def append_record(self, record: Optional[Dict[str, Any]]) -> None:
+        """Append a pre-built record (None is a no-op). Fail-open."""
+        if record is None or journals_disabled():
+            return
+        try:
+            ts = float(record.get("ts") or time.time())
+            _append_jsonl(self._path_for(ts), record)
+        except Exception:
+            logger.debug("l0-mirror append_record failed (fail-open)", exc_info=True)
+
     def append_messages(
         self,
         kind: str,
@@ -362,58 +558,45 @@ class L0Mirror:
         session_id: str = "",
         provider_names: Iterable[str] = (),
     ) -> None:
-        """Mirror a message-list payload (``session_end`` / ``pre_compress``)
-        just before it is handed to provider extraction."""
-        if journals_disabled():
-            return
-        try:
-            body = []
-            for msg in messages or []:
-                if not isinstance(msg, dict):
-                    continue
-                entry: Dict[str, Any] = {
-                    "role": msg.get("role") or "",
-                    "content": _scrub(_flatten_message_text(msg.get("content"))),
-                }
-                tool_calls = msg.get("tool_calls") or []
-                if tool_calls:
-                    entry["tool_calls"] = [
-                        (tc.get("function") or {}).get("name", "?")
-                        for tc in tool_calls if isinstance(tc, dict)
-                    ]
-                body.append(entry)
-            ts = time.time()
-            _append_jsonl(self._path_for(ts), {
-                "ts": round(ts, 3),
-                "kind": kind,
-                "session_id": session_id or "",
-                "body": body,
-                "meta": {
-                    "providers": list(provider_names),
-                    "message_count": len(body),
-                },
-            })
-        except Exception:
-            logger.debug("l0-mirror append_messages failed (fail-open)", exc_info=True)
+        """Record a boundary payload (``session_end`` / ``pre_compress``) as
+        a content-free marker — see :meth:`build_boundary_record`."""
+        self.append_record(
+            self.build_boundary_record(
+                kind, messages, session_id=session_id, provider_names=provider_names
+            )
+        )
 
 
 # ---------------------------------------------------------------------------
-# Process-level startup scan (once)
+# Process-level startup scan (once per pending directory)
 # ---------------------------------------------------------------------------
 
-_startup_scan_done = False
+_scanned_pending_dirs: set = set()
 _startup_scan_lock = threading.Lock()
 
 
 def run_pending_startup_scan_once(wal: PendingTurnWAL) -> None:
-    """Run the WAL startup scan/GC once per process (MemoryManager init calls
-    this; the gateway builds many managers, the directory only needs one
-    sweep). Fail-open."""
-    global _startup_scan_done
+    """Run the WAL startup scan/GC once per pending DIRECTORY per process.
+
+    MemoryManager init calls this; the gateway builds many managers over one
+    HERMES_HOME and the directory only needs one sweep — but a multi-profile
+    process constructs managers over SEVERAL homes, and a process-global once
+    flag would pin the scan (and its buffer-hit metric + GC) to whichever
+    profile happened to construct first, leaving the others unscanned
+    forever. Keyed by the wal's pinned directory instead. Fail-open.
+
+    Note: this is a startup sweep only — files fully acked while the process
+    stays up are GC'd on the NEXT process start, not continuously. Fine at
+    patch-cadence restart frequency; revisit if gateways ever run for months.
+    """
+    try:
+        key = str(wal._dir())
+    except Exception:  # pragma: no cover - _dir is attribute access
+        return
     with _startup_scan_lock:
-        if _startup_scan_done:
+        if key in _scanned_pending_dirs:
             return
-        _startup_scan_done = True
+        _scanned_pending_dirs.add(key)
     try:
         wal.scan_and_gc()
     except Exception:  # pragma: no cover - scan_and_gc guards internally
