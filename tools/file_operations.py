@@ -1031,7 +1031,8 @@ class ShellFileOperations(FileOperations):
                     pass
             return True
 
-    def _is_likely_binary(self, path: str, content_sample: str = None) -> bool:
+    def _is_likely_binary(self, path: str, content_sample: str = None,
+                          sample_truncated: bool = False) -> bool:
         """
         Check if a file is likely binary.
         
@@ -1052,7 +1053,16 @@ class ShellFileOperations(FileOperations):
             # sample carries the replacement char as binary (read-only) so the
             # agent can't corrupt it. Legitimate UTF-8 text effectively never
             # contains U+FFFD.
-            if "\ufffd" in content_sample[:1000]:
+            mojibake_sample = content_sample[:1000]
+            if sample_truncated:
+                # head -c can split a UTF-8 character at the byte boundary;
+                # decoding with errors="replace" leaves 1-3 trailing U+FFFDs.
+                trailing_replacements = (
+                    len(mojibake_sample) - len(mojibake_sample.rstrip("\ufffd"))
+                )
+                if 0 < trailing_replacements <= 3:
+                    mojibake_sample = mojibake_sample[:-trailing_replacements]
+            if "\ufffd" in mojibake_sample:
                 return True
             non_printable = sum(1 for c in content_sample[:1000]
                                if ord(c) < 32 and c not in '\n\r\t')
@@ -1532,7 +1542,9 @@ class ShellFileOperations(FileOperations):
             sample_cmd = f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null"
             sample_result = self._exec(sample_cmd)
             sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
-            is_binary = self._is_likely_binary(path, sample_output)
+            is_binary = self._is_likely_binary(
+                path, sample_output, sample_truncated=(file_size > 1000)
+            )
 
         if is_binary:
             # UTF-16 rescue (ported from MoonshotAI/kimi-code#2647): the
