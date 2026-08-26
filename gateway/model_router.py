@@ -337,6 +337,18 @@ def _api_key() -> str:
     )
 
 
+def _thinking_config(model: str) -> dict[str, Any]:
+    """Return a model-compatible Gemini thinking configuration.
+
+    Gemini 3.5+ returns HTTP 400 for ``thinkingBudget=0``; Gemini 3.7 cannot
+    disable thinking, and ``low`` is its minimum supported level.
+    """
+    match = re.search(r"gemini-(\d+)(?:\.(\d+))?", model)
+    if match and (int(match.group(1)), int(match.group(2) or 0)) < (3, 5):
+        return {"thinkingBudget": 0}
+    return {"thinkingLevel": "low"}
+
+
 def _call_gemini(
     user_prompt: str,
     *,
@@ -348,8 +360,8 @@ def _call_gemini(
 ) -> str:
     """Call Gemini API with separated system/user prompts for prompt caching.
 
-    Same request shape as the skill-gate plugin: temperature 0, thinking off,
-    structured JSON via responseMimeType/responseSchema, top-level
+    Same request shape as the skill-gate plugin: temperature 0, model-compatible
+    minimal thinking, structured JSON via responseMimeType/responseSchema, top-level
     systemInstruction (cached by Gemini across identical requests). No retry.
 
     Unlike the plugin, a missing API key raises so the caller takes the
@@ -365,7 +377,7 @@ def _call_gemini(
         "generationConfig": {
             "maxOutputTokens": max_tokens,
             "temperature": 0,
-            "thinkingConfig": {"thinkingBudget": 0},
+            "thinkingConfig": _thinking_config(model),
         },
     }
     if response_schema:
