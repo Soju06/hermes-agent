@@ -5091,6 +5091,7 @@ def _run_conversation_impl(
                         "Turn abandoned: the process was shutting down "
                         "before the model call could complete."
                     )
+                    _tag_exit("interpreter_shutdown")
                     return {
                         "final_response": _shutdown_summary,
                         "messages": messages,
