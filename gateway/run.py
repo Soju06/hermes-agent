@@ -17328,7 +17328,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Its only writes are the runner-owned streak dict and the decision log,
         so it can soak alongside a live skill-gate plugin without interfering.
 
-        enforce: applies ``switch``/``downgrade_to_chat``/
+        enforce: applies ``switch``/``downgrade_to_chat``/``refusal_switch``/
         ``repromote_to_primary`` directives the same way /model does (session
         override + store persist + agent eviction), and stamps
         ``applied: true/false`` on every decision record.
@@ -17409,7 +17409,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if (
             mode == "enforce"
             and directive
-            and decision.outcome in ("switch", "downgrade_to_chat", "repromote_to_primary")
+            and decision.outcome in (
+                "switch", "downgrade_to_chat", "repromote_to_primary", "refusal_switch",
+            )
         ):
             reasoning_effort = str(directive.get("reasoning_effort") or "")
             try:
@@ -17430,6 +17432,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     decision.outcome, session_key,
                     directive.get("route"), directive.get("model"), decision.label,
                 )
+                if (
+                    decision.outcome == "refusal_switch"
+                    and bool(getattr(getattr(catalog.router, "refusal", None), "notify", True))
+                ):
+                    try:
+                        confidence = float(decision.record.get("refusal_confidence"))
+                        evidence = str(decision.record.get("evidence") or "")[:80]
+                        notice = (
+                            f"⚠️ refusal-risk 감지 → {directive.get('route')} "
+                            f"({directive.get('model')}) 라우팅 "
+                            f"(conf {confidence:.2f}, {evidence})"
+                        )
+                        await self._deliver_platform_notice(source, notice)
+                    except Exception:
+                        logger.debug(
+                            "model router: refusal-risk notice send failed",
+                            exc_info=True,
+                        )
 
         await asyncio.to_thread(
             _model_router.log_decision,
