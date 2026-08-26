@@ -76,8 +76,9 @@ _ROUTER_KEYS = {
     "repromote_after_turns", "chat_route", "label_routes", "decision_log", "refusal",
 }
 _REFUSAL_KEYS = {
-    "enabled", "api_fallback", "min_confidence", "dev_route", "chat_route",
-    "document_route", "notify",
+    "enabled", "api_fallback", "clean_fork", "keep_user_turns", "mask_on_refusal",
+    "soft_detect", "max_recovery_hops", "min_confidence", "dev_route",
+    "chat_route", "document_route", "notify",
 }
 _ROUTER_MODES = ("off", "shadow", "enforce")
 # Classifier labels that may map to a route. NORMAL is not mappable — its
@@ -132,6 +133,11 @@ class RefusalConfig:
 
     enabled: bool = False
     api_fallback: bool = False
+    clean_fork: bool = True
+    keep_user_turns: int = 5
+    mask_on_refusal: bool = True
+    soft_detect: bool = True
+    max_recovery_hops: int = 2
     min_confidence: float = 0.85
     dev_route: str = "PERMISSIVE_DEV"
     chat_route: str = "PERMISSIVE_CHAT"
@@ -716,7 +722,10 @@ def _parse_refusal(raw: Any, issues: List[ConfigIssue]) -> RefusalConfig:
         ))
 
     kwargs: Dict[str, Any] = {}
-    for key in ("enabled", "api_fallback", "notify"):
+    for key in (
+        "enabled", "api_fallback", "clean_fork", "mask_on_refusal",
+        "soft_detect", "notify",
+    ):
         if key not in raw:
             continue
         value = raw[key]
@@ -729,6 +738,30 @@ def _parse_refusal(raw: Any, issues: List[ConfigIssue]) -> RefusalConfig:
                 f"(got {value!r}) — default used",
                 f"Use an unquoted YAML boolean: {key}: "
                 f"{'true' if getattr(RefusalConfig(), key) else 'false'}",
+            ))
+
+    if "keep_user_turns" in raw:
+        value = raw["keep_user_turns"]
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            kwargs["keep_user_turns"] = value
+        else:
+            issues.append(ConfigIssue(
+                "warning",
+                "model_routes: router.refusal.keep_user_turns must be an "
+                f"integer > 0 (got {value!r}) — default used",
+                f"Example: keep_user_turns: {RefusalConfig().keep_user_turns}",
+            ))
+
+    if "max_recovery_hops" in raw:
+        value = raw["max_recovery_hops"]
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            kwargs["max_recovery_hops"] = value
+        else:
+            issues.append(ConfigIssue(
+                "warning",
+                "model_routes: router.refusal.max_recovery_hops must be an "
+                f"integer > 0 (got {value!r}) — default used",
+                f"Example: max_recovery_hops: {RefusalConfig().max_recovery_hops}",
             ))
 
     if "min_confidence" in raw:
