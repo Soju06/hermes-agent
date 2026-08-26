@@ -49,6 +49,7 @@ def fresh_home(tmp_path, monkeypatch):
     for var in (
         "HERMES_KANBAN_DB",
         "HERMES_KANBAN_WORKSPACES_ROOT",
+        "HERMES_KANBAN_ATTACHMENTS_ROOT",
         "HERMES_KANBAN_HOME",
         "HERMES_KANBAN_BOARD",
     ):
@@ -98,12 +99,44 @@ class TestPathResolution:
         assert p == fresh_home / "kanban" / "boards" / "atm10-server" / "kanban.db"
 
 
-    def test_env_var_db_override_still_wins(self, fresh_home, tmp_path, monkeypatch):
-        """``HERMES_KANBAN_DB`` pins the file regardless of board= arg."""
-        forced = tmp_path / "custom.db"
-        monkeypatch.setenv("HERMES_KANBAN_DB", str(forced))
-        assert kb.kanban_db_path() == forced
-        assert kb.kanban_db_path(board="ignored") == forced
+    def test_explicit_board_overrides_inherited_worker_pins(
+        self, fresh_home, tmp_path, monkeypatch
+    ):
+        """A named board wins over every inherited per-path worker pin."""
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "worker.db"))
+        monkeypatch.setenv(
+            "HERMES_KANBAN_WORKSPACES_ROOT", str(tmp_path / "worker-workspaces")
+        )
+        monkeypatch.setenv(
+            "HERMES_KANBAN_ATTACHMENTS_ROOT", str(tmp_path / "worker-attachments")
+        )
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+
+        board_root = fresh_home / "kanban" / "boards" / "proj"
+        assert kb.kanban_db_path(board="proj") == board_root / "kanban.db"
+        assert kb.workspaces_root(board="proj") == board_root / "workspaces"
+        assert kb.attachments_root(board="proj") == board_root / "attachments"
+        assert kb.worker_logs_dir(board="proj") == board_root / "logs"
+
+    def test_worker_no_arg_paths_honor_env_pins(
+        self, fresh_home, monkeypatch
+    ):
+        """Unnamed worker calls retain the dispatcher-pinned board paths."""
+        kb.create_board("proj")
+        board_root = fresh_home / "kanban" / "boards" / "proj"
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(board_root / "kanban.db"))
+        monkeypatch.setenv(
+            "HERMES_KANBAN_WORKSPACES_ROOT", str(board_root / "workspaces")
+        )
+        monkeypatch.setenv(
+            "HERMES_KANBAN_ATTACHMENTS_ROOT", str(board_root / "attachments")
+        )
+        monkeypatch.setenv("HERMES_KANBAN_BOARD", "proj")
+
+        assert kb.kanban_db_path() == board_root / "kanban.db"
+        assert kb.workspaces_root() == board_root / "workspaces"
+        assert kb.attachments_root() == board_root / "attachments"
+        assert kb.worker_logs_dir() == board_root / "logs"
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +327,14 @@ class TestWorkerSpawnEnv:
 def _cli(args: list[str], env_extra: dict | None = None) -> subprocess.CompletedProcess:
     """Run ``hermes kanban …`` with PYTHONPATH pinned to the worktree."""
     env = dict(os.environ)
+    for var in (
+        "HERMES_KANBAN_DB",
+        "HERMES_KANBAN_WORKSPACES_ROOT",
+        "HERMES_KANBAN_ATTACHMENTS_ROOT",
+        "HERMES_KANBAN_HOME",
+        "HERMES_KANBAN_BOARD",
+    ):
+        env.pop(var, None)
     env["PYTHONPATH"] = str(_WORKTREE)
     if env_extra:
         env.update(env_extra)
@@ -342,5 +383,31 @@ class TestCLI:
         assert titlesB == ["Task B"]
         assert titlesD == []
 
+    def test_explicit_board_overrides_inherited_worker_env(self, tmp_path):
+        home = tmp_path / "hermes-home"
+        clean_env = {"HERMES_HOME": str(home)}
+        assert _cli(["boards", "create", "proj"], env_extra=clean_env).returncode == 0
 
+        inherited_worker_env = {
+            **clean_env,
+            "HERMES_KANBAN_DB": str(home / "kanban.db"),
+            "HERMES_KANBAN_WORKSPACES_ROOT": str(
+                home / "kanban" / "workspaces"
+            ),
+            "HERMES_KANBAN_BOARD": "default",
+        }
+        created = _cli(
+            ["--board", "proj", "create", "Explicit task", "--assignee", "dev"],
+            env_extra=inherited_worker_env,
+        )
+        assert created.returncode == 0, created.stderr
+
+        proj = _cli(["--board", "proj", "list", "--json"], env_extra=clean_env)
+        default = _cli(["list", "--json"], env_extra=clean_env)
+        assert proj.returncode == 0, proj.stderr
+        assert default.returncode == 0, default.stderr
+        assert [task["title"] for task in json.loads(proj.stdout)] == [
+            "Explicit task"
+        ]
+        assert json.loads(default.stdout) == []
 
