@@ -313,6 +313,48 @@ def _record_hygiene_cooldown(
         logger.debug("session hygiene cooldown persist failed: %s", exc)
 
 
+def _warn_hygiene_threshold_inversion(hygiene_pct, configured_threshold) -> None:
+    """Warn (never reject) when the hygiene/compressor layering is inverted.
+
+    Session hygiene is a pre-agent SAFETY NET and must trigger at a higher
+    context ratio than the agent's own compressor (``compression.threshold``).
+    If a config sets ``compression.threshold`` at or above
+    ``compression.hygiene_threshold``, the safety net starts firing before
+    the primary mechanism — hygiene compresses every turn while the agent's
+    compressor never gets a chance. Warning-only so existing deployments
+    keep working; unparsable values are ignored (the numeric validation of
+    each key happens at its own read site).
+
+    The hygiene block re-reads config on every incoming message, so the
+    warning is deduplicated per value pair — one line per misconfiguration,
+    not one per turn (it re-fires if the values change).
+    """
+    if configured_threshold is None:
+        return
+    try:
+        _threshold = float(configured_threshold)
+    except (TypeError, ValueError):
+        return
+    if _threshold >= hygiene_pct:
+        global _last_hygiene_inversion_warned
+        _pair = (_threshold, hygiene_pct)
+        if _last_hygiene_inversion_warned == _pair:
+            return
+        _last_hygiene_inversion_warned = _pair
+        logger.warning(
+            "compression.threshold (%.2f) >= compression.hygiene_threshold "
+            "(%.2f): the gateway hygiene safety net will fire before the "
+            "agent's own compressor. Set hygiene_threshold above "
+            "compression.threshold to restore the intended layering.",
+            _threshold, hygiene_pct,
+        )
+
+
+# Dedup latch for _warn_hygiene_threshold_inversion (per-process; the
+# hygiene config read runs once per incoming gateway message).
+_last_hygiene_inversion_warned = None
+
+
 def _status_template_to_regex(template: str) -> str:
     """Compile a compression status template constant into a regex source.
 
@@ -20795,9 +20837,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _hyg_provider = _model_cfg.get("provider") or None
                         _hyg_base_url = _model_cfg.get("base_url") or None
 
-                    # Read compression settings — only use enabled flag.
-                    # The threshold is intentionally separate from the agent's
-                    # compression.threshold (hygiene runs higher).
+                    # Read compression settings. The hygiene trigger ratio is
+                    # its own key (compression.hygiene_threshold, default
+                    # 0.85) — intentionally separate from the agent's
+                    # compression.threshold, because hygiene is the safety
+                    # net and must run HIGHER (layering checked below).
                     _comp_cfg = _hyg_data.get("compression", {})
                     if isinstance(_comp_cfg, dict):
                         _hyg_compression_enabled = str(
@@ -20840,6 +20884,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     _hyg_failure_cooldown_seconds = _parsed
                             except (TypeError, ValueError):
                                 pass
+                        # compression.hygiene_threshold: config exposure of
+                        # the previously hardcoded 0.85 trigger ratio. Out-of
+                        # -range or unparsable values keep the default.
+                        _raw_hyg_threshold = _comp_cfg.get("hygiene_threshold")
+                        if _raw_hyg_threshold is not None:
+                            try:
+                                _parsed = float(_raw_hyg_threshold)
+                                if 0.0 < _parsed <= 1.0:
+                                    _hyg_threshold_pct = _parsed
+                            except (TypeError, ValueError):
+                                pass
+                        _warn_hygiene_threshold_inversion(
+                            _hyg_threshold_pct, _comp_cfg.get("threshold")
+                        )
 
                 _hyg_configured_model = _hyg_model
                 _hyg_configured_provider = _hyg_provider
@@ -21198,7 +21256,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             # compressor can acquire the lock
                                             # immediately (no ABA against a new
                                             # holder — release is holder-scoped).
-                                            _hyg_commit_fence.release_cancelled_compression_lock()
+                                            # Off-loop: the hook ends in a
+                                            # synchronous SQLite DELETE
+                                            # (hermes_state.release_compression_lock)
+                                            # that showed up in event-loop stall
+                                            # stack dumps when run inline here.
+                                            # This is the cancellation path, so
+                                            # nothing downstream orders against
+                                            # the release, and the fence has
+                                            # already blocked any future commit.
+                                            await asyncio.to_thread(
+                                                _hyg_commit_fence.release_cancelled_compression_lock
+                                            )
                                             self._defer_agent_cleanup_until_future_done(
                                                 _hyg_future,
                                                 _hyg_agent,
@@ -21570,8 +21639,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         )
 
                     except Exception as e:
+                        # Format with %r plus the class name, NOT %s: the most
+                        # common escapee here is asyncio.TimeoutError, whose
+                        # str() is empty — every such line logged as
+                        # "auto-compress failed: " with no cause at all, which
+                        # made recurring hygiene failures undiagnosable.
                         logger.warning(
-                            "Session hygiene auto-compress failed: %s", e
+                            "Session hygiene auto-compress failed: %r (%s)",
+                            e, type(e).__name__,
                         )
 
         if _trace is not None:
