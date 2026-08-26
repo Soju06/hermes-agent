@@ -237,6 +237,7 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
     """
     if not text:
         return False
+    text = _shell_source_without_python_payloads(text)
     # Heredoc bodies that are provably inert data (quoted delimiter, data-sink
     # consumer like `cat > file <<'EOF'`) are masked before scanning (#88336):
     # a runbook line "a human can run: hermes gateway restart" inside such a
@@ -409,6 +410,52 @@ def _split_logical_lines(text: str) -> list[str]:
     return lines
 
 
+_PYTHON_C_RE = re.compile(
+    r"(?<!\S)(?:python|python\d+(?:\.\d+)*)\s+(?:-[^\s]+\s+)*-c\s+(['\"])",
+)
+_PYTHON_HEREDOC_RE = re.compile(
+    r"(?m)(?P<prefix>(?:^|[;&|]\s*)(?:python|python\d+(?:\.\d+)*)\s+[^\n]*<<-?\s*)(?P<quote>['\"]?)(?P<delim>[A-Za-z_][A-Za-z0-9_]*)\2\s*$"
+)
+
+
+def _shell_source_without_python_payloads(command: str) -> str:
+    """Remove only complete Python ``-c``/heredoc payloads before shell scans."""
+    if not command:
+        return command
+    text = command
+    # Complete quoted -c arguments are Python source, not shell commands.
+    out: list[str] = []
+    cursor = 0
+    for match in _PYTHON_C_RE.finditer(text):
+        quote = match.group(1)
+        end = text.find(quote, match.end())
+        if end < 0:
+            continue  # fail closed on ambiguous/unclosed syntax
+        out.append(text[cursor:match.end()])
+        out.append("__HERMES_PYTHON_PAYLOAD__")
+        cursor = end + 1
+    out.append(text[cursor:])
+    text = "".join(out)
+    # Complete Python heredoc bodies are similarly opaque; preserve line
+    # boundaries so surrounding shell statements remain visible.
+    lines = text.splitlines(keepends=True)
+    sanitized: list[str] = []
+    i = 0
+    while i < len(lines):
+        m = _PYTHON_HEREDOC_RE.match(lines[i].rstrip("\r\n"))
+        if not m:
+            sanitized.append(lines[i]); i += 1; continue
+        delim = m.group("delim"); j = i + 1
+        while j < len(lines) and lines[j].strip() != delim:
+            j += 1
+        if j >= len(lines):
+            sanitized.append(lines[i]); i += 1; continue
+        sanitized.append(lines[i])
+        sanitized.extend("\n" if line.endswith("\n") else "" for line in lines[i+1:j+1])
+        i = j + 1
+    return "".join(sanitized)
+
+
 def _iter_command_segments(command: str) -> Iterator[list[str]]:
     """Yield shell-tokenized command segments, honoring quotes and comments.
 
@@ -418,7 +465,7 @@ def _iter_command_segments(command: str) -> Iterator[list[str]]:
     (unbalanced quotes), fall back to per-physical-line tokenization for
     that logical line.
     """
-    normalized = command.replace("\\\n", "")
+    normalized = _shell_source_without_python_payloads(command).replace("\\\n", "")
     logical_lines = _split_logical_lines(normalized)
 
     for line in logical_lines:
