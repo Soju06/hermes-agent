@@ -1808,6 +1808,7 @@ def restore_primary_runtime(agent) -> bool:
         agent._fallback_activated = False
         agent._fallback_index = 0
         agent._rate_limit_backoff_count = 0  # reset exponential backoff counter
+        agent._fallback_reason = None
 
         # Reset the stale-call circuit breaker (#58962): the streak measured
         # the FALLBACK provider we're leaving; the restored primary deserves
@@ -1836,6 +1837,15 @@ def restore_primary_runtime(agent) -> bool:
                 # Notification surfaces are best-effort and must never undo a
                 # successful runtime restoration.
                 pass
+        # Publish the restore on the runtime_state hook so guardrail plugins
+        # (skill-gate) drop the fallback_reason from their cache when the
+        # primary returns.  Best-effort — restore must not fail on a hook.
+        try:
+            from agent.runtime_control import _emit_runtime_state_event, get_runtime_state
+
+            _emit_runtime_state_event(agent, event="restore", state=get_runtime_state(agent))
+        except Exception as _hook_err:
+            logger.debug("runtime_state restore event failed: %s", _hook_err)
         return True
     except Exception as e:
         logger.warning("Failed to restore primary runtime: %s", e)
@@ -3152,6 +3162,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     agent._provider_fallback_active = False
     agent._provider_fallback_route = None
     agent._fallback_index = 0
+    agent._fallback_reason = None
 
     # When the user deliberately swaps primary providers (e.g. openrouter
     # → anthropic), drop any fallback entries that target the OLD primary
