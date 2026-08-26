@@ -301,6 +301,11 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_EXEC_ASK",
     "HERMES_HOME_MODE",
     "HERMES_AGENT_USE_LEGACY_SESSION_KEYS",
+    # Model-route health kill switch + pytest-guard opt-in (ADR-003): either
+    # leaking from a developer/CI shell flips probe behavior for the whole
+    # test run; tests that need them set them explicitly.
+    "HERMES_MODEL_ROUTES_HEALTH",
+    "HERMES_MODEL_ROUTES_HEALTH_TEST",
     # Kanban path/board pins must never leak from a developer shell or
     # dispatched worker into tests; otherwise tests can write fake tasks to
     # the real ~/.hermes/kanban.db instead of the per-test HERMES_HOME.
@@ -473,6 +478,15 @@ def _hermetic_environment(tmp_path, monkeypatch):
     # defaultHost and silently select the wrong nested config block. Tests of
     # custom host resolution override/delete this explicitly.
     monkeypatch.setenv("HERMES_HONCHO_HOST", "hermes")
+
+    # Dynamic model router (fork, ADR-003): unit tests must never evaluate
+    # live routing. gateway.run._hermes_home is captured at import time —
+    # before this fixture's HERMES_HOME redirect — so _load_gateway_config()
+    # can see the developer's real config.yaml; with router.mode=enforce
+    # there, _model_router_stage would fire a real classifier call from
+    # unit tests. The env escape hatch WINS over config, so pin it off;
+    # router-mode tests manage this var explicitly (setenv/delenv).
+    monkeypatch.setenv("HERMES_MODEL_ROUTER_MODE", "off")
 
     # 3. Redirect HERMES_HOME to a per-test tempdir. Code that reads
     #    ``~/.hermes/*`` via ``get_hermes_home()`` now gets the tempdir.
