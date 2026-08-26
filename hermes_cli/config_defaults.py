@@ -7,6 +7,8 @@ verbatim from hermes_cli/config.py. Must not import from hermes_cli.config.
 DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
+    # Model routing catalog (ADR-003). Empty keeps routing dormant.
+    "model_routes": {},
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
@@ -1995,6 +1997,7 @@ DEFAULT_CONFIG = {
     "delegation": {
         "model": "",       # e.g. "google/gemini-3-flash-preview" (empty = inherit parent model)
         "provider": "",    # e.g. "openrouter" (empty = inherit parent provider + credentials)
+        "default_route": "",  # optional model_routes route for unrouted delegate tasks
         "base_url": "",    # direct OpenAI-compatible endpoint for subagents
         "api_key": "",     # API key for delegation.base_url (falls back to OPENAI_API_KEY)
         "api_mode": "",    # wire protocol for delegation.base_url: "chat_completions",
