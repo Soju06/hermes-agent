@@ -2133,6 +2133,28 @@ class ProcessRegistry:
             self._completion_consumed.add(session_id)
         return result
 
+    def _note_wait_timeout(self, session_id: str) -> int:
+        """Count consecutive timed-out waits on one process (reset on exit).
+
+        A model block-waiting through one full timeout is a normal flow; a
+        SECOND consecutive full wait on the same still-running process means
+        it is polling a long job in the foreground — the turn should end and
+        completion should arrive as an event instead (notify_on_complete).
+        """
+        with self._lock:
+            counts = getattr(self, "_wait_timeout_streaks", None)
+            if counts is None:
+                counts = {}
+                self._wait_timeout_streaks = counts
+            counts[session_id] = counts.get(session_id, 0) + 1
+            return counts[session_id]
+
+    def _clear_wait_timeout_streak(self, session_id: str) -> None:
+        with self._lock:
+            counts = getattr(self, "_wait_timeout_streaks", None)
+            if counts:
+                counts.pop(session_id, None)
+
     def wait(self, session_id: str, timeout: int = None) -> dict:
         """
         Block until a process exits, timeout, or interrupt.
@@ -2192,6 +2214,7 @@ class ProcessRegistry:
             self._reconcile_local_exit(session)
             if session.exited:
                 self._completion_consumed.add(session_id)
+                self._clear_wait_timeout_streak(session_id)
                 result = {
                     "status": "exited",
                     "command": session.command,
@@ -2250,6 +2273,22 @@ class ProcessRegistry:
             result["timeout_note"] = f"{timeout_note}. {base_note}"
         else:
             result["timeout_note"] = base_note
+
+        streak = self._note_wait_timeout(session_id)
+        try:
+            wait_cap = int(os.getenv("HERMES_PROCESS_WAIT_CAP", "1") or 1)
+        except (ValueError, TypeError):
+            wait_cap = 1
+        if wait_cap > 0 and streak > wait_cap:
+            session.notify_on_complete = True
+            result["notify_on_complete"] = True
+            result["timeout_note"] = (
+                f"{result['timeout_note']}. This is consecutive blocking wait "
+                f"#{streak} on this process — STOP polling in the foreground. "
+                "notify_on_complete has been enabled for you: end your turn "
+                "now with a short summary of what is running, and you will be "
+                "re-invoked automatically when it finishes."
+            )
         return result
 
     def kill_process(
@@ -3195,7 +3234,11 @@ PROCESS_SCHEMA = {
         "Actions: 'list' (show all), 'poll' (check status + new output), "
         "'log' (full output with pagination), 'wait' (block until done or timeout), "
         "'kill' (terminate), 'write' (send raw stdin data without newline), "
-        "'submit' (send data + Enter, for answering prompts), 'close' (close stdin/send EOF)."
+        "'submit' (send data + Enter, for answering prompts), 'close' (close stdin/send EOF). "
+        "'wait' is for jobs you expect to finish within ONE timeout window — do "
+        "not chain waits on the same process. If a wait times out, the job is "
+        "long: make sure notify_on_complete is set and END YOUR TURN with a "
+        "short summary of what is running; you'll be re-invoked on completion."
     ),
     "parameters": {
         "type": "object",
