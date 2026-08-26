@@ -13,6 +13,7 @@ model_routes pytest guard. Decision logs go to tmp via
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -1557,7 +1558,7 @@ def test_refusal_switch_clean_fork_disabled_preserves_transcript_and_notice(
     )
 
 
-def test_hard_refusal_masks_only_current_turn_and_stages_force(
+def test_hard_refusal_preserves_current_turn_and_stages_force(
     monkeypatch, tmp_path,
 ):
     messages = [
@@ -1580,20 +1581,22 @@ def test_hard_refusal_masks_only_current_turn_and_stages_force(
         )
     )
 
-    assert masked == 1
-    assert runner.session_store._db.inactive_ids == {4}
+    assert masked == 0
+    assert runner.session_store._db.inactive_ids == set()
     assert [
         message["content"]
         for message in runner.session_store._db.get_messages("sid-1")
         if message["role"] == "assistant"
-    ] == ["earlier completed answer"]
+    ] == ["earlier completed answer", "provider refusal output"]
     entry = runner._model_router_state["tg:c1"]
     assert entry["force_refusal_route"] is True
     assert entry["force_refusal_reason"] == "prior_turn_refused"
     assert entry["refusal_recovery_count"] == 1
 
 
-def test_soft_refusal_masks_current_turn_and_stages_force(monkeypatch, tmp_path):
+def test_soft_refusal_masks_current_turn_and_stages_force(
+    monkeypatch, tmp_path, caplog,
+):
     response = "A completed refusal explanation from the assistant. " * 2
     messages = [
         {"role": "user", "content": "earlier request"},
@@ -1611,13 +1614,14 @@ def test_soft_refusal_masks_current_turn_and_stages_force(monkeypatch, tmp_path)
     })
     monkeypatch.setattr(mr_mod, "classify_prior_refusal", probe)
 
-    masked = asyncio.run(runner._handle_gateway_soft_refusal(
-        "tg:c1",
-        "sid-1",
-        _source(),
-        {"final_response": response},
-        "current request",
-    ))
+    with caplog.at_level(logging.INFO, logger="agent.refusal_history"):
+        masked = asyncio.run(runner._handle_gateway_soft_refusal(
+            "tg:c1",
+            "sid-1",
+            _source(),
+            {"final_response": response},
+            "current request",
+        ))
 
     assert masked == 1
     assert runner.session_store._db.inactive_ids == {4}
@@ -1626,6 +1630,38 @@ def test_soft_refusal_masks_current_turn_and_stages_force(monkeypatch, tmp_path)
     assert entry["force_refusal_reason"] == "prior_turn_refused"
     assert entry["refusal_recovery_count"] == 1
     probe.assert_called_once()
+    assert "source=router_soft_refusal" in caplog.text
+    assert "configured=True apply=True" in caplog.text
+
+
+def test_soft_refusal_clean_fork_disabled_still_stages_without_mask(
+    monkeypatch, tmp_path,
+):
+    response = "A completed refusal explanation from the assistant. " * 2
+    runner, _ = _refusal_stage_runner(
+        monkeypatch,
+        tmp_path,
+        clean_fork=False,
+        messages=[
+            {"role": "user", "content": "current request"},
+            {"role": "assistant", "content": response},
+        ],
+    )
+    monkeypatch.setattr(mr_mod, "classify_prior_refusal", MagicMock(return_value={
+        "prior_refusal": True,
+        "prior_refusal_confidence": 0.94,
+        "source": "llm",
+    }))
+
+    masked = asyncio.run(runner._handle_gateway_soft_refusal(
+        "tg:c1", "sid-1", _source(), {"final_response": response}, "current request",
+    ))
+
+    assert masked == 0
+    assert runner.session_store._db.inactive_ids == set()
+    entry = runner._model_router_state["tg:c1"]
+    assert entry["force_refusal_route"] is True
+    assert entry["force_refusal_reason"] == "prior_turn_refused"
 
 
 def test_soft_refusal_below_threshold_does_not_mask_or_stage(monkeypatch, tmp_path):

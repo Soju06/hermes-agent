@@ -1,6 +1,52 @@
-"""History anchoring for refusal-driven model hops."""
+"""Refusal-source policy and history anchoring for model hops."""
 
 from __future__ import annotations
+
+from enum import Enum
+import logging
+
+
+logger = logging.getLogger(__name__)
+
+
+class RefusalSource(str, Enum):
+    """Origin of a refusal-shaped signal.
+
+    Only router-classified natural-language refusals are allowed to remove
+    context. Provider/API policy signals still qualify for fallback, but they
+    are not evidence that the current turn's tool context is contaminated.
+    """
+
+    ROUTER_SOFT_REFUSAL = "router_soft_refusal"
+    API_STRUCTURED_REFUSAL = "api_structured_refusal"
+    PROVIDER_OUTPUT_FILTER = "provider_output_filter"
+    STREAM_FILTER_ERROR = "stream_filter_error"
+    EXCEPTION_CONTENT_POLICY = "exception_content_policy"
+
+
+def should_apply_clean_fork(
+    source: RefusalSource,
+    *,
+    configured: bool = True,
+) -> bool:
+    """Return whether ``source`` may remove refusal-contaminated context.
+
+    ``model_routes.router.refusal.clean_fork`` is intentionally consulted
+    only for the router soft-refusal source. Structured API refusals and
+    provider/stream policy filters may trigger fallback, but always preserve
+    the complete conversation and current tool progress.
+    """
+
+    apply = bool(
+        configured and source is RefusalSource.ROUTER_SOFT_REFUSAL
+    )
+    logger.info(
+        "Refusal clean_fork decision source=%s configured=%s apply=%s",
+        source.value,
+        bool(configured),
+        apply,
+    )
+    return apply
 
 
 def current_user_ordinal_from_tail(
