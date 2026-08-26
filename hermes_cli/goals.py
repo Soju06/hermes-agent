@@ -76,6 +76,11 @@ DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES = 3
 # A broken/invalid API key returns 401 every call — the loop must not
 # run until the turn budget, wasting every turn on an unreachable judge.
 DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES = 5
+# Same guard for kanban goal-mode workers, deliberately stricter: a card's
+# turn budget (DEFAULT_MAX_TURNS) is far smaller than an interactive /goal
+# session's, so the CLI threshold above would burn a large slice of it before
+# reacting. Override via ``kanban.goal.judge_failure_limit`` in config.yaml.
+DEFAULT_KANBAN_JUDGE_FAILURE_LIMIT = 3
 
 # Quality gates: deterministic shell commands that must pass before the goal
 # judge may declare the goal done. Defaults mirror the bounded-autonomy
@@ -1021,6 +1026,29 @@ def _goal_judge_timeout() -> float:
     except Exception:
         pass
     return DEFAULT_JUDGE_TIMEOUT
+
+
+def _kanban_judge_failure_limit() -> int:
+    """Resolve ``kanban.goal.judge_failure_limit``, falling back to the default.
+
+    Same cached-``load_config()`` pattern as ``_goal_judge_max_tokens``. A
+    non-positive or non-int value falls back to the default rather than
+    crashing the kanban goal loop.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        value = (
+            ((cfg.get("kanban") or {}).get("goal") or {})
+            .get("judge_failure_limit", DEFAULT_KANBAN_JUDGE_FAILURE_LIMIT)
+        )
+        value = int(value)
+        if value > 0:
+            return value
+    except Exception:
+        pass
+    return DEFAULT_KANBAN_JUDGE_FAILURE_LIMIT
 
 
 def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, Any]]]:
@@ -2202,7 +2230,8 @@ def run_kanban_goal_loop(
     Returns a decision dict: ``{"outcome", "turns_used", "reason"}`` where
     outcome is one of ``"completed_by_worker"``, ``"review_requested_by_worker"``,
     ``"changes_requested_by_reviewer"``, ``"blocked_budget"``,
-    ``"blocked_by_worker"``, or ``"stopped"``.
+    ``"blocked_by_worker"``, ``"blocked_judge_unavailable"``, or
+    ``"stopped"``.
     """
 
     def _log(msg: str) -> None:
@@ -2216,10 +2245,21 @@ def run_kanban_goal_loop(
     if max_turns < 1:
         max_turns = DEFAULT_MAX_TURNS
 
+    judge_failure_limit = _kanban_judge_failure_limit()
+
     last_response = first_response or ""
     # The first turn already consumed one unit of budget.
     turns_used = 1
     nudged_to_finalize = False
+    # Consecutive judge transport failures (401 auth, DNS, timeout).
+    # judge_goal is fail-open (transport failure → "continue"), which is
+    # right for a flaky network but wrong for a permanently broken judge
+    # config: without this counter the worker burns the whole turn budget
+    # and lands in blocked_budget with a message that hides the real cause.
+    # Mirrors GoalManager.evaluate_after_turn's auto-pause, with a stricter
+    # threshold because the kanban budget is much smaller.
+    consecutive_transport_failures = 0
+    last_judge_transport_failed = False
 
     while True:
         # Did the worker terminate the task itself this turn?
@@ -2253,10 +2293,39 @@ def run_kanban_goal_loop(
         # The kanban worker loop has no wait-barrier concept (workers finish
         # via kanban_complete / kanban_block, not by parking), so a WAIT
         # verdict is treated as CONTINUE here.
-        verdict, reason, _parse_failed, _wait, _transport_failed = judge_goal(goal_text, last_response)
+        verdict, reason, _parse_failed, _wait, transport_failed = judge_goal(goal_text, last_response)
         if verdict == "wait":
             verdict = "continue"
         _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")
+
+        # Track consecutive judge transport failures; any usable judge reply
+        # (including a parse failure — the API itself answered) resets the
+        # streak, matching GoalManager.evaluate_after_turn.
+        last_judge_transport_failed = bool(transport_failed)
+        if transport_failed:
+            consecutive_transport_failures += 1
+        else:
+            consecutive_transport_failures = 0
+
+        if consecutive_transport_failures >= judge_failure_limit:
+            _log(
+                f"kanban goal loop: task {task_id} judge unreachable "
+                f"{consecutive_transport_failures} turn(s) in a row; blocking"
+            )
+            try:
+                block_fn(
+                    f"judge_unavailable: goal judge API unreachable "
+                    f"{consecutive_transport_failures} turn(s) in a row "
+                    f"(last error: {_truncate(reason, 200)}) — check the "
+                    f"auxiliary.goal_judge provider/key in config.yaml."
+                )
+            except Exception as exc:
+                _log(f"kanban goal loop: block_fn failed ({exc})")
+            return {
+                "outcome": "blocked_judge_unavailable",
+                "turns_used": turns_used,
+                "reason": "judge transport failures exceeded limit",
+            }
 
         if verdict == "done":
             if nudged_to_finalize:
@@ -2279,10 +2348,21 @@ def run_kanban_goal_loop(
         # Budget check BEFORE spending another turn.
         if turns_used >= max_turns:
             _log(f"kanban goal loop: task {task_id} exhausted {turns_used}/{max_turns} turns; blocking")
+            # Distinguish "the judge was unreachable" from "the worker never
+            # finished" — without this the two failure modes read identically
+            # on the board.
+            judge_note = (
+                " NOTE: the last judge call was a transport failure — the "
+                "verdict below is an error message, not an assessment of the "
+                "worker's output."
+                if last_judge_transport_failed
+                else ""
+            )
             try:
                 block_fn(
                     f"Goal-mode worker exhausted its turn budget "
-                    f"({turns_used}/{max_turns}) without completing the task. "
+                    f"({turns_used}/{max_turns}) without completing the task."
+                    f"{judge_note} "
                     f"Last judge verdict: {_truncate(reason, 300)}"
                 )
             except Exception as exc:
@@ -2317,6 +2397,7 @@ __all__ = [
     "KANBAN_GOAL_CONTINUATION_TEMPLATE",
     "KANBAN_GOAL_FINALIZE_TEMPLATE",
     "DEFAULT_MAX_TURNS",
+    "DEFAULT_KANBAN_JUDGE_FAILURE_LIMIT",
     "load_goal",
     "save_goal",
     "clear_goal",
