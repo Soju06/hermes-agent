@@ -29,8 +29,6 @@ prompt assembly.
   name is not declared under ``modes``.
 * ``modes.<name>.persona`` — persona markdown filename, relative to the
   ``personas`` directory.
-* ``base_persona`` — optional shared-prefix markdown filename, relative to
-  the ``personas`` directory.
 
 Persona content passes through the same threat scanner and truncation cap
 as SOUL.md (see ``agent.prompt_builder``) before entering the prompt.
@@ -252,25 +250,6 @@ def select_audience_mode(
     return ""
 
 
-def _contained_persona_path(persona: str, label: str) -> Optional[Path]:
-    """Resolve a persona filename while keeping it inside ``personas``."""
-    # Containment: the resolved persona file must live inside the personas
-    # directory.  A traversal, an absolute path, or a symlinked escape is
-    # treated as feature-off (None), never an error.
-    personas_dir = (get_hermes_home() / "personas").resolve()
-    try:
-        path = (personas_dir / persona).resolve()
-        if not path.is_relative_to(personas_dir):
-            logger.debug(
-                "persona path %r for %s escapes %s; feature off",
-                persona, label, personas_dir,
-            )
-            return None
-    except (OSError, ValueError, RuntimeError):
-        return None
-    return path
-
-
 def _persona_path(cfg: Dict[str, Any], mode: str) -> Optional[Path]:
     """Resolve the persona markdown path for *mode* (personas-dir relative)."""
     modes = cfg.get("modes")
@@ -282,7 +261,22 @@ def _persona_path(cfg: Dict[str, Any], mode: str) -> Optional[Path]:
     persona = _norm(spec.get("persona"))
     if not persona:
         return None
-    return _contained_persona_path(persona, f"mode {mode!r}")
+    # Containment: the resolved persona file must live inside the personas
+    # directory.  A traversal ('../../evil.md'), an absolute path, or a
+    # symlinked escape is treated as feature-off (None), never an error —
+    # modes.yaml is config, and broken config degrades to no-op.
+    personas_dir = (get_hermes_home() / "personas").resolve()
+    try:
+        path = (personas_dir / persona).resolve()
+        if not path.is_relative_to(personas_dir):
+            logger.debug(
+                "persona path %r for mode %r escapes %s; feature off",
+                persona, mode, personas_dir,
+            )
+            return None
+    except (OSError, ValueError):
+        return None
+    return path
 
 
 def _read_persona_raw(cfg: Dict[str, Any], mode: str) -> Optional[Tuple[Path, str]]:
@@ -404,52 +398,7 @@ def load_audience_persona(
         )
         if not content.strip():
             return None
-
-        # ``base_persona`` is optional.  Keep the absent-key path exactly as
-        # before: the selected mode is the complete injected content.
-        if "base_persona" not in cfg:
-            return mode, content
-        base_persona = _norm(cfg.get("base_persona"))
-        if not base_persona:
-            return mode, content
-
-        base_path = _contained_persona_path(base_persona, "base_persona")
-        if base_path is None or base_path == path:
-            return mode, content
-
-        # A broken optional base must never suppress a usable mode persona.
-        try:
-            if not base_path.is_file():
-                logger.debug("base persona file %s is missing; using mode persona alone", base_path)
-                return mode, content
-            base_content = base_path.read_text(encoding="utf-8").strip()
-            if not base_content:
-                logger.debug("base persona file %s is empty; using mode persona alone", base_path)
-                return mode, content
-
-            base_label = f"personas/{base_path.name}"
-            base_content = _scan_context_content(base_content, base_label)
-            base_content = _truncate_content(
-                base_content,
-                base_label,
-                context_length=context_length,
-                read_path=str(base_path),
-            )
-            if not base_content.strip():
-                logger.debug(
-                    "base persona file %s became empty after protection; using mode persona alone",
-                    base_path,
-                )
-                return mode, content
-        except Exception as exc:
-            logger.debug(
-                "Could not load base persona %s; using mode persona alone: %s",
-                base_path,
-                exc,
-            )
-            return mode, content
-
-        return mode, base_content + "\n\n" + content
+        return mode, content
     except Exception as exc:
         logger.debug("load_audience_persona failed (feature off): %s", exc)
         return None
