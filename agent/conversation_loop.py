@@ -1969,7 +1969,10 @@ def run_conversation(
                     trace.add_span("iteration", pending[0], time.time(), i=pending[1])
                     trace._pending_iteration = None
                 if "exit_reason" not in trace.tags:
-                    trace.tag(exit_reason="exception" if result is None else "early_return")
+                    # ``early_return(untagged)`` marks a return site that
+                    # forgot to call ``_tag_exit`` — distinct from tagged
+                    # early exits, which carry their own reason.
+                    trace.tag(exit_reason="exception" if result is None else "early_return(untagged)")
                 tags = {
                     "model": agent.model,
                     "iterations": getattr(agent, "_api_call_count", 0),
@@ -2184,6 +2187,27 @@ def _run_conversation_impl(
         if resume_turn and _resume_composed_final is not None
         else "unknown"
     )  # Diagnostic: why the loop ended
+    def _tag_exit(reason: str) -> None:
+        """Record why this turn is ending, from an early ``return`` site.
+
+        The loop's post-loop epilogue tags ``_turn_exit_reason`` onto the trace
+        and forwards it to ``finalize_turn``, but the ~30 early returns in this
+        function bypass both, so those turns land in the trace as the useless
+        catch-all ``early_return`` (the wrapper's fallback in
+        ``run_conversation``). Tag the bound trace here instead: an early exit
+        keeps its own reason and the fallback stays reserved for genuinely
+        untagged paths.
+
+        Observation only — never touches the returned dict, the user-facing
+        response, or control flow, and never raises into the turn.
+        """
+        nonlocal _turn_exit_reason
+        _turn_exit_reason = reason
+        if _tt is not None:
+            try:
+                _tt.tag(exit_reason=reason)
+            except Exception:
+                pass
     # Last composed answer intentionally held back by a verification gate. If
     # that continuation consumes the remaining budget, this is the best
     # user-facing result available; it must not be confused with error or
@@ -2220,6 +2244,7 @@ def _run_conversation_impl(
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
     if agent.api_mode == "codex_app_server":
+        _tag_exit("codex_app_server_turn")
         return agent._run_codex_app_server_turn(
             user_message=user_message,
             original_user_message=original_user_message,
@@ -3148,6 +3173,7 @@ def _run_conversation_impl(
                         # so user sees the rate-limit message that led here.
                         agent._flush_status_buffer()
                         agent._persist_session(messages, conversation_history)
+                        _tag_exit("nous_rate_limit_no_fallback")
                         return {
                             "final_response": (
                                 f"⏳ {_nous_msg}\n\n"
@@ -3737,6 +3763,7 @@ def _run_conversation_impl(
                         logger.error("%sInvalid API response after %d retries.", agent.log_prefix, max_retries)
                         agent._persist_session(messages, conversation_history)
                         _final_response = f"Invalid API response after {max_retries} retries: {_failure_hint}"
+                        _tag_exit("invalid_response_retries_exhausted")
                         return {
                             "final_response": _final_response,
                             "messages": messages,
@@ -3772,6 +3799,7 @@ def _run_conversation_impl(
                             close_interrupted_tool_sequence(messages, _interrupt_text)
                             agent._persist_session(messages, conversation_history)
                             agent.clear_interrupt()
+                            _tag_exit("interrupted_during_retry_wait")
                             return {
                                 "final_response": _interrupt_text,
                                 "messages": messages,
@@ -3943,6 +3971,7 @@ def _run_conversation_impl(
 
                     agent._cleanup_task_resources(effective_task_id)
                     agent._persist_session(messages, conversation_history)
+                    _tag_exit("content_policy_blocked(refusal)")
                     return _content_policy_blocked_result(
                         messages,
                         api_call_count,
@@ -4036,6 +4065,7 @@ def _run_conversation_impl(
                         )
                         agent._cleanup_task_resources(effective_task_id)
                         agent._persist_session(messages, conversation_history)
+                        _tag_exit("thinking_budget_exhausted")
                         return {
                             "final_response": _exhaust_response,
                             "messages": messages,
@@ -4261,6 +4291,7 @@ def _run_conversation_impl(
                             agent._session_messages = messages
                             agent._cleanup_task_resources(effective_task_id)
                             agent._persist_session(messages, conversation_history)
+                            _tag_exit("length_cap(continuations_exhausted)")
                             return {
                                 "final_response": partial_response or None,
                                 "messages": messages,
@@ -4331,6 +4362,7 @@ def _run_conversation_impl(
                             # never reaches finalize_turn (#48879 class).
                             close_interrupted_tool_sequence(messages, _final_response)
                             agent._persist_session(messages, conversation_history)
+                            _tag_exit("length_cap(stream_stub_stall)" if _is_stub_stall else "length_cap(unrecoverable)")
                             return {
                                 "final_response": _final_response,
                                 "messages": messages,
@@ -4348,6 +4380,7 @@ def _run_conversation_impl(
                         agent._cleanup_task_resources(effective_task_id)
                         agent._persist_session(messages, conversation_history)
 
+                        _tag_exit("length_cap(rolled_back)")
                         return {
                             "final_response": "Response truncated due to output length limit",
                             "messages": rolled_back_messages,
@@ -4361,6 +4394,7 @@ def _run_conversation_impl(
                         agent._flush_status_buffer()
                         agent._vprint(f"{agent.log_prefix}❌ First response truncated - cannot recover", force=True)
                         agent._persist_session(messages, conversation_history)
+                        _tag_exit("length_cap(first_response)")
                         return {
                             "final_response": "First response truncated due to output length limit",
                             "messages": messages,
@@ -5057,6 +5091,7 @@ def _run_conversation_impl(
                         "Turn abandoned: the process was shutting down "
                         "before the model call could complete."
                     )
+                    _tag_exit("interpreter_shutdown")
                     return {
                         "final_response": _shutdown_summary,
                         "messages": messages,
@@ -5583,6 +5618,7 @@ def _run_conversation_impl(
                     close_interrupted_tool_sequence(messages, _interrupt_text)
                     agent._persist_session(messages, conversation_history)
                     agent.clear_interrupt()
+                    _tag_exit("interrupted_during_error_handling")
                     return {
                         "final_response": _interrupt_text,
                         "messages": messages,
@@ -5652,6 +5688,7 @@ def _run_conversation_impl(
                         "(compression.enabled: false). Run /compress to compact manually, "
                         "/new to start fresh, or switch to a larger-context model."
                     )
+                    _tag_exit(f"context_overflow_compaction_disabled({classified.reason.value})")
                     return {
                         "final_response": _final_response,
                         "messages": messages,
@@ -6031,6 +6068,7 @@ def _run_conversation_impl(
                         logger.error("%s413 compression failed after %d attempts.", agent.log_prefix, max_compression_attempts)
                         agent._persist_session(messages, conversation_history)
                         _final_response = f"Request payload too large: max compression attempts ({max_compression_attempts}) reached."
+                        _tag_exit("payload_too_large(compression_attempts_exhausted)")
                         return {
                             "final_response": _final_response,
                             "messages": messages,
@@ -6062,6 +6100,7 @@ def _run_conversation_impl(
                         # NOT auto-reset the session (#9893/#35809).
                         compression_attempts -= 1
                         agent._persist_session(messages, conversation_history)
+                        _tag_exit("compression_deferred(lock_held)")
                         return _compression_deferred_result(
                             agent, messages, api_call_count
                         )
@@ -6103,6 +6142,7 @@ def _run_conversation_impl(
                         logger.error("%s413 payload too large. Cannot compress further.", agent.log_prefix)
                         agent._persist_session(messages, conversation_history)
                         _final_response = "Request payload too large (413). Cannot compress further."
+                        _tag_exit("payload_too_large(cannot_compress_further)")
                         return {
                             "final_response": _final_response,
                             "messages": messages,
@@ -6181,6 +6221,7 @@ def _run_conversation_impl(
                             logger.error("%sContext compression failed after %d attempts.", agent.log_prefix, max_compression_attempts)
                             agent._persist_session(messages, conversation_history)
                             _final_response = f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached."
+                            _tag_exit("output_cap_retry(compression_attempts_exhausted)")
                             return {
                                 "final_response": _final_response,
                                 "messages": messages,
@@ -6260,6 +6301,7 @@ def _run_conversation_impl(
                             "max_tokens exceeds the provider's output cap for this model. "
                             "Lower model.max_tokens in config.yaml."
                         )
+                        _tag_exit("output_cap_over_provider_limit")
                         return {
                             "final_response": _final_response,
                             "messages": messages,
@@ -6335,6 +6377,7 @@ def _run_conversation_impl(
                         logger.error("%sContext compression failed after %d attempts.", agent.log_prefix, max_compression_attempts)
                         agent._persist_session(messages, conversation_history)
                         _final_response = f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached."
+                        _tag_exit("context_overflow(compression_attempts_exhausted)")
                         return {
                             "final_response": _final_response,
                             "messages": messages,
@@ -6368,6 +6411,7 @@ def _run_conversation_impl(
                         # NOT auto-reset the session (#9893/#35809).
                         compression_attempts -= 1
                         agent._persist_session(messages, conversation_history)
+                        _tag_exit("compression_deferred(lock_held)")
                         return _compression_deferred_result(
                             agent, messages, api_call_count
                         )
@@ -6398,6 +6442,7 @@ def _run_conversation_impl(
                         logger.error("%sContext length exceeded: %s tokens. Cannot compress further.", agent.log_prefix, f"{new_tokens:,}")
                         agent._persist_session(messages, conversation_history)
                         _final_response = f"Context length exceeded ({new_tokens:,} tokens). Cannot compress further."
+                        _tag_exit("context_overflow(cannot_compress_further)")
                         return {
                             "final_response": _final_response,
                             "messages": messages,
@@ -6684,6 +6729,7 @@ def _run_conversation_impl(
                             f"Provider message: {_nonretryable_summary}\n\n"
                             f"{_CONTENT_POLICY_RECOVERY_HINT}"
                         )
+                        _tag_exit("content_policy_blocked(nonretryable)")
                         return _content_policy_blocked_result(
                             messages,
                             api_call_count,
@@ -6695,6 +6741,7 @@ def _run_conversation_impl(
                     # the max-retries path so every surface (CLI, TUI, desktop)
                     # renders one consistent billing signal.
                     if classified.reason == FailoverReason.billing:
+                        _tag_exit(f"nonretryable_api_error({classified.reason.value})")
                         return _billing_failure_result(
                             classified=classified,
                             summary=_nonretryable_summary,
@@ -6704,6 +6751,7 @@ def _run_conversation_impl(
                             base_url=_base,
                             model=_model,
                         )
+                    _tag_exit(f"nonretryable_api_error({classified.reason.value})")
                     return {
                         "final_response": _nonretryable_summary,
                         "messages": messages,
@@ -6916,6 +6964,7 @@ def _run_conversation_impl(
                             "execute_code with Python's open() for large "
                             "files, or to write in smaller sections."
                         )
+                    _tag_exit(f"all_retries_exhausted({classified.reason.value})")
                     return {
                         "final_response": _final_response,
                         "messages": messages,
@@ -7009,6 +7058,7 @@ def _run_conversation_impl(
                         close_interrupted_tool_sequence(messages, _interrupt_text)
                         agent._persist_session(messages, conversation_history)
                         agent.clear_interrupt()
+                        _tag_exit("interrupted_during_backoff")
                         return {
                             "final_response": _interrupt_text,
                             "messages": messages,
@@ -7249,6 +7299,7 @@ def _run_conversation_impl(
                     agent._cleanup_task_resources(effective_task_id)
                     agent._persist_session(messages, conversation_history)
                     
+                    _tag_exit("incomplete_scratchpad_retries_exhausted")
                     return {
                         "final_response": "Incomplete REASONING_SCRATCHPAD after 2 retries",
                         "messages": rolled_back_messages,
@@ -7391,6 +7442,7 @@ def _run_conversation_impl(
 
                 agent._codex_incomplete_retries = 0
                 agent._persist_session(messages, conversation_history)
+                _tag_exit("codex_incomplete_continuations_exhausted")
                 return {
                     "final_response": "Codex response remained incomplete after 3 continuation attempts",
                     "messages": messages,
@@ -7480,6 +7532,7 @@ def _run_conversation_impl(
                         # turn is not tool→user for strict providers.
                         close_interrupted_tool_sequence(messages, _final_response)
                         agent._persist_session(messages, conversation_history)
+                        _tag_exit("invalid_tool_call_retries_exhausted")
                         return {
                             "final_response": _final_response,
                             "messages": messages,
@@ -7564,6 +7617,7 @@ def _run_conversation_impl(
                         # exhaustion — this path never reaches finalize_turn.
                         close_interrupted_tool_sequence(messages, _final_response)
                         agent._persist_session(messages, conversation_history)
+                        _tag_exit("truncated_tool_call_arguments")
                         return {
                             "final_response": _final_response,
                             "messages": messages,
@@ -8288,6 +8342,7 @@ def _run_conversation_impl(
                                 close_interrupted_tool_sequence(messages, _interrupt_text)
                                 agent._persist_session(messages, conversation_history)
                                 agent.clear_interrupt()
+                                _tag_exit("interrupted_during_empty_response_retry")
                                 return {
                                     "final_response": _interrupt_text,
                                     "messages": messages,
