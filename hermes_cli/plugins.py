@@ -214,6 +214,11 @@ VALID_HOOKS: Set[str] = {
     # Contract: the transform-family first-valid-wins shape in
     # docs/plugins/hook-taxonomy.md.
     "transform_api_error_classification",
+    # Runtime/model state notifications. Fired by agent/runtime_control.py
+    # after model_status/model_switch and by other core runtime seams that need
+    # plugins to observe the effective model/provider/reasoning without relying
+    # on generic post_tool_call paths.
+    "runtime_state",
     "on_session_start",
     "on_session_end",
     "on_session_finalize",
