@@ -3840,7 +3840,7 @@ def delegate_task(
     # resolves the full credential bundle (base_url, api_key, api_mode) via the
     # same runtime provider system used by CLI/gateway startup. When
     # unconfigured, returns None values so children inherit from the parent.
-    if any(not _task_route_name(t) for t in task_list):
+    if credentials_cfg is None and any(not _task_route_name(t) for t in task_list):
         try:
             creds = _resolve_delegation_credentials(cfg, parent_agent)
         except ValueError as exc:
