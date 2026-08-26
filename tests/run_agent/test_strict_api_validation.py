@@ -65,6 +65,9 @@ class TestStrictApiValidation:
             {
                 "role": "assistant",
                 "content": "Checking now.",
+                "reasoning_details": [
+                    {"signature": "sig", "type": "reasoning", "text": "opaque"}
+                ],
                 "tool_calls": [
                     {
                         "id": "call_123",
@@ -78,18 +81,53 @@ class TestStrictApiValidation:
             {"role": "tool", "tool_call_id": "call_123", "content": "/tmp"},
         ]
 
-        # After _build_api_kwargs, Codex fields should be stripped
+        # After _build_api_kwargs, strict Chat Completions fields should be stripped
         kwargs = agent._build_api_kwargs(messages)
 
         assistant_msg = kwargs["messages"][1]
         tool_call = assistant_msg["tool_calls"][0]
 
-        # Fireworks rejects these fields
+        # Strict OpenAI-compatible endpoints reject these fields
+        assert "reasoning_details" not in assistant_msg
         assert "call_id" not in tool_call
         assert "response_item_id" not in tool_call
         # Standard fields should remain
         assert tool_call["id"] == "call_123"
         assert tool_call["function"]["name"] == "terminal"
+        # Persisted history should retain provider replay state; only the API copy is stripped.
+        assert "reasoning_details" in messages[1]
+
+    def test_reasoning_details_stripped_without_mutating_history(self, monkeypatch):
+        """Strict chat_completions requests should not leak reasoning_details."""
+        agent = _make_agent(
+            monkeypatch,
+            "glm-vooy",
+            api_mode="chat_completions",
+            base_url="https://glm.vooy.dev/v1",
+        )
+
+        messages = [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": "ok",
+                "reasoning": "trajectory-only reasoning",
+                "reasoning_content": "provider-facing reasoning",
+                "reasoning_details": [
+                    {"signature": "anthropic-style", "type": "thinking"}
+                ],
+            },
+        ]
+
+        kwargs = agent._build_api_kwargs(messages)
+
+        assistant_msg = kwargs["messages"][1]
+        assert "reasoning_details" not in assistant_msg
+        assert "reasoning" not in assistant_msg
+        assert assistant_msg["reasoning_content"] == "provider-facing reasoning"
+        assert messages[1]["reasoning_details"] == [
+            {"signature": "anthropic-style", "type": "thinking"}
+        ]
 
     def test_codex_preserves_fields_for_replay(self, monkeypatch):
         """Codex mode should preserve fields for Responses API replay."""
