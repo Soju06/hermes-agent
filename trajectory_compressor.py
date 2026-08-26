@@ -579,9 +579,12 @@ class TrajectoryCompressor:
             role = turn.get("from", "unknown")
             value = turn.get("value", "")
             
-            # Truncate very long values for the summary prompt
+            # Truncate very long values for the summary prompt.
+            # Marker carries the omitted count so it is self-identifying as a
+            # compression artifact and cannot be reproduced by a model
+            # pattern-completing a fresh payload.
             if len(value) > 3000:
-                value = value[:1500] + "\n...[truncated]...\n" + value[-500:]
+                value = value[:1500] + f"\n\u2026[hermes compressed: {len(value) - 2000:,} chars omitted]\n" + value[-500:]
             
             parts.append(f"[Turn {i} - {role.upper()}]:\n{value}")
         
