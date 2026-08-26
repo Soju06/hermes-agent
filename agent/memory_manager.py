@@ -995,6 +995,27 @@ class MemoryManager:
 
     # -- Lifecycle hooks -----------------------------------------------------
 
+    def _mirror_boundary(self, kind: str, messages: List[Dict[str, Any]]) -> None:
+        """Journal a boundary extraction marker to the L0-mirror, off-thread.
+
+        The marker record is derived inline (pure, content-free, cheap —
+        message dicts must not be walked later on another thread while the
+        caller keeps mutating them) and the disk append is submitted to the
+        single background worker, so boundary hooks never pay journal I/O on
+        the calling thread. Fail-open; skipped when no provider will consume
+        the payload.
+        """
+        mirror = self._l0_mirror
+        if not self._providers or mirror is None:
+            return
+        record = mirror.build_boundary_record(
+            kind,
+            messages,
+            provider_names=[p.name for p in self._providers],
+        )
+        if record is not None:
+            self._submit_background(lambda: mirror.append_record(record))
+
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         """Notify all providers of a new turn.
 
@@ -1011,15 +1032,14 @@ class MemoryManager:
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Notify all providers of session end."""
-        # ADR-004 Phase 0 (§② L0-mirror): the end-of-session extraction input
-        # is an outgoing episode payload too — mirror it before handing it to
-        # providers. Fail-open; skipped when no provider will consume it.
-        if self._providers and self._l0_mirror is not None:
-            self._l0_mirror.append_messages(
-                "session_end",
-                messages,
-                provider_names=[p.name for p in self._providers],
-            )
+        # ADR-004 Phase 0 (§② L0-mirror): record that a session-end
+        # extraction payload left for providers. The content itself is
+        # already mirrored per-turn by sync_all, so only a compact boundary
+        # MARKER is derived here (cheap, pure — see build_boundary_record)
+        # and the disk append is dispatched to the background worker: this
+        # method runs on the calling thread, and inline journal I/O on
+        # provider paths is exactly what _submit_background exists to avoid.
+        self._mirror_boundary("session_end", messages)
         for provider in self._providers:
             try:
                 provider.on_session_end(messages)
@@ -1171,14 +1191,12 @@ class MemoryManager:
         its exception is propagated so the caller can preserve the
         uncompressed transcript.
         """
-        # ADR-004 Phase 0 (§② L0-mirror): mirror the pre-compression
-        # extraction input before providers consume it. Fail-open.
-        if self._providers and self._l0_mirror is not None:
-            self._l0_mirror.append_messages(
-                "pre_compress",
-                messages,
-                provider_names=[p.name for p in self._providers],
-            )
+        # ADR-004 Phase 0 (§② L0-mirror): record the pre-compression
+        # extraction boundary. on_pre_compress fires MID-TURN inside
+        # compress_context, so only the cheap content-free marker is derived
+        # inline; the append runs on the background worker (per-turn content
+        # is already mirrored by sync_all).
+        self._mirror_boundary("pre_compress", messages)
         parts = []
         checkpoint_succeeded = False
         for provider in self._providers:
@@ -1353,6 +1371,56 @@ class MemoryManager:
                 )
             except Exception as e:
                 logger.debug("notify_memory_tool_write failed for op %s: %s", action, e)
+
+    def sync_note_backfill(
+        self,
+        note_path: str,
+        content: str,
+        *,
+        session_id: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Backfill a notes/ write as a typed idempotent episode (ADR-004 §③
+        step 7 / §6.1: every note write round-trips into the graph under
+        ``source_name="hermes-notes"``, ``source_id=note_path`` so
+        memory_search stays the single read surface and a re-ingest of the
+        same note supersedes its previous episode).
+
+        The CALLER gates this on ``memory.notes_backfill_enabled`` (default
+        OFF — the daemon-side IngestRequest pass-through is merged but not
+        yet deployed; see agent.memory_pipeline.notes_backfill_enabled).
+        Runs on the same single mem-sync worker as every other external
+        write (§③ serialization: notes writes ride the existing chain, no
+        second writer). Fail-open per provider.
+        """
+        providers = [p for p in self._providers if p.name != "builtin"]
+        if not providers or not content:
+            return
+
+        meta = {
+            "source_name": "hermes-notes",
+            "source_id": note_path,
+            "session_id": session_id,
+            **(metadata or {}),
+        }
+
+        def _run() -> None:
+            for provider in providers:
+                try:
+                    metadata_mode = self._provider_memory_write_metadata_mode(provider)
+                    if metadata_mode == "keyword":
+                        provider.on_memory_write("add", "notes", content, metadata=dict(meta))
+                    elif metadata_mode == "positional":
+                        provider.on_memory_write("add", "notes", content, dict(meta))
+                    else:
+                        provider.on_memory_write("add", "notes", content)
+                except Exception as e:
+                    logger.warning(
+                        "Memory provider '%s' note backfill failed: %s",
+                        provider.name, e,
+                    )
+
+        self._submit_background(_run)
 
     def on_delegation(self, task: str, result: str, *,
                       child_session_id: str = "", **kwargs) -> None:
