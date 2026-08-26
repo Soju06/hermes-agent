@@ -445,6 +445,32 @@ class TestClassifyApiError:
         result = classify_api_error(e)
         assert result.reason == FailoverReason.overloaded
 
+    def test_503_scoped_model_exhaustion_is_upstream_rate_limit(self):
+        message = (
+            "Rate limit exceeded. Try again in 3d 1h "
+            "(at 2026-08-16T11:00:00Z; earliest reset: account 34a40fb6...; "
+            "0 rate-limited, 0 quota-exceeded, 3 model-quota-exhausted)"
+        )
+        e = MockAPIError(message, status_code=503)
+        result = classify_api_error(
+            e,
+            provider="claude-lb",
+            model="claude-fable-5",
+        )
+        assert result.reason == FailoverReason.upstream_rate_limit
+        assert result.retryable is True
+        assert result.should_rotate_credential is False
+        assert result.should_fallback is True
+        assert result.error_context["upstream_provider"] == "claude-fable-5"
+
+    def test_529_scoped_model_exhaustion_is_upstream_rate_limit(self):
+        e = MockAPIError(
+            "Rate limit exceeded: 1 model-quota-exhausted",
+            status_code=529,
+        )
+        result = classify_api_error(e, model="claude-fable-5")
+        assert result.reason == FailoverReason.upstream_rate_limit
+
 
     def test_408_request_timeout_is_retryable_timeout(self):
         """HTTP 408 Request Timeout is a transient timing failure the server
@@ -478,6 +504,14 @@ class TestClassifyApiError:
         assert result.retryable is True
         assert result.should_rotate_credential is False
 
+    def test_message_only_scoped_model_exhaustion_is_upstream_rate_limit(self):
+        e = MockAPIError(
+            "Rate limit exceeded: provider overloaded; 3 MODEL-QUOTA-EXHAUSTED"
+        )
+        result = classify_api_error(e, provider="claude-lb")
+        assert result.reason == FailoverReason.upstream_rate_limit
+        assert result.should_rotate_credential is False
+
     def test_429_with_overloaded_body_is_overloaded_not_rate_limit(self):
         """Z.AI / Zhipu reuse HTTP 429 for server-wide overload. The credential
         is valid — the server is just busy — so it must classify as overloaded
@@ -499,6 +533,15 @@ class TestClassifyApiError:
             "Rate limit exceeded: too many requests", status_code=429
         )
         result = classify_api_error(e, provider="zai")
+        assert result.reason == FailoverReason.rate_limit
+        assert result.should_rotate_credential is True
+
+    def test_429_scoped_model_exhaustion_stays_rate_limit(self):
+        e = MockAPIError(
+            "Rate limit exceeded: 3 model-quota-exhausted",
+            status_code=429,
+        )
+        result = classify_api_error(e, provider="claude-lb")
         assert result.reason == FailoverReason.rate_limit
         assert result.should_rotate_credential is True
 
