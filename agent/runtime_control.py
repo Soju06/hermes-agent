@@ -162,14 +162,30 @@ def _route_status_info(agent: Any) -> Optional[Dict[str, Any]]:
         if not pairs:
             return None
         runtime = _agent_route_runtime(agent)
-        current = next(
-            (
-                name
-                for name, _ in pairs
-                if runtime_satisfies_route(runtime, name, cfg, catalog=catalog)
-            ),
-            None,
-        )
+        active_route_name = _safe_str(
+            getattr(agent, "_active_route_name", "")
+        ).strip()
+        current = None
+        if active_route_name and runtime_satisfies_route(
+            runtime, active_route_name, cfg, catalog=catalog
+        ):
+            current = next(
+                (
+                    name
+                    for name, _ in pairs
+                    if name.strip().lower() == active_route_name.lower()
+                ),
+                None,
+            )
+        if current is None:
+            current = next(
+                (
+                    name
+                    for name, _ in pairs
+                    if runtime_satisfies_route(runtime, name, cfg, catalog=catalog)
+                ),
+                None,
+            )
         return {
             "current": current,
             "available": [
@@ -759,6 +775,7 @@ def model_switch(
             if parsed_reasoning is None:
                 # Pure no-op: the current runtime is already a member of the
                 # route — do not re-apply or fire the gateway callback.
+                agent._active_route_name = matched_route
                 state = get_runtime_state(agent)
                 return json.dumps(
                     {
@@ -862,6 +879,9 @@ def model_switch(
         agent.reasoning_config = copy.deepcopy(parsed_reasoning)
         agent._runtime_reasoning_source = f"model_switch:{scope}"
         changed.append("reasoning")
+
+    if route_info is not None:
+        agent._active_route_name = route_info["name"]
 
     # Note: turn-scope snapshot/restore was removed (scope is always session).
     # If a legacy snapshot exists from a prior code path, update it defensively.
