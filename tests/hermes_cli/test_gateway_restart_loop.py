@@ -1459,6 +1459,71 @@ class TestLifecycleGuardModule:
         # Must not raise; relative script cannot resolve without a home.
         check_gateway_lifecycle("daily ops", "relative-script.sh")
 
+    def test_remote_fallback_does_not_resurrect_local_binary(self, tmp_path):
+        """#76762 follow-up: the local read skips binaries (NUL bytes), but a
+        read_remote_script callback that reads the same file another way —
+        terminal_tool's _read_script_in_env local-read branch does exactly
+        this — resurrected the machine code as text. Its decoded bytes were
+        then shlex-tokenized into NUL-bearing junk "paths" and the recursion
+        crashed in os.open with ValueError: embedded null byte, killing the
+        whole terminal tool call for ANY command that invokes a binary by
+        path (/usr/bin/time, /usr/bin/python3, venv/bin/python ...) inside a
+        gateway session.
+        """
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        # Fake ELF: NUL bytes plus a line whose first token is a
+        # slash-bearing junk "executable" with an embedded NUL — machine
+        # code tokenizes into shapes like this, and the walk treats a
+        # segment's leading /-token as a referenced script path.
+        binary = tmp_path / "fake-time"
+        binary.write_bytes(b"\x7fELF\x00\x00\n/usr/li\x00b/junk.so --flag\nhermes\x00")
+
+        def _terminal_tool_like_fallback(script_path: str):
+            # Mimics tools/terminal_tool.py::_read_script_in_env — reads the
+            # local file raw and decodes with errors="replace" (NUL survives:
+            # U+0000 is valid UTF-8).
+            from pathlib import Path as _P
+            p = _P(script_path)
+            if p.is_file():
+                return p.read_bytes().decode("utf-8", errors="replace")
+            return None
+
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            f'{binary} -f "elapsed=%es" bash benign.sh',
+            cwd=str(tmp_path),
+            read_remote_script=_terminal_tool_like_fallback,
+        )
+        assert result is False
+
+    def test_remote_fallback_binary_content_is_skipped(self):
+        """A remote backend's cat of a binary must be skipped like a local
+        binary (#76762: "a binary executed by the user is not a referenced
+        shell script"), not tokenized or regex-scanned. A compiled tool's
+        .rodata can legitimately contain lifecycle-looking strings (the
+        hermes launcher binary itself does) — scanning decoded machine code
+        would false-positive block it."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            "/remote/bin/tool --flag",
+            cwd="/remote",
+            read_remote_script=lambda _p: "\x7fELF\x00\x00hermes gateway restart\x00",
+        )
+        assert result is False
+
+    def test_read_referenced_script_tolerates_nul_in_path(self):
+        """Defence-in-depth: a NUL-bearing junk path reaching the bounded
+        reader must return "nothing to scan", not raise — resolve() already
+        tolerates ValueError (#76762) and os.open must match."""
+        from pathlib import Path
+        from cron.lifecycle_guard import _read_referenced_script
+        text, unsafe = _read_referenced_script(Path("/tmp/junk\x00path"))
+        assert text is None
+        assert unsafe is False
+
 
 # ---------------------------------------------------------------------------
 # Defense 2 (chokepoint): cron.jobs.create_job blocks the AGENT model-tool path
