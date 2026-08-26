@@ -327,3 +327,227 @@ class TestConnectedPlatformsOrder:
         assert cfg_a.get_connected_platforms() == cfg_b.get_connected_platforms()
         values = [p.value for p in cfg_a.get_connected_platforms()]
         assert values == sorted(values)
+
+# ---------------------------------------------------------------------------
+# Fork-only (prompt-tail freeze residue): the sections below cover the parts
+# of patch #18 that did NOT land upstream in c0c76a471 — the Runtime/Route
+# block freeze (static DesiredRoute + key-tuple cache + always-emitted
+# reasoning_source), routed-turn composition stability, and the
+# effective-delta eviction guard on gateway runtime overrides.
+# ---------------------------------------------------------------------------
+
+
+class TestRoutedTurnComposition:
+    def test_routed_turn_does_not_move_the_composed_prompt(self):
+        """A one-shot route state on the agent must not change composed
+        bytes — the directive is delivered on the user message instead."""
+        from agent.system_prompt import compose_effective_system_prompt
+
+        def _agent(route_state):
+            return SimpleNamespace(
+                model="gpt-5.6-sol",
+                provider="codex-nekos",
+                base_url="https://codex.nekos.me/v1",
+                api_mode="codex_responses",
+                reasoning_config={"enabled": True, "effort": "max"},
+                ephemeral_system_prompt="CTX",
+                _runtime_route_state=route_state,
+            )
+
+        routed = compose_effective_system_prompt(
+            _agent({"label": "RUNTIME_OVERRIDE", "target_model": "gpt-5.6-sol"}), "BASE"
+        )
+        unrouted = compose_effective_system_prompt(_agent(None), "BASE")
+        assert routed == unrouted
+
+
+class TestRuntimeRouteBlockFreeze:
+    def _agent(self, **overrides):
+        data = dict(
+            model="gpt-5.6-sol",
+            provider="codex-nekos",
+            base_url="https://codex.nekos.me/v1",
+            api_mode="codex_responses",
+            reasoning_config={"enabled": True, "effort": "max"},
+        )
+        data.update(overrides)
+        return SimpleNamespace(**data)
+
+    def test_reasoning_source_always_present(self):
+        from agent.system_prompt import build_runtime_route_block
+
+        with_default = build_runtime_route_block(self._agent(reasoning_config=None))
+        with_dict = build_runtime_route_block(self._agent())
+        assert "reasoning_source=default" in with_default
+        assert "reasoning_source=agent" in with_dict
+
+    def test_same_runtime_tuple_returns_cached_bytes(self):
+        from agent.system_prompt import build_runtime_route_block
+
+        agent = self._agent()
+        first = build_runtime_route_block(agent)
+        second = build_runtime_route_block(agent)
+        assert second is first  # tuple compare served the cached text
+
+    def test_runtime_change_rerenders(self):
+        from agent.system_prompt import build_runtime_route_block
+
+        agent = self._agent()
+        first = build_runtime_route_block(agent)
+        agent.model = "gpt-5.5"
+        second = build_runtime_route_block(agent)
+        assert first != second
+        assert "model=gpt-5.5" in second
+
+    def test_reasoning_value_deterministic_for_effective_config(self):
+        """The live flip: same effective config must render the same bytes
+        whether the agent was rebuilt (no attribution attr) or reused (attr
+        cleared at the turn boundary by the gateway)."""
+        from agent.system_prompt import build_runtime_route_block
+
+        rebuilt = self._agent()
+        reused = self._agent()
+        # The gateway clears stale mid-turn attribution each turn; simulate
+        # the post-clear state (attribute absent on both).
+        assert build_runtime_route_block(rebuilt) == build_runtime_route_block(reused)
+
+
+def _override_runner(monkeypatch, *, current_model, switch_result, config_model=None):
+    runner = _make_runner()
+    runner._pending_runtime_route_states = {}
+    runner._session_key_for_source = lambda source: "sess-key"
+    evictions = []
+    runner._evict_cached_agent = lambda key: evictions.append(key)
+    persisted = []
+    runner._persist_session_runtime_override = (
+        lambda session_key, **kw: persisted.append((session_key, kw))
+    )
+
+    monkeypatch.setattr(
+        "gateway.run._load_gateway_config",
+        lambda: {
+            "model": {
+                "default": config_model or current_model,
+                "provider": "codex-nekos",
+                "base_url": "https://codex.nekos.me/v1",
+            }
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.switch_model", lambda **kw: switch_result
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.get_compatible_custom_providers", lambda cfg: {}
+    )
+    return runner, evictions, persisted
+
+
+def _switch_result(model="gpt-5.6-sol"):
+    return SimpleNamespace(
+        success=True,
+        new_model=model,
+        target_provider="codex-nekos",
+        api_key="k",
+        base_url="https://codex.nekos.me/v1",
+        api_mode="codex_responses",
+        provider_label="codex-nekos",
+        error_message="",
+    )
+
+
+class TestRuntimeOverrideEvictionGuard:
+    def test_same_route_override_does_not_evict(self, monkeypatch):
+        """The codex-lb router re-selecting the already-active route every
+        PR-comment turn must not rebuild the agent (rebuild=False path)."""
+        runner, evictions, _ = _override_runner(
+            monkeypatch,
+            current_model="gpt-5.6-sol",
+            switch_result=_switch_result("gpt-5.6-sol"),
+        )
+        # Prior override == switch target: no effective delta.
+        runner._session_model_overrides["sess-key"] = {
+            "model": "gpt-5.6-sol",
+            "provider": "codex-nekos",
+            "api_key": "k",
+            "base_url": "https://codex.nekos.me/v1",
+            "api_mode": "codex_responses",
+        }
+
+        changed = runner._apply_gateway_runtime_override(  # noqa: SLF001
+            {"model": "gpt-5.6-sol", "provider": "codex-nekos", "reason": "codex-lb route"},
+            _source(),
+        )
+
+        assert changed is True  # override applied (directive still delivered)
+        assert evictions == []  # ... but the cached agent survives
+        # The route directive is still staged for user-message delivery.
+        assert runner._pending_runtime_route_states.get("sess-key")
+        # No "X -> X" switch note for a no-op route.
+        assert not getattr(runner, "_pending_model_notes", {}).get("sess-key")
+
+    def test_new_model_override_evicts_once(self, monkeypatch):
+        runner, evictions, _ = _override_runner(
+            monkeypatch,
+            current_model="claude-4.6-sonnet",
+            switch_result=_switch_result("gpt-5.6-sol"),
+        )
+
+        changed = runner._apply_gateway_runtime_override(  # noqa: SLF001
+            {"model": "gpt-5.6-sol", "provider": "codex-nekos", "reason": "review route"},
+            _source(),
+        )
+
+        assert changed is True
+        assert evictions == ["sess-key"]
+        assert "gpt-5.6-sol" in getattr(runner, "_pending_model_notes", {}).get("sess-key", "")
+
+    def test_reasoning_only_override_never_evicts_and_persists(self, monkeypatch):
+        """Reasoning is applied per-turn on the cached agent (excluded from
+        the cache signature) — and BOTH halves must persist so a gateway
+        restart cannot flip CurrentRuntime reasoning=max -> reasoning=unknown
+        for the same effective route (the live-measured value flip)."""
+        runner, evictions, persisted = _override_runner(
+            monkeypatch,
+            current_model="gpt-5.6-sol",
+            switch_result=_switch_result("gpt-5.6-sol"),
+        )
+        runner._get_session_entry = lambda key: None
+
+        changed = runner._apply_gateway_runtime_override(  # noqa: SLF001
+            {"reasoning_effort": "max", "reason": "review route"},
+            _source(),
+        )
+
+        assert changed is True
+        assert evictions == []
+        assert runner._session_reasoning_overrides["sess-key"] == {
+            "enabled": True,
+            "effort": "max",
+        }
+        assert any(
+            kw.get("include_reasoning") and kw.get("reasoning_config") == {"enabled": True, "effort": "max"}
+            for _k, kw in persisted
+        )
+
+
+class TestCliComposition:
+    def test_cli_composed_prompt_stable_across_calls(self):
+        """CLI agents (no ephemeral prompt, no route state) compose the same
+        bytes on every call — the freeze machinery adds no per-call
+        variability to non-gateway paths."""
+        from agent.system_prompt import compose_effective_system_prompt
+
+        agent = SimpleNamespace(
+            model="gpt-5.6-sol",
+            provider="codex-nekos",
+            base_url="https://codex.nekos.me/v1",
+            api_mode="codex_responses",
+            reasoning_config=None,
+            ephemeral_system_prompt=None,
+        )
+        first = compose_effective_system_prompt(agent, "BASE")
+        second = compose_effective_system_prompt(agent, "BASE")
+        assert first == second
+        assert first.startswith("BASE\n\n# Runtime/Route State")
+        assert "DesiredRoute: label=UNCLASSIFIED target=current" in first
+        assert "reasoning_source=default" in first
