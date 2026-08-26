@@ -77,6 +77,15 @@ MEMORY_BLOCK_HEADERS = {
 
 ENTRY_DELIMITER = "\n§\n"
 
+# Code-default char caps for MEMORY.md / USER.md. Config
+# (``memory.memory_char_limit`` / ``memory.user_char_limit``) is the single
+# source of truth; these constants exist ONLY as the fallback when config is
+# absent and must be imported everywhere a default is needed — never re-typed
+# as a literal (ADR-004 Phase 0 unified the drifted 2200/1375 literals against
+# the deployed 2750/2750 config).
+DEFAULT_MEMORY_CHAR_LIMIT = 2750
+DEFAULT_USER_CHAR_LIMIT = 2750
+
 
 # ---------------------------------------------------------------------------
 # Memory content scanning — lightweight check for injection/exfiltration
@@ -175,8 +184,8 @@ class MemoryStore:
 
     def __init__(
         self,
-        memory_char_limit: int = 2200,
-        user_char_limit: int = 1375,
+        memory_char_limit: int = DEFAULT_MEMORY_CHAR_LIMIT,
+        user_char_limit: int = DEFAULT_USER_CHAR_LIMIT,
         *,
         memory_enabled: bool = True,
         user_profile_enabled: bool = True,
@@ -921,8 +930,8 @@ def load_on_disk_store() -> "MemoryStore":
     Falls back to the built-in defaults if config can't be loaded, so this can
     never raise on a missing/unreadable config.
     """
-    memory_char_limit = 2200
-    user_char_limit = 1375
+    memory_char_limit = DEFAULT_MEMORY_CHAR_LIMIT
+    user_char_limit = DEFAULT_USER_CHAR_LIMIT
     memory_enabled = True
     user_profile_enabled = True
     try:
@@ -1442,4 +1451,3 @@ registry.register(
     emoji="🧠",
     dynamic_schema_overrides=_build_memory_schema_overrides,
 )
-
