@@ -1125,6 +1125,54 @@ def test_router_invalid_numeric_warns_and_defaults(key, value):
     assert getattr(catalog.router, key) == getattr(mr.RouterConfig(), key)
 
 
+def test_repromote_after_turns_defaults():
+    catalog = mr.load_routes(_cfg(routes=_router_routes()))
+    assert catalog.issues == []
+    assert catalog.router.repromote_after_turns == 3
+    assert catalog.routes["dev"].repromote_after_turns is None
+
+
+def test_router_repromote_after_turns_zero_disables_without_warning():
+    # 0 is a meaningful value (feature off) — the shared numeric loop would
+    # warn+default it back to enabled, so the dedicated branch must not.
+    catalog = mr.load_routes(
+        _cfg(routes=_router_routes(), router={"repromote_after_turns": 0})
+    )
+    assert catalog.issues == []
+    assert catalog.router.repromote_after_turns == 0
+
+
+def test_route_repromote_after_turns_override_parsed():
+    routes = _router_routes()
+    routes["dev"]["repromote_after_turns"] = 5
+    routes["chat"]["repromote_after_turns"] = 0
+    catalog = mr.load_routes(_cfg(routes=routes))
+    assert catalog.issues == []  # known route key: no unknown-key warning
+    assert catalog.routes["dev"].repromote_after_turns == 5
+    assert catalog.routes["chat"].repromote_after_turns == 0
+
+
+@pytest.mark.parametrize("bad", ["3", True, False, -1, 2.5])
+def test_router_repromote_after_turns_invalid_warns_and_defaults(bad):
+    catalog = mr.load_routes(
+        _cfg(routes=_router_routes(), router={"repromote_after_turns": bad})
+    )
+    assert any("repromote_after_turns" in w.message for w in _warnings(catalog))
+    assert _errors(catalog) == []
+    assert catalog.router.repromote_after_turns == 3
+
+
+@pytest.mark.parametrize("bad", ["3", True, False, -1, 2.5])
+def test_route_repromote_after_turns_invalid_warns_route_kept(bad):
+    # Warning severity by design: an error would drop the whole route from
+    # the catalog — a tuning-key typo must not kill live routing.
+    catalog = mr.load_routes(_cfg(routes={"dev": _route(repromote_after_turns=bad)}))
+    assert any("repromote_after_turns" in w.message for w in _warnings(catalog))
+    assert _errors(catalog) == []
+    assert "dev" in catalog.routes
+    assert catalog.routes["dev"].repromote_after_turns is None  # inherits router
+
+
 def test_router_chat_route_must_name_declared_route():
     catalog = mr.load_routes(
         _cfg(routes=_router_routes(), router={"mode": "shadow", "chat_route": "ghost"})
