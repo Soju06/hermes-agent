@@ -118,6 +118,7 @@ def handle_api_error(
             agent.log_prefix, api_call_count, api_error,
         )
         _shutdown_summary = "Turn abandoned: the process was shutting down before the model call could complete."
+        tag_exit("interpreter_shutdown")
         return _verdict("return", {
             "final_response": _shutdown_summary, "messages": messages, "api_calls": api_call_count,
             "completed": False, "failed": True, "error": _shutdown_summary,

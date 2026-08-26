@@ -203,21 +203,9 @@ def _loop_early_return(stmt: ast.Return) -> bool:
 
 
 def _known_untagged_return(module, stmt: ast.Return) -> str | None:
-    """Name the exits intentionally left untagged at this point of the topic.
-
-    The interpreter-shutdown abandon in ``turn_api_error.handle_api_error`` is tagged by
-    the follow-up commit of this topic (``fix(telemetry): tag upstream interpreter
-    shutdown exit``); until then it is inventoried here so the contract stays exact.
-    """
-    value = stmt.value
-    if (
-        module is turn_api_error
-        and isinstance(value, ast.Call)
-        and len(value.args) > 1
-        and isinstance(value.args[1], ast.Dict)
-        and any(_is_str_const(v, "interpreter_shutdown") for v in value.args[1].values)
-    ):
-        return "interpreter_shutdown"
+    """Name exits intentionally left untagged. None today: the interpreter-shutdown
+    abandon in ``turn_api_error.handle_api_error`` was the last one (tagged by
+    ``fix(telemetry): tag upstream interpreter shutdown exit``)."""
     return None
 
 
@@ -272,9 +260,7 @@ class TestEveryEarlyReturnIsTagged:
             f"terminal verdict(s) at {violations} are not immediately preceded by "
             f"tag_exit(...) — every early exit must record why the turn ended"
         )
-        assert Counter(known) == Counter({"interpreter_shutdown": 1}), (
-            f"inventoried untagged exits changed: {known}"
-        )
+        assert Counter(known) == Counter(), f"inventoried untagged exits changed: {known}"
         # The contract is only meaningful if the walker actually saw the phases'
         # terminal verdicts (guards against a refactor silently emptying this test).
         assert returns_seen >= 20
