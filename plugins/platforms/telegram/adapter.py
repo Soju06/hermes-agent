@@ -9809,6 +9809,9 @@ class TelegramAdapter(BasePlatformAdapter):
         chunk_len = len(event.text or "")
         if existing is None:
             event._last_chunk_len = chunk_len  # type: ignore[attr-defined]
+            # First-chunk enqueue time; the gateway runner uses it to surface
+            # the debounce delay in turn traces (transport.inbound_debounce).
+            event._hermes_debounce_enqueue_ts = time.time()  # type: ignore[attr-defined]
             self._pending_text_batches[key] = event
         else:
             # Append text from the follow-up chunk

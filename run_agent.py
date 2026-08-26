@@ -115,6 +115,7 @@ from agent.process_bootstrap import (
     _get_proxy_for_base_url,
 )
 from agent.iteration_budget import IterationBudget
+from agent import turn_trace
 from agent.interrupt_compat import request_hard_interrupt
 
 
@@ -5388,6 +5389,12 @@ class AIAgent:
         return cache
 
     def _create_request_openai_client(self, *, reason: str, api_kwargs: Optional[dict] = None) -> Any:
+        with turn_trace.span("llm.client_create", obj=self):
+            return self._create_request_openai_client_impl(
+                reason=reason, api_kwargs=api_kwargs
+            )
+
+    def _create_request_openai_client_impl(self, *, reason: str, api_kwargs: Optional[dict] = None) -> Any:
         from unittest.mock import Mock
 
         primary_client = self._ensure_primary_openai_client(reason=reason)
@@ -8333,13 +8340,24 @@ class AIAgent:
         """
         tool_calls = assistant_message.tool_calls
 
+        # Per-turn trace: running tool_calls total lives in the trace tags so
+        # the run_conversation wrapper can copy it onto the root `turn` span.
+        _tt = turn_trace.get_bound(self)
+        if _tt is not None:
+            try:
+                _tt.tag(tool_calls=_tt.tags.get("tool_calls", 0) + len(tool_calls))
+            except Exception:
+                pass
+
         # Allow _vprint during tool execution even with stream consumers
         self._executing_tools = True
         try:
             if len(tool_calls) <= 1:
-                return self._execute_tool_calls_sequential(
-                    assistant_message, messages, effective_task_id, api_call_count
-                )
+                with turn_trace.span("tools.batch", trace=_tt,
+                                     count=len(tool_calls), mode="sequential"):
+                    return self._execute_tool_calls_sequential(
+                        assistant_message, messages, effective_task_id, api_call_count
+                    )
 
             from agent.tool_dispatch_helpers import _plan_tool_batch_segments
             _active_env = get_active_env(effective_task_id)
@@ -8348,19 +8366,30 @@ class AIAgent:
 
             if len(segments) == 1:
                 kind = segments[0][0]
-                if kind == "parallel":
-                    return self._execute_tool_calls_concurrent(
+                # mode tag mirrors the actual dispatch path: a homogeneous
+                # plan keeps its single-path executor.
+                _mode = "concurrent" if kind == "parallel" else "sequential"
+                with turn_trace.span("tools.batch", trace=_tt,
+                                     count=len(tool_calls), mode=_mode):
+                    if kind == "parallel":
+                        return self._execute_tool_calls_concurrent(
+                            assistant_message, messages, effective_task_id, api_call_count
+                        )
+                    return self._execute_tool_calls_sequential(
                         assistant_message, messages, effective_task_id, api_call_count
                     )
-                return self._execute_tool_calls_sequential(
-                    assistant_message, messages, effective_task_id, api_call_count
-                )
 
             from agent.tool_executor import execute_tool_calls_segmented
-            return execute_tool_calls_segmented(
-                self, assistant_message, messages, effective_task_id, api_call_count,
-                segments=segments,
-            )
+            # Mixed batch: segment-by-segment dispatch (271a9d8ec). One
+            # tools.batch span covers the whole batch; per-tool tools.call
+            # spans come from the sequential/concurrent executors that
+            # execute_tool_calls_segmented reuses per segment.
+            with turn_trace.span("tools.batch", trace=_tt, count=len(tool_calls),
+                                 mode="segmented", segments=len(segments)):
+                return execute_tool_calls_segmented(
+                    self, assistant_message, messages, effective_task_id, api_call_count,
+                    segments=segments,
+                )
         finally:
             self._executing_tools = False
 
