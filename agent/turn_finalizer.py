@@ -24,7 +24,9 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 
+from agent import turn_trace
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.context_compressor import _DB_PERSISTED_MARKER
 from agent.message_content import flatten_message_text
@@ -142,6 +144,10 @@ def finalize_turn(
     loop). See module docstring.
     """
     from agent.conversation_loop import logger
+
+    # Per-turn trace (None when tracing is disabled).
+    _tt = turn_trace.get_bound(agent)
+    _finalize_started = time.time() if _tt is not None else None
 
     budget_exhausted = (
         api_call_count >= agent.max_iterations
@@ -279,23 +285,26 @@ def finalize_turn(
 
     # Save trajectory if enabled.  ``user_message`` may be a multimodal
     # list of parts; the trajectory format wants a plain string.
-    try:
-        agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed)
-    except Exception as _save_err:
-        _cleanup_errors.append(f"save_trajectory: {_save_err}")
-        logger.error("finalize_turn: _save_trajectory failed: %s", _save_err, exc_info=True)
+    with turn_trace.span("finalize.trajectory", trace=_tt):
+        try:
+            agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed)
+        except Exception as _save_err:
+            _cleanup_errors.append(f"save_trajectory: {_save_err}")
+            logger.error("finalize_turn: _save_trajectory failed: %s", _save_err, exc_info=True)
 
     # Clean up VM and browser for this task after conversation completes
-    try:
-        agent._cleanup_task_resources(effective_task_id)
-    except Exception as _cleanup_err:
-        _cleanup_errors.append(f"cleanup_task_resources: {_cleanup_err}")
-        logger.error("finalize_turn: _cleanup_task_resources failed: %s", _cleanup_err, exc_info=True)
+    with turn_trace.span("finalize.resource_cleanup", trace=_tt):
+        try:
+            agent._cleanup_task_resources(effective_task_id)
+        except Exception as _cleanup_err:
+            _cleanup_errors.append(f"cleanup_task_resources: {_cleanup_err}")
+            logger.error("finalize_turn: _cleanup_task_resources failed: %s", _cleanup_err, exc_info=True)
 
     # Persist session to both JSON log and SQLite only after private retry
     # scaffolding has been removed. Otherwise a later user "continue" turn
     # can replay assistant("(empty)") / recovery nudges and fall into the
     # same empty-response loop again.
+    _persist_started = time.time() if _tt is not None else None
     try:
         agent._drop_trailing_empty_response_scaffolding(messages)
 
@@ -459,6 +468,8 @@ def finalize_turn(
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
+    if _persist_started is not None:
+        _tt.add_span("finalize.persist", _persist_started, time.time())
 
     # The gateway owns a separate in-memory history snapshot. Keep it current
     # even when finalization reports a cleanup error: a later prompt must not be
@@ -527,6 +538,7 @@ def finalize_turn(
     # Gate: only applied when a real text response exists for this
     # turn and the user didn't interrupt.  Empty/interrupted turns
     # already have other surface text that shouldn't be augmented.
+    _hooks_started = time.time() if _tt is not None else None
     if final_response and not interrupted:
         try:
             _failed = getattr(agent, "_turn_failed_file_mutations", None) or {}
@@ -735,6 +747,8 @@ def finalize_turn(
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
+    if _hooks_started is not None:
+        _tt.add_span("finalize.post_hooks", _hooks_started, time.time())
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Persistence failures already set failed=True + an explanation in
@@ -785,6 +799,7 @@ def finalize_turn(
         agent._iters_since_skill = 0
 
     # External memory provider: sync the completed turn + queue next prefetch.
+    _md_started = time.time() if _tt is not None else None
     agent._sync_external_memory_for_turn(
         original_user_message=original_user_message,
         final_response=final_response,
@@ -841,5 +856,10 @@ def finalize_turn(
 
     agent._turn_preflight_display_snapshot = None
     agent._turn_received_provider_response = False
+
+    if _md_started is not None:
+        _tt.add_span("finalize.memory_dispatch", _md_started, time.time())
+    if _finalize_started is not None:
+        _tt.add_span("turn.finalize", _finalize_started, time.time())
 
     return result
