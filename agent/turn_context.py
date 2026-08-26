@@ -41,7 +41,7 @@ from agent.conversation_compression import (
 )
 from agent.context_engine import automatic_compaction_status_message
 from agent.iteration_budget import IterationBudget
-from agent.memory_manager import build_memory_context_block
+from agent.memory_manager import build_memory_context_block, memory_ingest_allowed
 from agent.memory_provider import is_trivial_prompt
 from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.model_metadata import (
@@ -1428,7 +1428,11 @@ def build_turn_context(
         agent._interrupt_thread_signal_pending = False
 
     # Notify memory providers of the new turn (BEFORE prefetch_all).
-    if agent._memory_manager and not resume_turn:
+    # Not for ingest-disabled forks (ADR-004 Phase 0): on_turn_start feeds the
+    # provider's ingest cadence and prefetch_all logs recall queries — both
+    # leak the fork's harness turn into the user's real memory namespace.
+    _memory_writes_allowed = memory_ingest_allowed(agent)
+    if agent._memory_manager and _memory_writes_allowed and not resume_turn:
         try:
             _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
             agent._memory_manager.on_turn_start(agent._user_turn_count, _turn_msg)
@@ -1441,7 +1445,7 @@ def build_turn_context(
     # prevent memory-context injection on turns that carry no semantic signal.
     ext_prefetch_cache = ""
     _memory_prefetch_started = time.time() if _tt is not None else None
-    if agent._memory_manager and not resume_turn:
+    if agent._memory_manager and _memory_writes_allowed and not resume_turn:
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
             if not is_trivial_prompt(_query):
