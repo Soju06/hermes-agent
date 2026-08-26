@@ -2146,6 +2146,14 @@ def _bridge_max_turns_from_config(home: "Path") -> None:
         elif "HERMES_MAX_ITERATIONS" in os.environ:
             # Clear stale bridge so downstream resolver applies its default.
             del os.environ["HERMES_MAX_ITERATIONS"]
+    if isinstance(agent_cfg, dict) and "process_wait_cap" in agent_cfg:
+        os.environ["HERMES_PROCESS_WAIT_CAP"] = str(agent_cfg["process_wait_cap"])
+    if isinstance(agent_cfg, dict) and "fast_conn_fail_limit" in agent_cfg:
+        os.environ["HERMES_FAST_CONN_FAIL_LIMIT"] = str(agent_cfg["fast_conn_fail_limit"])
+    if isinstance(agent_cfg, dict) and "gateway_turn_resume" in agent_cfg:
+        os.environ["HERMES_GATEWAY_TURN_RESUME"] = str(agent_cfg["gateway_turn_resume"])
+    if isinstance(agent_cfg, dict) and "turn_resume_max" in agent_cfg:
+        os.environ["HERMES_TURN_RESUME_MAX"] = str(agent_cfg["turn_resume_max"])
     # config-authoritative knobs for the session-search index (config.yaml
     # sessions.* wins over stale env; env stays the cross-process carrier).
     sessions_cfg = cfg.get("sessions", {})
@@ -2522,6 +2530,10 @@ if _config_path.exists():
                 os.environ["HERMES_AUTO_CONTINUE_FRESHNESS"] = str(
                     _agent_cfg["gateway_auto_continue_freshness"]
                 )
+            if "process_wait_cap" in _agent_cfg:
+                os.environ["HERMES_PROCESS_WAIT_CAP"] = str(_agent_cfg["process_wait_cap"])
+            if "fast_conn_fail_limit" in _agent_cfg:
+                os.environ["HERMES_FAST_CONN_FAIL_LIMIT"] = str(_agent_cfg["fast_conn_fail_limit"])
             if "gateway_startup_restore_drain_timeout" in _agent_cfg:
                 os.environ["HERMES_STARTUP_RESTORE_DRAIN_TIMEOUT"] = str(
                     _agent_cfg["gateway_startup_restore_drain_timeout"]
