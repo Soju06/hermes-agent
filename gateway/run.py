@@ -12518,7 +12518,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_key = row.get("session_key") or ""
             if session_key:
                 try:
-                    await self.async_session_store.clear_resume_pending(session_key)
                     await self.async_session_store.finish_active_turn(
                         session_key, force=True
                     )
