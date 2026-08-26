@@ -221,11 +221,11 @@ _REVIEW_MAX_ITERATIONS = 16
 # disables the cap (unbounded = pre-fix behavior).
 _REVIEW_MAX_INPUT_TOKENS_DEFAULT = 600_000
 
-
 def _background_review_task_config(
     task_cfg: Optional[Dict[str, Any]] = None,
+    aux_task: str = "background_review",
 ) -> Dict[str, Any]:
-    """Return ``auxiliary.background_review`` (or ``{}`` on any failure).
+    """Return an ``auxiliary`` review-task block (or ``{}`` on failure).
 
     Pass ``task_cfg`` when the caller already loaded the block once so spawn /
     resolve / prompt paths do not re-read config on every turn.
@@ -239,7 +239,7 @@ def _background_review_task_config(
     except Exception:
         return {}
     aux = cfg.get("auxiliary", {}) if isinstance(cfg.get("auxiliary"), dict) else {}
-    task = aux.get("background_review", {})
+    task = aux.get(aux_task, {})
     return task if isinstance(task, dict) else {}
 
 
@@ -321,14 +321,19 @@ def is_background_review_enabled(
 def _resolve_review_runtime(
     agent: Any,
     task_cfg: Optional[Dict[str, Any]] = None,
+    aux_task: str = "background_review",
 ) -> Dict[str, Any]:
-    """Resolve provider/model/credentials for the review fork.
+    """Resolve provider/model/credentials for a review-style fork.
 
     Default (auto / unset / same as parent): inherit the parent's live runtime
     (with codex_app_server -> codex_responses downgrade). ``routed`` is False —
     the fork uses the main model and the warm cache, exactly as before. When
-    ``auxiliary.background_review.{provider,model}`` names a concrete model
+    ``auxiliary.<aux_task>.{provider,model}`` names a concrete model
     different from the parent's, resolve that runtime and set ``routed=True``.
+
+    ``aux_task`` selects the auxiliary config block: ``background_review``
+    (default, unchanged behavior) or ``ingest_curator`` (the ADR-004 §4.4
+    curator fork, which shares this exact resolution policy by design).
     """
     parent_runtime = agent._current_main_runtime()
     parent_api_mode = parent_runtime.get("api_mode") or None
@@ -347,7 +352,7 @@ def _resolve_review_runtime(
         "args": list(getattr(agent, "acp_args", []) or []),
         "routed": False,
     }
-    task = _background_review_task_config(task_cfg)
+    task = _background_review_task_config(task_cfg, aux_task=aux_task)
     task_provider = (str(task.get("provider", "")).strip() or None)
     task_model = (str(task.get("model", "")).strip() or None)
     task_base_url = (str(task.get("base_url", "")).strip() or None)
@@ -378,7 +383,7 @@ def _resolve_review_runtime(
             "routed": True,
         }
     except Exception as e:
-        logger.debug("background-review aux routing failed (%s); using main model", e)
+        logger.debug("%s aux routing failed (%s); using main model", aux_task, e)
         return parent
 
 
