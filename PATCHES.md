@@ -862,6 +862,17 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 - **touches:** `gateway/run.py`, `gateway/session.py`, `agent/chat_completion_helpers.py`, `tests/gateway/test_model_router.py`, `tests/gateway/test_session_model_override_persistence.py`, `tests/gateway/test_reasoning_primary_runtime_sync.py`, `tests/run_agent/test_fallback_reasoning_override.py`
 - **2026-08-26-sync:** replayed reasoning persistence onto the corrected final prefix and combined it with active-route consumption and auto-reset route-state preservation. Refreshed the exact Gemini-classifier dependency edge after the ancestry repair, and removed the stale redundant post-redelivery `resume_pending` clear absorbed by this final assembled topic.
 
+### 81. precompress-checkpoint-signal
+- **branch:** `soju/patches/precompress-checkpoint-signal`
+- **stacked-on:** _(none — applies directly on base `b742be711a15aad543a871d2d3022277b70dc551`; fork changes in `MemoryManager.on_pre_compress` only add `_mirror_boundary(...)` 19 lines above the provider call, while the v2 detection, message selection, call, and exception policy retain upstream provenance)_
+- **origin:** `local-author`
+- **upstream_pr:** _(none yet)_
+- **state:** `pending-upstream`
+- **rationale:** `MemoryManager.on_pre_compress()` detected checkpoint API v2 providers and selected normalized evidence correctly, but called them without `require_checkpoint`; providers therefore stayed in their default best-effort mode, swallowed durable-write failures, and let required compression proceed as a false success. Forward the flag only to providers advertising the requested checkpoint API version, preserving the strict one-argument `on_pre_compress(self, messages)` contract for bundled and third-party v1 providers. Regression probes cover required/best-effort v2 signaling, legacy signature compatibility, and required-mode failure propagation.
+- **commits:**
+  - `721c2db6286f7a6c9f0398bea34fd829f49498ff` fix(memory): forward checkpoint requirement to v2 providers`
+- **touches:** `agent/memory_manager.py`, `tests/agent/test_pre_compress_checkpoint_contract.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
