@@ -28,16 +28,16 @@ class TestDisabledToolsetsAcceptsToolNames:
 
     def test_single_tool_name_is_removed(self):
         base = self._names()
-        assert "text_to_speech" in base, "precondition: tts registered in default surface"
-        after = self._names(["text_to_speech"])
-        assert "text_to_speech" not in after
+        assert "write_file" in base, "precondition: core file tool is registered"
+        after = self._names(["write_file"])
+        assert "write_file" not in after
         # Only that one tool leaves; everything else stays.
-        assert base - after == {"text_to_speech"}
+        assert base - after == {"write_file"}
 
     def test_multiple_tool_names_removed(self):
-        after = self._names(["text_to_speech", "memory_propose"])
-        assert "text_to_speech" not in after
-        assert "memory_propose" not in after
+        after = self._names(["write_file", "web_search"])
+        assert "write_file" not in after
+        assert "web_search" not in after
 
     def test_unknown_name_is_graceful_noop(self):
         base = self._names()
