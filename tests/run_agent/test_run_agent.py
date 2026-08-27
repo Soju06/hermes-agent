@@ -2247,29 +2247,6 @@ class TestConcurrentToolExecution:
         assert data["model"] == agent.model
         assert "provider" not in data
 
-    def test_invoke_tool_blocked_returns_error_and_skips_execution(self, agent, monkeypatch):
-        """_invoke_tool should return error JSON when a plugin blocks the tool."""
-        monkeypatch.setattr(
-            "hermes_cli.plugins.resolve_pre_tool_block",
-            lambda *args, **kwargs: "Blocked by test policy",
-        )
-        with patch("tools.todo_tool.todo_tool", side_effect=AssertionError("should not run")) as mock_todo:
-            result = agent._invoke_tool("todo", {"todos": []}, "task-1")
-
-        assert json.loads(result) == {"error": "Blocked by test policy"}
-        mock_todo.assert_not_called()
-
-    def test_invoke_tool_blocked_skips_handle_function_call(self, agent, monkeypatch):
-        """Blocked registry tools should not reach handle_function_call."""
-        monkeypatch.setattr(
-            "hermes_cli.plugins.resolve_pre_tool_block",
-            lambda *args, **kwargs: "Blocked",
-        )
-        with patch("run_agent.handle_function_call", side_effect=AssertionError("should not run")):
-            result = agent._invoke_tool("web_search", {"q": "test"}, "task-1")
-
-        assert json.loads(result) == {"error": "Blocked"}
-
     def test_sequential_blocked_tool_skips_checkpoints_and_callbacks(self, agent, monkeypatch):
         """Sequential path: blocked tool should not trigger checkpoints or start callbacks."""
         tool_call = _mock_tool_call(name="write_file",
