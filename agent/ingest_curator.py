@@ -1544,7 +1544,10 @@ def spawn_curation_thread(
     try:
         from tools.thread_context import propagate_context_to_thread
 
-        target = propagate_context_to_thread(_target)
+        # Detached daemon: it outlives the turn that triggered it, so the
+        # delegated-child marker must not ride along (it would latch for the
+        # process lifetime and suppress the Kanban toolset).
+        target = propagate_context_to_thread(_target, inherit_delegated_child=False)
     except Exception:
         target = _target
     threading.Thread(target=target, daemon=True, name="ingest-curator").start()
