@@ -99,7 +99,10 @@ def run_inline_shell(command: str, cwd: Path | None, timeout: int) -> str:
     if not output and completed.stderr:
         output = completed.stderr.rstrip("\n")
     if len(output) > _INLINE_SHELL_MAX_OUTPUT:
-        output = output[:_INLINE_SHELL_MAX_OUTPUT] + "...[truncated]"
+        # Self-identifying marker (carries the omitted count) so the agent
+        # cannot pattern-complete it into a fresh tool payload.
+        _omitted = len(output) - _INLINE_SHELL_MAX_OUTPUT
+        output = output[:_INLINE_SHELL_MAX_OUTPUT] + f"\u2026[hermes compressed: {_omitted:,} chars omitted]"
     return output
 
 
