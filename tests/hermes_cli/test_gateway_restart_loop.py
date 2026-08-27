@@ -144,6 +144,33 @@ class TestGatewayLifecyclePattern:
     def test_tokenizing_pass_does_not_overmatch(self, text):
         assert not _contains_gateway_lifecycle_command(text), f"Should NOT match: {text!r}"
 
+    @pytest.mark.parametrize("text", [
+        (
+            'kill -USR1 3739878 && echo "USR1 sent to mymel (3739878)"; '
+            "sleep 20; systemctl --user show hermes-gateway-mymel.service "
+            "-p MainPID -p ActiveState -p ExecMainStartTimestamp"
+        ),
+        "kill -USR1 1234; systemctl --user show hermes-gateway.service -p ActiveState",
+        "pkill -9 someapp && journalctl --user -u hermes-gateway.service -n 5",
+        "echo kill | grep hermes-gateway",
+    ])
+    def test_kill_detection_does_not_span_shell_statement_boundaries(self, text):
+        assert not _contains_gateway_lifecycle_command(text), f"Should NOT match: {text!r}"
+
+    @pytest.mark.parametrize("text", [
+        'pkill -f "hermes.*gateway"',
+        "pkill -f hermes-gateway",
+        'kill $(pgrep -f "hermes gateway run")',
+        "hermes gateway restart",
+        "hermes gateway stop",
+        "systemctl --user restart hermes-gateway.service",
+        "launchctl kickstart -k gui/501/ai.hermes.gateway",
+        "pkill \\\n-f hermes-gateway",
+        'pkill -f "hermes gateway"',
+    ])
+    def test_statement_boundary_fix_preserves_lifecycle_detections(self, text):
+        assert _contains_gateway_lifecycle_command(text), f"Should match: {text!r}"
+
 
     @pytest.mark.parametrize("text", [
         "restart the server application",
