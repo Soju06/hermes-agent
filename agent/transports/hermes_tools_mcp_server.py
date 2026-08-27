@@ -181,11 +181,28 @@ def _build_server() -> Any:
         ),
     )
 
+    # Honor the deployment's tool denylist so a tool turned off via
+    # ``agent.disabled_toolsets`` (a toolset name OR an individual tool name)
+    # is not silently re-exposed on Codex-routed turns through this sidecar.
+    # Read from config directly: the sidecar serves the same deployment, and
+    # there is no per-agent override in this bootstrap context.
+    disabled_toolsets = None
+    try:
+        from hermes_cli.config import load_config
+
+        disabled_toolsets = (load_config().get("agent") or {}).get(
+            "disabled_toolsets"
+        ) or None
+    except Exception:
+        # Fail open to the full surface — a config read failure must not
+        # strand a Codex session with no Hermes tools.
+        logger.debug("could not read disabled_toolsets for sidecar", exc_info=True)
+
     # Pull authoritative Hermes tool schemas for the ones we expose, so
     # MCP clients see the same parameter docs Hermes gives the model.
     all_defs = {
         td["function"]["name"]: td["function"]
-        for td in (get_tool_definitions(quiet_mode=True) or [])
+        for td in (get_tool_definitions(disabled_toolsets=disabled_toolsets, quiet_mode=True) or [])
         if isinstance(td, dict) and td.get("type") == "function"
     }
 
