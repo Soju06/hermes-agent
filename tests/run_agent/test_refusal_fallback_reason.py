@@ -94,11 +94,34 @@ def _refusal_routes_config(
     }
 
 
-def _loop_response(content="Recovered on fallback.", finish_reason="stop"):
+def _loop_response(
+    content="Recovered on fallback.", finish_reason="stop", tool_calls=None,
+):
     """Minimal OpenAI-style response for driving run_conversation()."""
-    msg = SimpleNamespace(content=content, tool_calls=None)
+    msg = SimpleNamespace(content=content, tool_calls=tool_calls)
     choice = SimpleNamespace(index=0, message=msg, finish_reason=finish_reason)
     return SimpleNamespace(choices=[choice], model="test/model", usage=None)
+
+
+def _anthropic_response(*blocks, stop_reason="end_turn"):
+    return SimpleNamespace(
+        content=list(blocks),
+        stop_reason=stop_reason,
+        model="claude-test",
+        usage=None,
+    )
+
+
+def _enable_test_tool(agent):
+    agent.tools = [{
+        "type": "function",
+        "function": {
+            "name": "terminal",
+            "description": "Run a test command.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }]
+    agent.valid_tool_names = {"terminal"}
 
 
 # ── Reason recorded on activation ─────────────────────────────────────────
@@ -650,7 +673,7 @@ class TestLoopCallSitesForwardReason:
         assert spy.call_args.kwargs["reason"] is FailoverReason.content_policy_blocked
         assert agent._fallback_reason == "content_policy_blocked"
 
-    def test_http200_refusal_hop_cleans_retry_request_history(self):
+    def test_http200_refusal_hop_preserves_retry_request_history(self, caplog):
         agent = _make_agent(fallback_model=[_FB])
         requests = []
         responses = iter([
@@ -668,18 +691,16 @@ class TestLoopCallSitesForwardReason:
         ]
         with (
             patch.object(agent, "_interruptible_api_call", side_effect=call),
-            patch.object(agent, "_buffer_status") as buffer_status,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
             patch("run_agent.OpenAI", return_value=MagicMock()),
             patch("agent.agent_runtime_helpers.time.sleep"),
-            patch("hermes_cli.config.load_config",
-                  return_value=_refusal_routes_config(keep_user_turns=2)),
             patch("agent.auxiliary_client.resolve_provider_client",
                   return_value=(_mock_client(), "gpt-4o")),
             patch("agent.model_metadata.get_model_context_length",
                   return_value=200000),
+            caplog.at_level(logging.INFO, logger="agent.refusal_history"),
         ):
             result = agent.run_conversation(
                 "latest request",
@@ -696,17 +717,84 @@ class TestLoopCallSitesForwardReason:
             message.get("content") == "I can't help with that."
             for message in requests[1]
         )
-        assert all(message.get("role") != "tool" for message in requests[1])
         assert any(
             message.get("content") == "I can't help with that."
             for message in result["messages"]
         )
-        assert agent._refusal_clean_fork_active is True
-        assert agent._refusal_recall_quarantine is True
-        assert any(
-            "clean_fork=yes dropped=0" in str(status_call.args[0])
-            for status_call in buffer_status.call_args_list
-        )
+        assert agent._refusal_clean_fork_active is False
+        assert agent._refusal_recall_quarantine is False
+        assert "source=provider_output_filter" in caplog.text
+        assert "apply=False" in caplog.text
+
+    def test_anthropic_refusal_after_tool_result_preserves_incident_context(
+        self, caplog,
+    ):
+        """2026-08-19 incident: Anthropic refusal after active tool work
+        must fallback without dropping the tool call/result from its input."""
+        fallback = {
+            "provider": "anthropic",
+            "model": "claude-opus-5",
+            "api_mode": "anthropic_messages",
+        }
+        agent = _make_agent(fallback_model=[fallback])
+        agent.api_mode = "anthropic_messages"
+        agent.provider = "anthropic"
+        _enable_test_tool(agent)
+        requests = []
+        responses = iter([
+            _anthropic_response(
+                SimpleNamespace(
+                    type="tool_use",
+                    id="call-incident",
+                    name="terminal",
+                    input={"command": "inspect-progress"},
+                ),
+                stop_reason="tool_use",
+            ),
+            _anthropic_response(stop_reason="refusal"),
+            _anthropic_response(
+                SimpleNamespace(
+                    type="text", text="Recovered with preserved tool context."
+                ),
+            ),
+        ])
+
+        def call(api_kwargs):
+            requests.append(api_kwargs["messages"])
+            return next(responses)
+
+        def activate(reason=None):
+            agent._fallback_index = len(agent._fallback_chain)
+            agent._fallback_activated = True
+            agent._fallback_reason = getattr(reason, "value", reason)
+            agent.model = "claude-opus-5"
+            return True
+
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=call),
+            patch.object(agent, "_try_activate_fallback", side_effect=activate),
+            patch("run_agent.handle_function_call",
+                  return_value="incident tool result: scope already inspected"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("run_agent.OpenAI", return_value=MagicMock()),
+            patch("agent.agent_runtime_helpers.time.sleep"),
+            patch("agent.model_metadata.get_model_context_length",
+                  return_value=200000),
+            caplog.at_level(logging.INFO, logger="agent.refusal_history"),
+        ):
+            result = agent.run_conversation("continue the in-progress work")
+
+        assert result["final_response"] == "Recovered with preserved tool context."
+        assert len(requests) == 3
+        fallback_input = repr(requests[-1])
+        assert "call-incident" in fallback_input
+        assert "incident tool result: scope already inspected" in fallback_input
+        assert agent._fallback_reason == "content_policy_blocked"
+        assert agent._refusal_clean_fork_active is False
+        assert "source=api_structured_refusal" in caplog.text
+        assert "apply=False" in caplog.text
 
     def test_http200_refusal_hop_respects_clean_fork_disabled(self):
         agent = _make_agent(fallback_model=[_FB])
@@ -770,6 +858,59 @@ class TestLoopCallSitesForwardReason:
         assert spy.call_args.kwargs["reason"] is FailoverReason.content_policy_blocked
         assert agent._fallback_reason == "content_policy_blocked"
 
+    def test_midstream_filter_preserves_current_tool_result(self, caplog):
+        agent = _make_agent(fallback_model=[_FB])
+        _enable_test_tool(agent)
+        requests = []
+        tool_call = SimpleNamespace(
+            id="call-stream",
+            type="function",
+            function=SimpleNamespace(name="terminal", arguments="{}"),
+        )
+        stub = SimpleNamespace(
+            id=PARTIAL_STREAM_STUB_ID,
+            model="test/model",
+            choices=[SimpleNamespace(
+                index=0,
+                message=SimpleNamespace(content="", tool_calls=None),
+                finish_reason=FINISH_REASON_LENGTH,
+            )],
+            usage=None,
+            _content_filter_terminated=True,
+        )
+        responses = iter([
+            _loop_response("", "tool_calls", [tool_call]),
+            stub,
+            _loop_response("Recovered after stream filter."),
+        ])
+
+        def call(api_kwargs):
+            requests.append([dict(message) for message in api_kwargs["messages"]])
+            return next(responses)
+
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=call),
+            patch("run_agent.handle_function_call",
+                  return_value="stream filter tool result"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("run_agent.OpenAI", return_value=MagicMock()),
+            patch("agent.agent_runtime_helpers.time.sleep"),
+            patch("agent.auxiliary_client.resolve_provider_client",
+                  return_value=(_mock_client(), "gpt-4o")),
+            patch("agent.model_metadata.get_model_context_length",
+                  return_value=200000),
+            caplog.at_level(logging.INFO, logger="agent.refusal_history"),
+        ):
+            result = agent.run_conversation("continue with tools")
+
+        assert result["final_response"] == "Recovered after stream filter."
+        assert "stream filter tool result" in repr(requests[-1])
+        assert agent._refusal_clean_fork_active is False
+        assert "source=stream_filter_error" in caplog.text
+        assert "apply=False" in caplog.text
+
     def test_nonretryable_refusal_exception_forwards_classified_reason(self):
         """A status-less safety refusal raised as an exception (#18028
         shape) must reach the is_client_error branch and forward
@@ -783,3 +924,48 @@ class TestLoopCallSitesForwardReason:
         assert spy.call_count == 1
         assert spy.call_args.kwargs["reason"] is FailoverReason.content_policy_blocked
         assert agent._fallback_reason == "content_policy_blocked"
+
+    def test_exception_content_policy_preserves_current_tool_result(self, caplog):
+        agent = _make_agent(fallback_model=[_FB])
+        _enable_test_tool(agent)
+        requests = []
+        tool_call = SimpleNamespace(
+            id="call-exception",
+            type="function",
+            function=SimpleNamespace(name="terminal", arguments="{}"),
+        )
+        responses = iter([
+            _loop_response("", "tool_calls", [tool_call]),
+            Exception("This content was flagged for possible cybersecurity risk."),
+            _loop_response("Recovered after exception policy block."),
+        ])
+
+        def call(api_kwargs):
+            requests.append([dict(message) for message in api_kwargs["messages"]])
+            response = next(responses)
+            if isinstance(response, Exception):
+                raise response
+            return response
+
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=call),
+            patch("run_agent.handle_function_call",
+                  return_value="exception policy tool result"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("run_agent.OpenAI", return_value=MagicMock()),
+            patch("agent.agent_runtime_helpers.time.sleep"),
+            patch("agent.auxiliary_client.resolve_provider_client",
+                  return_value=(_mock_client(), "gpt-4o")),
+            patch("agent.model_metadata.get_model_context_length",
+                  return_value=200000),
+            caplog.at_level(logging.INFO, logger="agent.refusal_history"),
+        ):
+            result = agent.run_conversation("continue with tools")
+
+        assert result["final_response"] == "Recovered after exception policy block."
+        assert "exception policy tool result" in repr(requests[-1])
+        assert agent._refusal_clean_fork_active is False
+        assert "source=exception_content_policy" in caplog.text
+        assert "apply=False" in caplog.text

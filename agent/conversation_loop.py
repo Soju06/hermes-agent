@@ -92,7 +92,10 @@ from agent.retry_utils import (
     zai_coding_overload_retry_ceiling,
 )
 from agent.repetition_guard import is_repetition_dominated
-from agent.refusal_history import current_user_ordinal_from_tail, user_anchor_from_tail
+from agent.refusal_history import (
+    RefusalSource,
+    should_apply_clean_fork,
+)
 from agent.trajectory import has_incomplete_scratchpad
 # Bind before the turn starts so a source-tree swap cannot load a skewed
 # finalizer at turn end.
@@ -1617,60 +1620,6 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
         if not _rewrite_system_content_blocks(api_messages[0], effective):
             api_messages[0]["content"] = effective
     return sp
-
-
-def _apply_refusal_clean_fork(
-    agent, messages, api_messages, current_turn_user_idx: int,
-) -> int:
-    """Clean both durable and in-flight history after a refusal fallback.
-
-    ``api_messages`` is a provider-shaped copy built before the retry loop, so
-    cleaning only ``messages`` would still resend the refusal-contaminated
-    request on an in-block ``continue``. Keep every completed earlier turn and
-    truncate only rows generated after this turn's real user anchor.
-
-    Returns the number of durable messages dropped, or zero when disabled.
-    """
-    try:
-        from hermes_cli.config import load_config
-        from hermes_cli.model_routes import load_routes
-
-        refusal = load_routes(load_config() or {}).router.refusal
-        clean_fork = bool(refusal.clean_fork)
-        keep_user_turns = int(refusal.keep_user_turns)
-    except Exception:
-        logger.debug("Refusal clean-fork config load failed; using defaults", exc_info=True)
-        clean_fork = True
-        keep_user_turns = 5
-
-    if not clean_fork:
-        return 0
-
-    user_from_tail = current_user_ordinal_from_tail(
-        messages,
-        current_turn_user_idx,
-        keep_user_turns=keep_user_turns,
-    )
-    if user_from_tail is None:
-        return 0
-    api_anchor = user_anchor_from_tail(
-        api_messages,
-        user_from_tail,
-        keep_user_turns=keep_user_turns,
-    )
-    if api_anchor is None:
-        return 0
-
-    original_count = len(messages)
-    messages[:] = messages[: current_turn_user_idx + 1]
-    api_messages[:] = api_messages[: api_anchor + 1]
-
-    agent._session_messages = messages
-    agent._refusal_clean_fork_active = True
-    agent._refusal_recall_quarantine = True
-    dropped = original_count - len(messages)
-    agent._buffer_status(f"⚠️ Refusal fallback clean_fork=yes dropped={dropped}")
-    return dropped
 
 
 def _ensure_cached_system_prompt_static(agent, system_message=None) -> None:
@@ -3894,6 +3843,22 @@ def _run_conversation_impl(
                         )
                     else:
                         _refusal_result = _refusal_transport.normalize_response(response)
+                    _refusal_provider_data = (
+                        getattr(_refusal_result, "provider_data", None) or {}
+                    )
+                    _refusal_source = (
+                        RefusalSource.API_STRUCTURED_REFUSAL
+                        if (
+                            getattr(response, "stop_reason", None) == "refusal"
+                            or bool(_refusal_provider_data.get("refusal"))
+                        )
+                        else RefusalSource.PROVIDER_OUTPUT_FILTER
+                    )
+                    # Structured API refusals and provider output filters are
+                    # fallback signals only. Neither proves that current tool
+                    # progress is contaminated, so clean_fork must preserve
+                    # the complete prompt assembled for the fallback.
+                    should_apply_clean_fork(_refusal_source)
                     _refusal_text = (getattr(_refusal_result, "content", None) or "").strip()
                     # Some refusals carry the explanation only in the reasoning
                     # channel; fall back to it so the user sees *something*.
@@ -3930,9 +3895,6 @@ def _run_conversation_impl(
                             "⚠️ Model declined to respond (safety refusal) — trying fallback..."
                         )
                     if agent._try_activate_fallback(reason=FailoverReason.content_policy_blocked):
-                        _apply_refusal_clean_fork(
-                            agent, messages, api_messages, current_turn_user_idx,
-                        )
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -4150,6 +4112,9 @@ def _run_conversation_impl(
                             _cf_terminated
                             and agent._fallback_index < len(agent._fallback_chain)
                         ):
+                            should_apply_clean_fork(
+                                RefusalSource.STREAM_FILTER_ERROR,
+                            )
                             agent._vprint(
                                 f"{agent.log_prefix}🛡️  Content filter terminated "
                                 f"stream — activating fallback provider...",
@@ -4170,10 +4135,6 @@ def _run_conversation_impl(
                                     if isinstance(_frag, dict):
                                         _frag.pop("_length_continuation_fragment", None)
                                         _frag.pop("_length_continuation_nudge", None)
-                                _apply_refusal_clean_fork(
-                                    agent, messages, api_messages,
-                                    current_turn_user_idx,
-                                )
                                 agent._session_messages = messages
                                 length_continue_retries = 0
                                 truncated_response_parts = []
@@ -5940,11 +5901,6 @@ def _run_conversation_impl(
                         "switching to fallback provider..."
                     )
                     if agent._try_activate_fallback(reason=classified.reason):
-                        if classified.reason == FailoverReason.content_policy_blocked:
-                            _apply_refusal_clean_fork(
-                                agent, messages, api_messages,
-                                current_turn_user_idx,
-                            )
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -6526,6 +6482,10 @@ def _run_conversation_impl(
                 ) and not is_context_length_error
 
                 if is_client_error:
+                    if classified.reason == FailoverReason.content_policy_blocked:
+                        should_apply_clean_fork(
+                            RefusalSource.EXCEPTION_CONTENT_POLICY,
+                        )
                     # Copilot self-heal BEFORE fallback: a stale/degraded
                     # credential surfaces as a 400
                     # ``model_not_available_for_integrator`` /

@@ -43,6 +43,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from agent.refusal_history import RefusalSource, should_apply_clean_fork
+
 from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
@@ -1212,7 +1214,13 @@ def classifier_decision(
                 if (
                     prior_refusal_qualified
                     and mode == "enforce"
-                    and bool(getattr(refusal, "mask_on_refusal", True))
+                    and should_apply_clean_fork(
+                        RefusalSource.ROUTER_SOFT_REFUSAL,
+                        configured=(
+                            bool(getattr(refusal, "clean_fork", True))
+                            and bool(getattr(refusal, "mask_on_refusal", True))
+                        ),
+                    )
                 ):
                     masked = _mask_newest_active_assistant(
                         session_store, context.session_id,
