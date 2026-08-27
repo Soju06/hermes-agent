@@ -1972,8 +1972,13 @@ def test_enforce_mode_applies_override_and_persists(monkeypatch, tmp_path):
         "api_mode": "chat_completions",
     }
     assert runner._session_model_overrides["tg:c1"] == expected_override
+    expected_persisted_override = dict(expected_override)
+    expected_persisted_override["reasoning_config"] = {
+        "enabled": True,
+        "effort": "xhigh",
+    }
     runner.session_store.set_model_override.assert_called_once_with(
-        "tg:c1", expected_override,
+        "tg:c1", expected_persisted_override,
     )
     runner._evict_cached_agent.assert_called_once_with("tg:c1")
     # Route carries reasoning_effort=xhigh and this base has session reasoning
@@ -2307,7 +2312,14 @@ def test_auto_reset_boundary_preserves_router_fresh_apply(monkeypatch, tmp_path)
 
     # Override survived in memory AND was re-persisted onto the new entry.
     assert runner._session_model_overrides["tg:c1"] == override
-    runner.session_store.set_model_override.assert_called_once_with("tg:c1", override)
+    persisted_override = dict(override)
+    persisted_override["reasoning_config"] = {
+        "enabled": True,
+        "effort": "xhigh",
+    }
+    runner.session_store.set_model_override.assert_called_once_with(
+        "tg:c1", persisted_override
+    )
     # Router-applied reasoning override and pending note survive with it.
     assert runner._session_reasoning_overrides["tg:c1"] == {"enabled": True, "effort": "xhigh"}
     assert "tg:c1" in runner._pending_model_notes

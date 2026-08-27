@@ -3278,27 +3278,35 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 api_mode=agent.api_mode,
             )
 
-        # Re-resolve reasoning_config for the new fallback model (Closes #21256).
-        # Shared chokepoint: per-model override > global reasoning_effort
-        # (YAML boolean False = disabled). Wrapped in try/except because a
-        # config load failure must not kill the swap.
-        try:
-            from hermes_cli.config import load_config
-            from hermes_constants import resolve_reasoning_config
+        # Preserve the already session-resolved value (gateway /reasoning or
+        # routed effort) across fallback activation.  Only an absent active
+        # value falls through to fallback-model config resolution (Closes
+        # #21256): per-model override > global reasoning_effort.  Provider
+        # adapters still own model-specific wire adaptation such as xhigh ->
+        # max; this layer must not pre-downgrade the session preference.
+        if getattr(agent, "reasoning_config", None) is None:
+            try:
+                from hermes_cli.config import load_config
+                from hermes_constants import resolve_reasoning_config
 
-            agent.reasoning_config = resolve_reasoning_config(
-                load_config() or {}, agent.model
-            )
+                agent.reasoning_config = resolve_reasoning_config(
+                    load_config() or {}, agent.model
+                )
+                logger.info(
+                    "Fallback %s: reasoning_config resolved: %s",
+                    agent.model, agent.reasoning_config,
+                )
+            except Exception as _reasoning_err:
+                logger.debug(
+                    "Failed to resolve reasoning_config for fallback %s; keeping current: %s",
+                    agent.model, _reasoning_err,
+                )
+                # Keep the absent value — config loading must not break the swap.
+        else:
             logger.info(
-                "Fallback %s: reasoning_config resolved: %s",
+                "Fallback %s: preserving active session reasoning_config: %s",
                 agent.model, agent.reasoning_config,
             )
-        except Exception as _reasoning_err:
-            logger.debug(
-                "Failed to resolve reasoning_config for fallback %s; keeping current: %s",
-                agent.model, _reasoning_err,
-            )
-            # Keep whatever reasoning_config was active — don't break the fallback swap.
 
         # Keep the prompt's self-identity in sync with the model actually
         # answering, so "what model are you?" doesn't report the primary.
