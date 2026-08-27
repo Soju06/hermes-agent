@@ -1090,6 +1090,7 @@ def memory_tool(
     old_text: str = None,
     new_text: str = None,
     operations: Optional[List[Dict[str, Any]]] = None,
+    reason: str = "",
     store: Optional[MemoryStore] = None,
 ) -> str:
     """
@@ -1130,6 +1131,10 @@ def memory_tool(
     if operations:
         if not isinstance(operations, list):
             return tool_error("operations must be a list of {action, content?, old_text?} objects.", success=False)
+        if any(op.get("action") in {"add", "replace"} for op in operations if isinstance(op, dict)):
+            reason_error = _validate_memory_write_reason(reason)
+            if reason_error:
+                return tool_error(reason_error, success=False)
         gate_result = _apply_batch_write_gate(target, operations)
         if gate_result is not None:
             return gate_result
@@ -1160,9 +1165,15 @@ def memory_tool(
         return gate_result
 
     if action == "add":
+        reason_error = _validate_memory_write_reason(reason)
+        if reason_error:
+            return tool_error(reason_error, success=False)
         result = store.add(target, content)
 
     elif action == "replace":
+        reason_error = _validate_memory_write_reason(reason)
+        if reason_error:
+            return tool_error(reason_error, success=False)
         result = store.replace(target, old_text, content)
 
     elif action == "remove":
@@ -1202,6 +1213,40 @@ def get_builtin_memory_store_flags(config: Optional[Dict[str, Any]] = None) -> T
         is_truthy_value(section.get("memory_enabled"), default=True),
         is_truthy_value(section.get("user_profile_enabled"), default=True),
     )
+
+
+def _validate_memory_write_reason(reason: str = "") -> Optional[str]:
+    """Validate the suitability reason required for memory add/replace.
+
+    The reason is a tool-boundary guardrail only; it is intentionally not
+    persisted with the memory entry. Keep this deliberately simple: require a
+    real sentence and reject the most common vacuous justifications. Semantic
+    routing between memory/skills remains the caller's responsibility and can be
+    further guarded by profile-local skill-gate rules.
+    """
+    normalized = " ".join(str(reason or "").strip().split())
+    generic_reasons = {
+        "important",
+        "user asked",
+        "remember this",
+        "durable",
+        "useful",
+        "preference",
+        "the user asked me to remember this",
+    }
+    if normalized.casefold() in generic_reasons:
+        return (
+            "reason is too generic for memory add/replace: explain why USER/MEMORY is "
+            "the right store instead of a skill, Graphiti, or session history."
+        )
+
+    if len(normalized) < 20:
+        return (
+            "reason is required for memory add/replace: briefly explain why this belongs "
+            "in USER/MEMORY rather than a skill, Graphiti, or session history."
+        )
+
+    return None
 
 
 @no_cache_check_fn
@@ -1326,6 +1371,14 @@ MEMORY_SCHEMA = {
                     "required": ["action"],
                 },
             },
+            "reason": {
+                "type": "string",
+                "description": (
+                    "Required for 'add' and 'replace'. Briefly explain why this belongs in "
+                    "USER/MEMORY rather than a skill, Graphiti, or session history. This "
+                    "reason is used only as a guardrail and is not stored."
+                )
+            },
         },
         "required": ["target"],
     },
@@ -1383,12 +1436,10 @@ registry.register(
         old_text=args.get("old_text"),
         new_text=args.get("new_text"),
         operations=args.get("operations"),
+        reason=args.get("reason", ""),
         store=kw.get("store")),
     check_fn=check_memory_requirements,
     emoji="🧠",
     dynamic_schema_overrides=_build_memory_schema_overrides,
 )
-
-
-
 
