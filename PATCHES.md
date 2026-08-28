@@ -866,7 +866,7 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 - **branch:** `soju/patches/precompress-checkpoint-signal`
 - **stacked-on:** _(none — applies directly on base `b742be711a15aad543a871d2d3022277b70dc551`; fork changes in `MemoryManager.on_pre_compress` only add `_mirror_boundary(...)` 19 lines above the provider call, while the v2 detection, message selection, call, and exception policy retain upstream provenance)_
 - **origin:** `local-author`
-- **upstream_pr:** _(none yet)_
+- **upstream_pr:** [NousResearch/hermes-agent#97063](https://github.com/NousResearch/hermes-agent/pull/97063)
 - **state:** `pending-upstream`
 - **rationale:** `MemoryManager.on_pre_compress()` detected checkpoint API v2 providers and selected normalized evidence correctly, but called them without `require_checkpoint`; providers therefore stayed in their default best-effort mode, swallowed durable-write failures, and let required compression proceed as a false success. Forward the flag only to providers advertising the requested checkpoint API version, preserving the strict one-argument `on_pre_compress(self, messages)` contract for bundled and third-party v1 providers. Regression probes cover required/best-effort v2 signaling, legacy signature compatibility, and required-mode failure propagation.
 - **commits:**
