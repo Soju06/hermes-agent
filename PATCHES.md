@@ -873,6 +873,17 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
   - `721c2db6286f7a6c9f0398bea34fd829f49498ff` fix(memory): forward checkpoint requirement to v2 providers`
 - **touches:** `agent/memory_manager.py`, `tests/agent/test_pre_compress_checkpoint_contract.py`
 
+### 82. conversation-started-date-stable
+- **branch:** `soju/patches/conversation-started-date-stable`
+- **stacked-on:** _(none — applies directly on base `b742be711a15aad543a871d2d3022277b70dc551`; `agent/system_prompt.py` is also touched by sibling patches (runtime-route prefix, base-persona) but in disjoint regions — new helpers land after `_append_tui_embedded_clarifier`, the render-site edit replaces only the `timestamp_line` f-string, and `invalidate_system_prompt` gains a capture block above its existing body)_
+- **origin:** `local-author`
+- **upstream_pr:** none
+- **state:** `pending-upstream`
+- **rationale:** `build_system_prompt` re-rendered `Conversation started:` from `now()` on every rebuild (compaction boundary, restore without a stored prompt), so a long-lived session's prompt claimed it began today — live `state.db` showed a session started Aug 26 carrying `Conversation started: Sunday, August 30` after its Aug 30 compaction. Factually wrong for the model and a pure prefix-cache loss. Freeze the rendered value per session: session-scoped `(session_id, value)` memo on the agent, seeded by `invalidate_system_prompt` from the prompt it discards (compaction path) or recovered from stored prompt bytes on restore (last matching line, shape-validated so quoted lookalikes in project context/memory are never adopted); only a genuinely new session renders `now()`. No DB read on the build path (`test_fresh_build_when_no_history` pins that contract). Unit + full-build integration tests (real `AIAgent`, patched `hermes_time.now`).
+- **commits:**
+  - `aa826025cb87e4838bcb9de4c706398853d5f28b` fix(prompt): freeze Conversation started date to the session's first build
+- **touches:** `agent/system_prompt.py`, `tests/agent/test_conversation_started_freeze.py` (new)
+
 ## State Vocabulary
 
 | state | meaning | when |
