@@ -148,6 +148,7 @@ def prepare_iteration(
     cache-safe by construction: steer text is appended as a new (not yet persisted) user row, the ghost-row
     filter neutralises copies of hidden interrupt placeholders, and repair runs BEFORE the request build."""
     from agent.conversation_loop import _maybe_inject_run_budget_wrapup
+    from agent.turn_todo_reminder import _maybe_inject_todo_reminder
 
     # nous.anthropic_wire=auto: a wire switch decided from the previous response lands here,
     # before this iteration's request is built and with nothing in flight.
@@ -184,6 +185,16 @@ def prepare_iteration(
     # newest tool result; off with no budget.
     if getattr(agent, "run_budget_seconds", None):
         _maybe_inject_run_budget_wrapup(agent, messages)
+
+    # Periodic todo reminder (Claude Code attachment parity): re-surface unfinished todo items
+    # when the todo tool has gone unused for a stretch of iterations. Same cache-safe tail
+    # channel as the run-budget notice; dormant when the list is empty or fully completed.
+    # Counters are bumped here (one per tool-loop iteration) and zeroed by the todo executor.
+    agent._todo_loop_iterations_since_write = getattr(agent, "_todo_loop_iterations_since_write", 0) + 1
+    agent._todo_loop_iterations_since_reminder = (
+        getattr(agent, "_todo_loop_iterations_since_reminder", 0) + 1
+    )
+    _maybe_inject_todo_reminder(agent, messages)
 
     # Appended to the newest tool result; never a synthetic user/system row.
     _maybe_inject_iteration_budget_warning(agent, messages)

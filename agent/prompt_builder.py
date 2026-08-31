@@ -408,7 +408,20 @@ TASK_COMPLETION_GUIDANCE = (
     "If a tool, install, or network call fails and blocks the real path, say so directly and try an alternative "
     "(different package manager, different approach, ask the user). NEVER substitute plausible-looking fabricated "
     "output (made-up data, invented file contents, synthesised API responses) for results you couldn't actually "
-    "produce. Reporting a blocker honestly is always better than inventing a result."
+    "produce. Reporting a blocker honestly is always better than inventing a result.\n"
+    "When a task has been agreed, the approval covers it end to end — in-scope steps don't need re-confirmation "
+    "(irreversible or shared-system actions still do). Announcing a step without the tool call in the same turn "
+    "hands control back with the work still pending; if the next step is decided, run it. Hand back only when done, "
+    "waiting on something external, or the next step needs the user's decision. If the user asks something "
+    "mid-task, answer and continue.\n"
+    "Before ending your turn, check your last paragraph. If it is a plan, an analysis, a question, a list of next "
+    "steps, or a promise about work you have not done ('I'll…', 'let me know when…'), do that work now with tool "
+    "calls. That includes retrying after errors and gathering missing information yourself. Do not stop because the "
+    "context or session is long. End your turn only when the task is complete or you are blocked on input only the "
+    "user can provide.\n"
+    "Exception: when the user is describing a problem, asking a question, or thinking out loud rather than "
+    "requesting a change, the deliverable is your assessment. Report your findings and stop. Don't apply a fix "
+    "until they ask for one."
 )
 
 # Universal parallel-tool-call guidance (ALL models): the runtime already executes independent calls

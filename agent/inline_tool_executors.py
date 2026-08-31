@@ -335,15 +335,26 @@ def _model_switch(agent, args: dict, ctx: InlineToolContext) -> Any:
     return dispatch_model_switch(agent, args)
 
 
+_todo_list_call = _tool(
+    "tools.todo_tool", "todo_tool", ("todos", "todos"), ("merge", "merge", False),
+    store=lambda agent, ctx: agent._todo_store,
+)
+
+
+def _todo_list(agent, args: dict, ctx: InlineToolContext) -> Any:
+    # Zero the reminder counter: the model touched its todo list, so the periodic
+    # re-surfacing clock restarts (see agent/turn_todo_reminder.py).
+    # One site covers both the sequential and the concurrent dispatch paths.
+    agent._todo_loop_iterations_since_write = 0
+    return _todo_list_call(agent, args, ctx)
+
+
 # Order is the historical if/elif order of ``execute_tool_calls_sequential``.
 _RAW_INLINE_TOOL_EXECUTORS: dict[str, InlineToolExecutor] = {
     # Core-owned runtime introspection/switching (agent/runtime_control.py): needs live agent state.
     "model_status": _model_status,
     "model_switch": _model_switch,
-    "todo_list": _tool(
-        "tools.todo_tool", "todo_tool", ("todos", "todos"), ("merge", "merge", False),
-        store=lambda agent, ctx: agent._todo_store,
-    ),
+    "todo_list": _todo_list,
     # Bot Mode teammate DM is injected, not registered: only a canonical Bot
     # Chat session carries the schema, and the tool re-gates on the title.
     "message_agent": _tool(

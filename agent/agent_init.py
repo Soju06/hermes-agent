@@ -1095,6 +1095,10 @@ def _init_session_state(agent, session_id, session_db, parent_session_id, reason
     # In-memory todo list for task planning (one per agent/session)
     from tools.todo_tool import TodoStore
     agent._todo_store = TodoStore()
+    # Todo-reminder counters (agent/turn_todo_reminder.py); the reminder gap starts at its
+    # threshold so the spacing rule cannot suppress the first eligible reminder.
+    agent._todo_loop_iterations_since_write = 0
+    agent._todo_loop_iterations_since_reminder = 10
 
 
 def _apply_display_config(agent, _agent_cfg, platform):
