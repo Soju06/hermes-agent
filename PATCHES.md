@@ -895,6 +895,28 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
   - `c255673025` feat(agent): Claude Code todo-continuity parity — periodic reminder, continuation nudge, end-to-end scope guidance
 - **touches:** `agent/conversation_loop.py`, `agent/agent_init.py`, `agent/tool_executor.py`, `agent/agent_runtime_helpers.py`, `agent/prompt_builder.py`, `tools/todo_tool.py`, `tests/agent/test_todo_reminder.py` (new)
 
+### 84. lean-single-aux-call
+- **branch:** `soju/patches/lean-single-aux-call`
+- **stacked-on:** `soju/patches/todo-continuity-parity` (chronological tip stack; file overlap with #51/#60/#70 in `agent/context_compressor.py` — verified their load-bearing symbols survive: `_LEAN_USER_MESSAGES_HEADING`, `_truncate_tool_call_args_json`)
+- **origin:** `cherry-pick:4f22543509d1b91dc45bcb369447126c5eb14fb7`
+- **upstream_pr:** 98628 (merged upstream 2026-09, ahead of our base) — **do not file.** Auto-drops at the next base bump: any base containing `4f22543509` supersedes this patch
+- **state:** `pending-upstream`
+- **rationale:** Lean-mode compaction's `_build_chunk_digests()` issued up to `_LEAN_DIGEST_MAX_CHUNKS=28` strictly sequential auxiliary LLM calls per compaction attempt (one per 72K-char chunk). Measured live 2026-09-04: 800k-token sessions took 956-1440s to compact and were fence-cancelled at the 600s ceiling (`commit_fence_cancelled`), then re-attempted every turn. Upstream hit the same symptom (#96603 "Summarizing Thread extremely slow", 7-11 min stalls) and fixed it by deleting the digest loop: the detailed identifier-preserving session log is folded into the ONE main summary request, oversized regions are evenly sampled with an exact-count elision marker. Cherry-pick resolution: kept the fork-base compressor around upstream-only summary-route pinning (not imported); docs retain this fork's `tail_mode: legacy` default while describing the single-call lean path; `tests/agent/test_compression_attempt_ownership.py` (upstream attempt-ownership subsystem absent at our base) replaced with a symbol-removal guard. `ed3562bbbc` (moot digest tests) not taken — its only path was fork-base-missing. Verified no regression: broad `-k "compress or compaction or lean"` selector fails the same 81 tests on base and on this tip (all `tools/daemon_pool.py` Python 3.14 `ThreadPoolExecutor._initializer` pre-existing + 1 LSP kill-guard), 0 new failures.
+- **commits:**
+  - `f5c64fefab` fix(compression): lean compaction makes exactly one auxiliary request per attempt
+- **touches:** `agent/context_compressor.py`, `tests/agent/test_compression_attempt_ownership.py`, `tests/agent/test_lean_single_aux_call.py` (new), `evals/compaction/runner.py`, `evals/compaction/results/SCORECARD-2026-08-15.md`, `website/docs/developer-guide/context-compression-and-caching.md`, `website/docs/user-guide/configuration.md`
+
+### 85. aux-anthropic-mode-max-tokens
+- **branch:** `soju/patches/aux-anthropic-mode-max-tokens`
+- **stacked-on:** `soju/patches/lean-single-aux-call` (chronological tip stack; `agent/auxiliary_client.py` overlap with #60 `anthropic-structured-output` — `_translate_anthropic_response_format` and its call sites survive)
+- **origin:** `local-author`
+- **upstream_pr:** none — upstreamable (generic gate mismatch, no fork-only deps). File after live soak; see rationale for the related open upstream issue and the four rejected blanket-forward PRs that bound how narrow the upstream PR must stay
+- **state:** `pending-upstream`
+- **rationale:** Related upstream context: open issue 60388 (`max_tokens` settings silently dropped); four blanket "forward caps to all providers" PRs (60454/60513/60620/60645) were closed unmerged, so any upstream PR must honor the declared `api_mode` as one more anthropic-compat signal and nothing broader. Defect: `_build_call_kwargs()` forwarded an explicit auxiliary `max_tokens` only when the endpoint was detected as anthropic-compatible by provider name (`minimax*`) or a `/anthropic` URL path. A config-declared provider with `api_mode: anthropic_messages` and a plain-host `base_url` (our `claude-lb` at `http://10.8.0.3:2455`) matched neither, so the cap was dropped and `AnthropicAuxiliaryClient.create()` → `build_anthropic_kwargs()` substituted the model's default output ceiling (`_ANTHROPIC_DEFAULT_OUTPUT_LIMIT = 128_000`). Transport selection (`_maybe_wrap_anthropic`) already honored `api_mode == "anthropic_messages"`; cap forwarding used a narrower gate. Measured live 2026-09-04 via claude-lb `debug_artifacts`: compressor requested `max_tokens=1400` per digest, proxy captured `max_tokens: 128000` on the wire; 77/77 compression calls exceeded the cap (avg 6,844 out, max 22,863) and latency was linear in output tokens (13.17 ms/tok, R²=0.961) — ~80% of compaction wall time. Fix: `_build_call_kwargs(..., api_mode=None)` + `or api_mode == "anthropic_messages"` in the cap gate; all 8 call sites (sync/async primary, same-provider retry, fallback, refreshed fallback) thread the resolved/destination api_mode. `max_tokens=None` behavior unchanged; `_ANTHROPIC_COMPAT_PROVIDERS`/`_is_anthropic_compat_endpoint`/adapter default fallback untouched.
+- **commits:**
+  - `d4de3a3dac` fix(auxiliary): forward explicit max_tokens when api_mode is anthropic_messages
+- **touches:** `agent/auxiliary_client.py`, `tests/agent/test_auxiliary_anthropic_mode_max_tokens.py` (new)
+
 ## State Vocabulary
 
 | state | meaning | when |
