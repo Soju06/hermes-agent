@@ -157,6 +157,20 @@ def test_reminder_no_store_attr():
     assert _maybe_inject_todo_reminder(Bare(), _tool_messages()) is False
 
 
+def test_reminder_ignores_non_int_counters():
+    """A MagicMock agent (or a partially initialised one) has non-int counters: no raise, no inject."""
+    from unittest.mock import MagicMock
+
+    from agent.turn_todo_reminder import _maybe_inject_todo_reminder
+
+    agent = MagicMock()
+    agent._todo_store = TodoStore()
+    agent._todo_store.write(_pending_items(), merge=False)
+    messages = _tool_messages()
+    assert _maybe_inject_todo_reminder(agent, messages) is False
+    assert messages[-1]["content"] == "result two"
+
+
 # ── todo_tool result message (CC TodoWrite parity) ───────────────────────────
 
 

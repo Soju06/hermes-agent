@@ -57,6 +57,11 @@ def _maybe_inject_todo_reminder(agent: Any, messages: list[dict[str, Any]]) -> b
         return False
     since_write = getattr(agent, "_todo_loop_iterations_since_write", 0)
     since_reminder = getattr(agent, "_todo_loop_iterations_since_reminder", 0)
+    # Only act on real integer counters: test doubles (MagicMock agents) and
+    # partially-initialised agents expose non-int attributes here, and this
+    # helper runs on every tool-loop iteration — never raise from it.
+    if not isinstance(since_write, int) or not isinstance(since_reminder, int):
+        return False
     if since_write < TODO_REMINDER_TURNS_SINCE_WRITE:
         return False
     if since_reminder < TODO_REMINDER_TURNS_BETWEEN:
