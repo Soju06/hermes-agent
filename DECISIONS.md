@@ -204,3 +204,21 @@ The end state we actually operate is "purpose → runtime" routing: dev sessions
 ### Patch
 
 `soju/patches/model-routing` (new topic: catalog, resolver, dynamic router, delegate_task enum — supersedes and drops `soju/patches/delegate-per-task-model`); `model_switch` route-enum lands as an evolution of `soju/patches/runtime-control`. skill-gate removal is a plugin-repo change (Soju06/skill-gate), sequenced after the bench gate passes.
+
+---
+
+## ADR-004 — Base bumps rebuild topics by cherry-picking their own commits; assembly-dependent topics form a chronological tip stack (2026-09-14)
+
+### Context
+The 2026-09-14 bump (v2026.8.25 base b742be71 → v2026.9.11 939e45c91d, ~9,200 upstream commits, 7,369 files, 712 renames) found 20 of 69 topic branches carrying merge history from old `soju/production` assemblies (up to 530 commits / 409 merges of "own" history), so `git rebase` onto the new base would have replayed hundreds of foreign commits. A rehearsal rebase showed 66 of 69 topics conflicting anyway.
+
+### Decision
+1. A topic's identity is its **own non-merge commits** (`git rev-list --no-merges topic ^base ^<tips of non-descendant topics>`, reconciled against the manifest commit list), not its branch history. Base bumps recreate each branch at its new parent and `cherry-pick` exactly those commits.
+2. Topics that only apply on an assembled tree are declared **stacked-on the previous topic of a chronological tip stack** that starts at the octopus assembly of the independent topics. They are rebuilt sequentially, each on the previous topic's new tip, and merged last. Independent topics stay rooted on the base and are rebuilt in parallel.
+3. Test-only re-seaming of upstream tests to fork gates lives in a dated `sync-YYYYMMDD-test-seams` topic at the tip of the stack, never inside the code topic.
+4. Before any bump, every branch tip and `soju/production` are tagged `backup/sync-<date>/...`; `soju/production` is only ever rebuilt by `bin/hermes-patches rebuild`.
+
+### Consequences
+- `bin/hermes-patches sync` (plain `git rebase` per topic) is not sufficient for tip-stack topics; the 2026-09-14 procedure (topics.json + per-group assignments + reports) is under `~/work/hermes/upstream-sync-20260914/`.
+- Commit trailers were missing on 19+ historical commits; `status` undercounts `Patch-State` on those branches (messages kept verbatim).
+- Dropped as merged-upstream this bump: #81 precompress-checkpoint-signal, #84 lean-single-aux-call.
