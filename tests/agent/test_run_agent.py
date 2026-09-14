@@ -2238,6 +2238,8 @@ class TestAgentRuntimePostHookOwnershipSync:
         ("notes_write", {"step": "propose", "content": "post-hook ownership sync"}),
         ("notes_read", {"action": "list"}),
         ("memory_propose", {"content": "post-hook ownership sync"}),
+        # Ingest-curator verdict sink (ADR-004 Phase 2) — agent-scoped inline tool.
+        ("curator_verdict", {"verdict": "noop"}),
     )
 
     @pytest.mark.parametrize(("tool_name", "tool_args"), _CASES)
@@ -2271,6 +2273,10 @@ class TestAgentRuntimePostHookOwnershipSync:
         monkeypatch.setattr(
             "tools.notes_tool.dispatch_notes_tool_for_agent",
             lambda agent, function_name, args: '{"ok":true}',
+        )
+        monkeypatch.setattr(
+            "agent.ingest_curator.dispatch_curator_verdict_for_agent",
+            lambda agent, args: '{"ok":true}',
         )
         monkeypatch.setattr(
             "tools.clarify_tool.clarify_tool",
