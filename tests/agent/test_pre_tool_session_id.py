@@ -1,5 +1,6 @@
 import ast
 import json
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -27,6 +28,8 @@ class _DummyAgent:
         self._checkpoint_mgr = SimpleNamespace(enabled=False)
         self._tool_guardrails = _AllowGuardrails()
         self._current_tool = None
+        self._tool_worker_threads_lock = threading.Lock()
+        self._tool_worker_threads = set()
         self._memory_manager = None
         self._context_engine_tool_names = set()
         self.context_compressor = None
@@ -80,9 +83,9 @@ def test_agent_runtime_helper_pre_tool_check_passes_session_and_call_id(monkeypa
 
     def fake_block(tool_name, args, **kwargs):
         captured.update({"tool_name": tool_name, "args": args, **kwargs})
-        return "blocked"
+        return "blocked", None
 
-    monkeypatch.setattr("hermes_cli.plugins.get_pre_tool_call_block_message", fake_block)
+    monkeypatch.setattr("hermes_cli.plugins._dispatch_pre_tool_call_hooks", fake_block)
 
     result = json.loads(
         invoke_tool(
@@ -105,9 +108,9 @@ def test_sequential_pre_tool_check_passes_session_and_call_id(monkeypatch):
 
     def fake_block(tool_name, args, **kwargs):
         captured.update({"tool_name": tool_name, "args": args, **kwargs})
-        return "blocked"
+        return "blocked", None
 
-    monkeypatch.setattr("hermes_cli.plugins.get_pre_tool_call_block_message", fake_block)
+    monkeypatch.setattr("hermes_cli.plugins._dispatch_pre_tool_call_hooks", fake_block)
     monkeypatch.setattr(
         "agent.tool_executor.maybe_persist_tool_result",
         lambda *, content, **_kwargs: content,
@@ -142,6 +145,9 @@ def test_agent_pre_tool_call_sites_forward_session_id_and_tool_call_id():
         repo / "agent" / "tool_executor.py",
         repo / "agent" / "agent_runtime_helpers.py",
     ]
+    # Upstream (2026-09 sync) funnels both call sites through
+    # ``hermes_cli.plugins._dispatch_pre_tool_call_hooks``; the ids travel either as explicit
+    # keywords or via a ``**tool_hook_ids(agent, task_id, tool_call_id)`` splat.
     calls = []
     for path in paths:
         tree = ast.parse(path.read_text())
@@ -149,10 +155,20 @@ def test_agent_pre_tool_call_sites_forward_session_id_and_tool_call_id():
             if isinstance(node, ast.Call):
                 func = node.func
                 name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", "")
-                if name == "get_pre_tool_call_block_message":
-                    calls.append((path.name, node.lineno, {kw.arg for kw in node.keywords if kw.arg}))
+                if name == "_dispatch_pre_tool_call_hooks":
+                    explicit = {kw.arg for kw in node.keywords if kw.arg}
+                    splats = [
+                        kw.value for kw in node.keywords
+                        if kw.arg is None and isinstance(kw.value, ast.Call)
+                    ]
+                    if any(
+                        (getattr(v.func, "id", None) or getattr(v.func, "attr", None)) == "tool_hook_ids"
+                        for v in splats
+                    ):
+                        explicit |= {"task_id", "session_id", "tool_call_id"}
+                    calls.append((path.name, node.lineno, explicit))
 
-    assert len(calls) == 3
+    assert len(calls) == 2, calls
     for path_name, line_no, kwargs in calls:
         assert "task_id" in kwargs, (path_name, line_no, kwargs)
         assert "session_id" in kwargs, (path_name, line_no, kwargs)

@@ -2254,6 +2254,9 @@ class TestAgentRuntimePostHookOwnershipSync:
         ("manage_catalog", {"action": "search", "query": "blender"}),
         ("gui_tour", {"action": "stop"}),
         ("delegate_task", {"goal": "Check the child path"}),
+        # Core-owned runtime introspection/switching (agent/runtime_control.py) is inline too.
+        ("model_status", {}),
+        ("model_switch", {"reason": "post-hook ownership sync"}),
     )
 
     @pytest.mark.parametrize(("tool_name", "tool_args"), _CASES)
