@@ -1810,7 +1810,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                     reply_expected=next_reply_expected, persist_user_display_metadata={
                         **display_metadata_for_event(pending_event),
                         **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event)} or None,
-                    turn_trace_obj=turn_ctx.turn_trace_obj,
+                    turn_trace_obj=getattr(turn_ctx, "turn_trace_obj", None),
                 )
         except asyncio.CancelledError:
             await _run_followup_processing_hook(
