@@ -1094,6 +1094,36 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 - **touches:** `tests/agent/test_background_review_memory_scope.py`, `tests/agent/test_builtin_memory_disabled_surface.py`, `tests/agent/test_skip_memory_store_65429.py`, `tests/tools/test_process_registry.py`
 - **v2026.9.11-sync:** NEW — created 2026-09-14.
 
+### 88. sync-20260914-fixups
+- **branch:** `soju/patches/sync-20260914-fixups`
+- **stacked-on:** `soju/patches/sync-20260914-test-seams` (2026-09-14 chronological tip stack)
+- **origin:** `local-author`
+- **upstream_pr:** none
+- **state:** `local-only`
+- **rationale:** Post-sync regression fixups found by the full-suite comparison against pristine v2026.9.11 (66 tests failing only on the stack). Code fixes, each annotated with its OWNER TOPIC to be folded in at the next base bump: `_maybe_inject_todo_reminder` only acts on real int counters (#83); `gateway/model_router.py` read_text encoding (#34); display-wiring hooks `_consume_pending_runtime_route_state` / `_consume_refusal_recall_quarantine` read via getattr and `_make_runtime_update_callback` made a staticmethod so upstream's SimpleNamespace runner doubles work (#1/#8/#58); `turn_trace_obj` read via getattr in the queued follow-up path (#15); named `providers.<name>` entries restored to upstream's `provider="custom"` + `requested_provider=<slug>` identity contract — `hermes_cli/runtime_provider_custom.py` is byte-identical to upstream again (#1, drop the 7d690a provider_label hunk at the next bump). Test seams (fork behaviour intentional): auxiliary wire strips `reasoning` (#12); durable `no_progress` cooldown accepted by the rotation-state test (#61); shutdown-drain spy accepts `kill_all(exclude_durable=True)` (#62). Details: `~/work/hermes/upstream-sync-20260914/reports/sync-20260914-fixups.md`.
+- **commits:**
+  - `c18916d4cc` fix(agent): todo reminder only acts on integer loop counters
+  - `bd24a67465` fix(gateway): model_router .env read passes encoding=utf-8
+  - `6df65201c6` fix(gateway): turn wiring tolerates bare runner doubles for fork hooks
+  - `20af1512b1` fix(gateway): queued follow-up reads turn_trace_obj via getattr
+  - `69481b4788` test(agent): re-seam auxiliary wire test to the fork's reasoning strip
+  - `22edad0a3f` test(agent): stale-cooldown test allows the fork's durable no-progress cooldown
+  - `f5766a017b` test(gateway): settle-window kill_all spy accepts exclude_durable kwarg
+  - `1963690e9f` fix(runtime): named custom providers resolve with provider='custom' again
+- **v2026.9.11-sync:** NEW — created 2026-09-14.
+
+### 89. sync-20260914-kanban-seams
+- **branch:** `soju/patches/sync-20260914-kanban-seams`
+- **stacked-on:** `soju/patches/sync-20260914-fixups` (2026-09-14 chronological tip stack — tip of the whole production stack)
+- **origin:** `local-author`
+- **upstream_pr:** none — test-only
+- **state:** `local-only`
+- **rationale:** (1) 15 upstream kanban notifier/wake tests isolated their DB purely via the `HERMES_KANBAN_DB` pin; with #72 (explicit board beats the pin) and upstream's notifier now opening boards explicitly they read the real default board. Shared helper `tests/gateway/_kanban_isolation.py::init_isolated_kanban` (same pattern as #72's own seam) applied to 16 pin sites in 5 files; no assertion weakened. Production sets no `HERMES_KANBAN_DB`. (2) ~35 `tests/hermes_cli/test_update_*` tests failed only under xdist on the stack: five upstream tests force fresh imports via `del sys.modules[...]` without restoring, so later tests patched stale module objects and `hermes update` ran un-mocked — **which is what fast-forwarded `main` to upstream and ran real `git checkout main` / `pull --ff-only upstream main` inside a scratch worktree on 2026-09-14 12:43 UTC**. Fixed with `tests/hermes_cli/conftest.py::evict_modules` (restores both the `sys.modules` entry and the parent-package attribute). Details: `~/work/hermes/upstream-sync-20260914/reports/sync-20260914-kanban-seams.md`.
+- **commits:**
+  - `455cb2715d` test(kanban): isolate notifier tests via HERMES_KANBAN_HOME, not the DB pin
+  - `21729888fb` test(hermes_cli): restore evicted modules after fresh-import fixtures
+- **v2026.9.11-sync:** NEW — created 2026-09-14.
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -1187,7 +1217,9 @@ soju/patches/reasoning-route-wire
 soju/patches/todo-continuity-parity
 soju/patches/aux-anthropic-mode-max-tokens
 soju/patches/session-store-lock-offload
-soju/patches/sync-20260914-test-seams (tip of the stack)
+soju/patches/sync-20260914-test-seams
+soju/patches/sync-20260914-fixups
+soju/patches/sync-20260914-kanban-seams (tip of the stack)
 # dropped 2026-09-14: soju/patches/precompress-checkpoint-signal (merged upstream)
 ```
 
