@@ -66,7 +66,7 @@ class TestFailFastLoop:
         monkeypatch.setattr(agent, "_has_pending_fallback", lambda: False)
         monkeypatch.setattr(agent, "_try_activate_fallback", lambda *a, **k: False)
         # No real sleeps during backoff.
-        monkeypatch.setattr("agent.conversation_loop.jittered_backoff", lambda *a, **k: 0.0)
+        monkeypatch.setattr("agent.retry_utils.jittered_backoff", lambda *a, **k: 0.0)
 
         result = agent.run_conversation(user_message="hi")
 
@@ -90,7 +90,7 @@ class TestFailFastLoop:
         monkeypatch.setattr(agent, "_interruptible_api_call", _boom)
         monkeypatch.setattr(agent, "_has_pending_fallback", lambda: False)
         monkeypatch.setattr(agent, "_try_activate_fallback", lambda *a, **k: False)
-        monkeypatch.setattr("agent.conversation_loop.jittered_backoff", lambda *a, **k: 0.0)
+        monkeypatch.setattr("agent.retry_utils.jittered_backoff", lambda *a, **k: 0.0)
 
         result = agent.run_conversation(user_message="hi")
 
@@ -115,7 +115,7 @@ class TestFailFastLoop:
         monkeypatch.setattr(agent, "_interruptible_api_call", _slow_boom)
         monkeypatch.setattr(agent, "_has_pending_fallback", lambda: False)
         monkeypatch.setattr(agent, "_try_activate_fallback", lambda *a, **k: False)
-        monkeypatch.setattr("agent.conversation_loop.jittered_backoff", lambda *a, **k: 0.0)
+        monkeypatch.setattr("agent.retry_utils.jittered_backoff", lambda *a, **k: 0.0)
         # Make every attempt LOOK slow: advance the clock 3s per time() call
         # pair via a monotonic offset injected around the attempt timer.
         _real_time = _time.time
