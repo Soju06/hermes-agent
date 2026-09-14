@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone, UTC
@@ -161,23 +162,24 @@ class SessionLifecycleMixin:
         return "suspended" if entry.suspended else None
 
     def _update_entry(self, session_key: str, mutate) -> bool:
-        """Apply ``mutate(entry)`` under ``_lock`` and full-save; False when the entry is missing
-        or *mutate* returned False (nothing to persist)."""
+        """Apply ``mutate(entry)`` under ``_lock``, then persist that one entry AFTER releasing
+        the lock (single-entry fast path); False when the entry is missing or *mutate* returned
+        False (nothing to persist)."""
         with self._lock:
             entry = self._entry_locked(session_key)
             if entry is None or mutate(entry) is False:
                 return False
-            self._save()
-            return True
+        self._save_entry(session_key)
+        return True
 
     def _update_all_entries_locked(self, mutate) -> int:
-        """Apply ``mutate(entry) -> bool`` to every entry under ``_lock``; save once if any
-        returned True. Returns the count that did."""
+        """Apply ``mutate(entry) -> bool`` to every entry under ``_lock``; one full rewrite after
+        the lock is released if any returned True. Returns the count that did."""
         with self._lock:
             self._ensure_loaded_locked()
             changed = sum(1 for entry in self._entries.values() if mutate(entry))
-            if changed:
-                self._save()
+        if changed:
+            self._save()  # full rewrite after the lock is released
         return changed
 
     def suspend_session(self, session_key: str) -> bool:
@@ -187,46 +189,70 @@ class SessionLifecycleMixin:
         """
         return self._update_entry(session_key, lambda e: setattr(e, "suspended", True))
 
-    def _set_turn_marker_locked(self, session_key: str, entry: SessionEntry, token, started_at) -> None:
+    def _swap_turn_marker(
+        self, session_key: str, *, token, started_at, expected_token=None, require_match: bool = False,
+    ) -> bool:
         """Persist the active-turn pair BEFORE publishing it in memory, so a failed write can
-        neither leak an unowned token nor drop a live one. Lock held."""
-        candidate = entry.to_dict()
-        candidate["active_turn_token"] = token
-        candidate["active_turn_started_at"] = _iso(started_at)
-        touched = _now() if started_at is not None else None
-        if touched is not None:
-            # Keeps the legacy 120s startup heuristic working for an older binary during a rolling
-            # downgrade/upgrade window.
-            candidate["updated_at"] = touched.isoformat()
-        self._save_entry(session_key, entry_data=candidate, lock_held=True)
-        entry.active_turn_token = token
-        entry.active_turn_started_at = started_at
-        if touched is not None:
-            entry.updated_at = touched
+        neither leak an unowned token nor drop a live one — without holding ``_lock`` across the
+        durable write. ``_save_lock`` is taken outermost (capture + write + publish form one
+        save-lock interval); ``_lock`` is held only to capture and to publish. With
+        ``require_match`` the live token must still equal ``expected_token`` (compare-and-swap).
+        If the live entry was structurally replaced while the write was in flight, the row is
+        repaired from the newer live route and False is returned."""
+        self._ensure_loaded()  # a first load may itself save; never under ``_save_lock``
+        with self._lazy("_save_lock", threading.Lock):
+            with self._lock:
+                entry = self._entry_locked(session_key)
+                if entry is None or (require_match and entry.active_turn_token != expected_token):
+                    return False
+                candidate = entry.to_dict()
+                candidate["active_turn_token"] = token
+                candidate["active_turn_started_at"] = _iso(started_at)
+                touched = _now() if started_at is not None else None
+                if touched is not None:
+                    # Keeps the legacy 120s startup heuristic working for an older binary during a
+                    # rolling downgrade/upgrade window.
+                    candidate["updated_at"] = touched.isoformat()
+                captured = self._capture_entry_save_locked(session_key, candidate)
+            # Persist before publishing, but never retain the store lock while SQLite (or the
+            # fallback mirror) is slow.
+            assert captured is not None
+            self._persist_entry_save_locked(session_key, captured)
+
+            repair_snapshot = None
+            with self._lock:
+                current = self._entries.get(session_key)
+                if current is not entry or (require_match and current.active_turn_token != expected_token):
+                    # A structural replacement (or a newer turn) raced the durable candidate:
+                    # repair the row with the newer live route before returning.
+                    repair_snapshot = self._snapshot_routing_locked()
+                else:
+                    entry.active_turn_token = token
+                    entry.active_turn_started_at = started_at
+                    if touched is not None:
+                        entry.updated_at = touched
+            if repair_snapshot is not None:
+                self._persist_routing_data_save_locked(*repair_snapshot)
+                return False
+        return True
 
     def mark_turn_active(self, session_key: str) -> Optional[str]:
         """Persist exact ownership of the running agent turn; returns the opaque token for
         :meth:`clear_turn_active`. Re-marking replaces the previous token so a stale asynchronous
         unwind cannot clear a newer turn."""
         token = uuid.uuid4().hex
-        with self._lock:
-            entry = self._entry_locked(session_key)
-            if entry is None:
-                return None
-            # Aware UTC, unlike the local wall clock elsewhere: the next process compares it with
-            # epoch transcript timestamps and may run in another zone (DST, container vs unit TZ).
-            self._set_turn_marker_locked(session_key, entry, token, datetime.now(UTC))
+        # Aware UTC, unlike the local wall clock elsewhere: the next process compares it with
+        # epoch transcript timestamps and may run in another zone (DST, container vs unit TZ).
+        if not self._swap_turn_marker(session_key, token=token, started_at=datetime.now(UTC)):
+            return None
         return token
 
     def clear_turn_active(self, session_key: str, token: str) -> bool:
         """Compare-and-swap clear an active-turn marker; ``False`` when the entry disappeared or a
         newer turn owns it."""
-        with self._lock:
-            entry = self._entry_locked(session_key)
-            if entry is None or entry.active_turn_token != token:
-                return False
-            self._set_turn_marker_locked(session_key, entry, None, None)
-        return True
+        return self._swap_turn_marker(
+            session_key, token=None, started_at=None, expected_token=token, require_match=True,
+        )
 
     def recover_interrupted_turns(self, max_age_seconds: int = 60 * 60) -> int:
         """Promote crash-left turn markers into ``resume_pending`` (unclean startup only).
@@ -310,9 +336,8 @@ class SessionLifecycleMixin:
             ]
             for key in removed_keys:
                 self._entries.pop(key, None)
-            if removed_keys:
-                self._save()
         if removed_keys:
+            self._save()  # full rewrite after the lock is released
             logger.info("SessionStore pruned %d entries older than %d days",
                         len(removed_keys), max_age_days)
         return len(removed_keys)

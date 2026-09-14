@@ -873,7 +873,7 @@ class SessionStore(
         self._routing_db_loaded = False
         self._routing_fallback_baseline: Optional[dict[str, Any]] = None
         self._lock = threading.Lock()  # guards _entries / _loaded only
-        self._save_lock = threading.Lock()  # whole-index persistence, never held with _lock
+        self._save_lock = threading.Lock()  # durable routing writes; taken before _lock, never under it
         # Fast (single-entry) and full saves share one generation counter so they are totally
         # ordered; _fast_persisted_entries: key -> (revision, entry_json) since the last rewrite.
         self._routing_generation = 0
@@ -1213,27 +1213,41 @@ class SessionStore(
 
         cleaned = sanitize_model_override(override)
 
-        with self._lock:
-            entry = self._entry_locked(session_key)
-            if entry is None:
-                return
-            # A /model write, a clear included (``--global``, ``/resume``), is the newer model-route
-            # writer: it supersedes a persisted runtime route (runtime_model/runtime_provider) but
-            # leaves runtime_reasoning_effort alone.
-            has_runtime_route = bool(entry.runtime_model or entry.runtime_provider)
-            if entry.model_override == cleaned and not has_runtime_route:
-                return
-            # Publish only after persistence so a failed clear remains retryable.
-            data, generation = self._snapshot_routing_locked()
-            # Snapshot reconciliation may replace the entry after database recovery.
-            entry = self._entries[session_key]
-            data[session_key] = replace(
-                entry, model_override=cleaned, runtime_model=None, runtime_provider=None,
-            ).to_dict()
-            self._persist_routing_data(data, generation)
-            entry.model_override = cleaned
-            entry.runtime_model = None
-            entry.runtime_provider = None
+        # Publish only after persistence so a failed clear remains retryable — but never hold
+        # ``_lock`` across the durable write: capture the candidate under ``_lock``, persist it
+        # under ``_save_lock`` only, then re-acquire ``_lock`` to publish (or repair the row if
+        # the live entry was structurally replaced meanwhile).
+        self._ensure_loaded()  # a first load may itself save; never under ``_save_lock``
+        with self._lazy("_save_lock", threading.Lock):
+            with self._lock:
+                entry = self._entry_locked(session_key)
+                if entry is None:
+                    return
+                # A /model write, a clear included (``--global``, ``/resume``), is the newer
+                # model-route writer: it supersedes a persisted runtime route
+                # (runtime_model/runtime_provider) but leaves runtime_reasoning_effort alone.
+                has_runtime_route = bool(entry.runtime_model or entry.runtime_provider)
+                if entry.model_override == cleaned and not has_runtime_route:
+                    return
+                # Snapshot reconciliation may replace the entry after database recovery.
+                self._reconcile_recovered_routing_locked()
+                entry = self._entries[session_key]
+                candidate = replace(
+                    entry, model_override=cleaned, runtime_model=None, runtime_provider=None,
+                ).to_dict()
+                captured = self._capture_entry_save_locked(session_key, candidate)
+            assert captured is not None
+            self._persist_entry_save_locked(session_key, captured)
+            repair_snapshot = None
+            with self._lock:
+                if self._entries.get(session_key) is not entry:
+                    repair_snapshot = self._snapshot_routing_locked()
+                else:
+                    entry.model_override = cleaned
+                    entry.runtime_model = None
+                    entry.runtime_provider = None
+            if repair_snapshot is not None:
+                self._persist_routing_data_save_locked(*repair_snapshot)
 
     def set_session_yolo(self, session_key: str, enabled: Optional[bool]) -> bool:
         """Persist the lane's ``/yolo`` bypass (None: back to the launch policy); False when the key has no
@@ -1288,8 +1302,8 @@ class SessionStore(
                     str(reasoning_effort).strip().lower() if reasoning_effort else None
                 )
             entry.updated_at = _now()
-            self._save()
-            return True
+        self._save_entry(session_key)
+        return True
 
     def clear_runtime_overrides(
         self,
@@ -1311,8 +1325,8 @@ class SessionStore(
             if reasoning:
                 entry.runtime_reasoning_effort = None
             entry.updated_at = _now()
-            self._save()
-            return True
+        self._save_entry(session_key)
+        return True
 
     def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:
         """Force reset a session, creating a new session ID."""
@@ -1347,15 +1361,22 @@ class SessionStore(
         return new_entry
 
     def _replace_route_locked(self, session_key, old_entry, session_id, now, **fields) -> SessionEntry:
-        """Publish a fresh entry (inheriting origin/platform/chat_type) and save. Lock held."""
+        """Publish a fresh entry (inheriting origin/platform/chat_type) and save. Lock held (released
+        and re-acquired around the durable write)."""
         new_entry = SessionEntry(
             session_key=session_key, session_id=session_id, created_at=now, updated_at=now,
             origin=old_entry.origin, platform=old_entry.platform, chat_type=old_entry.chat_type,
             transport_profile=old_entry.transport_profile, **fields,
         )
         self._entries[session_key] = new_entry
-        self._save()
-        self._rows_pending.add(session_id)  # after the save: a raising save leaves nothing pending
+        # Pending BEFORE the save: it releases ``_lock`` around the durable write, and a reader in that
+        # window must already see the published id as pending. A raising save leaves nothing pending.
+        self._rows_pending.add(session_id)
+        try:
+            self._save(lock_held=True)  # releases ``_lock`` around the durable write
+        except BaseException:
+            self._rows_pending.discard(session_id)
+            raise
         return new_entry
 
     def rekey_profile_routing(self, old_name: str, new_name: str) -> int:
@@ -1381,8 +1402,8 @@ class SessionStore(
                 if origin is not None and getattr(origin, "profile", None) == old:
                     origin = _dc_replace(origin, profile=new)
                 self._entries[new_key] = _dc_replace(entry, session_key=new_key, origin=origin)
-            if moving:
-                self._save()
+        if moving:
+            self._save()  # full rewrite after the lock is released
         return len(moving)
 
     def purge_profile_routing(self, profile: str) -> int:
@@ -1401,8 +1422,8 @@ class SessionStore(
             dropped = [key for key in self._entries if key.startswith(ns)]
             for key in dropped:
                 self._entries.pop(key, None)
-            if dropped:
-                self._save()
+        if dropped:
+            self._save()  # full rewrite after the lock is released
         return len(dropped)
 
     def remove_by_session_id(self, session_id: str) -> int:
@@ -1425,8 +1446,8 @@ class SessionStore(
                 hints = getattr(self, "_session_owner_hints", None)
                 if hints is not None:
                     hints.pop(session_id, None)
-                self._save()
         if dropped:
+            self._save()  # full rewrite after the lock is released
             logger.info("SessionStore removed %d routing entr%s for deleted session %s",
                         len(dropped), "y" if len(dropped) == 1 else "ies", session_id)
         return len(dropped)
@@ -1440,7 +1461,7 @@ class SessionStore(
             if entry is None or entry.session_id != session_id:
                 return False
             self._entries.pop(session_key, None)
-            self._save()
+        self._save()  # full rewrite after the lock is released
         return True
 
     def restore_route(self, entry: SessionEntry, *, expected_session_id: str) -> bool:
@@ -1452,7 +1473,7 @@ class SessionStore(
             if current is None or current.session_id != expected_session_id:
                 return False
             self._entries[entry.session_key] = entry
-            self._save()
+        self._save()  # full rewrite after the lock is released
         if self._persistence_for_key(entry.session_key):
             self._reopen_session_row(entry.session_key, entry.session_id)
         self._announce_route(entry.session_key, entry)

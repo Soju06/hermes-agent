@@ -4,7 +4,6 @@ load/save paths (state.db gateway_routing primary, sessions.json legacy mirror).
 
 from __future__ import annotations
 
-import contextlib
 import functools
 import logging
 import json
@@ -409,16 +408,20 @@ class SessionPersistenceMixin:
         if mirror_retired and db_load_succeeded:
             # Rewrite the mirror while the fences that kept those routes out still hold: a prune's
             # ages out, and the import would then restore the retired route.
-            self._save()
+            self._save(lock_held=True)
             if not getattr(self, "_write_sessions_json", True):
                 # That save left an existing mirror as it was: strip the routes from it directly,
-                # or every later start imports them again.
+                # or every later start imports them again. It takes ``_save_lock``, which is never
+                # acquired while ``_lock`` is held: release the store lock around it.
+                self._lock.release()
                 try:
                     self.strip_retired_mirror_routes()
                 except Exception:
                     logger.warning("gateway.session: could not strip retired routes from sessions.json", exc_info=True)
+                finally:
+                    self._lock.acquire()
         # A hard crash skips graceful shutdown and leaves sessions.json pointing at ended sessions.
-        self._prune_stale_sessions_locked()
+        self._prune_stale_sessions_locked(lock_held=True)
 
     def _heal_missing_origins(self, entries) -> None:
         for entry in entries:
@@ -484,10 +487,11 @@ class SessionPersistenceMixin:
             print(f"[gateway] Warning: Failed to load sessions: {e}")
         return retired
 
-    def _prune_stale_sessions_locked(self) -> None:
+    def _prune_stale_sessions_locked(self, *, lock_held: bool = False) -> None:
         """Remove routing entries whose session has ended in state.db (startup, lock held). Stale ==
         ``end_reason IS NOT NULL``; rows absent from the DB are kept; a ``None`` DB handle is a
-        no-op; DB errors are non-fatal."""
+        no-op; DB errors are non-fatal. ``lock_held=True`` is the startup path (``_lock`` held by
+        ``_ensure_loaded_locked``); ``False`` serves focused maintenance/tests calling it directly."""
         if not self._entries:
             return
         stale_keys: list = []
@@ -514,7 +518,7 @@ class SessionPersistenceMixin:
         for key in stale_keys:
             del self._entries[key]
         if stale_keys or recovered_keys:
-            self._save()
+            self._save(lock_held=lock_held)
 
     def _stale_entry_verdict(self, key: str, entry, row):
         """For a routing entry whose row has ended: ``"prune"``, a replacement entry (repoint), or
@@ -579,9 +583,25 @@ class SessionPersistenceMixin:
         """Serializable snapshot of ``_entries``. Lock held."""
         return {key: entry.to_dict() for key, entry in self._entries.items()}
 
-    def _save(self) -> None:
-        """Persist the routing index while the caller holds ``_lock``."""
-        self._persist_routing_data(*self._snapshot_routing_locked())
+    def _save(self, *, lock_held: bool = False) -> None:
+        """Persist a full snapshot without retaining ``_lock`` across I/O.
+
+        A writer parked in SQLite/fsync must never hold the store-wide ``_lock``: every reader on
+        the event loop (``get_entry``, ``get_model_override``, message dispatch) would stall for
+        the whole write. Runtime writers use :meth:`_save_entries` (this method's default) or the
+        single-entry :meth:`_save_entry`. ``lock_held=True`` supports the startup load and
+        stale-prune calls, which enter with the non-reentrant store lock held: the snapshot is
+        taken under the lock, which is then released around the durable write and re-acquired.
+        """
+        if not lock_held:
+            self._save_entries()
+            return
+        data, generation = self._snapshot_routing_locked()
+        self._lock.release()
+        try:
+            self._persist_routing_data(data, generation)
+        finally:
+            self._lock.acquire()
 
     def _next_routing_generation_locked(self) -> int:
         """Bump and return the shared routing counter (lock held). Full snapshots AND single-entry
@@ -626,47 +646,57 @@ class SessionPersistenceMixin:
         return self._entries_as_dicts(), self._next_routing_generation_locked()
 
     def _persist_routing_data(self, data: dict[str, Any], generation: int) -> None:
-        """Serialize all whole-index writers through one durable write lock."""
+        """Serialize all whole-index writers through one durable write lock (never ``_lock``)."""
         with self._lazy("_save_lock", threading.Lock):
-            if generation <= getattr(self, "_persisted_routing_generation", 0):
-                return
-            # Fold in fast upserts numbered above this snapshot: they were serialized after us and
-            # a delayed full rewrite must not regress them.
-            fast_persisted = getattr(self, "_fast_persisted_entries", None)
-            if fast_persisted:
-                for key, (revision, entry_json) in fast_persisted.items():
-                    if revision > generation:
-                        data[key] = json.loads(entry_json)
-            db_saved = False
-            store = self._routing_persistence
-            if store is not None:
-                try:
-                    retired = store.routing.replace_routing_entries(
-                        {k: json.dumps(v) for k, v in data.items()}, routing_scope=self._routing_scope())
-                    db_saved = True
-                    # A retired route the save skipped stays out of the mirror too: its fence may
-                    # age out (a prune's), and the next start's legacy import would restore it.
-                    if retired:
-                        data = {k: v for k, v in data.items() if k not in retired}
-                except Exception as exc:
-                    logger.warning("gateway.session: state.db routing save failed: %s", exc)
-            if getattr(self, "_write_sessions_json", True) or not db_saved:
-                try:
-                    self._save_sessions_json(data)
-                except Exception as exc:
-                    if not db_saved:
-                        raise
-                    # state.db is authoritative: a failed legacy mirror must not report the
-                    # already-committed primary write as failed.
-                    logger.warning(
-                        "gateway.session: sessions.json mirror save failed after state.db commit: "
-                        "%s", exc)
-            self._persisted_routing_generation = generation
-            # This rewrite supersedes fast records at or below its generation; newer ones stay for
-            # the next delayed full writer.
-            if fast_persisted:
-                for key in [k for k, (rev, _) in fast_persisted.items() if rev <= generation]:
-                    del fast_persisted[key]
+            self._persist_routing_data_save_locked(data, generation)
+
+    def _persist_routing_data_save_locked(self, data: dict[str, Any], generation: int) -> None:
+        """Persist a full routing snapshot while ``_save_lock`` is held.
+
+        Kept separate from :meth:`_persist_routing_data` so failure-atomic single-entry
+        transitions (:meth:`_persist_entry_save_locked`) can serialize a candidate and its
+        full-snapshot fallback under ONE save-lock interval without ever retaining
+        ``SessionStore._lock`` across SQLite or fsync.
+        """
+        if generation <= getattr(self, "_persisted_routing_generation", 0):
+            return
+        # Fold in fast upserts numbered above this snapshot: they were serialized after us and
+        # a delayed full rewrite must not regress them.
+        fast_persisted = getattr(self, "_fast_persisted_entries", None)
+        if fast_persisted:
+            for key, (revision, entry_json) in fast_persisted.items():
+                if revision > generation:
+                    data[key] = json.loads(entry_json)
+        db_saved = False
+        store = self._routing_persistence
+        if store is not None:
+            try:
+                retired = store.routing.replace_routing_entries(
+                    {k: json.dumps(v) for k, v in data.items()}, routing_scope=self._routing_scope())
+                db_saved = True
+                # A retired route the save skipped stays out of the mirror too: its fence may
+                # age out (a prune's), and the next start's legacy import would restore it.
+                if retired:
+                    data = {k: v for k, v in data.items() if k not in retired}
+            except Exception as exc:
+                logger.warning("gateway.session: state.db routing save failed: %s", exc)
+        if getattr(self, "_write_sessions_json", True) or not db_saved:
+            try:
+                self._save_sessions_json(data)
+            except Exception as exc:
+                if not db_saved:
+                    raise
+                # state.db is authoritative: a failed legacy mirror must not report the
+                # already-committed primary write as failed.
+                logger.warning(
+                    "gateway.session: sessions.json mirror save failed after state.db commit: "
+                    "%s", exc)
+        self._persisted_routing_generation = generation
+        # This rewrite supersedes fast records at or below its generation; newer ones stay for
+        # the next delayed full writer.
+        if fast_persisted:
+            for key in [k for k, (rev, _) in fast_persisted.items() if rev <= generation]:
+                del fast_persisted[key]
 
     def _save_sessions_json(self, data: dict[str, Any]) -> None:
         """Write the legacy sessions.json mirror of the routing index (atomic + fsync)."""
@@ -688,37 +718,68 @@ class SessionPersistenceMixin:
         ``_save_lock`` the upsert is skipped if a full snapshot or a newer fast save of this key
         already persisted (the reverse case lives in ``_persist_routing_data``). No DB or a failed
         upsert falls back to the full rewrite. ``entry_data`` persists a candidate BEFORE it is
-        published to the live entry (failure-atomic transitions); the fallback carries it too."""
-        guard = contextlib.nullcontext() if lock_held else self._lock
-        with guard:
-            entry = self._entries.get(session_key)
-            if entry is None:
-                return
-            serialized = dict(entry_data) if entry_data is not None else entry.to_dict()
-            # The O(n) full snapshot is deferred to the fallback branch.
-            entry_json, revision = json.dumps(serialized), self._next_routing_generation_locked()
+        published to the live entry (failure-atomic transitions); the fallback carries it too.
+
+        The candidate is captured (serialized + revision allocated) under ``_lock`` and persisted
+        under ``_save_lock`` ONLY: a writer parked in SQLite/fsync must never stall the event-loop
+        readers. ``lock_held=True`` is therefore a hard error — callers that already hold ``_lock``
+        use :meth:`_capture_entry_save_locked` + :meth:`_persist_entry_save_locked` themselves
+        (see ``SessionLifecycleMixin._swap_turn_marker``)."""
+        if lock_held:
+            raise RuntimeError(
+                "_save_entry cannot perform persistence while SessionStore._lock is held"
+            )
+        with self._lock:
+            captured = self._capture_entry_save_locked(session_key, entry_data)
+        if captured is None:
+            return
+        with self._lazy("_save_lock", threading.Lock):
+            self._persist_entry_save_locked(session_key, captured)
+
+    def _capture_entry_save_locked(
+        self, session_key: str, entry_data: Optional[dict[str, Any]] = None,
+    ) -> Optional[tuple[str, int, Optional[dict[str, Any]]]]:
+        """Serialize one entry and allocate its revision. ``_lock`` held. Returns
+        ``(entry_json, revision, candidate_entry)`` — ``candidate_entry`` is the caller-supplied
+        transition (None when the live entry was serialized) — or None when the entry is gone."""
+        entry = self._entries.get(session_key)
+        if entry is None:
+            return None
+        serialized = dict(entry_data) if entry_data is not None else entry.to_dict()
+        # The O(n) full snapshot is deferred to the fallback branch.
+        entry_json, revision = json.dumps(serialized), self._next_routing_generation_locked()
+        return entry_json, revision, (serialized if entry_data is not None else None)
+
+    def _persist_entry_save_locked(
+        self, session_key: str, captured: tuple[str, int, Optional[dict[str, Any]]],
+    ) -> None:
+        """Persist a captured entry while ``_save_lock`` (never ``_lock``) is held. A failed or
+        unavailable UPSERT falls back to the full rewrite under the same save-lock interval; the
+        fallback re-acquires ``_lock`` only to snapshot."""
+        entry_json, revision, candidate_entry = captured
         store = self._routing_persistence
         if store is not None:
             try:
-                with self._lazy("_save_lock", threading.Lock):
-                    if getattr(self, "_persisted_routing_generation", 0) >= revision:
-                        return
-                    fast_persisted = self._lazy("_fast_persisted_entries", dict)
-                    persisted = fast_persisted.get(session_key)
-                    if persisted is not None and persisted[0] >= revision:
-                        return
-                    store.routing.upsert_routing_entry(session_key, entry_json, routing_scope=self._routing_scope())
-                    fast_persisted[session_key] = (revision, entry_json)
+                if getattr(self, "_persisted_routing_generation", 0) >= revision:
+                    return
+                fast_persisted = self._lazy("_fast_persisted_entries", dict)
+                persisted = fast_persisted.get(session_key)
+                if persisted is not None and persisted[0] >= revision:
+                    return
+                store.routing.upsert_routing_entry(session_key, entry_json, routing_scope=self._routing_scope())
+                fast_persisted[session_key] = (revision, entry_json)
                 return
             except Exception as exc:
                 logger.warning(
                     "gateway.session: single-entry routing save failed for %r (%s); falling back "
                     "to full index rewrite", session_key, exc)
-        if entry_data is not None:
+        if candidate_entry is not None:
             # Full-snapshot fallback carrying the candidate transition.
-            with guard:
+            with self._lock:
                 fallback_data = self._entries_as_dicts()
-            fallback_data[session_key] = dict(entry_data)
-            self._persist_routing_data(fallback_data, revision)
+            fallback_data[session_key] = dict(candidate_entry)
+            self._persist_routing_data_save_locked(fallback_data, revision)
         else:
-            self._save_entries()
+            with self._lock:
+                fallback_data, fallback_generation = self._snapshot_routing_locked()
+            self._persist_routing_data_save_locked(fallback_data, fallback_generation)

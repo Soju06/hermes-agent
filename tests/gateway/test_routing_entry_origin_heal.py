@@ -113,5 +113,5 @@ def test_boot_heal_never_lets_a_stale_mirror_overwrite_newer_routing_state(tmp_p
     assert len(calls) == 2
     assert recovered.suspended is True and recovered.origin is not None
     with store._lock:
-        store._save()
+        store._save(lock_held=True)
     assert json.loads(real_load(routing_scope=store._routing_scope())[key])['suspended'] is True

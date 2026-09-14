@@ -126,8 +126,10 @@ def test_failed_mark_persistence_does_not_leak_marker_into_later_save(tmp_path):
     store = _make_store(tmp_path)
     source = _make_source()
     entry = store.get_or_create_session(source)
-    real_save_entry = store._save_entry
-    store._save_entry = MagicMock(side_effect=OSError("disk unavailable"))
+    real_persist_entry = store._persist_entry_save_locked
+    store._persist_entry_save_locked = MagicMock(
+        side_effect=OSError("disk unavailable")
+    )
 
     with pytest.raises(OSError, match="disk unavailable"):
         store.mark_turn_active(entry.session_key)
@@ -137,10 +139,10 @@ def test_failed_mark_persistence_does_not_leak_marker_into_later_save(tmp_path):
     assert current.active_turn_started_at is None
 
     # A later unrelated save must not make the failed marker durable.
-    store._save_entry = real_save_entry
+    store._persist_entry_save_locked = real_persist_entry
     with store._lock:
         store._entries[entry.session_key].updated_at = datetime.now()
-        store._save()
+        store._save(lock_held=True)
 
     reloaded = _make_store(tmp_path)
     assert reloaded.recover_interrupted_turns() == 0
@@ -154,8 +156,10 @@ def test_failed_clear_persistence_keeps_token_retryable_and_durable_clear_wins(t
     token = store.mark_turn_active(entry.session_key)
     assert token is not None
 
-    real_save_entry = store._save_entry
-    store._save_entry = MagicMock(side_effect=OSError("disk unavailable"))
+    real_persist_entry = store._persist_entry_save_locked
+    store._persist_entry_save_locked = MagicMock(
+        side_effect=OSError("disk unavailable")
+    )
 
     with pytest.raises(OSError, match="disk unavailable"):
         store.clear_turn_active(entry.session_key, token)
@@ -164,7 +168,7 @@ def test_failed_clear_persistence_keeps_token_retryable_and_durable_clear_wins(t
     assert current.active_turn_token == token
     assert current.active_turn_started_at is not None
 
-    store._save_entry = real_save_entry
+    store._persist_entry_save_locked = real_persist_entry
     assert store.clear_turn_active(entry.session_key, token) is True
 
     reloaded = _make_store(tmp_path)
@@ -177,23 +181,27 @@ def test_state_db_failure_atomic_marker_round_trip(tmp_path):
     store = _make_db_store(tmp_path)
     source = _make_source("state-db-active-turn")
     entry = store.get_or_create_session(source)
-    real_save_entry = store._save_entry
+    real_persist_entry = store._persist_entry_save_locked
 
-    store._save_entry = MagicMock(side_effect=OSError("state.db unavailable"))
+    store._persist_entry_save_locked = MagicMock(
+        side_effect=OSError("state.db unavailable")
+    )
     with pytest.raises(OSError, match="state.db unavailable"):
         store.mark_turn_active(entry.session_key)
     assert _entry_for(store, source).active_turn_token is None
 
-    store._save_entry = real_save_entry
+    store._persist_entry_save_locked = real_persist_entry
     token = store.mark_turn_active(entry.session_key)
     assert token is not None
 
-    store._save_entry = MagicMock(side_effect=OSError("state.db unavailable"))
+    store._persist_entry_save_locked = MagicMock(
+        side_effect=OSError("state.db unavailable")
+    )
     with pytest.raises(OSError, match="state.db unavailable"):
         store.clear_turn_active(entry.session_key, token)
     assert _entry_for(store, source).active_turn_token == token
 
-    store._save_entry = real_save_entry
+    store._persist_entry_save_locked = real_persist_entry
     assert store.clear_turn_active(entry.session_key, token) is True
     _close_store_handles(store)
 
@@ -238,7 +246,7 @@ def test_exact_old_active_turn_recovers_even_when_updated_at_is_stale(tmp_path):
         current = store._entries[entry.session_key]
         current.updated_at = datetime.now() - timedelta(hours=2)
         current.active_turn_started_at = datetime.now() - timedelta(minutes=10)
-        store._save()
+        store._save(lock_held=True)
 
     # Prove the marker survives a fresh SessionStore and is not relying on the
     # in-memory object that wrote it.

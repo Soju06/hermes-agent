@@ -20,9 +20,13 @@ def _store_with_entry() -> tuple[SessionStore, SessionEntry]:
     store._lock = threading.Lock()
     store._loaded = True
     store._entries = {SESSION_KEY: entry}
-    store._save = lambda: None
+    store._save = lambda *args, **kwargs: None
     store._snapshot_routing_locked = lambda: ({}, 1)
     store._persist_routing_data = lambda data, generation: None
+    # Writers persist per-entry after releasing the store lock; stub that path too.
+    store._save_entry = lambda *args, **kwargs: None
+    store._capture_entry_save_locked = lambda *args, **kwargs: ("{}", 1, None)
+    store._persist_entry_save_locked = lambda *args, **kwargs: None
     return store, entry
 
 
@@ -87,7 +91,13 @@ def test_model_override_clear_also_clears_older_runtime_route():
     entry.runtime_provider = "runtime-provider"
     entry.runtime_reasoning_effort = "high"
     persisted = []
-    store._persist_routing_data = lambda data, generation: persisted.append(data)
+
+    def _capture(session_key, entry_data=None):
+        # set_model_override persists its candidate through the single-entry path, outside _lock.
+        persisted.append((session_key, entry_data))
+        return "{}", 1, entry_data
+
+    store._capture_entry_save_locked = _capture
 
     # When
     store.set_model_override(SESSION_KEY, None)
@@ -98,7 +108,8 @@ def test_model_override_clear_also_clears_older_runtime_route():
     assert entry.runtime_provider is None
     assert entry.runtime_reasoning_effort == "high"
     assert len(persisted) == 1
-    durable = persisted[0][SESSION_KEY]
+    key, durable = persisted[0]
+    assert key == SESSION_KEY
     assert (durable["runtime_model"], durable["runtime_provider"]) == (None, None)
     assert durable["runtime_reasoning_effort"] == "high"
 
@@ -107,7 +118,12 @@ def test_model_override_clear_without_any_route_writes_nothing():
     # Given
     store, entry = _store_with_entry()
     entry.runtime_reasoning_effort = "high"
-    store._persist_routing_data = lambda data, generation: pytest.fail("an unchanged clear must not persist")
+    def _no_write(*args, **kwargs):
+        pytest.fail("an unchanged clear must not persist")
+
+    store._persist_routing_data = _no_write
+    store._capture_entry_save_locked = _no_write
+    store._persist_entry_save_locked = _no_write
 
     # When
     store.set_model_override(SESSION_KEY, None)
