@@ -2156,7 +2156,11 @@ class TestDelegateRouteSchema(unittest.TestCase):
     def test_schema_dormant_without_routes(self, _pairs):
         from tools.delegate_tool import _build_dynamic_schema_overrides
 
-        overrides = _build_dynamic_schema_overrides()
+        # Upstream (2026.9) rebuilds tasks.items itself to drop the ``group`` field unless
+        # delegation.independent_completions is on; pin it on so the identity check below
+        # still isolates the route injection (the only thing this test is about).
+        with patch("tools.delegate_tool_config._get_independent_completions", return_value=True):
+            overrides = _build_dynamic_schema_overrides()
         props = overrides["parameters"]["properties"]
         static_props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
         # No route param anywhere; property set matches the upstream shape.
@@ -2276,8 +2280,13 @@ class TestDelegateRouteResolution(unittest.TestCase):
         MockAgent.assert_not_called()
 
     def test_per_task_route_overrides_top_level(self):
+        # Multi-task batches must pass upstream's batch goal gate (terse goals are
+        # rejected as unexpanded templates), so spell the goals out.
         _, MockAgent = self._run(
-            tasks=[{"goal": "a", "route": "chat"}, {"goal": "b"}],
+            tasks=[
+                {"goal": "Summarize the quarterly report for the finance channel", "route": "chat"},
+                {"goal": "Refactor the gateway retry loop and add regression tests"},
+            ],
             route="dev",
         )
         models = [call[1]["model"] for call in MockAgent.call_args_list]
