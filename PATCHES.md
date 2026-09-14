@@ -917,6 +917,17 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
   - `d4de3a3dac` fix(auxiliary): forward explicit max_tokens when api_mode is anthropic_messages
 - **touches:** `agent/auxiliary_client.py`, `tests/agent/test_auxiliary_anthropic_mode_max_tokens.py` (new)
 
+### 86. session-store-lock-offload
+- **branch:** `soju/patches/session-store-lock-offload`
+- **stacked-on:** `soju/production` @ `79922b1e0b` (2026-09-04 assembled stack). The change rewrites `mark_turn_active`/`begin_active_turn` and metadata writers that live across #21 `durable-turns`, #1 `runtime-control` and base, so it only applies on the assembled tree. At the next base bump rebase it with `git rebase --onto <new soju/production> 79922b1e0b soju/patches/session-store-lock-offload` (plain `bin/hermes-patches sync` would try to replay the whole carried history) and merge it LAST.
+- **origin:** `local-author`
+- **upstream_pr:** none — upstreamable in principle (upstream `gateway/session_persistence.py` still runs the UPSERT under `_lock` when `lock_held=True`; probed 2026-09-14 on upstream main: a 1000 ms persistence write blocked `get_model_override` for 855 ms), but the fork version depends on `begin_active_turn` from #21. File after porting to the mixin split.
+- **state:** `local-only`
+- **rationale:** Same defect class as the 2026-07-28/29 gateway outages (event loop stalled behind SQLite held under a store lock). `SessionStore._save_entry(lock_held=True)` and `_save()` ran the SQLite UPSERT / full `sessions.json` rewrite + fsync while the caller still held the store-wide non-reentrant `_lock`, so every reader on the event loop waited for the write. Fix: capture the serialized entry + revision under `_lock`, persist under `_save_lock` only (`_capture_entry_save_locked` / `_persist_entry_save_locked` / `_persist_routing_data_save_locked`); `mark_turn_active`/`begin_active_turn` take `_save_lock` outermost, release `_lock` around the durable write and repair the row if the live entry was structurally replaced meanwhile; metadata/override/suspend writers use `_save_entry` after releasing the lock; `lock_held=True` on `_save_entry` is now a hard error; `_save(lock_held=True)` survives only for the startup stale-prune path (releases/re-acquires around I/O). Measured on the assembled stack: reader blocked 857 ms → 1 ms during a 1000 ms write. Provenance: written in the live production tree by another session on 2026-08-31 (preserved as `~/work/hermes-cc-parity/live-tree-wip-session-store-20260831.patch`), re-applied after the 2026-09-04 rebuild, running in both gateways since 2026-09-04 10:14 UTC; promoted from uncommitted WIP to this topic on 2026-09-14. `tests/gateway` on the topic tree: only pre-existing `test_health_detailed_returns_ok` (`degraded`, environment) fails; it fails identically on the WIP-free tree.
+- **commits:**
+  - `79e5d0f05968` fix(gateway): never hold SessionStore._lock across routing persistence I/O
+- **touches:** `gateway/session.py`, `tests/gateway/test_active_turn_recovery.py`, `tests/gateway/test_clean_shutdown_marker.py`, `tests/gateway/test_durable_turn_records.py`, `tests/gateway/test_session_db_recovery.py`, `tests/gateway/test_session_reset_notify.py`, `tests/gateway/test_runtime_override_store_precedence.py` (test double gains a `_save_entry` stub — the only `tests/gateway` delta vs the WIP-free tree; full suite 2026-09-14: 23 pre-existing failures identical on both trees)
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -989,6 +1000,7 @@ soju/patches/hygiene-noprogress-cooldown (stacked on anthropic-structured-output
 soju/patches/fts-v2-orphan-hardening
 soju/patches/read-file-binary-sniff
 soju/patches/approval-grep-escaped-quote
+soju/patches/session-store-lock-offload (stacked on soju/production @79922b1e0b — rebase with --onto, merge last)
 ```
 
 ## Operating Procedures
