@@ -2234,6 +2234,10 @@ class TestAgentRuntimePostHookOwnershipSync:
         # Core-owned runtime introspection/switching (agent/runtime_control.py) is inline too.
         ("model_status", {}),
         ("model_switch", {"reason": "post-hook ownership sync"}),
+        # Notes tier (ADR-004 Phase 1) rides the same inline table as ``memory``.
+        ("notes_write", {"step": "propose", "content": "post-hook ownership sync"}),
+        ("notes_read", {"action": "list"}),
+        ("memory_propose", {"content": "post-hook ownership sync"}),
     )
 
     @pytest.mark.parametrize(("tool_name", "tool_args"), _CASES)
@@ -2263,6 +2267,10 @@ class TestAgentRuntimePostHookOwnershipSync:
         monkeypatch.setattr(
             "tools.memory_tool.memory_tool",
             lambda **kwargs: '{"ok":true}',
+        )
+        monkeypatch.setattr(
+            "tools.notes_tool.dispatch_notes_tool_for_agent",
+            lambda agent, function_name, args: '{"ok":true}',
         )
         monkeypatch.setattr(
             "tools.clarify_tool.clarify_tool",
