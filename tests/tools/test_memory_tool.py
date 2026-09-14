@@ -15,6 +15,10 @@ from tools.memory_tool import (
 from tools.skill_provenance import reset_current_write_origin, set_current_write_origin
 
 
+# Write reason accepted by the add/patch reason gate (fork patch: memory-write-reason-gate).
+WRITE_REASON = "This is a durable environment fact that should persist across sessions."
+
+
 def _blocked(content, pattern_id=None):
     """Assert content is refused by the scanner, optionally by a named pattern."""
     result = _scan_memory_content(content)
@@ -581,20 +585,20 @@ class TestMemoryToolDispatcher:
         # must succeed instead of erroring 'content is required'.
         store.add("memory", "fact A")
         result = json.loads(
-            memory_tool(action="patch", old_text="fact A", new_text="fact A refined", store=store)
+            memory_tool(action="patch", old_text="fact A", new_text="fact A refined", reason=WRITE_REASON, store=store)
         )
         assert result["success"] is True
         assert "fact A refined" in store.memory_entries
         assert "fact A" not in [e for e in store.memory_entries if e == "fact A"]
 
     def test_new_text_alias_for_content_on_add(self, store):
-        result = json.loads(memory_tool(action="add", new_text="added via new_text", store=store))
+        result = json.loads(memory_tool(action="add", new_text="added via new_text", reason=WRITE_REASON, store=store))
         assert result["success"] is True
         assert "added via new_text" in store.memory_entries
 
     def test_content_wins_when_both_content_and_new_text_set(self, store):
         result = json.loads(
-            memory_tool(action="add", content="the real one", new_text="ignored", store=store)
+            memory_tool(action="add", content="the real one", new_text="ignored", reason=WRITE_REASON, store=store)
         )
         assert result["success"] is True
         assert "the real one" in store.memory_entries
@@ -1080,7 +1084,8 @@ class TestBackgroundReviewDeleteGate:
         token = set_current_write_origin("background_review")
         try:
             result = json.loads(memory_tool(
-                action="patch", old_text="entry the fork", content="rewritten by fork", store=store))
+                action="patch", old_text="entry the fork", content="rewritten by fork", reason=WRITE_REASON,
+                store=store))
         finally:
             reset_current_write_origin(token)
         assert result["staged"] is True
@@ -1096,7 +1101,7 @@ class TestBackgroundReviewDeleteGate:
             result = json.loads(memory_tool(operations=[
                 {"action": "remove", "old_text": "rule one"},
                 {"action": "add", "content": "fork consolidation"},
-            ], store=store))
+            ], reason=WRITE_REASON, store=store))
         finally:
             reset_current_write_origin(token)
         assert result["staged"] is True
@@ -1106,7 +1111,7 @@ class TestBackgroundReviewDeleteGate:
     def test_add_still_allowed_in_background_review(self, store):
         token = set_current_write_origin("background_review")
         try:
-            result = json.loads(memory_tool(action="add", content="a fact worth keeping", store=store))
+            result = json.loads(memory_tool(action="add", content="a fact worth keeping", reason=WRITE_REASON, store=store))
         finally:
             reset_current_write_origin(token)
         assert result["success"] is True
@@ -1128,7 +1133,7 @@ class TestBackgroundReviewDeleteGate:
         try:
             result = json.loads(memory_tool(
                 action="patch", old_text="entry an explicit refine may rewrite", content="rewritten by refine",
-                store=store))
+                reason=WRITE_REASON, store=store))
         finally:
             reset_review_attended(att)
             reset_current_write_origin(token)

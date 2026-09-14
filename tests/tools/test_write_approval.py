@@ -88,7 +88,8 @@ def test_cli_memory_approve_without_live_agent_uses_fresh_store(hermes_home, cap
 
     _set_approval("memory", True)
     staging = MemoryStore(); staging.load_from_disk()
-    r = json.loads(memory_tool("add", "memory", "remember the launch date", store=staging))
+    r = json.loads(memory_tool("add", "memory", "remember the launch date",
+                               reason="Durable fact that should persist across sessions.", store=staging))
     assert r.get("pending_id"), r
     assert wa.pending_count("memory") == 1
 
@@ -337,7 +338,8 @@ def test_memory_inline_deny_blocks(hermes_home, approval_callback_cleanup):
     set_approval_callback(lambda command, description, **kw: "deny")
 
     store = MemoryStore(); store.load_from_disk()
-    r = json.loads(memory_tool("add", "memory", "denied fact", store=store))
+    r = json.loads(memory_tool("add", "memory", "denied fact",
+                               reason="Durable fact that should persist across sessions.", store=store))
     assert r["success"] is False
     assert "denied" in r["error"].lower()
     assert store.memory_entries == []
