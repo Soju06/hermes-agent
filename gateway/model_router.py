@@ -241,7 +241,7 @@ def _read_env_key(name: str) -> str:
         return value.strip()
     env_path = get_hermes_home() / ".env"
     try:
-        for line in env_path.read_text().splitlines():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
             if not line or line.lstrip().startswith("#") or "=" not in line:
                 continue
             key, val = line.split("=", 1)
