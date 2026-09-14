@@ -526,12 +526,12 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         agent.request_overrides = overrides
         agent._gateway_turn_request_overrides = turn_overrides
 
-    def _make_runtime_update_callback(self):
+    @staticmethod
+    def _make_runtime_update_callback(ctx, runner):
         """Sync callback for ``agent.runtime_update_callback`` (agent/runtime_control.py): mirror a
         session-scoped model/reasoning switch into the session override state and persist the
-        secret-free identifiers on the SessionEntry."""
-        ctx = self._ctx
-        runner = self._runner
+        secret-free identifiers on the SessionEntry. Static (ctx/runner passed in) so the wiring
+        below stays drivable from bare test doubles that are not TurnRunner instances."""
 
         def _runtime_update_callback(*, scope: str, model_override=None, reasoning_config=None) -> None:
             if scope != "session" or not ctx.session_key:
@@ -605,7 +605,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         arm_surface_turn(agent, runner._consume_pending_turn_sidecar_notes(ctx.session_key), voice_turn=ctx.voice_turn)
         # Session-scoped runtime switches (agent model_switch) mirror into the session override state
         # and the durable SessionEntry runtime fields so the route survives cache eviction/restart.
-        agent.runtime_update_callback = self._make_runtime_update_callback()
+        agent.runtime_update_callback = TurnRunner._make_runtime_update_callback(ctx, runner)
         agent.background_review_callback, bg_release = self._make_bg_review_callbacks()
         # Register the release hook on the adapter so base.py's finally block fires it after the
         # main response is delivered.
