@@ -20,6 +20,9 @@ _ALWAYS_ALLOWED_FOR_USERS: FrozenSet[str] = frozenset({"help", "whoami"})
 
 _DM_CHAT_TYPES = frozenset({"dm", "direct", "private", ""})
 
+# Reply to a user refused by ``SlashAccessPolicy.can_resolve_approval`` (sent privately when possible).
+APPROVAL_NOT_PERMITTED = "⛔ Only an admin or the person who made this request can answer this approval."
+
 # scope -> (admin list key, user command list key)
 _SCOPE_KEYS = {
     "dm": ("allow_admin_from", "user_allowed_commands"),
@@ -47,6 +50,13 @@ class SlashAccessPolicy:
         return bool(canonical_cmd) and (
             canonical_cmd in _ALWAYS_ALLOWED_FOR_USERS or canonical_cmd in self.user_allowed_commands
         )
+
+    def can_resolve_approval(self, user_id: Optional[str], requester_user_id: Optional[str]) -> bool:
+        """Who may answer a dangerous-command approval (buttons, bare yes/no, /approve, /deny):
+        an admin, or the user whose turn raised it. Gating disabled -> everyone (unchanged)."""
+        if self.is_admin(user_id):
+            return True
+        return bool(user_id) and str(user_id) == str(requester_user_id or "")
 
 
 _DISABLED_POLICY = SlashAccessPolicy(
@@ -117,7 +127,7 @@ def policy_for_source(gateway_config: Any, source: Any) -> SlashAccessPolicy:
     return policy_from_extra(extra, scope)
 
 
-__all__ = ["SlashAccessPolicy", "policy_from_extra", "policy_for_source"]
+__all__ = ["APPROVAL_NOT_PERMITTED", "SlashAccessPolicy", "policy_from_extra", "policy_for_source"]
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

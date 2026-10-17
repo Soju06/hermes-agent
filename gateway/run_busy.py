@@ -446,6 +446,18 @@ class GatewayBusySessionMixin:
                 _raw_text = (event.text or "").strip().lower()
                 _match = self._PLAINTEXT_APPROVAL_WORDS.get(_raw_text)
                 if _match is not None:
+                    _denied = self._approval_response_denied(event.source, session_key)
+                    if _denied:
+                        # Consumed (never steered in as chat); the refusal goes only to the sender.
+                        _adapter = self._adapter_for_source(event.source)
+                        try:
+                            if _adapter:
+                                await _adapter.send_private_notice(
+                                    event.source.chat_id, event.source.user_id, _denied,
+                                    metadata=self._thread_metadata_for_source(event.source))
+                        except Exception:
+                            logger.debug("Approval refusal notice failed", exc_info=True)
+                        return True
                     _verb, _normalized_args = _match
                     _approval_handler = (
                         self._handle_approve_command if _verb == "approve" else self._handle_deny_command

@@ -115,13 +115,25 @@ def _denial_breaker_addendum(session_key: str) -> str:
 # instead of only hearing "denied". Ported from qwibitai/nanoclaw#2832.
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
+_gateway_requesters: dict[str, str] = {}     # session_key → user id whose turn owns its approvals
 
 
-def register_gateway_notify(session_key: str, cb) -> None:
+def register_gateway_notify(session_key: str, cb, requester_user_id: Optional[str] = None) -> None:
     """Register ``cb(approval_data: dict) -> None`` for sending approval requests. The callback
-    bridges sync→async: it runs in the agent thread and must schedule the send on the loop."""
+    bridges sync→async: it runs in the agent thread and must schedule the send on the loop.
+    *requester_user_id* is the user whose turn this is (see ``get_gateway_approval_requester``)."""
     with _lock:
         _gateway_notify_cbs[session_key] = cb
+        if requester_user_id:
+            _gateway_requesters[session_key] = str(requester_user_id)
+        else:
+            _gateway_requesters.pop(session_key, None)
+
+
+def get_gateway_approval_requester(session_key: str) -> Optional[str]:
+    """User id whose running turn raised *session_key*'s approvals, or None when unknown."""
+    with _lock:
+        return _gateway_requesters.get(session_key)
 
 
 def unregister_gateway_notify(session_key: str) -> None:
@@ -129,6 +141,7 @@ def unregister_gateway_notify(session_key: str) -> None:
     they don't hang forever (agent run finished or interrupted)."""
     with _lock:
         _gateway_notify_cbs.pop(session_key, None)
+        _gateway_requesters.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
     for entry in entries:
         entry.event.set()

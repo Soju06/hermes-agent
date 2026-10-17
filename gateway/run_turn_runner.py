@@ -1511,7 +1511,8 @@ class TurnRunner:
         ctx = self._ctx
         session_key = ctx.session_key or ""
         token = set_current_session_key(session_key)
-        register_gateway_notify(session_key, self._approval_notify_sync)
+        register_gateway_notify(session_key, self._approval_notify_sync,
+                                requester_user_id=getattr(ctx.source, "user_id", None))
         try:
             api_message = _wrap_current_message_with_observed_context(self._native_image_run_message(), observed_group_context)
             kwargs = {"conversation_history": agent_history, "task_id": ctx.session_id}

@@ -46,6 +46,7 @@ def _clear_approval_state():
     from tools import approval as mod
     mod._gateway_queues.clear()
     mod._gateway_notify_cbs.clear()
+    mod._gateway_requesters.clear()
     mod._session_approved.clear()
     mod._permanent_approved.clear()
     mod._pending.clear()
@@ -134,3 +135,45 @@ def test_no_pending_approval_does_not_consume_conversational_yes():
     _clear_approval_state()
 
 
+
+
+def _gate_runner(requester):
+    """Runner with a DM admin set and a blocking approval raised by *requester*."""
+    from tools.approval import register_gateway_notify
+    runner, adapter = _make_runner()
+    runner.config.platforms[Platform.TELEGRAM].extra["allow_admin_from"] = ["admin"]
+    adapter.send_private_notice = AsyncMock()
+    session_key, entry = _register_blocking_approval(runner)
+    register_gateway_notify(session_key, lambda _data: None, requester_user_id=requester)
+    return runner, adapter, session_key, entry
+
+
+def test_plaintext_yes_from_non_admin_non_requester_is_refused():
+    from gateway.slash_access import APPROVAL_NOT_PERMITTED
+    _clear_approval_state()
+    runner, adapter, session_key, entry = _gate_runner(requester="someone_else")
+
+    handled = asyncio.run(
+        runner._handle_active_session_busy_message(_make_event("yes"), session_key)
+    )
+
+    assert handled is True  # consumed: never steered into the agent as chat
+    assert not entry.event.is_set()
+    adapter.send_private_notice.assert_awaited_once()
+    args = adapter.send_private_notice.call_args.args
+    assert args[:3] == ("c1", "u1", APPROVAL_NOT_PERMITTED)
+    _clear_approval_state()
+
+
+def test_plaintext_yes_from_requester_resolves_under_admin_gate():
+    _clear_approval_state()
+    runner, adapter, session_key, entry = _gate_runner(requester="u1")
+
+    handled = asyncio.run(
+        runner._handle_active_session_busy_message(_make_event("yes"), session_key)
+    )
+
+    assert handled is True
+    assert entry.event.is_set() and entry.result == "once"
+    adapter.send_private_notice.assert_not_awaited()
+    _clear_approval_state()

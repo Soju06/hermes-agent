@@ -1131,6 +1131,19 @@ class GatewaySlashCommandsMixin(
             return session_key, t(stale_key)
         return session_key, t(none_key)
 
+    def _approval_response_denied(self, source, session_key: str) -> Optional[str]:
+        """Refusal text when ``source`` may not answer ``session_key``'s pending approval, else None.
+        Reuses the slash admin set (``allow_admin_from`` / ``group_allow_admin_from``) plus the user
+        whose turn raised the approval; no admin set for the scope -> None (everyone, unchanged)."""
+        from gateway.slash_access import APPROVAL_NOT_PERMITTED, policy_for_source
+        from tools.approval import get_gateway_approval_requester
+        requester = get_gateway_approval_requester(session_key)
+        if policy_for_source(self.config, source).can_resolve_approval(source.user_id, requester):
+            return None
+        logger.info("Approval response refused for %s in session %s (not admin, not requester %s)",
+                    source.user_id, session_key, requester)
+        return APPROVAL_NOT_PERMITTED
+
     async def _handle_approve_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /approve — unblock waiting agent thread(s). They block inside tools/approval.py;
         signalling the event resumes them so the command executes inline (same flow as the CLI)."""
@@ -1139,6 +1152,9 @@ class GatewaySlashCommandsMixin(
                                                               "gateway.approve.no_pending")
         if stale:
             return stale
+        denied = self._approval_response_denied(event.source, session_key)
+        if denied:
+            return denied
         # Args: "all", "all session", "all always", "session", "always" ("always" beats "session").
         args = event.get_command_args().strip().lower().split()
         choices = {_APPROVE_CHOICE_BY_ARG[a] for a in args if a in _APPROVE_CHOICE_BY_ARG}
@@ -1162,6 +1178,9 @@ class GatewaySlashCommandsMixin(
                                                               "gateway.deny.no_pending")
         if stale:
             return stale
+        denied = self._approval_response_denied(event.source, session_key)
+        if denied:
+            return denied
         # A leading "all" denies every pending command; the rest (or the whole arg string without
         # "all") is the optional deny reason relayed to the agent, capped to a sane one-liner.
         raw_args = event.get_command_args().strip()

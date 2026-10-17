@@ -206,6 +206,65 @@ class TestSlackApprovalAction:
         mock_resolve.assert_not_called()
 
 
+class TestSlackApprovalAdminGate:
+    """With an admin set for the scope, only an admin or the requester may answer the prompt."""
+
+    SESSION_KEY = "agent:main:slack:group:C1:1111"
+
+    def _setup(self, clicker_id):
+        from tools.approval import register_gateway_notify
+        adapter = _make_adapter()
+        adapter.config.extra["group_allow_admin_from"] = ["U_ADMIN"]
+        _attach_auth_runner(adapter)
+        adapter._approval_resolved["1.2"] = False
+        client = adapter._team_clients["T1"]
+        client.chat_update = AsyncMock()
+        client.chat_postEphemeral = AsyncMock(return_value={"message_ts": "9.9"})
+        register_gateway_notify(self.SESSION_KEY, lambda _data: None, requester_user_id="U_REQ")
+        body = {
+            "message": {"ts": "1.2", "thread_ts": "1.0", "blocks": []},
+            "channel": {"id": "C1"},
+            "user": {"name": clicker_id.lower(), "id": clicker_id},
+        }
+        action = {"action_id": "hermes_approve_once", "value": self.SESSION_KEY}
+        return adapter, client, body, action
+
+    async def _click(self, clicker_id):
+        from tools.approval import unregister_gateway_notify
+        adapter, client, body, action = self._setup(clicker_id)
+        try:
+            with patch("tools.approval.resolve_gateway_approval", return_value=1) as resolve:
+                await adapter._handle_approval_action(AsyncMock(), body, action)
+        finally:
+            unregister_gateway_notify(self.SESSION_KEY)
+        return adapter, client, resolve
+
+    @pytest.mark.asyncio
+    async def test_admin_click_resolves(self):
+        _adapter, client, resolve = await self._click("U_ADMIN")
+        resolve.assert_called_once_with(self.SESSION_KEY, "once")
+        client.chat_postEphemeral.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_requester_click_resolves(self):
+        _adapter, client, resolve = await self._click("U_REQ")
+        resolve.assert_called_once_with(self.SESSION_KEY, "once")
+        client.chat_postEphemeral.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_other_user_click_is_refused_privately(self):
+        from gateway.slash_access import APPROVAL_NOT_PERMITTED
+        adapter, client, resolve = await self._click("U_OTHER")
+        resolve.assert_not_called()
+        client.chat_update.assert_not_called()
+        kwargs = client.chat_postEphemeral.call_args.kwargs
+        assert kwargs["user"] == "U_OTHER" and kwargs["channel"] == "C1"
+        assert kwargs["thread_ts"] == "1.0"
+        assert APPROVAL_NOT_PERMITTED in kwargs["text"]
+        # The refused click must not consume the prompt: an admin can still answer it.
+        assert adapter._approval_resolved.get("1.2") is False
+
+
 class TestSlackInteractiveAuth:
     def test_delegates_to_gateway_runner_auth(self):
         adapter = _make_adapter()

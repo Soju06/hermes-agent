@@ -5241,12 +5241,33 @@ class SlackAdapter(BasePlatformAdapter):
             "[Slack] Feedback button clicked: value=%s user=%s channel=%s ts=%s", value, user_id,
             channel_id, message.get("ts", ""))
 
+    def _may_answer_approval(self, user_id: str, channel_id: str, session_key: str) -> bool:
+        """Approval buttons follow the slash admin set (``allow_admin_from`` in DMs,
+        ``group_allow_admin_from`` in channels) plus the user whose turn raised the prompt.
+        No admin set for the scope -> every authorized user (unchanged)."""
+        from gateway.slash_access import policy_from_extra
+        from tools.approval import get_gateway_approval_requester
+        extra = self.config.extra if isinstance(self.config.extra, dict) else {}
+        scope = "dm" if str(channel_id or "").startswith("D") else "group"
+        return policy_from_extra(extra, scope).can_resolve_approval(
+            user_id, get_gateway_approval_requester(session_key))
+
     async def _handle_approval_action(self, ack, body, action) -> None:
         """Handle an approval button click from Block Kit."""
         started = await self._begin_interaction(ack, body, action, "approval")
         if started is None:
             return
         team_id, action_id, session_key, message, msg_ts, channel_id, user_name, user_id = started
+        # Gate BEFORE the double-click pop so a refused click leaves the prompt answerable.
+        if not self._may_answer_approval(user_id, channel_id, session_key):
+            logger.warning(
+                "[Slack] Approval click by %s (%s) refused: not an admin or the requester",
+                user_name, user_id)
+            from gateway.slash_access import APPROVAL_NOT_PERMITTED
+            await self.send_private_notice(
+                channel_id, user_id, APPROVAL_NOT_PERMITTED,
+                metadata={"thread_id": message.get("thread_ts"), "team_id": team_id})
+            return
         choice = self._APPROVAL_CHOICES.get(action_id, "deny")
         # Double-click guard (atomic pop). Also accept the bare ts: the approval may
         # have been stored without a team id while the click carries one.
