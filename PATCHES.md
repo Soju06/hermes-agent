@@ -1124,6 +1124,39 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
   - `21729888fb` test(hermes_cli): restore evicted modules after fresh-import fixtures
 - **v2026.9.11-sync:** NEW — created 2026-09-14.
 
+### 90. slack-stale-reconnect-task
+- **branch:** `soju/patches/slack-stale-reconnect-task`
+- **stacked-on:** `soju/patches/sync-20260914-kanban-seams` (chronological tip stack; written and tested on the assembled soju/production 547716fcc4, whose tree equals the kanban-seams tip)
+- **origin:** `local-author`
+- **upstream_pr:** none
+- **state:** `local-only`
+- **rationale:** Slack's roughly 5-hourly `disconnect` frame makes slack_sdk 3.43 reconnect inside an untracked `asyncio.ensure_future(run_message_listeners(...))`. When the adapter watchdog restarted the handler in the middle of that refresh (2026-10-17 21:23), `_stop_socket_mode_handler` cancelled only `_socket_mode_task` and three client attributes, so the orphan survived and then looped on `Connector is closed.` / `Session is closed` every 10 s against the closed aiohttp session. Fix: `_track_socket_reconnects(client)` wraps the client's `connect_to_new_endpoint` and records entering tasks in a WeakSet; teardown marks the client superseded and cancels and awaits those tasks before closing the session. If the SDK renames the method the wrap silently no-ops (old behaviour). Deployed to live 2026-10-19 by cherry-pick (cdca4a874a, from d6e8992133). Details: `~/work/vooy/claw-migration-2026-10-05/observe/2026-10-19-hermes-followups.md` section 1.
+- **commits:**
+  - `26156486f5` fix(slack): cancel the untracked disconnect-refresh reconnect on handler teardown
+- **touches:** `plugins/platforms/slack/adapter.py`, `tests/gateway/test_slack_socket_reconnect_heal.py`
+
+### 91. startup-integrity-check-offload
+- **branch:** `soju/patches/startup-integrity-check-offload`
+- **stacked-on:** `soju/patches/slack-stale-reconnect-task` (chronological tip stack)
+- **origin:** `local-author`
+- **upstream_pr:** none
+- **state:** `local-only`
+- **rationale:** After an unclean exit, `record_startup()` reached `_report_unclean_exit` and `check_state_db_integrity()`, which ran `PRAGMA quick_check(1)` synchronously on the event-loop thread against the 11 GB `state.db` (537 s loop stall on 2026-10-19 01:00, 429.6 s on 09-29). The gateway start path now calls `record_startup(background_integrity_check=True)`: exit-diag records `state_db_integrity: "pending"` and a daemon thread runs the check, then writes a separate `gateway.previous_unclean_exit.state_db_integrity` record (verdict, elapsed_s) and the same ERROR on corruption. Direct callers keep the synchronous default. The source branch was named fix/startup-migration-check; the cause is the integrity check, not `state_db_data_migrations`. Deployed to live 2026-10-19 by cherry-pick (65c63b0e1d, from 2df3fdc3b4). Details: `~/work/vooy/claw-migration-2026-10-05/observe/2026-10-19-hermes-followups.md` section 2.
+- **commits:**
+  - `d703b507f3` fix(gateway): run the post-unclean-exit state.db quick_check off the startup path
+- **touches:** `gateway/lifecycle_ledger.py`, `gateway/run.py`, `tests/gateway/test_lifecycle_state_db_check.py`
+
+### 92. cron-fire-fence-heartbeat
+- **branch:** `soju/patches/cron-fire-fence-heartbeat`
+- **stacked-on:** `soju/patches/startup-integrity-check-offload` (chronological tip stack; tip of the whole production stack)
+- **origin:** `local-author`
+- **upstream_pr:** none
+- **state:** `local-only`
+- **rationale:** The restart-safe cron worker holds the job's fire fence (in-process RLock plus flock) through result delivery by design. The worker's 60 s claim-heartbeat thread waited up to 30 s (`_JOBS_LOCK_TIMEOUT_SECONDS`) on that fence, got the fail-closed False and read it as ownership loss, so runs whose delivery took longer than about 30 s were recorded `error: "Interrupted by shutdown before terminal completion."` although they were delivered (storage-janitor 2026-10-18, clb-renewal-watch 2026-10-19). Fix: `heartbeat_fire_claim(..., raise_if_fence_unavailable=False)`; only the heartbeat loop opts in and treats `FireFenceUnavailable` as an unverified tick inside the 180 s grace. A real takeover (fence acquired, different owner) is still immediate loss, and other callers keep the fail-closed False. Deployed to live 2026-10-19 by cherry-pick (b9de701076, from 51f589b2c3). Details: `~/work/vooy/claw-migration-2026-10-05/observe/2026-10-19-hermes-followups.md` section 3.
+- **commits:**
+  - `d8d3910461` fix(cron): a fire-fence timeout in the claim heartbeat is "unverified", not ownership loss
+- **touches:** `cron/jobs.py`, `cron/scheduler.py`, `tests/cron/test_script_claim_heartbeat.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -1219,7 +1252,10 @@ soju/patches/aux-anthropic-mode-max-tokens
 soju/patches/session-store-lock-offload
 soju/patches/sync-20260914-test-seams
 soju/patches/sync-20260914-fixups
-soju/patches/sync-20260914-kanban-seams (tip of the stack)
+soju/patches/sync-20260914-kanban-seams
+soju/patches/slack-stale-reconnect-task
+soju/patches/startup-integrity-check-offload
+soju/patches/cron-fire-fence-heartbeat (tip of the stack)
 # dropped 2026-09-14: soju/patches/precompress-checkpoint-signal (merged upstream)
 ```
 
