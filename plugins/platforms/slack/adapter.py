@@ -66,6 +66,7 @@ try:  # sibling modules; support both package and flat plugin-dir import
     from .adapter_slash_payload import slash_command_text, slash_thread_id
     from .adapter_reactions_context import slack_reactions_marker
     from .adapter_socket_lifecycle import SlackSocketLifecycleMixin
+    from .adapter_socket_reconnect import socket_reconnect_tasks, track_socket_reconnects
     from .adapter_vault_code import SlackVaultCodeMixin
     from .adapter_image_batch import collect_image_uploads
     from .adapter_forwarded import (
@@ -80,6 +81,7 @@ except ImportError:  # pragma: no cover - plugin loaded outside package context
     from adapter_slash_payload import slash_command_text, slash_thread_id  # type: ignore
     from adapter_reactions_context import slack_reactions_marker  # type: ignore
     from adapter_socket_lifecycle import SlackSocketLifecycleMixin  # type: ignore
+    from adapter_socket_reconnect import socket_reconnect_tasks, track_socket_reconnects  # type: ignore
     from adapter_vault_code import SlackVaultCodeMixin  # type: ignore
     from adapter_image_batch import collect_image_uploads  # type: ignore
 
@@ -1234,6 +1236,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
             raise RuntimeError("Socket Mode requires an initialized app and app token")
         self._handler = AsyncSocketModeHandler(self._app, self._app_token, proxy=self._proxy_url)
         _apply_slack_proxy(self._handler.client, self._proxy_url)
+        track_socket_reconnects(self._handler.client)
         task = asyncio.create_task(self._handler.start_async())
         self._socket_mode_task = task
         self._socket_handler_started_monotonic = time.monotonic()
@@ -1255,8 +1258,10 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackVaultCodeMixin, BasePlatformA
         handler, task = self._handler, self._socket_mode_task
         self._handler = self._socket_mode_task = None
         client = getattr(handler, "client", None)
+        # Includes the untracked disconnect-refresh reconnect (adapter_socket_reconnect.py).
         await _cancel_socket_tasks(
-            [task] + [getattr(client, attr, None) for attr in _SOCKET_CLIENT_TASK_ATTRS])
+            [task] + [getattr(client, attr, None) for attr in _SOCKET_CLIENT_TASK_ATTRS]
+            + socket_reconnect_tasks(client))
         if handler is not None:
             try:
                 await handler.close_async()

@@ -119,10 +119,17 @@ class _FakeSocketModeClient:
             if getattr(self, attr) is not None and not getattr(self, attr).done()
         ]
 
-    async def connect_to_new_endpoint(self) -> None:
+    async def connect_to_new_endpoint(self, force: bool = False) -> None:
         # monitor_current_session() (on staleness) and receive_messages() (on a
         # CLOSE frame) both reach connect() through here, independently.
         await self.connect()
+
+    async def run_message_listeners(self, message: dict) -> None:
+        # Mirrors AsyncBaseSocketModeClient.run_message_listeners(): a Slack
+        # ``disconnect`` frame reconnects in place. process_message() runs this
+        # from an untracked asyncio.ensure_future(), so no attribute points at it.
+        if message.get("type") == "disconnect":
+            await self.connect_to_new_endpoint(force=True)
 
     async def monitor_current_session(self) -> None:
         while not self.closed:
@@ -316,6 +323,86 @@ class TestSocketModeTeardown:
 
         assert adapter._handler is None and adapter._socket_mode_task is None
         assert all(task.done() and handler.client.closed for handler, task in replacements)
+
+
+class TestUntrackedDisconnectRefresh:
+    """2026-10-17 21:23Z: Slack's periodic ``disconnect`` frame started an in-place
+    refresh from an untracked ``run_message_listeners`` future (slack_sdk
+    socket_mode/async_client.py:131 -> :142). The watchdog saw ``is_connected()``
+    False mid-refresh and restarted the handler; the orphan's in-flight connect()
+    lost its session and logged ``Session is closed`` every 10s for 27.6h."""
+
+    @staticmethod
+    def _start(adapter, monkeypatch):
+        handler = _FakeHandler()
+        handler.client.aiohttp_client_session.reachable = True
+        monkeypatch.setattr(
+            _slack_mod, "AsyncSocketModeHandler", lambda *a, **kw: handler
+        )
+        adapter._start_socket_mode_handler()
+        return handler
+
+    @pytest.mark.asyncio
+    async def test_refresh_reconnect_dies_with_the_old_handler(self, adapter, monkeypatch):
+        handler = self._start(adapter, monkeypatch)
+        client = handler.client
+        session = client.aiohttp_client_session
+        # One loop step: start_async() connects (reachable, no suspension) and parks.
+        await asyncio.sleep(0)
+
+        # Slack refresh: the new endpoint is not reachable yet, so the SDK's
+        # connect() is retrying inside a future nobody holds a reference to.
+        session.reachable = False
+        orphan = asyncio.ensure_future(
+            client.run_message_listeners({"type": "disconnect"})
+        )
+        try:
+            # One loop step: the refused connect() suspends inside its retry loop.
+            await asyncio.sleep(0)
+            assert not orphan.done()
+
+            await adapter._stop_socket_mode_handler()
+
+            # Done when teardown returns: a finished task cannot retry later, so no wait.
+            assert orphan.done(), "the disconnect-refresh reconnect outlived teardown"
+            assert session.ws_connect_after_close == 0, (
+                "the disconnect-refresh reconnect retried against a closed session "
+                f"{session.ws_connect_after_close} time(s) during teardown"
+            )
+        finally:
+            orphan.cancel()
+            await asyncio.gather(orphan, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_refresh_after_teardown_never_dials(self, adapter, monkeypatch):
+        """A disconnect frame processed after teardown began must not start connect()."""
+        handler = self._start(adapter, monkeypatch)
+        client = handler.client
+        session = client.aiohttp_client_session
+        await asyncio.sleep(0)  # start_async() connects and parks
+
+        await adapter._stop_socket_mode_handler()
+        late = asyncio.ensure_future(client.run_message_listeners({"type": "disconnect"}))
+        try:
+            await asyncio.wait_for(late, timeout=1.0)
+            assert session.ws_connect_after_close == 0
+        finally:
+            late.cancel()
+            await asyncio.gather(late, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_live_client_still_reconnects(self, adapter, monkeypatch):
+        """Tracking must not change the SDK's own reconnect on a live client."""
+        handler = self._start(adapter, monkeypatch)
+        client = handler.client
+        await asyncio.sleep(0)  # start_async() connects and parks
+
+        await asyncio.wait_for(
+            client.run_message_listeners({"type": "disconnect"}), timeout=1.0
+        )
+        assert not getattr(client, "_hermes_superseded", False)
+        assert len(getattr(client, "_hermes_reconnect_tasks")) == 0
+        await adapter._stop_socket_mode_handler()
 
 
 class TestSocketModeRestart:
