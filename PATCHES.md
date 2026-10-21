@@ -1157,6 +1157,17 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
   - `d8d3910461` fix(cron): a fire-fence timeout in the claim heartbeat is "unverified", not ownership loss
 - **touches:** `cron/jobs.py`, `cron/scheduler.py`, `tests/cron/test_script_claim_heartbeat.py`
 
+### 93. slack-approval-admin-gate
+- **branch:** `soju/patches/slack-approval-admin-gate`
+- **stacked-on:** _(none — applies directly on base 939e45c91d (v2026.9.11); parallel lane. git merge-tree of the topic into the assembled soju/production b9de701076 is conflict-free)_
+- **origin:** `local-author`
+- **upstream_pr:** none
+- **state:** `local-only`
+- **rationale:** On a shared Slack deployment (chat allow-all, admins in `allow_admin_from` / `group_allow_admin_from`) the exec-approval buttons and bare "yes"/"no" replies checked only the chat allowlist, so any workspace member could approve another user's dangerous command; when the scope has an admin set, an approval may now be answered only by an admin or by the user whose turn raised it (`SlashAccessPolicy.can_resolve_approval`, requester recorded by `register_gateway_notify(requester_user_id=...)`), refused clicks and bare words get a private notice and leave the prompt answerable, `/approve` and `/deny` apply the same rule, and a scope without an admin set keeps upstream behaviour. The bare-word and slash gate is shared gateway code, so it applies on every platform that sets an admin set; Discord buttons keep their own `require_admin_for_exec_approval`. Review: fork PR #3 (base `base/v2026.9.11`). Not deployed to live yet; enters production at the next rebuild.
+- **commits:** (range 939e45c91d..d1c293aa5c)
+  - `d1c293aa5c` fix(slack): gate exec-approval answers on the slash admin set
+- **touches:** `gateway/run_busy.py`, `gateway/run_turn_runner.py`, `gateway/slash_access.py`, `gateway/slash_commands.py`, `plugins/platforms/slack/adapter.py`, `tools/approval.py`, `tests/gateway/test_plaintext_approval_routing.py`, `tests/gateway/test_slack_approval_buttons.py`
+
 ## State Vocabulary
 
 | state | meaning | when |
@@ -1220,6 +1231,7 @@ soju/patches/kanban-board-env-precedence
 soju/patches/kanban-goal-judge-unavailable
 soju/patches/hygiene-diag-and-lock-offload (stacked on hygiene-noprogress-cooldown)
 soju/patches/sync-20260819-test-seams (stacked on runtime-control)
+soju/patches/slack-approval-admin-gate
 # sequential lane (chronological tip stack on top of the assembled parallel lane, in this order; merge LAST, each contains the previous)
 soju/patches/conn-error-fail-fast
 soju/patches/durable-turns
