@@ -67,6 +67,15 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     # `sc stop`) presuppose a service install this guard has no evidence of and stay uncovered.
     r"|(?:\b(?:p?kill|taskkill|stop-process)\b[^\n;&|]*\bhermes\b[^\n;&|]*\bgateway)"
     r"|(?:\b(?:p?kill|taskkill|stop-process)\b[^\n;&|]*\bgateway\b[^\n;&|]*\bhermes)"
+    # Branch D inside a substitution: a PID list computed by a pipeline in a `$(...)` / backtick /
+    # PowerShell ` (...)` operand of the same kill (`kill $(ps aux | grep 'hermes gateway' | awk
+    # '{print $2}')`). Only the substitution's own closer (or a nested `(`) bounds its gaps. Before
+    # the opener a backtick is skipped only as a complete pair, so a closing backtick never opens,
+    # and the gap never crosses another kill verb, so each match starts at the nearest one and the
+    # scan stays linear.
+    r"|(?:\b(?:p?kill|taskkill|stop-process)\b"
+    r"(?:(?!\b(?:p?kill|taskkill|stop-process)\b)[^\n;&|`]|`[^\n`]*`)*(?:`|(?<=[\s$])\()"
+    r"[^\n()`]*\b(?:hermes\b[^\n()`]*\bgateway|gateway\b[^\n()`]*\bhermes))"
 )
 
 # Branch E: process killers whose TARGET is the interpreter image hosting the gateway. A supervised
@@ -223,9 +232,9 @@ def contains_host_interpreter_kill(text: str) -> bool:
                 return True
     return False
 
-# Every branch uses `[^\n]*` between verb and label so matches cannot span unrelated lines. A POSIX
-# backslash-newline continuation is therefore collapsed to a space before matching (as the shell
-# does) rather than loosening `[^\n]*`.
+# Every branch uses `[^\n]*` between verb and label so matches cannot span unrelated lines (Branch D's
+# gaps also stop at `;&|` outside a substitution). A POSIX backslash-newline continuation is
+# therefore collapsed to a space before matching (as the shell does) rather than loosening `[^\n]*`.
 # Every branch above uses `[^\n]*` between its verb and the gateway identifier so the match can't span
 # unrelated lines of a longer cron prompt/script, but that also means a real multi-line shell invocation
 # split across continuation lines (e.g. `launchctl submit \` / `  -l ai.hermes.gateway-... \` / `  -- ...`,

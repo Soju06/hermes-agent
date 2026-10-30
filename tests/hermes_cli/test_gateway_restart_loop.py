@@ -189,6 +189,8 @@ class TestGatewayLifecyclePattern:
         "kill -USR1 1234; systemctl --user show hermes-gateway.service -p ActiveState",
         "pkill -9 someapp && journalctl --user -u hermes-gateway.service -n 5",
         "echo kill | grep hermes-gateway",
+        "kill -USR1 $(cat /tmp/app.pid); systemctl --user show hermes-gateway.service -p ActiveState",
+        "kill -HUP `cat app.pid`; systemctl --user status hermes-gateway",
     ])
     def test_kill_detection_does_not_span_shell_statement_boundaries(self, text):
         assert not _contains_gateway_lifecycle_command(text), f"Should NOT match: {text!r}"
@@ -203,6 +205,12 @@ class TestGatewayLifecyclePattern:
         "launchctl kickstart -k gui/501/ai.hermes.gateway",
         "pkill \\\n-f hermes-gateway",
         'pkill -f "hermes gateway"',
+        # A PID list piped together inside the kill's own substitution is one statement.
+        "kill -9 $(ps aux | grep 'hermes gateway' | awk '{print $2}')",
+        "kill $(ps aux | awk '/hermes/ && /gateway/ {print $2}')",
+        "kill `ps aux | grep hermes-gateway | awk '{print $2}'`",
+        "kill -TERM $(ps aux | grep gateway | grep hermes | awk '{print $2}')",
+        "Stop-Process -Id (Get-Process | Where-Object {$_.CommandLine -match 'hermes gateway'}).Id",
     ])
     def test_statement_boundary_fix_preserves_lifecycle_detections(self, text):
         assert _contains_gateway_lifecycle_command(text), f"Should match: {text!r}"
