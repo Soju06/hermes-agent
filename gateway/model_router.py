@@ -182,7 +182,9 @@ def _compute_is_owner(source_context: dict[str, Any]) -> bool:
     env_key = _OWNER_ENV_MAP.get(platform, "")
     if not env_key:
         return True
-    allowed_raw = os.environ.get(env_key, "")
+    # The gateway's per-profile gate reader: a routed profile's own allowlist (#72348).
+    from gateway.platforms._shared import platform_gate_env
+    allowed_raw = platform_gate_env(env_key)
     allowed_ids = {uid.strip() for uid in allowed_raw.split(",") if uid.strip()}
     if not allowed_ids:
         return True
@@ -236,7 +238,14 @@ def _truncate(text: Any, limit: int = MAX_TURN_CHARS) -> str:
 
 
 def _read_env_key(name: str) -> str:
-    value = os.getenv(name)
+    """A classifier credential: the active profile secret scope (under multiplexing the routed
+    profile's own key, never the launch profile's ``os.environ``; no scope bound fails closed),
+    then this home's ``.env``."""
+    from agent.secret_scope import UnscopedSecretError, get_secret
+    try:
+        value = get_secret(name)
+    except UnscopedSecretError:
+        return ""
     if value:
         return value.strip()
     env_path = get_hermes_home() / ".env"

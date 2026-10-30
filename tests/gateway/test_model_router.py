@@ -327,6 +327,33 @@ def test_missing_api_key_takes_fallback_path(monkeypatch, tmp_path):
     assert detail["source"] == "fallback"
 
 
+def test_classifier_key_honors_the_profile_secret_scope(monkeypatch, tmp_path):
+    """Under multiplexing ``os.environ`` holds the launch profile's values (gateway/AGENTS.md
+    § Profile scope): a routed profile's classifier key comes from its own secret scope, and a read
+    with no scope bound fails closed (empty key, so the regex fallback path) instead of borrowing the
+    launch profile's key. Single-profile processes keep reading the process env."""
+    from agent.secret_scope import (
+        reset_multiplex_context, reset_secret_scope, set_multiplex_context, set_secret_scope,
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    for name in ("HERMES_GRAPHITI_EMBEDDER_API_KEY", "GEMINI_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("GOOGLE_API_KEY", "launch-profile-key")
+    assert mr_mod._api_key() == "launch-profile-key"
+
+    multiplex = set_multiplex_context(True)
+    try:
+        assert mr_mod._api_key() == ""
+        scope = set_secret_scope({"GOOGLE_API_KEY": "routed-profile-key"}, profile_home=str(tmp_path / "routed"))
+        try:
+            assert mr_mod._api_key() == "routed-profile-key"
+        finally:
+            reset_secret_scope(scope)
+    finally:
+        reset_multiplex_context(multiplex)
+
+
 def test_call_gemini_request_shape(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     captured = {}
@@ -552,6 +579,25 @@ def test_static_rule_is_owner_env_semantics(monkeypatch):
     monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "   ,  ")
     decision = _evaluate(text="안녕", cfg=cfg, runtime=runtime, complete_dev=_complete("NORMAL"))
     assert decision.rule is None
+
+
+def test_static_rule_is_owner_reads_the_routed_profiles_allowlist(monkeypatch, tmp_path):
+    """``is_owner`` reads the ``<PLATFORM>_ALLOWED_USERS`` allowlist through the gateway's per-profile
+    gate reader: under multiplexing a routed profile's own allowlist decides, never the launch
+    profile's ``os.environ`` copy (allowlist leak, #72348)."""
+    from agent.secret_scope import (
+        reset_multiplex_context, reset_secret_scope, set_multiplex_context, set_secret_scope,
+    )
+
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "launch-owner")
+    multiplex = set_multiplex_context(True)
+    scope = set_secret_scope({"TELEGRAM_ALLOWED_USERS": "u1"}, profile_home=str(tmp_path / "routed"))
+    try:
+        assert mr_mod._compute_is_owner({"platform": "telegram", "user_id": "u1"}) is True
+        assert mr_mod._compute_is_owner({"platform": "telegram", "user_id": "launch-owner"}) is False
+    finally:
+        reset_secret_scope(scope)
+        reset_multiplex_context(multiplex)
 
 
 def test_static_rule_source_field_conditions():
