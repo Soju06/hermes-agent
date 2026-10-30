@@ -63,7 +63,7 @@ from sqlite_support import _on_disk_journal_mode, apply_database_pragmas, apply_
 from storage_errors import is_malformed_db_error, is_sqlite_lock_error
 from storage_user_copy import set_last_init_error
 
-from ._maintenance_thread import start_maintenance_thread, stop_maintenance_thread
+from ._maintenance_thread import inline_maintenance_tick, start_maintenance_thread, stop_maintenance_thread
 from ._schema import (
     _enter_fts_fail_open, _fts_table_probe, _init_schema, _is_fts_write_corruption_error, declared_schema_drift,
 )
@@ -374,6 +374,7 @@ class StoreHolder:
         self._last_checkpoint_write_count = self._last_fts_merge_write_count = 0
         self._maint_stop = threading.Event()
         self._maint_thread: Optional[threading.Thread] = None
+        self._maint_inline = False  # True only when that thread could not start
         initialization_complete = False
         try:
             if read_only:
@@ -866,8 +867,11 @@ class StoreHolder:
                             pass
                         raise
                 # Maintenance is driven by the dedicated DB thread; the write
-                # hot path only advances the cadence counter.
+                # hot path only advances the cadence counter (and ticks inline
+                # only on a handle whose maintenance thread could not start).
                 self._write_count += 1
+                if self._maint_inline:
+                    inline_maintenance_tick(self)
                 return result
             except WriterMutexTimeout:
                 # No transaction began; preserve local contention attribution and never replay it.

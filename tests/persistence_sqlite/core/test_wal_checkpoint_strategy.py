@@ -9,6 +9,8 @@ the live gateway writer and corrupt B-tree pages (#45383).
 import logging
 import os
 import sqlite3
+import threading
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -337,5 +339,99 @@ class TestMaintenanceTickGenerationProbe:
             assert db._db_wal_generation_lost is True, "the tick did not probe the WAL generation"
             assert not checkpoint_calls, f"the tick checkpointed a lost WAL generation: {checkpoint_calls}"
             assert merges == [], "the tick ran an FTS merge on a lost WAL generation"
+        finally:
+            db.close()
+
+
+class TestMaintenanceThreadStartFailure:
+    """A maintenance thread that cannot start must not make state.db unopenable.
+
+    The thread is best-effort, like the checkpoint and FTS merge it runs, and opening the store never
+    depended on it while that work ran inline. A start failure (thread or pid limit, or a process-wide
+    ``threading.Thread`` stand-in that runs targets inline) used to abort ``StoreHolder.__init__``, so every
+    caller reported storage as unavailable. That handle now keeps the inline per-Nth-write cadence.
+    """
+
+    @staticmethod
+    def _refuse_maintenance_thread(monkeypatch):
+        real_thread = threading.Thread
+
+        class _NoMaintenanceThread(real_thread):
+            def start(self):
+                if self.name == "session-db-maintenance":
+                    raise RuntimeError("can't start new thread")
+                super().start()
+
+        monkeypatch.setattr(_maintenance_thread.threading, "Thread", _NoMaintenanceThread)
+
+    @staticmethod
+    def _insert_session(db, session_id):
+        db._execute_write(lambda conn: conn.execute(
+            "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
+            (session_id, "test", time.time()),
+        ))
+
+    def test_open_survives_thread_start_failure_and_maintains_inline(self, tmp_path, monkeypatch, caplog):
+        self._refuse_maintenance_thread(monkeypatch)
+        with caplog.at_level(logging.WARNING, logger="hermes_state"):
+            db = StoreHolder(db_path=tmp_path / "state.db")
+        try:
+            assert db._maint_thread is None
+            assert any("maintenance thread" in r.getMessage() for r in caplog.records), (
+                "a handle without its maintenance thread must leave a WARNING")
+            calls = []
+            monkeypatch.setattr(db, "_try_wal_checkpoint", lambda: calls.append("checkpoint"))
+            monkeypatch.setattr(_maintenance_thread, "_try_incremental_merge_fts", lambda holder: calls.append("merge"))
+            db._CHECKPOINT_EVERY_N_WRITES = 2
+            db._FTS_MERGE_EVERY_N_WRITES = 4
+            for i in range(4):
+                self._insert_session(db, f"sess_{i}")
+            assert calls == ["checkpoint", "checkpoint", "merge"]
+        finally:
+            db.close()
+
+    def test_inline_running_thread_stand_in_never_blocks_the_open(self, tmp_path, monkeypatch):
+        """The TUI gateway tests swap ``server.threading.Thread`` (the process-wide class) for stand-ins
+        that run the target inline with its args. The maintenance loop then ran on the opener and
+        StoreHolder() never returned."""
+        real_thread = threading.Thread
+
+        class _InlineMaintenanceThread(real_thread):
+            def start(self):
+                if self.name == "session-db-maintenance":
+                    self.run()  # target(*args, **kwargs) on the caller, as the inline stand-ins do
+                    return
+                super().start()
+
+        opened = {}
+        opener = real_thread(
+            target=lambda: opened.setdefault("db", StoreHolder(db_path=tmp_path / "state.db")), daemon=True)
+        monkeypatch.setattr(_maintenance_thread.threading, "Thread", _InlineMaintenanceThread)
+        opener.start()
+        opener.join(timeout=30)
+        assert not opener.is_alive(), "StoreHolder() blocked inside the inline-run maintenance loop"
+        db = opened["db"]
+        try:
+            assert db._maint_thread is None
+            assert db._maint_inline is True
+        finally:
+            db.close()
+
+    def test_inline_maintenance_failure_never_fails_or_replays_the_write(self, tmp_path, monkeypatch):
+        """The inline tick runs after the commit: an error reaching _execute_write's lock-retry
+        handlers would replay a write that already landed."""
+        self._refuse_maintenance_thread(monkeypatch)
+        db = StoreHolder(db_path=tmp_path / "state.db")
+        try:
+            ticks = []
+
+            def _failing_tick(holder):
+                ticks.append(1)
+                raise sqlite3.OperationalError("database is locked")
+
+            monkeypatch.setattr(_maintenance_thread, "maintenance_tick", _failing_tick)
+            self._insert_session(db, "only")
+            assert ticks == [1]
+            assert db._conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 1
         finally:
             db.close()
