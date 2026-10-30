@@ -424,6 +424,95 @@ class TestRoutedTurnComposition:
         assert routed == unrouted
 
 
+def _wire_turn(agent, *, route_state=None, staged_notes=(), reasoning_config=None):
+    """Run the real ``TurnRunner._wire_turn_agent_callbacks`` for one turn of ``sess-key``; return the
+    agent. The runner double serves this turn's staged route state and sidecar notes."""
+    from gateway.run_turn_runner import TurnRunner
+
+    runner = SimpleNamespace(
+        _service_tier=None,
+        _consume_pending_runtime_route_state=lambda key: route_state,
+        _consume_pending_turn_sidecar_notes=lambda key: list(staged_notes),
+    )
+    ctx = SimpleNamespace(
+        progress_callback=None,
+        native_tool_start_callback=None,
+        voice_ack_callback=None,
+        _voice_ack_guild=[None],
+        voice_turn=False,
+        _native_slack_task_cards=False,
+        native_tool_complete_callback=None,
+        _step_callback_sync=None,
+        _hooks_ref=SimpleNamespace(loaded_hooks=[]),
+        _status_callback_sync=None,
+        _event_callback_sync=None,
+        _status_adapter=None,
+        session_key="sess-key",
+        user_config={},
+        source=SimpleNamespace(platform=Platform.DISCORD),
+        mute_notification_reply=False,
+        _thinking_enabled=False,
+        agent_holder=[None],
+        tools_holder=[None],
+        process_task_id=None,
+        process_baseline=None,
+        run_generation=0,
+    )
+    holder = SimpleNamespace(
+        _ctx=ctx,
+        _approval_owner=None,
+        _runner=runner,
+        _make_bg_review_callbacks=lambda: (lambda message: None, lambda: None),
+        _merge_turn_request_overrides=TurnRunner._merge_turn_request_overrides,
+        _clarify_callback_sync=lambda *a, **k: None,
+        _notice_callback_sync=lambda *a, **k: None,
+        _attach_session_title_callback=lambda agent, ctx: None,
+    )
+    effective = {"enabled": True, "effort": "max"} if reasoning_config is None else reasoning_config
+    TurnRunner._wire_turn_agent_callbacks(holder, agent, {}, effective, None, None, False)
+    return agent
+
+
+_ROUTE_STATE = {
+    "label": "SYSTEM_DEV",
+    "target_provider": "codex-nekos",
+    "target_model": "gpt-5.6-sol",
+    "target_reasoning_effort": "max",
+    "source": "skill-gate/context-policy-router",
+    "strictness": "auto_reconsiderable",
+    "confidence": 0.91,
+    "reason": "Hermes runtime work",
+}
+
+
+class TestTurnWiringRoutingDirective:
+    """The routed turn's directive rides its user message through upstream's ``arm_surface_turn``
+    funnel: staged sidecar notes first, then the directive, one-shot."""
+
+    def test_routed_turn_appends_directive_after_staged_notes(self):
+        from agent.system_prompt import format_routing_directive
+
+        agent = _wire_turn(SimpleNamespace(), route_state=dict(_ROUTE_STATE), staged_notes=["[Note: reset]"])
+
+        assert agent._gateway_turn_context_notes.startswith("[Note: reset]\n\n[Routing directive: label=SYSTEM_DEV ")
+        assert agent._gateway_turn_context_notes == (
+            "[Note: reset]\n\n" + format_routing_directive(_ROUTE_STATE)
+        )
+
+    def test_unrouted_turn_carries_no_directive(self):
+        agent = _wire_turn(SimpleNamespace(), staged_notes=["[Note: reset]"])
+
+        assert agent._gateway_turn_context_notes == "[Note: reset]"
+
+    def test_reused_agent_drops_the_directive_on_the_next_turn(self):
+        agent = _wire_turn(SimpleNamespace(), route_state=dict(_ROUTE_STATE))
+        assert "[Routing directive: " in agent._gateway_turn_context_notes
+
+        _wire_turn(agent)
+
+        assert agent._gateway_turn_context_notes == ""
+
+
 class TestRuntimeRouteBlockFreeze:
     def _agent(self, **overrides):
         data = dict(
@@ -464,15 +553,19 @@ class TestRuntimeRouteBlockFreeze:
 
     def test_reasoning_value_deterministic_for_effective_config(self):
         """The live flip: same effective config must render the same bytes
-        whether the agent was rebuilt (no attribution attr) or reused (attr
-        cleared at the turn boundary by the gateway)."""
+        whether the agent was rebuilt (no attribution attr) or reused (a
+        mid-turn model_switch left one). The gateway's turn wiring clears the
+        stale attribution at the turn boundary."""
         from agent.system_prompt import build_runtime_route_block
 
-        rebuilt = self._agent()
-        reused = self._agent()
-        # The gateway clears stale mid-turn attribution each turn; simulate
-        # the post-clear state (attribute absent on both).
-        assert build_runtime_route_block(rebuilt) == build_runtime_route_block(reused)
+        rebuilt = _wire_turn(self._agent())
+        reused = self._agent(_runtime_reasoning_source="model_switch:session")
+        assert "reasoning_source=model_switch:session" in build_runtime_route_block(reused)
+
+        _wire_turn(reused)
+
+        assert not hasattr(reused, "_runtime_reasoning_source")
+        assert build_runtime_route_block(reused) == build_runtime_route_block(rebuilt)
 
 
 def _override_runner(monkeypatch, *, current_model, switch_result, config_model=None):
