@@ -4,11 +4,13 @@ When ``model_routes.routes`` declares at least one route, ``delegate_task`` grow
 (top-level, and per task in ``tasks[]``) built from the catalog at ``get_definitions()`` time; with
 no routes declared the schema and the spawn path are upstream's. Precedence for one task: its own
 ``route`` > the top-level ``route`` > ``delegation.default_route`` > the active delegation provider
-(``delegation.backend``). A routed task runs on the route's health-checked provider/model (the
-default → fallbacks walk of ``hermes_cli.model_routes.resolve_route``) and the route's
-``reasoning_effort`` beats ``delegation.reasoning_effort``. An unknown route, or one whose whole
-chain is unhealthy, fails the call with a tool error naming the declared routes: never a silent
-fallback.
+(``delegation.backend``). ``default_route`` answers only for the DEFAULT backend: a session's
+``/delegation`` pick or a configured non-default ``delegation.backend`` is an explicit backend choice,
+and a session override beats config, so that backend answers unrouted tasks. A routed task runs on
+the route's health-checked provider/model (the default → fallbacks walk of
+``hermes_cli.model_routes.resolve_route``) and the route's ``reasoning_effort`` beats
+``delegation.reasoning_effort``. An unknown route, or one whose whole chain is unhealthy, fails the
+call with a tool error naming the declared routes: never a silent fallback.
 
 A resolved route is handed to core in the delegation provider's route vocabulary
 (``agent/delegation_provider.py``) and turned into a ``TaskRoute`` by the same code a provider's
@@ -127,6 +129,17 @@ def _declared_route(name: str, cfg: dict, full_cfg: dict, catalog: Any) -> dict[
     return route
 
 
+def _default_route(cfg: dict[str, Any], parent_agent: Any) -> str:
+    """``delegation.default_route`` while the calling session delegates on the default backend, else
+    ``""``: a chosen backend (the session's ``/delegation`` pick, else ``delegation.backend``) answers."""
+    from agent.delegation_backends import session_delegation_config
+    from agent.delegation_registry import DEFAULT_BACKEND, configured_backend
+    name = str(cfg.get("default_route") or "").strip()
+    if name and configured_backend(session_delegation_config(cfg, parent_agent)) != DEFAULT_BACKEND:
+        return ""
+    return name
+
+
 def _without_route(task: dict[str, Any]) -> dict[str, Any]:
     """The task as the delegation provider sees it: ``route`` is this module's parameter, never the provider's."""
     return {k: v for k, v in task.items() if k != "route"} if "route" in task else task
@@ -135,11 +148,12 @@ def _without_route(task: dict[str, Any]) -> dict[str, Any]:
 def resolve_routed_tasks(task_list: list[dict[str, Any]], cfg: dict[str, Any], parent_agent: Any,
                          top_route: Optional[str] = None) -> tuple[list[Any], Optional[str]]:
     """One ``TaskRoute`` per task, like ``tools.delegate_tool_routes.resolve_task_routes``: a task naming a model
-    route (its own > ``top_route`` > ``delegation.default_route``) takes that route, every other task the active
-    delegation provider's. ``([], error)`` when a named route cannot be used. Each distinct route resolves once."""
+    route (its own > ``top_route`` > ``delegation.default_route`` on the default backend) takes that route, every
+    other task the active delegation provider's. ``([], error)`` when a named route cannot be used. Each distinct
+    route resolves once."""
     from tools.delegate_tool_routes import _route_to_task_route, resolve_task_routes
     top = str(top_route or "").strip()
-    default_route = str(cfg.get("default_route") or "").strip()
+    default_route = _default_route(cfg, parent_agent)
     names = [str(task.get("route") or "").strip() or top or default_route for task in task_list]
     provider_tasks = [_without_route(task) for task in task_list]
     if not any(names):
