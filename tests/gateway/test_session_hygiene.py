@@ -903,7 +903,14 @@ async def test_hygiene_compression_cooldown_survives_gateway_restart(
 
             def _compress_context(self, messages, *_args, **_kwargs):
                 # Summary generation failed: compressor aborts and returns
-                # the transcript unchanged.
+                # the transcript unchanged. Mirror the per-attempt signals the
+                # real agent leaves on an abort (_begin_compression_attempt +
+                # _candidate_rejected) so the no-commit diagnosis is exercised.
+                self._last_compression_attempt_recorded = True
+                self._last_compression_attempt_in_place = None
+                self._last_compression_summary_warning = (
+                    self.context_compressor._last_summary_error
+                )
                 return (messages, None)
 
         runner1, _adapter1, event1 = _make_cooldown_runner(
@@ -916,6 +923,9 @@ async def test_hygiene_compression_cooldown_survives_gateway_restart(
         first_run_logs = "\n".join(
             record.getMessage() for record in caplog.records
         )
+        # A summary abort with a bound session_db is diagnosed as the abort,
+        # never as the missing-session_db #21301 path.
+        assert "attempt aborted before commit: aux model exploded" in first_run_logs
         assert "no session_db on the hygiene agent" not in first_run_logs
 
         # The abort must have persisted a cooldown to the DB.
