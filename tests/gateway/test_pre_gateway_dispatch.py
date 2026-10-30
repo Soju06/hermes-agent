@@ -192,11 +192,14 @@ async def test_hook_runtime_override_does_not_apply_before_auth(monkeypatch):
             ]
         return []
 
-    def _fail_switch_model(**_kwargs):
-        raise AssertionError("runtime override applied before auth")
+    # Recorded, not raised: _apply_gateway_runtime_override logs and swallows a raising switch, so
+    # an AssertionError here could never fail the test.
+    switch_calls = []
 
     monkeypatch.setattr("hermes_cli.plugins.ainvoke_hook", _fake_hook)
-    monkeypatch.setattr("hermes_cli.model_switch.switch_model", _fail_switch_model)
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model",
+                        lambda **kwargs: switch_calls.append(kwargs) or _fake_switch_result())
+    monkeypatch.setattr("gateway.slash_commands_model._model_switch_skew_guard", lambda: None)
 
     runner, _adapter = _make_runner(Platform.WHATSAPP)
     runner.pairing_store.generate_code.return_value = "12345"
@@ -204,7 +207,10 @@ async def test_hook_runtime_override_does_not_apply_before_auth(monkeypatch):
     result = await runner._handle_message(_make_event("codex-lb 817 확인해줘"))
 
     assert result is None
+    assert switch_calls == []
     assert runner._session_model_overrides == {}
+    # The directive's reasoning half is the other state a pre-auth application would write.
+    assert runner._session_reasoning_overrides == {}
 
 
 def _runtime_override_hook(**directive):
