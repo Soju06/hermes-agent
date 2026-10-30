@@ -256,6 +256,48 @@ async def _release_turn_marker(authority, event):
         await authority.runner._clear_durable_active_turn(event)
 
 
+def _hand_over_turn_trace(authority, admission_id, event, *, handed):
+    """The executed turn's waterfall trace (``agent/turn_trace.py``, None unless HERMES_TURN_TRACE)
+    was begun on this restored event by ``_handle_message_with_agent``; the adapter lifecycle that
+    sends the reply finishes it after delivery. The waiting adopter takes it, like the crash marker;
+    with no adopter (recovered no-waiter reply, API or automation execution, a raised turn) nothing
+    else can reach it, so it is finished here."""
+    from agent import turn_trace
+    trace = _bound_turn_trace(event)
+    if trace is None:
+        return
+    turn_trace.bind(event, None)
+    turn_trace.bind(event.source, None)
+    adopter = _marker_adopters(authority).get(admission_id) if handed else None
+    if adopter is None:
+        trace.finish(status='ok' if handed else 'error')
+        return
+    try:
+        # The restored event lost the adapter's debounce stamp; the adopter still carries it.
+        debounce_ts = getattr(adopter, '_hermes_debounce_enqueue_ts', None)
+        if debounce_ts:
+            trace.mark('transport.inbound_debounce', at=float(debounce_ts))
+            trace.tag(debounce_ms=round((trace.started_at - float(debounce_ts)) * 1000.0, 1))
+    except Exception:
+        pass
+    turn_trace.bind(adopter, trace)
+
+
+def _bound_turn_trace(event):
+    """Event first, then its source: a pre-dispatch rewrite replaces the event but keeps the source."""
+    from agent import turn_trace
+    return turn_trace.get_bound(event) or turn_trace.get_bound(getattr(event, 'source', None))
+
+
+def _finish_adopted_turn_trace(event):
+    """Finish (idempotent) the trace a busy follow-up's observer adopted from the drain."""
+    from agent import turn_trace
+    trace = _bound_turn_trace(event)
+    if trace is not None:
+        trace.finish(status='ok')
+        turn_trace.bind(getattr(event, 'source', None), None)
+
+
 def pause_notice(authority, ref, reason):
     """The committed input stays queued behind a paused FIFO (a turn lost across an owner
     restart, or a head the preflight refused). Tell the platform user once per pause episode
@@ -409,6 +451,7 @@ async def execute_admission(authority, ref, row):
             await _hand_over_turn_marker(authority, row['admission_id'], event)
             return response
     finally:
+        _hand_over_turn_trace(authority, row['admission_id'], event, handed=handed)
         if not native:
             # No adapter task awaits this turn to run its post-delivery callbacks: the drain runs them
             # once the turn settled and its reply went out (``fire_post_delivery``).
@@ -580,6 +623,7 @@ async def dispatch_shared_busy(adapter, event, session_key, *, durable=False):
             # which listens on the adopter (``event``).
             await adapter._release_turn_marker(delivery_event)
             await adapter._release_turn_marker(event)
+            _finish_adopted_turn_trace(event)  # the drain handed this turn's trace to ``event``
             await _run_own_post_delivery(adapter, session_key, event)
 
     token, commit_token = busy_acceptance.set(accepted), busy_commit.set(committed)

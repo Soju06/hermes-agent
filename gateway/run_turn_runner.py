@@ -1086,11 +1086,13 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         token = set_current_session_key(session_key)
         from gateway.run_turn_runner_approval_transport import approval_transport
         register_gateway_notify(session_key, approval_transport(self))
+        # getattr: upstream's TurnRunner tests drive this with SimpleNamespace ctx doubles (no trace).
+        _trace = getattr(ctx, "turn_trace_obj", None)
         try:
-            if ctx.turn_trace_obj is not None:
+            if _trace is not None:
                 # Bind the gateway's trace to the agent instance for the duration of the run so
                 # the loop / tool executors / finalizer find it via turn_trace.get_bound(agent).
-                turn_trace.bind(agent, ctx.turn_trace_obj)
+                turn_trace.bind(agent, _trace)
             run_message = self._native_image_run_message()
             api_message = _wrap_current_message_with_observed_context(run_message, observed_group_context)
             kwargs = {"conversation_history": agent_history, "task_id": ctx.session_id}
@@ -1160,7 +1162,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 from tools.clarify_gateway import clear_session
                 clear_session(session_key)
             reset_current_session_key(token)
-            if ctx.turn_trace_obj is not None:
+            if _trace is not None:
                 turn_trace.bind(agent, None)
 
     def _finish_stream_consumer(self, result, agent_history, stream_consumer):
@@ -1369,9 +1371,11 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         )
         ctx = self._ctx
         runner = self._runner
-        if ctx.turn_trace_obj is not None:
-            turn_trace.adopt(ctx.turn_trace_obj)
-        _trace_setup_started = time.time() if ctx.turn_trace_obj is not None else 0.0
+        # getattr: upstream's TurnRunner tests drive this with SimpleNamespace ctx doubles (no trace).
+        _trace = getattr(ctx, "turn_trace_obj", None)
+        if _trace is not None:
+            turn_trace.adopt(_trace)
+        _trace_setup_started = time.time() if _trace is not None else 0.0
         # Platform.LOCAL ("local") maps to the "cli" hint key the agent understands.
         # session_key is propagated via contextvars in _set_session_env() (_SESSION_KEY) and via
         # set_current_session_key() (_approval_session_key) below — both concurrency-safe and inherited by
@@ -1476,8 +1480,8 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         from agent.primary_auth_fallback import attach_primary_auth_failure
         attach_primary_auth_failure(agent, pending_primary_auth)
         self._wire_turn_agent_callbacks(agent, turn_route, reasoning_config, stream_delta_cb, interim_cb, want_interim)
-        if ctx.turn_trace_obj is not None:
-            ctx.turn_trace_obj.add_span(
+        if _trace is not None:
+            _trace.add_span(
                 "gateway.agent_setup", _trace_setup_started, time.time(),
                 rebuild=not reused_cached_agent,
             )
