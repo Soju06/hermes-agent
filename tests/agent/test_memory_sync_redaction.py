@@ -58,6 +58,8 @@ FANOUTS = {
     "on_pre_compress": lambda m, t: m.on_pre_compress(t, evidence_messages=t),
     "on_delegation": lambda m, t: m.on_delegation(f"task {_LEAK}", f"result {_LEAK}"),
     "on_memory_write": lambda m, t: m.on_memory_write("add", "memory", _LEAK, metadata={"old_text": _LEAK}),
+    # Fork: ADR-004 notes-tier backfill (agent.memory_pipeline) is a provider fan-out too.
+    "sync_note_backfill": lambda m, t: m.sync_note_backfill("decision/db.md", f"note {_LEAK}", metadata={"quote": _LEAK}),
 }
 
 

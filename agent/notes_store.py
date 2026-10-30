@@ -53,7 +53,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-import yaml
+import hermes_yaml
 
 from agent.redact import redact_sensitive_text
 from utils import atomic_replace
@@ -205,7 +205,7 @@ def _threat_check(text: str) -> None:
 
 
 def _serialize(frontmatter: Dict[str, Any], body: str) -> str:
-    fm = yaml.safe_dump(
+    fm = hermes_yaml.safe_dump(
         frontmatter, allow_unicode=True, sort_keys=False, default_flow_style=False
     ).strip()
     return f"{_FRONTMATTER_DELIM}\n{fm}\n{_FRONTMATTER_DELIM}\n{body.strip()}\n"
@@ -220,7 +220,7 @@ def _parse(raw: str) -> Tuple[Dict[str, Any], str]:
         end = lines[1:].index(_FRONTMATTER_DELIM) + 1
     except ValueError:
         raise NoteValidationError("Note frontmatter block is unterminated.")
-    fm = yaml.safe_load("\n".join(lines[1:end])) or {}
+    fm = hermes_yaml.safe_load("\n".join(lines[1:end])) or {}
     if not isinstance(fm, dict):
         raise NoteValidationError("Note frontmatter is not a mapping.")
     body = "\n".join(lines[end + 1:]).strip()
