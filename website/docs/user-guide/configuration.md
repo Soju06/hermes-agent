@@ -956,6 +956,26 @@ memory:
 
 With `memory.write_approval: true`, writes made through the `memory` tool need your approval before they land: interactive CLI turns prompt inline; messaging sessions and the background self-improvement review stage the write for `/memory pending` → `/memory approve <id>` / `/memory reject <id>` review. Toggle at runtime with `/memory approval on|off`. See [Controlling memory writes](./features/memory.md#controlling-memory-writes-write_approval).
 
+### Memory ingest curator
+
+The memory ingest curator is a background fork that reviews recent turns from the memory write-ahead log and drafts a routing verdict per span (full extraction, raw only, merge batch, note or skill proposal, or no-op). It is separate from the [skill curator](./features/curator.md): its keys sit in the same `curator:` section, but `curator.enabled` does not switch it on or off. It ships inert. With `curator.ingest_enabled: true` and `curator.shadow_mode: true`, a run only appends its verdicts to `~/.hermes/state/curator-ledger.jsonl`; nothing is ingested and no note, skill or `MEMORY.md` write results from it.
+
+```yaml
+curator:
+  ingest_enabled: false        # master switch for the memory ingest curator (independent of curator.enabled)
+  shadow_mode: true            # true = record verdicts in the shadow ledger only; false = send curated spans to the memory provider
+  salience:
+    threshold: 12              # accumulated turn score that starts a run
+    weight_proposal: 3         # score added per memory_propose call in a turn
+    weight_tool_success: 2     # score added for a tool-heavy turn (3+ tool results, at most 20% errors)
+    weight_non_trivial: 1      # score added for a turn with a tool result or a user message of 40+ chars
+    fallback_turns: 10         # most user turns allowed between two runs, whatever the score
+  idle_seconds: 600            # run after this long idle with unreviewed turns; 0 disables the idle trigger
+  session_end_min_turns: 3     # session end starts a run only after at least this many turns
+```
+
+Salience and fallback runs replay the conversation snapshot; session end, idle and pre-compression runs read only the new log spans. The fork uses the `auxiliary.ingest_curator` slot (default `auto`, the main model, with a 300-second timeout); see [Auxiliary Models](#auxiliary-models) to route it to another provider or model.
+
 ## Context File Truncation
 
 Controls how much content Hermes loads from each automatic context file before applying head/tail truncation. This applies to files injected into the system prompt such as `SOUL.md`, `.hermes.md`, `AGENTS.md`, `CLAUDE.md`, and `.cursorrules`. It does **not** affect the `read_file` tool.
