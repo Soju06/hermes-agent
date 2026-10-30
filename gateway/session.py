@@ -1195,22 +1195,23 @@ class SessionStore(
             entry = self._entry_locked(session_key)
             if entry is None:
                 return
-            # A /model write is the newer model-route writer: it supersedes a persisted runtime
-            # route (runtime_model/runtime_provider) but leaves runtime_reasoning_effort alone.
+            # A /model write, a clear included (``--global``, ``/resume``), is the newer model-route
+            # writer: it supersedes a persisted runtime route (runtime_model/runtime_provider) but
+            # leaves runtime_reasoning_effort alone.
             has_runtime_route = bool(entry.runtime_model or entry.runtime_provider)
-            if entry.model_override == cleaned and not (cleaned is not None and has_runtime_route):
+            if entry.model_override == cleaned and not has_runtime_route:
                 return
-            route_clear = {"runtime_model": None, "runtime_provider": None} if cleaned is not None else {}
             # Publish only after persistence so a failed clear remains retryable.
             data, generation = self._snapshot_routing_locked()
             # Snapshot reconciliation may replace the entry after database recovery.
             entry = self._entries[session_key]
-            data[session_key] = replace(entry, model_override=cleaned, **route_clear).to_dict()
+            data[session_key] = replace(
+                entry, model_override=cleaned, runtime_model=None, runtime_provider=None,
+            ).to_dict()
             self._persist_routing_data(data, generation)
             entry.model_override = cleaned
-            if cleaned is not None:
-                entry.runtime_model = None
-                entry.runtime_provider = None
+            entry.runtime_model = None
+            entry.runtime_provider = None
 
     def set_session_yolo(self, session_key: str, enabled: Optional[bool]) -> bool:
         """Persist the lane's ``/yolo`` bypass (None: back to the launch policy); False when the key has no

@@ -5,9 +5,14 @@ from types import SimpleNamespace
 import pytest
 
 import gateway.run as gateway_run
+from gateway.config import Platform
+from gateway.session import SessionSource
 
 
-SESSION_KEY = "agent:main:local:dm"
+# A messaging session: LOCAL sessions answer from their frozen launch policy before any persisted
+# override is read, so the route only matters on a messaging turn.
+SOURCE = SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm")
+SESSION_KEY = "agent:main:telegram:dm:12345"
 DEFAULT_MODEL = "default-model"
 DEFAULT_RUNTIME = {
     "api_key": "default-secret",
@@ -58,7 +63,9 @@ def _runner(store: _FakeStore) -> gateway_run.GatewayRunner:
 
 
 def _resolve(runner: gateway_run.GatewayRunner) -> tuple[str, dict]:
+    # The turn's source rides along (as in run_turn.py) so the launch-policy gate runs first.
     return runner._resolve_session_agent_runtime(
+        source=SOURCE,
         session_key=SESSION_KEY,
         user_config={
             "model": {

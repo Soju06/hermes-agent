@@ -3,6 +3,8 @@ from __future__ import annotations
 import threading
 from datetime import datetime
 
+import pytest
+
 from gateway.session import SessionEntry, SessionStore
 
 
@@ -73,3 +75,43 @@ def test_model_override_write_clears_older_runtime_route_only():
     assert entry.runtime_model is None
     assert entry.runtime_provider is None
     assert entry.runtime_reasoning_effort == "low"
+
+
+def test_model_override_clear_also_clears_older_runtime_route():
+    """A clear is a /model write too (``/model --global``, ``/resume``, the /login guest sweep): it
+    supersedes a persisted runtime route even when no /model pin was stored, so the next rehydrate
+    cannot resurrect the route the clear was meant to drop."""
+    # Given
+    store, entry = _store_with_entry()
+    entry.runtime_model = "runtime-model"
+    entry.runtime_provider = "runtime-provider"
+    entry.runtime_reasoning_effort = "high"
+    persisted = []
+    store._persist_routing_data = lambda data, generation: persisted.append(data)
+
+    # When
+    store.set_model_override(SESSION_KEY, None)
+
+    # Then
+    assert entry.model_override is None
+    assert entry.runtime_model is None
+    assert entry.runtime_provider is None
+    assert entry.runtime_reasoning_effort == "high"
+    assert len(persisted) == 1
+    durable = persisted[0][SESSION_KEY]
+    assert (durable["runtime_model"], durable["runtime_provider"]) == (None, None)
+    assert durable["runtime_reasoning_effort"] == "high"
+
+
+def test_model_override_clear_without_any_route_writes_nothing():
+    # Given
+    store, entry = _store_with_entry()
+    entry.runtime_reasoning_effort = "high"
+    store._persist_routing_data = lambda data, generation: pytest.fail("an unchanged clear must not persist")
+
+    # When
+    store.set_model_override(SESSION_KEY, None)
+
+    # Then
+    assert entry.model_override is None
+    assert entry.runtime_reasoning_effort == "high"

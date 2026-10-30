@@ -11,10 +11,12 @@ from gateway.session import SessionSource, SessionStore
 
 
 def _source() -> SessionSource:
+    # A messaging source: LOCAL sessions answer from their frozen launch policy before any
+    # persisted override is read, so only a messaging turn ever reads this route.
     return SessionSource(
-        platform=Platform.LOCAL,
-        chat_id="cli",
-        chat_name="CLI",
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_name="Telegram DM",
         chat_type="dm",
         user_id="user-1",
     )
@@ -96,8 +98,9 @@ def test_runtime_route_rehydrates_from_state_db_without_json(tmp_path, monkeypat
     )
 
     # When
+    # Production shape (run_turn.py): the turn passes its source, so the launch-policy gate runs.
     model, runtime = runner._resolve_session_agent_runtime(
-        session_key=session_key,
+        source=_source(),
         user_config={
             "model": {
                 "default": "default-model",
@@ -105,7 +108,7 @@ def test_runtime_route_rehydrates_from_state_db_without_json(tmp_path, monkeypat
             }
         },
     )
-    reasoning = runner._resolve_session_reasoning_config(session_key=session_key)
+    reasoning = runner._resolve_session_reasoning_config(source=_source())
 
     # Then
     assert model == "restart-model"
