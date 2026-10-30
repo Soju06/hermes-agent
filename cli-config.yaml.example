@@ -354,7 +354,8 @@ model:
 #       accepted:                      # model ids already "in this tier" (no-op suppression);
 #         - claude-fable-5             # use dash forms: claude-opus-4-8 matches a live
 #         - gpt-5.6-sol                # claude-opus-4.8, not the other way around
-#       fallbacks:                     # ordered failover chain, health-probed at switch time
+#       fallbacks:                     # ordered failover chain; an entry with a fresh unhealthy
+#                                      # verdict (from real traffic) is skipped
 #         - provider: codex-nekos
 #           model: gpt-5.6-sol
 #           reasoning_effort: xhigh    # (example) fallback effort is NOT inherited from the route
@@ -367,12 +368,18 @@ model:
 #       description: "Conversation, quick Q&A"
 #       provider: glm-vooy
 #       model: grok-4.5
-#   health:                            # provider health probing (fail-open: auth errors count healthy)
+#   health:                            # passive-first: real completion traffic files the verdicts
+#                                      # (outage-shaped failover = unhealthy, live success clears it);
+#                                      # no verdict = assumed healthy, no probe. The probe only
+#                                      # rechecks a stale unhealthy verdict (fail-open: auth errors
+#                                      # count healthy)
 #     enabled: true                    # kill switch; env HERMES_MODEL_ROUTES_HEALTH=0/1 overrides
 #     cache_path: ""                   # "" = <hermes home>/state/model_route_health.json
-#     ok_ttl_seconds: 300              # healthy results cached this long
-#     fail_ttl_seconds: 120            # failures retried sooner
-#     probe_timeout_seconds: 2.5
+#     ok_ttl_seconds: 300              # healthy verdicts served from cache this long (then assumed
+#                                      # healthy again, never re-probed)
+#     fail_ttl_seconds: 120            # unhealthy verdicts block the provider this long, then one
+#                                      # recovery probe rechecks it
+#     probe_timeout_seconds: 2.5       # recovery probe only
 #   static_rules:                      # matched before the LLM classifier; first match wins
 #     - name: pr-review-shorthand      # optional; shows up as `rule` in the decision log
 #       route: dev
