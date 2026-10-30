@@ -530,12 +530,19 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
     def _make_runtime_update_callback(ctx, runner):
         """Sync callback for ``agent.runtime_update_callback`` (agent/runtime_control.py): mirror a
         session-scoped model/reasoning switch into the session override state and persist the
-        secret-free identifiers on the SessionEntry. Static (ctx/runner passed in) so the wiring
-        below stays drivable from bare test doubles that are not TurnRunner instances."""
+        secret-free identifiers on the SessionEntry. A LOCAL (launch-policy) session commits it
+        through its owner's policy mutation instead (gateway/session_runtime_switch.py). Static
+        (ctx/runner passed in) so the wiring below stays drivable from bare test doubles that are
+        not TurnRunner instances."""
 
         def _runtime_update_callback(*, scope: str, model_override=None, reasoning_config=None) -> None:
             if scope != "session" or not ctx.session_key:
                 return
+            if not model_override and reasoning_config is None:
+                return
+            from gateway.session_runtime_switch import commit_local_runtime_switch
+            if commit_local_runtime_switch(runner, getattr(ctx, "source", None), model_override, reasoning_config):
+                return  # a LOCAL session's policy is its durable route; the override slot never reaches it
             if model_override:
                 runner._session_state(ctx.session_key).conversation.model_override = {
                     "model": model_override.get("model", ""),
