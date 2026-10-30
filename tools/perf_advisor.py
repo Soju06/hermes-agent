@@ -7,7 +7,7 @@ full-tree scans (``Path.rglob``/``os.walk``/unpruned ``find``/bare
 foreground ``sleep`` polling loops, and multi-minute foreground jobs that
 pin a session worker.  The native ``search_files`` tool (ripgrep-backed,
 .gitignore-aware) answers the same questions in ~1s, and background
-processes with ``notify_on_complete`` re-enter the session for free.
+processes with ``notify=true`` re-enter the session for free.
 
 This module is the thin corrective shot: after a tool call finishes, if it
 was slow AND matches a known antipattern, append ONE advisory line to the
@@ -107,7 +107,7 @@ def perf_advisory(
             return (
                 f"\n\n[perf-advisor] This command spent {duration_s:.0f}s including "
                 "foreground sleep. Don't poll with sleep loops: run the job with "
-                "background=true + notify_on_complete=true and end your turn — "
+                "background=true, notify=true and end your turn — "
                 "the completion re-enters the session automatically."
             )
 
@@ -115,7 +115,7 @@ def perf_advisory(
             return (
                 f"\n\n[perf-advisor] This foreground command blocked the turn for "
                 f"{duration_s:.0f}s. For jobs this long use background=true with "
-                "notify_on_complete=true (one process(action='wait') is fine), so "
+                "notify=true (one process_manage(action='wait') is fine), so "
                 "the session worker isn't pinned and you keep working or end the "
                 "turn cleanly."
             )
