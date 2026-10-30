@@ -25,16 +25,18 @@ class TestDisabledToolsetsAcceptsToolNames:
         }
 
     def test_single_tool_name_is_removed(self):
+        # skill_view: always available, and a tool of the `skills` toolset, not a toolset name.
+        # (text_to_speech is only listed when its SDK is installed or lazy installs are allowed.)
         base = self._names()
-        assert "text_to_speech" in base, "precondition: tts registered in default surface"
-        after = self._names(["text_to_speech"])
-        assert "text_to_speech" not in after
+        assert "skill_view" in base, "precondition: skill_view registered in default surface"
+        after = self._names(["skill_view"])
+        assert "skill_view" not in after
         # Only that one tool leaves; everything else stays.
-        assert base - after == {"text_to_speech"}
+        assert base - after == {"skill_view"}
 
     def test_multiple_tool_names_removed(self):
-        after = self._names(["text_to_speech", "memory_propose"])
-        assert "text_to_speech" not in after
+        after = self._names(["skill_view", "memory_propose"])
+        assert "skill_view" not in after
         assert "memory_propose" not in after
 
     def test_unknown_name_is_graceful_noop(self):
@@ -49,6 +51,24 @@ class TestDisabledToolsetsAcceptsToolNames:
         after = self._names(["memory"])
         assert "memory" not in after
         assert "notes_read" not in after, "toolset subtraction should remove the bundle"
+
+    def test_tool_name_removes_one_tool_toolset_name_removes_bundle(self):
+        # `terminal` is both a toolset (terminal + process_manage) and a tool; `process_manage`
+        # is only a tool. Raw catalog: tool_search assembly would defer process_manage.
+        def raw(disabled=None):
+            return {
+                t["function"]["name"]
+                for t in get_tool_definitions(
+                    disabled_toolsets=disabled, quiet_mode=True, skip_tool_search_assembly=True,
+                )
+            }
+
+        base = raw()
+        assert {"terminal", "process_manage"} <= base, "precondition: terminal toolset registered"
+        assert base - raw(["process_manage"]) == {"process_manage"}
+        without_terminal = raw(["terminal"])
+        assert "terminal" not in without_terminal
+        assert "process_manage" not in without_terminal, "toolset match wins over the tool name"
 
 
 # =========================================================================

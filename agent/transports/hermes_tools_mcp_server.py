@@ -95,10 +95,12 @@ def _build_server() -> Any:
     # there is no per-agent override in this bootstrap context.
     disabled_toolsets = None
     try:
+        from agent.skill_utils import parse_config_string_list
         from hermes_cli.config import load_config
 
-        disabled_toolsets = (load_config().get("agent") or {}).get(
-            "disabled_toolsets"
+        # Same reader as every other surface: a bare name or a JSON-array string is a list.
+        disabled_toolsets = parse_config_string_list(
+            (load_config().get("agent") or {}).get("disabled_toolsets")
         ) or None
     except Exception:
         # Fail open to the full surface — a config read failure must not
