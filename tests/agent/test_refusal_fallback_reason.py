@@ -30,9 +30,9 @@ from run_agent import AIAgent
 def _make_agent(fallback_model=None):
     """Create a minimal AIAgent with optional fallback config."""
     with (
-        patch("run_agent.get_tool_definitions", return_value=[]),
-        patch("run_agent.check_toolset_requirements", return_value={}),
-        patch("run_agent.OpenAI"),
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
     ):
         agent = AIAgent(
             api_key="test-key",
@@ -141,7 +141,7 @@ class TestRestoreClearsReason:
 
     def test_restore_clears_reason_and_flag(self):
         agent = self._activated_agent()
-        with patch("run_agent.OpenAI", return_value=MagicMock()):
+        with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
             assert agent._restore_primary_runtime() is True
         assert agent._fallback_activated is False
         assert agent._fallback_reason is None
@@ -232,7 +232,7 @@ class TestRuntimeStateHook:
                     return_value=(_mock_client(), "gpt-4o")):
             agent._try_activate_fallback(reason=FailoverReason.content_policy_blocked)
         with (
-            patch("run_agent.OpenAI", return_value=MagicMock()),
+            patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()),
             patch("hermes_cli.plugins.invoke_hook") as mock_hook,
         ):
             assert agent._restore_primary_runtime() is True
@@ -261,7 +261,7 @@ class TestOtherResetPaths:
             agent._try_activate_fallback(reason=FailoverReason.content_policy_blocked)
         assert agent._fallback_reason == "content_policy_blocked"
         with (
-            patch("run_agent.OpenAI", return_value=MagicMock()),
+            patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()),
             patch("hermes_cli.timeouts.get_provider_request_timeout", return_value=None),
         ):
             agent.switch_model(
@@ -311,6 +311,36 @@ class TestOtherResetPaths:
         assert agent._fallback_activated is False
         assert agent._fallback_reason is None
 
+    def test_voice_turn_route_end_discards_reason_with_the_fallback(self, tmp_path, monkeypatch):
+        """A fallback activated inside a voice turn is discarded when the voice route ends
+        (``_fallback_activated`` returns to its pre-voice value); its reason must go with it,
+        or the next turn publishes a refusal fallback that is no longer live."""
+        from agent.voice_turn_route import begin_voice_turn_route, end_voice_turn_route
+        from tests.fakes.fake_llm_provider import FakeLLMServer, write_hermes_home
+
+        with FakeLLMServer([]) as main, FakeLLMServer([]) as voice, FakeLLMServer([]) as fb:
+            home = write_hermes_home(tmp_path / ".hermes", main.base_url, extra_config=(
+                "auxiliary:\n  voice_chat:\n    provider: custom\n"
+                f"    base_url: {voice.base_url}\n    model: voice-model\n    api_key: sk-fake-voice\n"
+            ))
+            monkeypatch.setenv("HERMES_HOME", str(home))
+            agent = AIAgent(
+                model="fake-model", provider="custom", base_url=main.base_url, api_key="sk-fake-e2e",
+                quiet_mode=True, skip_context_files=True, skip_memory=True, enabled_toolsets=["memory"],
+                fallback_model={"provider": "custom", "model": "fb-model", "base_url": fb.base_url,
+                                "api_key": "sk-fake-fb"},
+            )
+            agent._voice_turn_pending = True
+            begin_voice_turn_route(agent, [{"role": "user", "content": "hi"}], "system")
+            assert agent.model == "voice-model"
+            assert agent._try_activate_fallback(reason=FailoverReason.content_policy_blocked) is True
+            assert (agent.model, agent._fallback_reason) == ("fb-model", "content_policy_blocked")
+            end_voice_turn_route(agent)
+        assert agent.model == "fake-model"
+        assert agent._fallback_activated is False
+        assert agent._fallback_reason is None
+        assert get_runtime_state(agent)["fallback_reason"] is None
+
     def test_runtime_snapshot_roundtrip_carries_reason(self):
         """snapshot_runtime/restore_runtime must copy the reason with the flag."""
         from agent.runtime_control import restore_runtime, snapshot_runtime
@@ -324,7 +354,7 @@ class TestOtherResetPaths:
 
         agent._fallback_reason = None
         agent._fallback_activated = False
-        with patch("run_agent.OpenAI", return_value=MagicMock()):
+        with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
             restore_runtime(agent, snapshot)
         assert agent._fallback_activated is True
         assert agent._fallback_reason == "content_policy_blocked"
@@ -352,7 +382,7 @@ class TestLoopCallSitesForwardReason:
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
-            patch("run_agent.OpenAI", return_value=MagicMock()),
+            patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()),
             patch("agent.agent_runtime_helpers.time.sleep"),
             patch("agent.auxiliary_client.resolve_provider_client",
                   return_value=(_mock_client(), "gpt-4o")),

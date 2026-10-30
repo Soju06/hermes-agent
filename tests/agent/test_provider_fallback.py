@@ -619,12 +619,14 @@ class TestDeclaredFallbackApiMode:
 
     def test_invalid_declared_api_mode_falls_back_to_heuristics(self):
         """A typo'd api_mode must degrade to the URL heuristics (default
-        chat_completions on an unrecognized host), not a broken transport."""
+        chat_completions on an unrecognized host), not a broken transport.
+        (``anthropic-messages`` is an accepted alias upstream, so the typo
+        here is a misspelling no alias table maps.)"""
         fbs = [
             {
                 "provider": "claude-lb",
                 "model": "claude-opus-5",
-                "api_mode": "anthropic-messages",  # wrong separator
+                "api_mode": "anthropic_mesages",  # misspelt, not an alias
             }
         ]
         agent = _make_agent(fallback_model=fbs)
