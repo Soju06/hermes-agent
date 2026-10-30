@@ -25,7 +25,11 @@ logger = logging.getLogger(__name__)
 # now" — mirrors the probe's fail-open classification (5xx, 402/429/credit,
 # connection failures). Deliberately excluded: auth (our credentials),
 # content_policy_blocked (this prompt), context/format errors (this request),
-# upstream_rate_limit (one model at an aggregator, not the provider).
+# upstream_rate_limit (one model at an aggregator, not the provider). Of the
+# v0.22.5 additions, upstream_blocked (WAF/CDN 403) stays out for probe parity
+# (the probe counts a 403 healthy); model_entitlement, data_policy_denied,
+# incomplete_response and role_alternation are account/model/request-scoped.
+# tests/agent/test_passive_provider_health.py partitions the whole enum.
 PASSIVE_UNHEALTHY_REASONS = frozenset({
     FailoverReason.billing,
     FailoverReason.rate_limit,

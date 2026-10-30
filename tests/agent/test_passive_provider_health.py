@@ -51,6 +51,42 @@ def _mock_client(base_url="https://api.example.com/v1", api_key="fb-key"):
 
 _FB = {"provider": "openai", "model": "gpt-4o"}
 
+# FailoverReasons that never file an unhealthy verdict: the failure is scoped to our
+# credentials or account, this request, or one model behind the provider, so other
+# traffic on the provider can still succeed. upstream_blocked (a WAF/CDN 403) stays
+# out for probe parity, because the recovery probe counts every 403 healthy.
+_NOT_A_PROVIDER_OUTAGE = frozenset({
+    # credentials / account / entitlement
+    FailoverReason.auth,
+    FailoverReason.auth_permanent,
+    FailoverReason.model_entitlement,
+    FailoverReason.long_context_tier,
+    FailoverReason.oauth_long_context_beta_forbidden,
+    FailoverReason.provider_policy_blocked,
+    FailoverReason.data_policy_denied,
+    FailoverReason.upstream_blocked,
+    FailoverReason.ssl_cert_verification,
+    # one model at an aggregator, or a model the provider does not serve
+    FailoverReason.upstream_rate_limit,
+    FailoverReason.model_not_found,
+    # this request's content or shape
+    FailoverReason.content_policy_blocked,
+    FailoverReason.context_overflow,
+    FailoverReason.payload_too_large,
+    FailoverReason.image_too_large,
+    FailoverReason.image_corrupt,
+    FailoverReason.format_error,
+    FailoverReason.role_alternation,
+    FailoverReason.invalid_encrypted_content,
+    FailoverReason.multimodal_tool_content_unsupported,
+    FailoverReason.reasoning_mandatory,
+    FailoverReason.thinking_signature,
+    FailoverReason.llama_cpp_grammar_pattern,
+    FailoverReason.incomplete_response,
+    # unclassifiable: never guess an outage
+    FailoverReason.unknown,
+})
+
 
 # ── Reason classification ──────────────────────────────────────────────────
 
@@ -66,15 +102,16 @@ class TestUnhealthyReasonSet:
         } == set(PASSIVE_UNHEALTHY_REASONS)
 
     def test_request_scoped_reasons_excluded(self):
-        for reason in (
-            FailoverReason.auth,
-            FailoverReason.content_policy_blocked,
-            FailoverReason.context_overflow,
-            FailoverReason.format_error,
-            FailoverReason.upstream_rate_limit,
-            None,
-        ):
+        for reason in (*_NOT_A_PROVIDER_OUTAGE, None):
             assert reason not in PASSIVE_UNHEALTHY_REASONS
+
+    def test_every_failover_reason_has_a_passive_health_decision(self):
+        """Each FailoverReason either files an unhealthy verdict or is excluded on purpose.
+        A member upstream adds lands in neither set and fails here until it is classified
+        (v0.22.5 added upstream_blocked, model_entitlement, incomplete_response,
+        data_policy_denied and role_alternation; all excluded)."""
+        assert not (_NOT_A_PROVIDER_OUTAGE & PASSIVE_UNHEALTHY_REASONS)
+        assert _NOT_A_PROVIDER_OUTAGE | PASSIVE_UNHEALTHY_REASONS == set(FailoverReason)
 
 
 # ── Failure hook on fallback activation ────────────────────────────────────
