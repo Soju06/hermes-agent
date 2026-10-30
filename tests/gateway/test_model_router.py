@@ -787,6 +787,8 @@ def test_enforce_mode_applies_override_and_persists(monkeypatch, tmp_path):
         "api_key": "sk-test",
         "base_url": "https://p1.example/v1",
         "api_mode": "chat_completions",
+        "request_overrides": {},
+        "capabilities": {},
     }
     assert runner._session_model_overrides["tg:c1"] == expected_override
     runner.session_store.set_model_override.assert_called_once_with(
@@ -994,45 +996,65 @@ def test_stage_routes_on_pre_hook_original_text(monkeypatch, tmp_path):
 
 
 def test_enforce_apply_model_path_parity(monkeypatch, tmp_path):
-    """A3: enforce apply mirrors /model — pending self-identification note
-    (route + reason) and session-DB update_session_model persist."""
+    """A3: an enforce apply commits the switch exactly as a typed standing /model does
+    (``_record_model_switch``): the session-DB write carries the route (provider, base_url, api_mode;
+    resume must not send the new model to the old host), the override keeps request_overrides and
+    capabilities, the store write-through matches, and a pending ``/model --once`` restore is dropped
+    so the turn end does not revert the switch. The router's own note names the route."""
+    from gateway.slash_commands_model import _ModelSwitchContext
     from hermes_cli.model_switch import ModelSwitchResult
 
     monkeypatch.setenv("HERMES_MODEL_ROUTER_DECISION_LOG", str(tmp_path / "d.jsonl"))
     cfg = _cfg(router={"mode": "enforce"})
-    runner = _make_runner(
-        monkeypatch, cfg, runtime=("model-b", {"provider": "p2", "base_url": "https://p2.example/v1"}),
+    result = ModelSwitchResult(
+        success=True,
+        new_model="model-a",
+        target_provider="p1",
+        api_key="sk-test",
+        base_url="https://p1.example/v1",
+        api_mode="chat_completions",
+        request_overrides={"extra_body": {"seed": 7}},
+        runtime_capabilities={"vision": True},
     )
-    runner._session_db = SimpleNamespace(update_session_model=AsyncMock())
-    runner.session_store.get_or_create_session = MagicMock(
-        return_value=SimpleNamespace(session_id="sid-1"),
-    )
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", MagicMock(return_value=result))
     monkeypatch.setattr(
         mr_mod, "_call_gemini",
         lambda *a, **k: json.dumps({"evidence": "S5", "label": "SYSTEM_DEV", "confidence": 0.9}),
     )
-    monkeypatch.setattr(
-        "hermes_cli.model_switch.switch_model",
-        MagicMock(return_value=ModelSwitchResult(
-            success=True,
-            new_model="model-a",
-            target_provider="p1",
-            api_key="sk-test",
-            base_url="https://p1.example/v1",
-            api_mode="chat_completions",
-        )),
-    )
 
+    def _runner_with_pending_once():
+        runner = _make_runner(
+            monkeypatch, cfg, runtime=("model-b", {"provider": "p2", "base_url": "https://p2.example/v1"}),
+        )
+        runner._session_db = SimpleNamespace(update_session_model=AsyncMock())
+        runner.session_store.get_or_create_session = MagicMock(
+            return_value=SimpleNamespace(session_id="sid-1"),
+        )
+        runner._pending_one_turn_model_restores = {"tg:c1": {"had_override": False}}
+        return runner
+
+    routed, typed = _runner_with_pending_once(), _runner_with_pending_once()
     asyncio.run(
-        runner._model_router_stage(_event("gateway 버그 고쳐줘"), _source(), "tg:c1", mode="enforce")
+        routed._model_router_stage(_event("gateway 버그 고쳐줘"), _source(), "tg:c1", mode="enforce")
     )
+    ctx = _ModelSwitchContext(
+        session_key="tg:c1", source=_source(), config_path=None, persist_global=False,
+        current_model="model-b",
+    )
+    asyncio.run(typed._record_model_switch(result, ctx, source=_source(), one_turn=False, picker=False))
 
-    note = runner._pending_model_notes["tg:c1"]
+    assert (routed._session_db.update_session_model.await_args
+            == typed._session_db.update_session_model.await_args)
+    assert routed._session_model_overrides["tg:c1"] == typed._session_model_overrides["tg:c1"]
+    assert (routed.session_store.set_model_override.call_args
+            == typed.session_store.set_model_override.call_args)
+    for runner in (routed, typed):
+        assert not runner._pending_one_turn_model_restores.get("tg:c1")
+    note = routed._pending_model_notes["tg:c1"]
     assert "switched" in note and "model-a" in note
     assert "route 'dev'" in note  # mentions the route name
-    runner._session_db.update_session_model.assert_awaited_once_with("sid-1", "model-a")
     # A2 flag was recorded for the auto-reset boundary consume.
-    assert "tg:c1" in runner._model_router_fresh_applies
+    assert "tg:c1" in routed._model_router_fresh_applies
 
 
 def _applied_runner(monkeypatch, tmp_path):

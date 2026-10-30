@@ -224,11 +224,14 @@ class GatewayInboundModelRouterMixin:
     ) -> tuple[bool, bool]:
         """Apply a resolved route directive the way /model applies a switch.
 
-        Returns (applied, reasoning_applied). Mirrors the commit path of the /model command's
-        _finish_switch: resolve credentials via switch_model, persist the new model to the session DB
-        (dashboard freshness, #34850), queue a pending model note so the agent self-identifies after
-        the silent switch, write the in-memory session override, write-through the non-secret parts
-        to the session store, and evict the cached agent.
+        Returns (applied, reasoning_applied). Mirrors the commit path of a typed standing /model
+        switch (``GatewayModelCommandsMixin._record_model_switch``): resolve credentials via switch_model,
+        persist the new model and its route to the session DB (dashboard freshness #34850; resume must
+        not send the new model to the old host), queue a pending model note so the agent
+        self-identifies after the silent switch, write the in-memory session override (request
+        overrides and capabilities included), drop a pending ``/model --once`` restore so the turn end
+        does not revert this switch, write-through the non-secret parts to the session store, and
+        evict the cached agent.
 
         Deliberate simplification vs. the slash path: no in-place ``switch_model`` on a cached agent —
         the router always evicts and lets the next turn rebuild from the override. The router runs
@@ -280,7 +283,10 @@ class GatewayInboundModelRouterMixin:
         if _sess_db is not None and source is not None:
             try:
                 _sess_entry = await self.async_session_store.get_or_create_session(source)
-                await _sess_db.update_session_model(_sess_entry.session_id, result.new_model)
+                await _sess_db.update_session_model(
+                    _sess_entry.session_id, result.new_model, provider=result.target_provider,
+                    base_url=result.base_url, api_mode=result.api_mode,
+                )
             except Exception:
                 logger.debug("model router: persist model switch to session DB failed", exc_info=True)
 
@@ -300,7 +306,11 @@ class GatewayInboundModelRouterMixin:
         self._session_model_overrides[session_key] = {
             "model": result.new_model, "provider": result.target_provider, "api_key": result.api_key,
             "base_url": result.base_url, "api_mode": result.api_mode,
+            "request_overrides": dict(result.request_overrides or {}),
+            "capabilities": dict(result.runtime_capabilities or {}),
         }
+        if hasattr(self, "_pending_one_turn_model_restores"):  # a standing switch, as a typed /model
+            self._pending_one_turn_model_restores.pop(session_key, None)
         # Mark this session as freshly router-applied so the was_auto_reset conversation-boundary
         # cleanup later in this same inbound turn does not silently revert the switch (#48031 class)
         # — see _consume_auto_reset_boundary, which consumes the flag. A dict (not a set) so the
