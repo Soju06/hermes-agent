@@ -16,6 +16,7 @@ from hermes_cli.plugins import (
     PluginContext,
     PluginManager,
     PluginManifest,
+    VALID_HOOKS,
     _dispatch_pre_tool_call_hooks,
     get_pre_tool_call_block_message,
     get_pre_verify_continue_message,

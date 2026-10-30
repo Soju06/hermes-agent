@@ -123,7 +123,7 @@ def _explode_runtime_resolution():
 
 def test_run_agent_prefers_session_override_over_global_runtime(monkeypatch):
     monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
-    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gateway_run, "_reload_runtime_env_preserving_config_authority", lambda: None)
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", _explode_runtime_resolution)
 
     fake_run_agent = types.ModuleType("run_agent")
@@ -167,7 +167,7 @@ def test_run_agent_prefers_session_override_over_global_runtime(monkeypatch):
 
 def test_runtime_update_callback_persists_session_overrides(monkeypatch):
     monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
-    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gateway_run, "_reload_runtime_env_preserving_config_authority", lambda: None)
     monkeypatch.setattr(
         gateway_run,
         "_resolve_runtime_agent_kwargs",
@@ -246,7 +246,7 @@ def test_persisted_runtime_override_survives_gateway_restart(tmp_path, monkeypat
     runner = _make_runner()
     runner.session_store = store2
 
-    def fake_resolve_runtime_provider(*, requested=None, explicit_base_url=None, explicit_api_key=None):
+    def fake_resolve_runtime_provider(*, requested=None, target_model=None, explicit_base_url=None, explicit_api_key=None):
         assert requested == "codex-nekos"
         assert explicit_base_url is None
         assert explicit_api_key is None
