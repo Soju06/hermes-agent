@@ -73,10 +73,13 @@ class GatewayInboundModelRouterMixin:
             value = (runtime_kwargs or {}).get(name)
             if value:
                 snapshot[name] = value
-        # Effective reasoning effort (session override → config), needed by runtime_satisfies_route's
-        # effort-aware membership (plugin parity with runtime_matches_spec). Cheap: dict lookup + config read.
+        # Effective reasoning effort (session override → per-model override for the EFFECTIVE model →
+        # config), needed by runtime_satisfies_route's effort-aware membership (plugin parity with
+        # runtime_matches_spec). Cheap: dict lookup + config read.
         try:
-            reasoning = self._resolve_session_reasoning_config(source=source, session_key=session_key)
+            reasoning = self._resolve_session_reasoning_config(
+                source=source, session_key=session_key, model=model or "",
+            )
         except Exception:
             logger.debug("model router: reasoning snapshot failed", exc_info=True)
             reasoning = None

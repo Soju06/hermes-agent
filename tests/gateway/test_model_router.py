@@ -971,6 +971,24 @@ def test_stage_takes_runtime_snapshot_on_event_loop(monkeypatch, tmp_path):
     assert seen == {"on_loop": True}
 
 
+def test_runtime_snapshot_reasoning_follows_the_effective_model(monkeypatch):
+    """runtime_satisfies_route's effort-aware membership reads the snapshot's reasoning_effort, so a
+    per-model ``agent.reasoning_overrides`` entry is evaluated for the session's EFFECTIVE model (a
+    /model or router override: model-a), not ``model.default`` (model-b), as every upstream caller of
+    ``_resolve_session_reasoning_config`` passes it."""
+    cfg = _cfg()
+    cfg["model"] = {"default": "model-b"}
+    cfg["agent"] = {"reasoning_effort": "low", "reasoning_overrides": {"model-a": "xhigh"}}
+    runner = _make_runner(
+        monkeypatch, cfg, runtime=("model-a", {"provider": "p1", "base_url": "https://p1.example/v1"}),
+    )
+
+    snapshot = runner._model_router_runtime_snapshot(_source(), "tg:c1")
+
+    assert snapshot == {"model": "model-a", "provider": "p1", "base_url": "https://p1.example/v1",
+                        "reasoning_effort": "xhigh"}
+
+
 def test_stage_routes_on_pre_hook_original_text(monkeypatch, tmp_path):
     """Plugin hooks may prepend advisories / rewrite event.text before the
     stage runs; the classifier must see the pre-hook original (bench inputs
