@@ -1962,7 +1962,7 @@ def route_classified_error(
         if not pool_may_recover:
             agent._buffer_diagnostic_status(_eager_fallback_status(classified, _is_upstream, _is_transport_failure))
             reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
-            if agent._try_activate_fallback(reason=classified.reason, reset_at=reset_at):
+            if agent._try_activate_fallback(reason=classified.reason, reset_at=reset_at, retry_pending=True):
                 return _fallback_break()
 
     # A 401/403 surviving credential refresh means a broken credential or endpoint:

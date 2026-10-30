@@ -1986,23 +1986,22 @@ def _rescope_fallback_extra_body(agent, old_model: str, old_provider: str, old_b
         logger.debug("Failed to resolve extra_body for fallback %s; keeping current: %s", agent.model, _eb_err)
 
 
-def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=None) -> bool:
+def try_activate_fallback(
+    agent, reason: FailoverReason | None = None, reset_at=None, *, retry_pending: bool = False,
+) -> bool:
     """Switch to the next fallback model/provider in the chain; False when exhausted. Swaps client,
     model slug and provider in place so the retry loop continues on the new backend; client
     construction goes through resolve_provider_client (no duplicated provider→key mappings)."""
     from agent.fallback_cooldown import _arm_rate_limit_cooldown, switch_deferred_by_reset
     from agent.fallback_notice import announce_fallback_switch, fallback_trigger_text
     if switch_deferred_by_reset(agent, reason, reset_at):
+        # Passive health: only the in-loop eager switch (retry_pending) rides the reset window
+        # out on this runtime; a deferral with no retry left ends the turn on it.
+        if not retry_pending:
+            _passive_health.note_runtime_abandoned(agent, reason)
         return False
-    if reason in _passive_health.PASSIVE_UNHEALTHY_REASONS:
-        # The loop is abandoning the CURRENT runtime for an outage-shaped
-        # failure — file the passive verdict before the chain advances so
-        # fresh route resolutions fail over immediately. Recursive skip
-        # calls re-enter here with the same runtime; the recorder's burst
-        # guard dedups them.
-        _passive_health.record_passive_provider_outcome(
-            agent, False, reason.value if reason is not None else "unknown"
-        )
+    # Leaving the CURRENT runtime: file the verdict before the chain advances (burst-guarded).
+    _passive_health.note_runtime_abandoned(agent, reason)
     cooldown_seconds = _arm_rate_limit_cooldown(agent, reason, reset_at=reset_at)
     while True:
         if agent._fallback_index >= len(agent._fallback_chain):

@@ -8,7 +8,9 @@ provider_health() only probes as a recovery check on stale-unhealthy
 verdicts.
 
 Called from the completion success paths (``chat_completion_helpers``,
-``chat_completion_nonstream``) and from ``try_activate_fallback``.
+``chat_completion_nonstream``) and from ``try_activate_fallback``, which files the
+verdict for the runtime it leaves; a reset-deferred switch files it only when no retry
+is left (``retry_pending=False``), since only then does the turn end on that runtime.
 """
 
 from __future__ import annotations
@@ -46,6 +48,13 @@ def record_passive_provider_outcome(agent, healthy: bool, reason: str) -> None:
             record_provider_outcome(key, healthy, reason)
     except Exception:
         logger.debug("passive provider health record failed", exc_info=True)
+
+
+def note_runtime_abandoned(agent, reason) -> None:
+    """The turn is giving up on the CURRENT runtime for ``reason``: file an unhealthy verdict
+    when the reason is outage-shaped, so fresh route resolutions fail over without a probe."""
+    if reason in PASSIVE_UNHEALTHY_REASONS:
+        record_passive_provider_outcome(agent, False, reason.value)
 
 
 def note_provider_success(agent) -> None:

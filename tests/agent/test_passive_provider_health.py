@@ -125,9 +125,9 @@ class TestFallbackActivationRecordsUnhealthy:
                 assert agent._try_activate_fallback(reason=FailoverReason.overloaded) is False
         rec_mock.assert_called_once_with("claude-lb", False, "overloaded")
 
-    def test_reset_deferred_switch_does_not_record(self):
-        """fallback.min_switch_reset_seconds keeps the turn on the primary when its rate
-        limit reopens soon; the runtime is not abandoned, so no unhealthy verdict is filed."""
+    def _deferred_switch(self, **kwargs):
+        """One reset-deferred switch: fallback.min_switch_reset_seconds=120 and a rate
+        limit that reopens in 30 s keep the turn on the primary (upstream #117484)."""
         agent = _make_agent(fallback_model=[_FB])
         with (
             patch("agent.auxiliary_client.resolve_provider_client",
@@ -140,9 +140,21 @@ class TestFallbackActivationRecordsUnhealthy:
             patch("hermes_cli.model_routes.record_provider_outcome") as rec_mock,
         ):
             assert agent._try_activate_fallback(
-                reason=FailoverReason.rate_limit, reset_at=1_700_000_030
+                reason=FailoverReason.rate_limit, reset_at=1_700_000_030, **kwargs
             ) is False
-        rec_mock.assert_not_called()
+        assert agent.provider == "claude-lb"  # deferred: the primary stays bound
+        return rec_mock
+
+    def test_reset_deferred_switch_with_retry_pending_does_not_record(self):
+        """The in-loop eager switch passes retry_pending=True: the retry loop rides the
+        reset window out on the primary, so the runtime is not abandoned and no
+        unhealthy verdict is filed."""
+        self._deferred_switch(retry_pending=True).assert_not_called()
+
+    def test_reset_deferred_switch_with_no_retry_left_records(self):
+        """Retry exhaustion and the non-retryable exit call without retry_pending: a
+        deferral there ends the turn on the primary, so the verdict is still filed."""
+        self._deferred_switch().assert_called_once_with("claude-lb", False, "rate_limit")
 
     def test_unmapped_runtime_skips_recording(self):
         agent = _make_agent(fallback_model=[_FB])
@@ -164,6 +176,67 @@ class TestFallbackActivationRecordsUnhealthy:
                   side_effect=RuntimeError("config exploded")),
         ):
             assert agent._try_activate_fallback(reason=FailoverReason.server_error) is True
+
+
+class _RateLimited(Exception):
+    """Primary 429 as the conversation loop sees it (classified rate_limit)."""
+
+    status_code = 429
+
+    def __init__(self):
+        super().__init__("Error code: 429 - rate limit exceeded")
+        self.response = SimpleNamespace(headers={})
+        self.body = {"error": {"message": "rate limit exceeded"}}
+
+
+class TestResetDeferredSwitchAcrossTheRetryLoop:
+    """fallback.min_switch_reset_seconds through the real retry loop: the eager in-loop
+    deferrals file nothing while retries remain, and once retries are spent the
+    exhaustion call (still deferred, so the turn ends on the primary) files exactly
+    one unhealthy verdict for it."""
+
+    def test_verdict_filed_once_when_retries_are_spent(self):
+        import time
+
+        from hermes_cli.config import load_config
+        from hermes_constants import get_hermes_home
+
+        (get_hermes_home() / "config.yaml").write_text(
+            "fallback:\n  min_switch_reset_seconds: 120\n", encoding="utf-8")
+        assert load_config()["fallback"]["min_switch_reset_seconds"] == 120
+
+        agent = _make_agent(fallback_model=[_FB])
+        agent._api_max_retries = 2
+        attempts = []
+        recorded_after = []
+
+        def _primary_429(*_args, **_kwargs):
+            attempts.append(agent.provider)
+            raise _RateLimited()
+
+        def _record(key, healthy, reason):
+            recorded_after.append((len(attempts), key, healthy, reason))
+
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=_primary_429),
+            patch.object(agent, "_interruptible_streaming_api_call", side_effect=_primary_429),
+            patch.object(agent, "_extract_api_error_context",
+                         side_effect=lambda _err: {"reset_at": time.time() + 30}),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("agent.auxiliary_client.resolve_provider_client",
+                  return_value=(_mock_client(), "gpt-4o")),
+            patch("agent.model_metadata.get_model_context_length", return_value=200000),
+            patch("hermes_cli.model_routes.provider_key_for_runtime",
+                  return_value="claude-lb"),
+            patch("hermes_cli.model_routes.record_provider_outcome", side_effect=_record),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result.get("failed") or result.get("error")
+        assert attempts and set(attempts) == {"claude-lb"}  # never switched
+        assert recorded_after == [(len(attempts), "claude-lb", False, "rate_limit")]
 
 
 # ── Success hook ───────────────────────────────────────────────────────────
