@@ -19,6 +19,9 @@ import hermes_yaml as yaml
 
 from model_tools import get_tool_definitions
 
+# Write reason accepted by the add/patch reason gate (fork patch: memory-write-reason-gate).
+WRITE_REASON = "This is a durable environment fact that should persist across sessions."
+
 
 @pytest.fixture(autouse=True)
 def _clear_caches():
@@ -186,8 +189,10 @@ class TestIndependentStoreWriteGates:
         from tools.memory_tool import memory_tool
 
         store = self._store(memory_enabled=False, user_profile_enabled=True)
-        denied = json.loads(memory_tool(action="add", target="memory", content="fact", store=store))
-        allowed = json.loads(memory_tool(action="add", target="user", content="pref", store=store))
+        denied = json.loads(memory_tool(action="add", target="memory", content="fact", reason=WRITE_REASON,
+                                        store=store))
+        allowed = json.loads(memory_tool(action="add", target="user", content="pref", reason=WRITE_REASON,
+                                         store=store))
 
         assert denied["success"] is False
         assert denied["target"] == "memory"
@@ -197,8 +202,10 @@ class TestIndependentStoreWriteGates:
         from tools.memory_tool import memory_tool
 
         store = self._store(memory_enabled=True, user_profile_enabled=False)
-        denied = json.loads(memory_tool(action="add", target="user", content="pref", store=store))
-        allowed = json.loads(memory_tool(action="add", target="memory", content="fact", store=store))
+        denied = json.loads(memory_tool(action="add", target="user", content="pref", reason=WRITE_REASON,
+                                        store=store))
+        allowed = json.loads(memory_tool(action="add", target="memory", content="fact", reason=WRITE_REASON,
+                                         store=store))
 
         assert denied["success"] is False
         assert denied["target"] == "user"

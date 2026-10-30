@@ -12,6 +12,9 @@ from tools.memory_tool import memory_tool
 from tools.memory_tool_store import MemoryStore
 from hermes_cli.write_approval_commands import _changed_entries
 
+# Write reason accepted by the add/patch reason gate (fork patch: memory-write-reason-gate).
+WRITE_REASON = "This is a durable environment fact that should persist across sessions."
+
 PACKED = "todo: item A; item B; item C"
 
 
@@ -32,13 +35,13 @@ class TestPatchSingleOp:
 
     def test_patch_splices_only_the_matched_span(self, packed_store):
         result = json.loads(memory_tool(
-            action="patch", old_text="item B", new_text="item B done", store=packed_store))
+            action="patch", old_text="item B", new_text="item B done", reason=WRITE_REASON, store=packed_store))
         assert result["success"] is True
         assert packed_store._entries_for("memory") == ["todo: item A; item B done; item C"]
 
     def test_patch_returns_before_and_after(self, packed_store):
         result = json.loads(memory_tool(
-            action="patch", old_text="item B", new_text="item B done", store=packed_store))
+            action="patch", old_text="item B", new_text="item B done", reason=WRITE_REASON, store=packed_store))
         assert result["patched_entry_before"] == PACKED
         assert result["patched_entry_after"] == "todo: item A; item B done; item C"
 
@@ -55,14 +58,14 @@ class TestPatchSingleOp:
 
     def test_patch_unmatched_old_text_fails_without_write(self, packed_store):
         result = json.loads(memory_tool(
-            action="patch", old_text="item Z", new_text="whatever", store=packed_store))
+            action="patch", old_text="item Z", new_text="whatever", reason=WRITE_REASON, store=packed_store))
         assert result["success"] is False
         assert packed_store._entries_for("memory") == [PACKED]
 
     def test_patch_multi_entry_match_is_rejected(self, packed_store):
         packed_store.add("memory", "also mentions item B elsewhere")
         result = json.loads(memory_tool(
-            action="patch", old_text="item B", new_text="x", store=packed_store))
+            action="patch", old_text="item B", new_text="x", reason=WRITE_REASON, store=packed_store))
         assert result["success"] is False
         assert packed_store._entries_for("memory") == [PACKED, "also mentions item B elsewhere"]
 

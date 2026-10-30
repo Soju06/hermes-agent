@@ -14,6 +14,10 @@ import shutil
 
 import pytest
 
+# Write reason accepted by the add/patch reason gate (fork patch: memory-write-reason-gate).
+WRITE_REASON = "This is a durable environment fact that should persist across sessions."
+
+
 @pytest.fixture
 def hermes_home(monkeypatch):
     d = tempfile.mkdtemp(prefix="hermes_wa_test_")
@@ -208,7 +212,8 @@ def _review_stages_remove(shape):
     for entry in (_KEPT, _REVIEWED):
         assert store.add("memory", entry)["success"]
     op = {"action": "remove", "old_text": "Staging DB"}
-    kwargs = op if shape == "single" else {"operations": [op, {"action": "add", "content": "Deploys via make ship"}]}
+    kwargs = op if shape == "single" else {"operations": [op, {"action": "add", "content": "Deploys via make ship"}],
+                                           "reason": WRITE_REASON}
     origin, attended = set_current_write_origin("background_review"), set_review_attended(False)
     try:
         staged = json.loads(memory_tool(target="memory", store=store, **kwargs))
@@ -228,7 +233,8 @@ def test_approve_refuses_staged_remove_whose_entry_changed(hermes_home, shape):
     from tools import write_approval as wa
     store, pid = _review_stages_remove(shape)
     newer = "Staging DB: pg-staging-3 (migrated 2026-09-20, creds in vault 'stg')"
-    assert json.loads(memory_tool(action="patch", old_text=_REVIEWED, content=newer, store=store))["success"]
+    assert json.loads(memory_tool(action="patch", old_text=_REVIEWED, content=newer, reason=WRITE_REASON,
+                                  store=store))["success"]
 
     out = handle_pending_subcommand(wa.MEMORY, ["approve", pid], memory_store=load_on_disk_store())
 
@@ -370,7 +376,7 @@ def test_headless_memory_write_stages_without_inline_prompt(
     store = MemoryStore()
     store.load_from_disk()
 
-    r = json.loads(memory_tool("add", "memory", "headless fact", store=store))
+    r = json.loads(memory_tool("add", "memory", "headless fact", reason=WRITE_REASON, store=store))
 
     assert calls == []
     assert r["success"] is True
@@ -398,7 +404,7 @@ def test_memory_invalid_params_rejected_before_staging(hermes_home):
 def _stage_one_memory_write():
     from tools.memory_tool import memory_tool, MemoryStore
     store = MemoryStore(); store.load_from_disk()
-    r = json.loads(memory_tool("add", "memory", "surface hint fact", store=store))
+    r = json.loads(memory_tool("add", "memory", "surface hint fact", reason=WRITE_REASON, store=store))
     assert r.get("staged") is True, r
     return r
 

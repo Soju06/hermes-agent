@@ -22,6 +22,9 @@ if _REPO_ROOT not in sys.path:
 
 import agent.background_review as bg
 
+# Write reason accepted by the add/patch reason gate (fork patch: memory-write-reason-gate).
+WRITE_REASON = "This is a durable environment fact that should persist across sessions."
+
 
 def _review_agent(memory_enabled=True, user_profile_enabled=False) -> SimpleNamespace:
     """The whitelist only reads the profile's memory flags off the fork."""
@@ -142,7 +145,8 @@ class TestConsolidationProposalSurfaces:
         token = set_current_write_origin("background_review")
         try:
             raw = memory_tool(
-                action="patch", old_text="standing rule", content="consolidated entry", store=store)
+                action="patch", old_text="standing rule", content="consolidated entry", reason=WRITE_REASON,
+                store=store)
         finally:
             reset_current_write_origin(token)
         result = json.loads(raw)
@@ -172,9 +176,10 @@ class TestConsolidationProposalSurfaces:
 
         token = set_current_write_origin("background_review")
         try:
-            add_raw = memory_tool(action="add", content="y" * 600, store=store)
+            add_raw = memory_tool(action="add", content="y" * 600, reason=WRITE_REASON, store=store)
             replace_raw = memory_tool(
-                action="patch", old_text="seed entry one", content="merged entry", store=store)
+                action="patch", old_text="seed entry one", content="merged entry", reason=WRITE_REASON,
+                store=store)
         finally:
             reset_current_write_origin(token)
         assert json.loads(add_raw)["success"] is False  # the budget still rejects the add

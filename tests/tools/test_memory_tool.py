@@ -294,7 +294,7 @@ class TestMemoryStoreReplace:
         assert miss["closest_entries"] == ["Deploys go through GitHub Actions to Fly.io with manual approval."]
         assert "current_entries" not in miss  # batch aborts still never echo the store (#97316)
         result = json.loads(memory_tool(action="patch", old_text="Deploys go through GitHub Actions to Fly.io with manual approval.",
-                                        content="", new_text="Deploys: Fly.io.", store=store))
+                                        content="", new_text="Deploys: Fly.io.", reason=WRITE_REASON, store=store))
         assert result["success"] is True and "Deploys: Fly.io." in store.memory_entries
 
 
