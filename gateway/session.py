@@ -1467,6 +1467,10 @@ class SessionStore(
                         {"terminal_cwd": old_entry.metadata["terminal_cwd"]}
                         if preserve_prompt_pin and "terminal_cwd" in old_entry.metadata else {}
                     ),
+                    # The durable runtime route (agent model_switch / runtime_override) is the /model
+                    # pin's twin: it rides a non-boundary re-pin too; /resume clears both after this.
+                    runtime_model=old_entry.runtime_model, runtime_provider=old_entry.runtime_provider,
+                    runtime_reasoning_effort=old_entry.runtime_reasoning_effort,
                 )
         if refused:
             return None
