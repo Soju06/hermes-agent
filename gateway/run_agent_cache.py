@@ -324,9 +324,12 @@ class GatewayAgentCacheMixin:
 
     def _consume_refusal_recall_quarantine(self, session_key: str) -> bool:
         """Consume the one-turn recall quarantine armed by a clean-fork."""
-        if not session_key:
+        # Session state lives on GatewayRunner; a mixin-only runner double (the route-state
+        # wiring tests) has none, and the turn wiring must not fail on it.
+        peek = getattr(self, "_peek_session_state", None)
+        if not session_key or not callable(peek):
             return False
-        state = self._peek_session_state(session_key)
+        state = peek(session_key)
         if state is None:
             return False
         active = bool(state.conversation.refusal_recall_quarantine)
