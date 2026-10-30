@@ -354,9 +354,13 @@ class GatewayTurnHygieneMixin:
                 # (the coordination store's release_compression_lock) that showed up in event-loop stall
                 # stack dumps when run inline. This is the cancellation
                 # path — nothing downstream orders against the release and the fence already blocks any
-                # future commit.
-                await asyncio.to_thread(fence.release_cancelled_compression_lock)
-                self._hmwa_hygiene_defer_cleanup(attempt, context)
+                # future commit. The await opens a window the inline call did not have: a CancelledError
+                # there must still defer cleanup, else the caller's ``finally`` tears the agent down under
+                # the still-running executor worker.
+                try:
+                    await asyncio.to_thread(fence.release_cancelled_compression_lock)
+                finally:
+                    self._hmwa_hygiene_defer_cleanup(attempt, context)
                 return None
             else:
                 break

@@ -1389,7 +1389,7 @@ async def test_session_hygiene_failure_log_preserves_exception_type(
 
     class TimeoutRaisingAgent:
         def __init__(self, **_kwargs):
-            raise asyncio.TimeoutError()
+            raise TimeoutError()
 
     caplog.set_level(logging.INFO, logger="gateway.run")
     runner, _adapter, event = _make_progress_runner(
@@ -1491,6 +1491,57 @@ async def test_session_hygiene_timeout_releases_lock_off_loop(
 
     release_worker.set()
     await asyncio.wait_for(asyncio.to_thread(cleanup_done.wait), timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_session_hygiene_cancel_during_off_loop_release_still_defers_cleanup():
+    """Awaiting the off-loop release opens a window the inline call never had.
+
+    A CancelledError delivered while ``release_cancelled_compression_lock``
+    runs on its worker thread must still hand the agent's cleanup to the
+    still-running compression future. Otherwise the detached attempt's
+    ``finally`` sees ``cleanup_deferred=False`` and tears the agent down
+    under the live executor worker.
+    """
+    from agent.conversation_compression import CompressionCommitFence
+
+    release_entered = threading.Event()
+    release_gate = threading.Event()
+
+    class BlockingReleaseFence(CompressionCommitFence):
+        def release_cancelled_compression_lock(self) -> None:
+            release_entered.set()
+            release_gate.wait(timeout=10)
+            return super().release_cancelled_compression_lock()
+
+    gateway_run = importlib.import_module("gateway.run")
+    runner = object.__new__(gateway_run.GatewayRunner)
+    deferred: list = []
+    runner._defer_agent_cleanup_until_future_done = (
+        lambda future, agent, *, context: deferred.append((future, agent, context))
+    )
+
+    worker_future = asyncio.get_running_loop().create_future()
+    agent = object()
+    attempt = gateway_run.GatewayRunner._HygieneAttempt(agent=agent, meta=None)
+    attempt.commit_fence = BlockingReleaseFence()
+    attempt.future = worker_future
+
+    task = asyncio.create_task(
+        runner._hmwa_hygiene_cancel_or_adopt(attempt, "session hygiene timeout")
+    )
+    try:
+        assert await asyncio.to_thread(release_entered.wait, 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        release_gate.set()
+
+    assert attempt.commit_fence.is_cancelled
+    assert attempt.cleanup_deferred is True
+    assert deferred == [(worker_future, agent, "session hygiene timeout")]
+    worker_future.cancel()
 
 
 # ---------------------------------------------------------------------------
