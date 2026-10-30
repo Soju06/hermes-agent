@@ -437,3 +437,52 @@ class TestLoopCallSitesForwardReason:
         assert spy.call_count == 1
         assert spy.call_args.kwargs["reason"] is FailoverReason.content_policy_blocked
         assert agent._fallback_reason == "content_policy_blocked"
+
+    @staticmethod
+    def _as_codex_primary(agent):
+        """Reshape the agent onto a ChatGPT Codex (Responses API) primary."""
+        agent.api_mode = "codex_responses"
+        agent.provider = "openai-codex"
+        agent.base_url = "https://chatgpt.com/backend-api/codex"
+        agent._base_url_lower = agent.base_url.lower()
+        agent._base_url_hostname = "chatgpt.com"
+        agent.model = "gpt-5.5"
+
+    @staticmethod
+    def _codex_soft_failure(code, message):
+        """Codex HTTP-200 ``status=failed`` Response: the SDK never raises on it."""
+        return SimpleNamespace(
+            status="failed", output=[], output_text="", model="gpt-5.5", usage=None,
+            incomplete_details=None, error=SimpleNamespace(code=code, message=message),
+        )
+
+    def test_codex_soft_failure_safety_refusal_forwards_reason(self):
+        """A Codex safety refusal delivered as HTTP-200 ``status=failed`` goes through
+        retry_invalid_response's eager fallback, not the content_filter branch; it must
+        still activate the fallback with reason=content_policy_blocked."""
+        agent = _make_agent(fallback_model=[_FB])
+        self._as_codex_primary(agent)
+        refusal = self._codex_soft_failure(
+            "content_policy_violation",
+            "This content was flagged for possible cybersecurity risk.",
+        )
+        result, spy = self._run(agent, [refusal, _loop_response()])
+        assert result["final_response"] == "Recovered on fallback."
+        assert spy.call_count == 1
+        assert spy.call_args.kwargs["reason"] is FailoverReason.content_policy_blocked
+        assert agent._fallback_reason == "content_policy_blocked"
+
+    def test_codex_soft_failure_non_refusal_keeps_bare_activation(self):
+        """Only the content-policy reason is forwarded from that path: a rate-limit soft
+        failure must not reach _try_activate_fallback as reason=rate_limit (that would arm
+        the primary cooldown), and records no reason."""
+        agent = _make_agent(fallback_model=[_FB])
+        self._as_codex_primary(agent)
+        throttled = self._codex_soft_failure(
+            "rate_limit_exceeded", "Rate limit reached, please try again later",
+        )
+        result, spy = self._run(agent, [throttled, _loop_response()])
+        assert result["final_response"] == "Recovered on fallback."
+        assert spy.call_count == 1
+        assert spy.call_args.kwargs == {}
+        assert agent._fallback_reason is None

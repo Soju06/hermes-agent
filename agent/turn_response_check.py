@@ -289,11 +289,18 @@ def retry_invalid_response(
             agent._buffer_diagnostic_status(f"🔄 Codex soft failure ({_soft.reason.value}) — switched to the next pool credential, retrying...")
             return _verdict("continue")
     retry_count += 1
+    # A Codex safety refusal is the same HTTP-200 soft failure: forward its reason so the fallback
+    # records why it activated (``_fallback_reason`` / runtime_state). Content-policy only — a
+    # rate_limit/billing reason would arm the primary cooldown, which this path never did.
+    _fallback_kwargs = (
+        {"reason": FailoverReason.content_policy_blocked}
+        if _soft is not None and _soft.reason == FailoverReason.content_policy_blocked else {}
+    )
 
     # Eager fallback: empty/malformed responses often mean rate limiting.
     if agent._fallback_index < len(agent._fallback_chain):
         agent._buffer_diagnostic_status("⚠️ Empty/malformed response — switching to fallback...")
-    if agent._try_activate_fallback():
+    if agent._try_activate_fallback(**_fallback_kwargs):
         # The buffered status above is dropped once the fallback answers: log the trigger (#152101).
         logger.warning("%sInvalid API response (%s) — switched to fallback", agent.log_prefix, ", ".join(error_details))
         active_system_prompt = _arm_fallback_restart(
@@ -313,7 +320,7 @@ def retry_invalid_response(
     if retry_count >= max_retries:
         if agent._has_pending_fallback():
             agent._buffer_diagnostic_status(f"⚠️ Max retries ({max_retries}) for invalid responses — trying fallback...")
-        if agent._try_activate_fallback():
+        if agent._try_activate_fallback(**_fallback_kwargs):
             active_system_prompt = _arm_fallback_restart(
                 agent, api_messages, active_system_prompt, _retry)
             retry_count = 0
