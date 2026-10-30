@@ -184,6 +184,8 @@ async def _admit_once(authority, event, webhook, hooks, live, committed):
             # a provider retry or relay re-send resends that, and resolves to this row.
             from gateway.session_ingress_media import ingress_fingerprint
             admitted._ingress_sha256 = ingress_fingerprint(committed[0], event.raw_message)
+            # The fork model router classifies the delivery as received (``_admit_native`` commits it).
+            admitted._hermes_router_pre_hook_text = event.text
         if getattr(admitted, '_hermes_runtime_override_directives', None):
             # Staged runtime_override directives ride only this in-memory event, never the
             # committed payload: they apply now, before the commit (fork runtime-control).

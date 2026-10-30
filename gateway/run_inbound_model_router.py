@@ -96,11 +96,17 @@ class GatewayInboundModelRouterMixin:
         """Evaluate (and in enforce mode apply) the dynamic model router.
 
         Runs AFTER the running-agent PRIORITY/interrupt/steer interception block, immediately before
-        the idle slash-command dispatch and the fresh-agent leg. Messages intercepted by that PRIORITY
-        block (steer/stop/queue against a running agent) are therefore NOT routed — a deliberate
-        deviation from the skill-gate plugin, which classified them; the next fresh message routes
-        instead. Expected diff class during shadow soak. The placement also means no router
-        suspension point precedes the running-session check.
+        the idle slash-command dispatch and the fresh-agent leg. Messages the running turn consumes
+        (a steer, an interrupt, /stop) are therefore NOT routed — a deliberate deviation from the
+        skill-gate plugin, which classified them; the next fresh message routes instead. Expected diff
+        class during shadow soak. The placement also means no router suspension point precedes the
+        running-session check.
+
+        With a session authority (every gateway boot) an ordinary message is admitted to the durable
+        FIFO at ingress and this stage runs when the drain executes it, on the restored event: a
+        follow-up queued behind a running turn IS routed, at the start of its own turn. ``original_text``
+        is then the pre-hook snapshot the admission committed (``_hm_admit_event``), since the
+        ``pre_gateway_dispatch`` hook ran once, at ingress.
 
         Evaluation order:
 

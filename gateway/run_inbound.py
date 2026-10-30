@@ -224,14 +224,17 @@ class GatewayInboundMixin(
         self._scale_to_zero_note_real_inbound()
         # Snapshot the pre-hook message text for the dynamic model router: plugin hooks may rewrite
         # (or prepend to) event.text, but the router must classify the same text the plugin-era
-        # classifier saw — injected advisories are label noise the bench dataset had to strip.
-        _pre_hook_router_text = str(getattr(event, "text", None) or "")
+        # classifier saw — injected advisories are label noise the bench dataset had to strip. An
+        # admission the drain executes keeps the snapshot its ingress committed (``restore_native``).
+        _pre_hook_router_text = getattr(event, "_hermes_router_pre_hook_text", None)
+        if _pre_hook_router_text is None:
+            _pre_hook_router_text = str(getattr(event, "text", None) or "")
         event = await self._hm_pre_gateway_dispatch_hook(event, source)
         if event is None:
             return None
         source = event.source
-        # Private event attribute (process-local, never serialized), same pattern as the runtime
-        # override directives; set on the post-hook event since ``rewrite`` may have replaced it.
+        # Private event attribute, same pattern as the runtime override directives; set on the
+        # post-hook event since ``rewrite`` may have replaced it. ``_admit_native`` commits it.
         with suppress(Exception):
             event._hermes_router_pre_hook_text = _pre_hook_router_text
 
@@ -1405,7 +1408,7 @@ class GatewayInboundMixin(
 
         # Dynamic model router (ADR-003 Phase 2): route evaluation for authorized, non-internal
         # messages that reached the fresh-agent dispatch leg. Placed AFTER the running-agent
-        # PRIORITY block so steer/stop/queue messages against a running agent gain zero latency and
+        # PRIORITY block so steer/interrupt/stop messages against a running agent gain zero latency and
         # no suspension point precedes the running-session check — and BEFORE slash-command dispatch
         # so static rules still apply to slash commands (see _model_router_stage docstring).
         # mode=off (the default) costs a single config check. Always fail open — routing must never

@@ -608,6 +608,9 @@ class SessionAuthority:
             payload['native_text_v1']['ingress_sha256'] = fingerprint  # the delivery before a rewrite
         from gateway.session_moa_turn import stamp_moa_turn
         stamp_moa_turn(event, payload['native_text_v1'])
+        pre_hook = getattr(event, '_hermes_router_pre_hook_text', None)  # fork model router (restore_native)
+        if pre_hook is not None and pre_hook != event.text:  # an unhooked input keeps its exact envelope
+            payload['native_text_v1']['router_pre_hook_text'] = pre_hook
         self._require_admission_open()
         source = restore_native_source(payload)  # no re-hash of the just-captured media on the loop
         from gateway.session_runtime_workers import tracked_write
