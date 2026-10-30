@@ -617,6 +617,11 @@ def _get_platform_tools(config: dict, platform: str, *, include_default_mcp_serv
         enabled_toolsets = _composite_toolsets(toolset_names, platform, explicitly_configured)
 
     _recover_platform_native_toolsets(enabled_toolsets, platform, skip=configurable_keys | plugin_ts_keys | platform_default_keys)
+    if explicitly_configured and not toolset_names:
+        # An explicit EMPTY list means none (#82010). The fork's ``runtime`` toolset (model_status /
+        # model_switch, toolsets.py) is recovered above as a non-configurable core toolset, but it is
+        # agent introspection, not a capability of the platform: it never revives a zero-tool state.
+        enabled_toolsets.discard("runtime")
     if plugin_ts_keys:
         enabled_toolsets |= _enabled_plugin_toolsets(config, platform, toolset_names, plugin_ts_keys)
 

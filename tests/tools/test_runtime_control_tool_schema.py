@@ -108,3 +108,19 @@ def test_model_status_schema_is_static():
     from tools.runtime_control_tool import _MODEL_STATUS_SCHEMA
 
     assert _MODEL_STATUS_SCHEMA["parameters"] == {"type": "object", "properties": {}}
+
+
+def test_runtime_toolset_rides_every_selection_but_an_explicit_empty_one():
+    """``runtime`` is a non-configurable core toolset (no checklist entry), so ``_get_platform_tools``
+    recovers it onto the platform composite and every named selection; an explicitly saved EMPTY list
+    is a zero-tool state (#82010) it must not revive (2026-10-30 sync review)."""
+    from hermes_cli.tools_config import _get_platform_tools
+
+    def enabled(selection):
+        config = {} if selection is None else {"platform_toolsets": {"cli": selection}}
+        return _get_platform_tools(config, "cli", include_default_mcp_servers=False)
+
+    assert "runtime" in enabled(None)
+    assert "runtime" in enabled(["hermes-cli"])
+    assert "runtime" in enabled(["memory"])
+    assert enabled([]) == set()
