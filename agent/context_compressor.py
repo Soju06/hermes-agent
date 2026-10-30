@@ -3555,6 +3555,8 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         self._note_aux_route_fallback(_aux_route)
         # Reasoning-field fallback (DeepSeek/Qwen/Kimi put the summary in reasoning_content); capped.
         content = extract_content_or_reasoning(response, max_reasoning_chars=8000)
+        # Strip the <analysis> pre-pass first so the empty/refusal guards below judge the summary body.
+        content = strip_analysis_block(content)
         where = f"(provider={self.provider or 'auto'} model={self.summary_model or self.model})"
         # Some OpenAI-compatible proxies (e.g. cmkey.cn, one-api channels) return a well-formed HTTP 200
         # with an empty or whitespace-only ``content`` instead of an error or empty ``choices``. That
@@ -3641,8 +3643,6 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             # Strip <think> blocks: they would be stored, injected, and compounded on every iterative update.
             from agent.agent_runtime_helpers import strip_think_blocks
             content = strip_think_blocks(None, content).strip() or content
-            # Same for the <analysis> pre-pass block the prompt asks for (context_compressor_prompt_rules).
-            content = strip_analysis_block(content) or content
             # The summarizer may echo secrets verbatim; redact the output too.
             summary = _redact_compaction_text(content.strip())
             # Restore any [SKILL_PRUNED] marker the summarizer paraphrased away.

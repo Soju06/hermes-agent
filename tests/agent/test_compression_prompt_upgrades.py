@@ -13,6 +13,28 @@ from agent.context_compressor import ContextCompressor
 from agent.context_compressor_prompt_rules import strip_analysis_block
 
 
+def _stop_response(content):
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=content), finish_reason="stop")]
+    )
+
+
+def _mk_aborting_compressor():
+    with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        return ContextCompressor(
+            model="test", quiet_mode=True,
+            protect_first_n=2, protect_last_n=2,
+            abort_on_summary_failure=False,
+        )
+
+
+def _msgs(n=12):
+    return [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i} " + "x" * 50}
+        for i in range(n)
+    ]
+
+
 def _mk_compressor():
     return ContextCompressor(
         model="test-model",
@@ -75,10 +97,48 @@ def test_analysis_block_stripped_from_stored_summary():
     _, summary = _capture_summary_prompt(compressor)
     assert "<analysis>" not in summary
     assert "chronological read-through" not in summary
-    # The real content survives the strip.
-    assert "fix the bug" in summary
+    # The model's own body survives the strip (deterministic grounding also writes "fix the bug",
+    # so assert on the section only the model reply carries).
+    assert "## User Messages\n- 'fix the bug'" in summary
     # The stored iterative-update seed is also clean.
     assert "<analysis>" not in (compressor._previous_summary or "")
+
+
+def test_refusal_after_analysis_block_is_rejected_and_never_becomes_previous_summary():
+    """The refusal guard judges the body, not the <analysis> preparation block in front of it.
+
+    The guard's prefix regex is anchored at the start of the reply, so a model that writes the
+    requested pre-pass and then refuses would slip past it unless the block is stripped first.
+    """
+    c = _mk_aborting_compressor()
+    msgs = _msgs()
+    reply = (
+        "<analysis>User asked to summarize the debugging session; agent edited parser.py.</analysis>\n"
+        "I cannot produce a summary of this conversation."
+    )
+    with patch("agent.context_compressor.call_llm", return_value=_stop_response(reply)):
+        result = c.compress(msgs, current_tokens=999999, force=True)
+
+    assert result == msgs
+    assert c._last_compress_aborted is True
+    assert c._last_summary_empty_content_failure is True
+    assert "refusal content" in (c._last_summary_error or "")
+    assert c._previous_summary is None
+
+
+def test_analysis_only_reply_is_empty_content_and_never_becomes_previous_summary():
+    """A reply that is only the preparation block has no summary body: it is empty content."""
+    c = _mk_aborting_compressor()
+    msgs = _msgs()
+    reply = "<analysis>chronological notes, but the model stopped before the body</analysis>"
+    with patch("agent.context_compressor.call_llm", return_value=_stop_response(reply)):
+        result = c.compress(msgs, current_tokens=999999, force=True)
+
+    assert result == msgs
+    assert c._last_compress_aborted is True
+    assert c._last_summary_empty_content_failure is True
+    assert "empty content" in (c._last_summary_error or "")
+    assert c._previous_summary is None
 
 
 def test_strip_analysis_block_closed_tags():

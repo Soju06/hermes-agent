@@ -9,9 +9,10 @@ untouched; f-string interpolation does not re-parse them, so braces in them are 
 
 Chronological ``<analysis>`` pre-pass: a cheap/fast summarizer that fills the template in one shot
 tends to fabricate or drop detail; an explicit chronological read-through first (Claude Code's
-/compact design) improves faithfulness. The block is working material: ``_generate_summary`` strips
-it before the summary is stored, so it never reaches the conversation or compounds through the
-iterative-update feedback loop.
+/compact design) improves faithfulness. The block is working material: ``_call_summary_llm`` strips it
+right after extracting the reply, before the empty-content and refusal guards judge the body, so a
+reply that is only the block (or the block followed by a refusal) takes the failure path, and the
+block never reaches the stored summary or compounds through the iterative-update feedback loop.
 """
 
 import re
