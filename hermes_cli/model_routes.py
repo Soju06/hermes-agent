@@ -1201,9 +1201,11 @@ def provider_health(
 # the same dead provider several times within one turn (recursive skip calls,
 # multi-entry chains). One verdict per provider per window is plenty — the
 # suppression is in-process only, so concurrent hermes processes still land
-# their own (idempotent) writes via the flock merge.
+# their own (idempotent) writes via the flock merge. Keyed by (health cache
+# path, provider key): one process serves several profiles, each with its own
+# cache, and one profile's write must not suppress another's.
 _PASSIVE_WRITE_SUPPRESS_SECONDS = 5.0
-_last_passive_unhealthy_write: Dict[str, float] = {}
+_last_passive_unhealthy_write: Dict[Tuple[str, str], float] = {}
 
 # mtime-keyed memo for has_unhealthy_verdicts() — the completion-success hook
 # runs per API call, so it must cost one os.stat in steady state, not a JSON
@@ -1293,16 +1295,17 @@ def record_provider_outcome(
             return  # same seam as provider_health — agent-path unit tests must not touch the real cache
         path = health.resolved_cache_path()
         now = _now()
+        guard_key = (str(path), key)
         if healthy:
             entry = _read_health_cache(path).get(key)
             if not (isinstance(entry, dict) and not entry.get("healthy")):
                 return  # nothing to clear
-            _last_passive_unhealthy_write.pop(key, None)
+            _last_passive_unhealthy_write.pop(guard_key, None)
         else:
-            last = _last_passive_unhealthy_write.get(key, 0.0)
+            last = _last_passive_unhealthy_write.get(guard_key, 0.0)
             if now - last < _PASSIVE_WRITE_SUPPRESS_SECONDS:
                 return
-            _last_passive_unhealthy_write[key] = now
+            _last_passive_unhealthy_write[guard_key] = now
         _store_health_verdict(
             path,
             key,

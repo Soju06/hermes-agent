@@ -1014,6 +1014,28 @@ def test_record_unhealthy_burst_suppressed(monkeypatch, tmp_path, health_test_en
     assert entry["ts"] == clock.t
 
 
+def test_record_unhealthy_burst_guard_is_per_health_cache(monkeypatch, tmp_path, health_test_env, passive_state):
+    """One process serves several profiles, each with its own health cache. Profile A's
+    unhealthy write must not suppress profile B's write for the same provider key inside
+    the burst window, and A's clear must not reopen B's window."""
+    health_a = mr.HealthConfig(cache_path=str(tmp_path / "a" / "health.json"))
+    health_b = mr.HealthConfig(cache_path=str(tmp_path / "b" / "health.json"))
+    clock = _Clock(1000.0)
+    monkeypatch.setattr(mr, "_now", clock)
+
+    mr.record_provider_outcome("claude-lb", False, "overloaded", health=health_a)
+    clock.t += 1.0
+    mr.record_provider_outcome("claude-lb", False, "server_error", health=health_b)
+    assert _read_cache(health_a)["claude-lb"]["reason"] == "passive: overloaded"
+    assert _read_cache(health_b)["claude-lb"]["reason"] == "passive: server_error"
+
+    clock.t += 1.0
+    mr.record_provider_outcome("claude-lb", True, "recovered", health=health_a)
+    mr.record_provider_outcome("claude-lb", False, "timeout", health=health_b)
+    assert _read_cache(health_a)["claude-lb"]["healthy"] is True
+    assert _read_cache(health_b)["claude-lb"]["reason"] == "passive: server_error"  # still in B's window
+
+
 def test_record_healthy_only_clears_unhealthy(monkeypatch, tmp_path, health_test_env, passive_state):
     health = _health(tmp_path)
     monkeypatch.setattr(mr, "_now", _Clock(1000.0))
