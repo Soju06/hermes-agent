@@ -1,51 +1,57 @@
 #!/usr/bin/env bash
-# hermes-venv-rebuild — idempotent editable install of the live hermes-agent tree.
+# hermes-venv-rebuild — rebuild the live hermes-agent tree's Python environment from its own lock.
 #
-# Use after switching git branches in ~/.hermes/hermes-agent/, after a sync, or
-# any time the live venv might be out of sync with the working tree.
+# Since the v0.22.5 base (2026-10-30 sync) upstream pins EVERY runtime dependency behind
+# `python_version >= '3.14'` and manages environments through `pm` (pm/AGENTS.md): a plain
+# `uv pip install -e .` on the 3.12 interpreter installs nothing, and `dev`/`test` are
+# dependency-groups, not extras. The sanctioned build is `python -m pm.build_env`, which
+# installs from uv.lock (exact pins, overrides, markers) and records the extras as the
+# runtime selection PM expects.
 #
-# DOES NOT restart any gateway. That's a separate, conscious step.
+# Use after switching git branches in ~/.hermes/hermes-agent/ or after a sync.
+# DOES NOT restart any gateway. Stop the gateways first: the build removes and recreates $VENV.
 
 set -euo pipefail
 
 LIVE_TREE="${LIVE_TREE:-$HOME/.hermes/hermes-agent}"
-VENV="$LIVE_TREE/venv"
+VENV="${VENV:-$LIVE_TREE/venv}"
+PY314="${HERMES_BUILD_PYTHON:-$(ls -d "$HOME"/.local/share/uv/python/cpython-3.14*-linux-x86_64-gnu/bin/python3.14 2>/dev/null | tail -1)}"
+EXTRAS=(${HERMES_VENV_EXTRAS:-messaging slack anthropic})   # platform extras this host uses
 
 if [[ ! -d "$LIVE_TREE" ]]; then
     echo "FATAL: live tree not found at $LIVE_TREE" >&2
     exit 1
 fi
+if [[ -z "$PY314" || ! -x "$PY314" ]]; then
+    echo "FATAL: no CPython 3.14 found (uv python install 3.14, or set HERMES_BUILD_PYTHON)" >&2
+    exit 1
+fi
 
 cd "$LIVE_TREE"
+echo "Live tree branch: $(git rev-parse --abbrev-ref HEAD) @ $(git rev-parse --short HEAD)"
+echo "Build python:     $PY314 ($("$PY314" --version))"
+echo "Extras:           ${EXTRAS[*]}  (+ dependency groups dev, test)"
 
-CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
-CURRENT_COMMIT=$(git rev-parse --short HEAD)
-echo "Live tree branch: $CURRENT_BRANCH @ $CURRENT_COMMIT"
-
-if [[ ! -d "$VENV" ]]; then
-    echo "venv missing — creating fresh..."
-    uv venv "$VENV"
-fi
-
-source "$VENV/bin/activate"
-
-echo "Reinstalling editable hermes_agent..."
-# `--reinstall` so the .pth file is rewritten if the live tree path changed.
-uv pip install --quiet --reinstall -e ".[dev]"
-
-# Sanity: confirm the .pth points where we expect.
-PTH_FILE=$(find "$VENV/lib" -name '__editable__.hermes_agent-*.pth' | head -1)
-if [[ -z "$PTH_FILE" ]]; then
-    echo "WARN: editable .pth not found — install may have failed" >&2
+if pgrep -f "$VENV/bin/python" >/dev/null 2>&1; then
+    echo "FATAL: processes are still running from $VENV — stop the gateways first" >&2
+    pgrep -af "$VENV/bin/python" | head -5 >&2
     exit 2
 fi
-echo "Editable .pth: $PTH_FILE"
-echo "  → $(cat "$PTH_FILE")"
 
-# Quick import smoke
-python -c "import run_agent, gateway.run, tools.delegate_tool; print('import OK')"
+extra_args=()
+for e in "${EXTRAS[@]}"; do extra_args+=(--extra "$e"); done
+# Fresh build (pm.build_env refuses an in-place sync); --record-selection publishes the extras as the
+# runtime selection so a later `hermes pm` sync extends rather than replaces the environment.
+nice -n 10 "$PY314" -m pm.build_env --source . --out "$VENV" --python "$PY314" \
+    --group dev --group test "${extra_args[@]}" --explicit --record-selection
+
+# Sanity
+"$VENV/bin/python" --version
+"$VENV/bin/python" -c "import run_agent, gateway.run, tools.delegate_tool; print('import OK')"
+uv pip check --python "$VENV/bin/python" || echo "WARN: pip check reported problems (known on v0.22.5: browser-harness pins pillow==12.3.0 while the lock installs 13.0.0)"
 
 echo
-echo "Done. Restart gateways manually with:"
-echo "  hermes --profile nachoneko gateway --replace"
-echo "  hermes --profile mymel     gateway --replace"
+echo "Done. Next (one at a time, after reading the sync report's deploy notes):"
+echo "  venv/bin/python -c 'from hermes_state import SessionDB; SessionDB()'   # pre-warm the one-time FTS realign per profile"
+echo "  hermes config migrate  (per profile, on copies first)"
+echo "  hermes --profile <name> gateway --replace"
