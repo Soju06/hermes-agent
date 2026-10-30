@@ -1151,11 +1151,13 @@ class TestDurableLocalSpawn:
             session = registry.spawn_local("echo hello", cwd="/tmp")
 
         assert len(captured) == 1
-        argv, _kwargs = captured[0]
+        argv, kwargs = captured[0]
         assert argv[:5] == [
             "/usr/bin/systemd-run", "--user", "--scope", "--quiet",
             f"--unit=hermes-bg-{session.id}",
         ]
+        # The scope launcher must not inherit the TUI gateway's JSON-RPC stdin.
+        assert kwargs["stdin"] is subprocess.DEVNULL
         separator = argv.index("--")
         inner = argv[separator + 1:]
         assert inner[-3:-1] == ["/bin/bash", "-lic"]

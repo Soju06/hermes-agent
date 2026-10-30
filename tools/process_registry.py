@@ -1239,7 +1239,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
             proc = self._spawn_durable_local(session, safe_command, spawn_env, dict(
                 text=True, cwd=session.cwd, encoding="utf-8", errors="replace", stdout=subprocess.PIPE,
                 # detached-spawn: ok - a durable job outlives the gateway on purpose (terminal.durable_background)
-                stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True, **_popen_kwargs))
+                stderr=subprocess.STDOUT, start_new_session=True, **_popen_kwargs))
         if proc is None:
             output = open_output_log(log) if log else subprocess.PIPE
             try:

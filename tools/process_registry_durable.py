@@ -165,6 +165,7 @@ class ProcessDurableMixin:
             subprocess.run(
                 ["systemctl", "--user", "stop", f"{scope_unit}.scope"],
                 check=False,
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=5,
@@ -226,7 +227,9 @@ class ProcessDurableMixin:
                 "--",
                 *_nice_argv([_find_shell(), "-lic", durable_shell_command]),
             ]
-            candidate = subprocess.Popen(durable_argv, env=systemd_user_bus_env(spawn_env), **popen_common)
+            candidate = subprocess.Popen(
+                durable_argv, env=systemd_user_bus_env(spawn_env), stdin=subprocess.DEVNULL, **popen_common,
+            )
             ready, failure = self._await_scope_ready(candidate, marker)
             if ready:
                 proc = candidate
@@ -432,6 +435,7 @@ class ProcessDurableMixin:
                     f"{self._durable_scope_unit(session.id)}.scope",
                 ],
                 check=False,
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=5,
