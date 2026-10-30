@@ -304,13 +304,13 @@ def cmd_validate(_args: argparse.Namespace) -> int:
 
 POST_UPDATE_HEALTH_TESTS = [
     "tests/agent/lsp/test_service.py",
-    "tests/run_agent/test_runtime_control.py",
-    "tests/test_model_tools.py",
+    "tests/agent/test_runtime_control.py",
+    "tests/tools/test_model_tools.py",
     "tests/gateway/test_session.py",
     "tests/gateway/test_session_model_override_routing.py",
     "tests/gateway/test_pre_gateway_dispatch.py",
     "tests/hermes_cli/test_plugins.py",
-    "tests/run_agent/test_run_agent.py",
+    "tests/agent/test_run_agent.py",
     "tests/agent/test_redact.py",
     "tests/gateway/test_signal.py",
     "tests/agent/test_runtime_state_session_split.py",
