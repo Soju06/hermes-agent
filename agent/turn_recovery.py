@@ -470,7 +470,9 @@ def _recover_format_errors(
     # Upstream mutation can invalidate a thinking signature. Native Anthropic has multiple replay
     # carriers and preserved historical blocks, so suppress the rejected opaque blocks across all
     # carriers and persist that suppression. Other transports keep their established one-request
-    # repair: drop reasoning_details only.
+    # repair, which must drop the ordered ``anthropic_content_blocks`` carrier with
+    # ``reasoning_details``: the Anthropic converter (Kimi's as-is replay) and Bedrock Converse's
+    # fallback both prefer it, so leaving it resends the same signed blocks into the same 400.
     if classified.reason == FailoverReason.thinking_signature and not _retry.thinking_sig_retry_attempted:
         _retry.thinking_sig_retry_attempted = True
         from agent.anthropic_thinking_replay import remember_rejected_thinking, tracks_rejected_thinking
@@ -481,10 +483,13 @@ def _recover_format_errors(
         else:
             removed = 0
             for message in api_messages:
-                if isinstance(message, dict) and "reasoning_details" in message:
+                if isinstance(message, dict) and (
+                    "reasoning_details" in message or "anthropic_content_blocks" in message
+                ):
                     message.pop("reasoning_details", None)
+                    message.pop("anthropic_content_blocks", None)
                     removed += 1
-            detail = "stripped reasoning_details"
+            detail = "stripped reasoning_details and anthropic_content_blocks"
         _vlines(agent, f"⚠️  Thinking block signature invalid, {detail} and retrying...")
         logger.warning(
             "%sThinking block signature recovery: %s from %d carrier/message(s) "

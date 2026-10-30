@@ -6,8 +6,13 @@ Motivation: a self-hosted Claude LB forwards content blocks to real Anthropic
 verbatim, so signatures generated through it validate on replay. Stripping
 thinking there (the default third-party behaviour) breaks interleaved-thinking
 reasoning continuity mid tool-loop on the production Claude route.
+
+The signature-400 recovery must strip both replay channels: a flagged LB
+shares the native route's durable suppression, and every other route's
+one-request repair drops the ordered carrier with ``reasoning_details``.
 """
 
+import copy
 from types import SimpleNamespace
 
 import pytest
@@ -174,3 +179,83 @@ def test_flag_is_scoped_to_the_profile_that_set_it(monkeypatch, tmp_path):
     assert route_under(flagged) == "native"
     assert route_under(plain) == "third_party"
     assert route_under(flagged) == "native"
+
+
+def _signature_400_retry(agent, history):
+    """Drive production signature-400 recovery; return the repaired request copy."""
+    from agent.error_classifier import FailoverReason
+    from agent.turn_recovery import _recover_format_errors
+    from agent.turn_retry_state import TurnRetryState
+
+    before, request, retry = copy.deepcopy(history), copy.deepcopy(history), TurnRetryState()
+    assert _recover_format_errors(
+        agent, RuntimeError("Invalid signature in thinking block"),
+        SimpleNamespace(reason=FailoverReason.thinking_signature), retry, history, request,
+    )
+    assert retry.thinking_sig_retry_attempted and history == before
+    return request
+
+
+def _recovery_agent(api_mode, base_url, model):
+    return SimpleNamespace(
+        api_mode=api_mode, base_url=base_url, model=model, log_prefix="",
+        _vprint=lambda *args, **kwargs: None,
+    )
+
+
+def test_kimi_signature_retry_drops_the_ordered_carrier_and_keeps_its_contract():
+    """Kimi replays carriers as-is and keeps the one-request repair. The ordered
+    carrier wins over ``reasoning_details`` in the converter, so a repair that
+    left it would resend the same signed blocks into the same 400."""
+    kimi, model = "https://api.kimi.com/coding", "kimi-k2.5"
+    history = _tool_loop_messages()
+    history[1]["reasoning_content"] = "check a.py first"
+    stash = [{"type": "text", "text": "stashed tool output"}]
+    history[2]["_anthropic_content_blocks"] = stash
+    agent = _recovery_agent("anthropic_messages", kimi, model)
+    assert policy.anthropic_thinking_route(kimi, model) == "kimi"
+    assert not tracks_rejected_thinking(agent)
+
+    def assistant_blocks(messages):
+        _sys, out = convert_messages_to_anthropic(messages, base_url=kimi, model=model)
+        return next(m for m in out if m["role"] == "assistant")["content"]
+
+    assert [b.get("signature") for b in assistant_blocks(history) if b["type"] == "thinking"] == [SIG]
+    retry = _signature_400_retry(agent, history)
+    blocks = assistant_blocks(retry)
+    # No signature goes back; Kimi still gets its readable reasoning and the tool call.
+    assert [b for b in blocks if b["type"] == "thinking"] == [
+        {"type": "thinking", "thinking": "check a.py first"}
+    ]
+    assert [b["id"] for b in blocks if b["type"] == "tool_use"] == ["toolu_1"]
+    # The tool row's private stash is not a thinking carrier and survives the repair.
+    assert retry[2]["_anthropic_content_blocks"] == stash
+
+
+def test_converse_signature_retry_drops_the_anthropic_carrier_after_stream_denied_fallback():
+    """After the sticky stream-denied fallback a Claude session runs on Converse
+    (``bedrock_converse``), whose replay reads ``anthropic_content_blocks`` for turns
+    the AnthropicBedrock path produced; the one-request repair must drop it."""
+    from agent.bedrock_adapter import convert_messages_to_converse
+
+    model = "anthropic.claude-fable-5-v1:0"
+    agent = _recovery_agent(
+        "bedrock_converse", "https://bedrock-runtime.us-east-1.amazonaws.com", model
+    )
+    assert not tracks_rejected_thinking(agent)
+
+    def converse_assistant_blocks(messages):
+        _system, out = convert_messages_to_converse(messages, model=model)
+        return next(m for m in out if m["role"] == "assistant")["content"]
+
+    def signatures(blocks):
+        return [
+            b["reasoningContent"]["reasoningText"].get("signature")
+            for b in blocks if "reasoningContent" in b
+        ]
+
+    history = _tool_loop_messages()
+    assert signatures(converse_assistant_blocks(history)) == [SIG]
+    blocks = converse_assistant_blocks(_signature_400_retry(agent, history))
+    assert not signatures(blocks)
+    assert [b["toolUse"]["toolUseId"] for b in blocks if "toolUse" in b] == ["toolu_1"]
