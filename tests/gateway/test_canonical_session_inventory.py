@@ -73,7 +73,8 @@ async def test_created_session_snapshot_carries_inventory_for_frozen_toolsets(tm
         assert {'file', 'terminal'} <= set(info['enabled_toolsets'])
 
     narrowed = await call('session.create', request_id='narrow', source='cli', cwd=str(repo), toolsets=['terminal'])
-    assert set(narrowed['info']['tools']) - {'other'} == {'terminal'}, narrowed['info']['tools']
+    # Fork (runtime-control): the ``runtime`` group (model_status) rides every non-empty pick.
+    assert set(narrowed['info']['tools']) - {'other', 'runtime'} == {'terminal'}, narrowed['info']['tools']
 
 
 @pytest.mark.asyncio
