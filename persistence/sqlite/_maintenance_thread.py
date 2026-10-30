@@ -13,6 +13,8 @@ import threading
 import weakref
 from typing import TYPE_CHECKING
 
+from persistence.sqlite._state.errors import StateDbReplacedError  # DeletedWalGenerationError subclasses it
+
 from ._schema import _try_incremental_merge_fts
 
 if TYPE_CHECKING:
@@ -62,12 +64,35 @@ def stop_maintenance_thread(holder: StoreHolder) -> None:
         maint.join(timeout=2.0)
 
 
+def _generation_intact(holder: StoreHolder) -> bool:
+    """Re-run the writers' in-lock replaced/lost-generation probe before background maintenance.
+
+    Inline, the checkpoint and FTS merge ran right after the triggering write's probe; on this
+    thread up to one interval passes without one, and a checkpoint on a lost WAL generation writes
+    stale frames into the main DB (#105670). A positive probe sets the same sticky quarantine a
+    write would, so every later tick (and close()) skips the file too."""
+    if holder._quarantine_reason() is not None:
+        return False
+    with holder._lock:
+        if holder._conn is None:  # closed underneath the tick: nothing to maintain
+            return False
+        try:
+            holder._raise_if_db_replaced()
+        except StateDbReplacedError:
+            return False
+    return True
+
+
 def maintenance_tick(holder: StoreHolder) -> None:
     """Run due maintenance outside any caller's write transaction."""
     write_count = holder._write_count
-    if write_count - holder._last_checkpoint_write_count >= holder._CHECKPOINT_EVERY_N_WRITES:
+    checkpoint_due = write_count - holder._last_checkpoint_write_count >= holder._CHECKPOINT_EVERY_N_WRITES
+    fts_merge_due = write_count - holder._last_fts_merge_write_count >= holder._FTS_MERGE_EVERY_N_WRITES
+    if not (checkpoint_due or fts_merge_due) or not _generation_intact(holder):
+        return
+    if checkpoint_due:
         holder._last_checkpoint_write_count = write_count
         holder._try_wal_checkpoint()
-    if write_count - holder._last_fts_merge_write_count >= holder._FTS_MERGE_EVERY_N_WRITES:
+    if fts_merge_due:
         holder._last_fts_merge_write_count = write_count
         _try_incremental_merge_fts(holder)

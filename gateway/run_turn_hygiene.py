@@ -721,7 +721,22 @@ class GatewayTurnHygieneMixin:
         # Same contextvars contract as the compression call below: under multiplex_profiles the
         # profile secret scope / HERMES_HOME override live in ContextVars.
         loop = asyncio.get_running_loop()
-        _hyg_agent = await loop.run_in_executor(None, copy_context().run, _hyg_build_agent)
+        _hyg_build = loop.run_in_executor(None, copy_context().run, _hyg_build_agent)
+        # The build is default-executor hygiene work with synchronous store reads, so it registers with
+        # shutdown at submit time like the compression worker: stop() then skips the state.db
+        # close/checkpoint while it runs. There is no agent to interrupt yet (that pass skips None).
+        self._track_deferred_agent_worker(_hyg_build, None)
+        try:
+            # Shielded: cancelling the turn cannot stop a running executor job, only orphan its agent.
+            _hyg_agent = await asyncio.shield(_hyg_build)
+        except asyncio.CancelledError:
+            # The detached attempt never receives this agent, so its finally cannot release it.
+            def _release_orphaned_build(done):
+                if not done.cancelled() and done.exception() is None:
+                    self._defer_agent_cleanup_until_future_done(done, done.result(), context="session hygiene")
+
+            _hyg_build.add_done_callback(_release_orphaned_build)
+            raise
         return _hyg_agent, _hyg_session_db
 
     async def _hmwa_hygiene_detached_attempt(

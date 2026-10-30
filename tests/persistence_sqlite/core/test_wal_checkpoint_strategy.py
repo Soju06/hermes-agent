@@ -7,15 +7,20 @@ the live gateway writer and corrupt B-tree pages (#45383).
 """
 
 import logging
+import os
 import sqlite3
-from unittest.mock import MagicMock
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from persistence.sqlite import _maintenance_thread, _registry
+from persistence.sqlite import _maintenance_thread, _registry, _schema
 from persistence.sqlite._holder import StoreHolder
 from persistence.sqlite.admin import SQLiteStoreAdmin
 from persistence.sqlite.admin._maintenance import _FtsStorageOptimizer
+from persistence.sqlite.conversation._store.messages import append_message
+from persistence.sqlite.conversation._store.sessions import create_session
+from tests.persistence_sqlite.core._wal_generation_harness import pin_wal
 
 
 class TrackingConnection:
@@ -293,3 +298,44 @@ class TestCheckpointFrequency:
         # path). Waking it early via the stop event would defeat the
         # point, so poke the weakref path directly with a short interval.
         assert thread.daemon
+
+
+class TestMaintenanceTickGenerationProbe:
+    """The background tick re-probes for a replaced file or lost WAL generation before maintaining.
+
+    Inline, the checkpoint and FTS merge ran right after the triggering write's in-lock probe; on the
+    maintenance thread up to one interval passes without one, and a checkpoint on a lost generation
+    writes stale frames into the main DB (#105670).
+    """
+
+    @pytest.mark.platforms("linux")  # deleted-WAL detection uses Linux unlink semantics
+    def test_tick_after_deleted_wal_generation_quarantines_instead_of_maintaining(self, tmp_path, monkeypatch):
+        # Pin WAL so this host's SQLite matches the production topology (as in the #105670 guard tests).
+        pin_wal(monkeypatch)
+        path = tmp_path / "state.db"
+        db = StoreHolder(db_path=path)
+        try:
+            # Only the explicit tick below may run maintenance.
+            _maintenance_thread.stop_maintenance_thread(db)
+            create_session(db, "s", "cli")
+            append_message(db, "s", role="user", content="before")
+            if not db._wal_active or not Path(str(path) + "-wal").exists():
+                pytest.skip("WAL not active on this filesystem")
+            db._CHECKPOINT_EVERY_N_WRITES = 1
+            db._FTS_MERGE_EVERY_N_WRITES = 1
+            merges = []
+            monkeypatch.setattr(_schema, "_merge_fts_incrementally", lambda holder, **kw: merges.append(kw) or 0)
+            for suffix in ("-wal", "-shm"):
+                sidecar = Path(str(path) + suffix)
+                if sidecar.exists():
+                    os.unlink(sidecar)
+
+            with patch.object(db._conn, "execute", wraps=db._conn.execute) as mock_execute:
+                _maintenance_thread.maintenance_tick(db)
+            checkpoint_calls = [c for c in mock_execute.call_args_list if "wal_checkpoint" in str(c).lower()]
+
+            assert db._db_wal_generation_lost is True, "the tick did not probe the WAL generation"
+            assert not checkpoint_calls, f"the tick checkpointed a lost WAL generation: {checkpoint_calls}"
+            assert merges == [], "the tick ran an FTS merge on a lost WAL generation"
+        finally:
+            db.close()
