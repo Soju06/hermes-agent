@@ -25,11 +25,7 @@ def _is_markdown_table_row(line: str) -> bool:
 
 def _split_markdown_table_row(line: str) -> list[str]:
     """Split a simple GFM pipe-table row into stripped cell values."""
-    stripped = line.strip()
-    if stripped.startswith("|"):
-        stripped = stripped[1:]
-    if stripped.endswith("|"):
-        stripped = stripped[:-1]
+    stripped = line.strip().removeprefix("|").removesuffix("|")
     return [cell.strip() for cell in stripped.split("|")]
 
 

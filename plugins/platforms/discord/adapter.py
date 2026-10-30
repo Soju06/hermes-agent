@@ -302,7 +302,7 @@ from gateway.config import Platform, PlatformConfig, discord_channel_id_from_lin
 from gateway.approval_actor import clarify_refusal, refusal_text, slash_confirm_refusal
 
 from gateway.platforms.helpers import (
-    MessageDeduplicator, ThreadParticipationTracker, convert_table_to_bullets, is_discord_channel_obfuscated,
+    MessageDeduplicator, ThreadParticipationTracker, is_discord_channel_obfuscated,
     numbered_clarify_choices, tag_safe_display_name,
 )
 from gateway.platforms.helpers import cancel_task, inline_document_text
