@@ -16,9 +16,10 @@ import os
 import time
 from typing import Any, Optional
 
-from agent.message_sanitization import close_interrupted_tool_sequence
 from agent.turn_failure_copy import stamp_failure
-from agent.turn_recovery import _TRANSPORT_FAILURE_REASONS
+from agent.turn_recovery import (
+    _TRANSPORT_FAILURE_REASONS, _failed_turn_result, _with_delivered_partial, settle_delivered_partial,
+)
 from agent.turn_retry_state import TurnRetryState
 
 logger = logging.getLogger("agent.conversation_loop")
@@ -74,11 +75,16 @@ def _fast_fail_limit() -> int:
 def fast_transport_failure_result(
     agent: Any, api_error: Exception, classified: Any, retry: TurnRetryState, *,
     messages: list[dict[str, Any]], conversation_history: Any, api_call_count: int,
+    current_turn_user_idx: Any = None,
 ) -> Optional[dict[str, Any]]:
     """The failed-turn result once the instant-failure streak reaches the limit, else None.
 
     Runs after the eager fallback had its chance: a streak here means fallback either does not
-    exist or already failed to absorb the outage."""
+    exist or already failed to absorb the outage. Persists like retry exhaustion: this turn's
+    continuation trail collapses into the delivered partial (kept as the reply, ``partial``),
+    and an open user/tool tail is left to the failed-turn boundary closers
+    (``conversation_loop._close_durable_failed_turn``, the gateway's own), which write a
+    display-only row instead of an error the model would read back as its own reply."""
     limit = _fast_fail_limit()
     if not (
         classified.reason in _TRANSPORT_FAILURE_REASONS
@@ -102,11 +108,15 @@ def fast_transport_failure_result(
         agent._client_log_context(),
         api_error,
     )
-    close_interrupted_tool_sequence(messages, f"[System: API call aborted — {msg}]")
+    delivered = settle_delivered_partial(agent, messages, current_turn_user_idx)
     agent._persist_session(messages, conversation_history)
+    final_response, keep_partial = _with_delivered_partial(msg, msg, delivered)
     # The classifier's retry verdict, as on retry exhaustion: kanban in-place recovery and the
     # error surfaces key on ``failure_retryable``.
-    return stamp_failure({
-        "final_response": msg, "messages": messages, "api_calls": api_call_count,
-        "completed": False, "failed": True, "error": msg,
-    }, classified.reason.value, bool(classified.retryable))
+    result = stamp_failure(
+        _failed_turn_result(final_response, messages, api_call_count, msg),
+        classified.reason.value, bool(classified.retryable),
+    )
+    if keep_partial:
+        result["partial"] = True
+    return result

@@ -208,8 +208,8 @@ def handle_api_error(
     # Past the eager fallback: an instant-failure streak with no fallback left ends the turn instead
     # of burning the remaining retries against an endpoint that refuses connections outright.
     _fast_fail = fast_transport_failure_result(
-        agent, api_error, classified, _retry, messages=messages,
-        conversation_history=conversation_history, api_call_count=api_call_count,
+        agent, api_error, classified, _retry, messages=messages, conversation_history=conversation_history,
+        api_call_count=api_call_count, current_turn_user_idx=current_turn_user_idx,
     )
     if _fast_fail is not None:
         _tag_exit(f"fast_transport_failure_streak({classified.reason.value})")

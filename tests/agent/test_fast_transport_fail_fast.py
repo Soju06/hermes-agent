@@ -9,6 +9,7 @@ attempts instead of burning the full max_retries backoff cycle in silence.
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -28,7 +29,7 @@ class _Clock:
         self.offset += seconds
 
 
-def _make_agent(monkeypatch):
+def _make_agent(monkeypatch, **agent_kwargs):
     from run_agent import AIAgent
 
     with (
@@ -42,10 +43,24 @@ def _make_agent(monkeypatch):
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=True,
+            **agent_kwargs,
         )
     agent.client = MagicMock()
     agent.compression_enabled = False
     return agent
+
+
+def _chat_response(content="", finish_reason="stop", tool_calls=None):
+    message = SimpleNamespace(content=content, tool_calls=tool_calls)
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=message, finish_reason=finish_reason)], model="test/model", usage=None,
+    )
+
+
+def _instant_refusals(n=12):
+    import openai
+
+    return [openai.APIConnectionError(request=MagicMock()) for _ in range(n)]
 
 
 def _make_anthropic_stream_agent(connect):
@@ -230,6 +245,62 @@ class TestTerminalResultContract:
         assert terminal, statuses
         # display.suppress_warning_notifications hides exactly these.
         assert all(is_warning_status(k, m) for k, m in terminal)
+
+
+class TestTranscriptSettlement:
+    """The fail-fast persists the transcript the way retry exhaustion does: the continuation
+    trail collapses into the delivered partial, and an open tail is left to the failed-turn
+    boundary closers instead of a model-visible error row."""
+
+    def test_tool_round_tail_is_closed_by_the_failed_turn_boundary(self, monkeypatch, tmp_path):
+        from hermes_state import SessionDB
+        from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND, PARTIAL_FAILED_TURN_NOTICE
+
+        monkeypatch.setenv("HERMES_FAST_CONN_FAIL_LIMIT", "3")
+        db = SessionDB(db_path=tmp_path / "state.db")
+        agent = _make_agent(monkeypatch, session_db=db, session_id="fail-fast-tool-tail")
+        agent._api_max_retries = 12
+        tool_call = SimpleNamespace(
+            id="call_1", type="function", function=SimpleNamespace(name="web_search", arguments="{}"),
+        )
+        agent.client.chat.completions.create.side_effect = [
+            _chat_response(finish_reason="tool_calls", tool_calls=[tool_call]), *_instant_refusals(),
+        ]
+
+        with patch("model_tools.handle_function_call", return_value="ok"):
+            result = agent.run_conversation(user_message="look it up")
+
+        assert "unreachable" in result["error"].lower()
+        tail = result["messages"][-1]
+        # Display-only boundary with the side-effect warning; stripped before provider requests.
+        assert (tail["role"], tail.get("display_kind"), tail["content"]) == (
+            "assistant", FAILED_TURN_DISPLAY_KIND, PARTIAL_FAILED_TURN_NOTICE)
+        assert not any("API call aborted" in str(m.get("content")) for m in result["messages"])
+        assert db.latest_conversation_role("fail-fast-tool-tail") == "assistant"
+
+    def test_continuation_trail_collapses_into_the_delivered_partial(self, monkeypatch):
+        partial = "Here is the first half of the report, already shown to the user."
+        monkeypatch.setenv("HERMES_FAST_CONN_FAIL_LIMIT", "3")
+        agent = _make_agent(monkeypatch)
+        agent._api_max_retries = 12
+        agent.client.chat.completions.create.side_effect = [
+            _chat_response(content=partial, finish_reason="length"), *_instant_refusals(),
+        ]
+
+        result = agent.run_conversation(user_message="write a long report")
+
+        assert "unreachable" in result["error"].lower()
+        assert result.get("partial") is True and result["failed"] is True
+        assert partial in result["final_response"]
+        # Gateway retention contract: the reply differs from the error string.
+        assert result["final_response"].strip() != result["error"].strip()
+        # No dangling synthetic nudge: the turn persists as user -> one assistant row.
+        assert not any(
+            m.get("_length_continuation_nudge") or m.get("_length_continuation_fragment")
+            for m in result["messages"]
+        )
+        assert [m["role"] for m in result["messages"]][-2:] == ["user", "assistant"]
+        assert (result["messages"][-1]["content"], result["messages"][-1]["finish_reason"]) == (partial, "error")
 
 
 class TestStreamingPath:
