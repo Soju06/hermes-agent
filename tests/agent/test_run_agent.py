@@ -2699,8 +2699,11 @@ class TestHandleMaxIterations:
         agent.provider = "openai"
         agent._cached_system_prompt = "You are helpful."
         messages = [{"role": "user", "content": "do stuff"}]
+        # Fork (runtime-route-awareness): the ordinary request's system message is composed the way
+        # build_api_messages composes it (cached prompt + live Runtime/Route State block).
+        from agent.system_prompt import compose_effective_system_prompt
         ordinary = agent._build_api_kwargs(
-            [{"role": "system", "content": agent._cached_system_prompt}, *messages]
+            [{"role": "system", "content": compose_effective_system_prompt(agent, agent._cached_system_prompt)}, *messages]
         )
 
         result = agent._handle_max_iterations(messages, 60)
@@ -3190,6 +3193,11 @@ class TestRunConversation:
         assert result["completed"] is True
         system = agent.client.chat.completions.create.call_args.kwargs["messages"][0]
         assert system["role"] == "system"
+        # Fork (runtime-route-awareness): the live Runtime/Route State block rides the volatile tier,
+        # after the session context; the static prefix block is unchanged.
+        volatile_text = system["content"][1]["text"]
+        assert volatile_text == "\n\nsession context" or volatile_text.startswith(
+            "\n\nsession context\n\n# Runtime/Route State\n")
         assert system["content"] == [
             {
                 "type": "text",
@@ -3198,7 +3206,7 @@ class TestRunConversation:
             },
             {
                 "type": "text",
-                "text": "\n\nsession context",
+                "text": volatile_text,
                 "cache_control": {"type": "ephemeral"},
             },
         ]
