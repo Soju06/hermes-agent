@@ -384,9 +384,18 @@ def cmd_post_update_health(args: argparse.Namespace) -> int:
         print("SKIP: semantic pytest suite not run (--skip-tests)")
     else:
         py = _python_for(repo)
-        cmd = [py, "-m", "pytest", "-q", "-o", "addopts=", *POST_UPDATE_HEALTH_TESTS]
+        runner = repo / "scripts" / "run_tests.sh"
+        if runner.exists():
+            # Upstream (v0.22.5+) runs every test file in its own subprocess for CI parity; running the
+            # 16 files in one pytest process leaks module state between them and reports false failures.
+            cmd = ["bash", str(runner), *POST_UPDATE_HEALTH_TESTS, "-q"]
+            env = {**os.environ, "HERMES_PYTHON": py}
+        else:
+            cmd = [py, "-m", "pytest", "-q", "-o", "addopts=", *POST_UPDATE_HEALTH_TESTS]
+            env = None
         try:
-            run(cmd, cwd=repo, check=True)
+            print("$", " ".join(cmd))
+            subprocess.run(cmd, cwd=str(repo), check=True, text=True, env=env)
         except subprocess.CalledProcessError as exc:
             print(f"FAIL: semantic pytest suite failed with exit code {exc.returncode}")
             failed = True
