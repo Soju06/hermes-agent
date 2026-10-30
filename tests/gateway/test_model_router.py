@@ -13,6 +13,7 @@ model_routes pytest guard. Decision logs go to tmp via
 
 import asyncio
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -26,7 +27,10 @@ from gateway.session import SessionSource
 from hermes_cli.model_routes import load_routes
 
 
-SKILL_GATE_DIR = Path("/home/ubuntu/.hermes/plugins/skill-gate")
+# Opt-in byte-parity source: a skill-gate plugin checkout OUTSIDE the live Hermes home (the test
+# suite's home I/O guard refuses every read under the real ~/.hermes, and importing the live plugin
+# would execute production code). Unset = the parity test skips.
+SKILL_GATE_DIR = Path(os.environ.get("HERMES_TEST_SKILL_GATE_DIR") or "/nonexistent/skill-gate")
 
 EXPECTED_RECORD_FIELDS = {
     "policy", "session_key", "label", "confidence", "evidence", "source",
@@ -160,14 +164,14 @@ def _evaluate(
 
 
 # ---------------------------------------------------------------------------
-# Byte-identity parity with the skill-gate porting source (skipped where the
-# read-only plugin checkout is not present)
+# Byte-identity parity with the skill-gate porting source (skipped unless
+# HERMES_TEST_SKILL_GATE_DIR names a read-only plugin checkout)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.skipif(
     not (SKILL_GATE_DIR / "policy_router.py").exists(),
-    reason="skill-gate plugin source not present on this host",
+    reason="set HERMES_TEST_SKILL_GATE_DIR to a skill-gate plugin checkout outside the live home",
 )
 def test_verbatim_parity_with_skill_gate_plugin():
     import importlib.util

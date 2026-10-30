@@ -2300,6 +2300,24 @@ class TestDelegateRouteResolution(unittest.TestCase):
         self.assertEqual(kwargs["model"], "model-c")
         self.assertEqual(kwargs["provider"], "p2")
 
+    def test_mixed_batch_routes_claimed_tasks_and_asks_provider_for_the_rest(self):
+        """A routed task takes its model route while an unrouted sibling keeps the
+        delegation provider's route (here: inherit the parent). The provider never
+        sees the fork's ``route`` key, or the default backend would refuse it as an
+        undeclared parameter."""
+        result, MockAgent = self._run(
+            tasks=[
+                {"goal": "Summarize the quarterly report for the finance channel", "route": "chat"},
+                {"goal": "Refactor the gateway retry loop and add regression tests", "route": ""},
+            ],
+        )
+        self.assertNotIn("error", json.loads(result))
+        routed, inherited = (call[1] for call in MockAgent.call_args_list)
+        self.assertEqual((routed["model"], routed["provider"]), ("model-c", "p2"))
+        parent_model = _make_mock_parent().model
+        self.assertEqual(inherited["model"], parent_model)
+        self.assertEqual(inherited["provider"], _make_mock_parent().provider)
+
     @patch("tools.delegate_tool_model_routes._load_full_config")
     @patch("tools.delegate_tool._resolve_delegation_credentials")
     @patch("tools.delegate_tool._load_config", return_value={"max_iterations": 5})
