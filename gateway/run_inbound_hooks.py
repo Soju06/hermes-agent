@@ -78,7 +78,8 @@ class GatewayInboundHooksMixin:
         Results: ``{"action": "skip"}`` → drop; ``{"action": "rewrite", "text"}`` → replace ``event.text``;
         ``{"action": "prepend", "text"}`` → prepend text (accumulates); ``{"action": "runtime_override", ...}``
         → staged on the event and applied by ``_hm_apply_runtime_override_directives`` only after auth and
-        the emergency-stop gate; ``allow``/None → normal dispatch. On the messaging path it runs BEFORE
+        the emergency-stop gate (``_hm_apply_producer_runtime_overrides`` before a producer commit);
+        ``allow``/None → normal dispatch. On the messaging path it runs BEFORE
         auth so plugins can handle unauthorized senders; on the producer path (webhook/relay,
         ``admit_producer``) it runs AFTER the delivery's authorization, which preparing its payload
         performs, so it never sees a refused sender.
@@ -154,6 +155,18 @@ class GatewayInboundHooksMixin:
             # the event (same pattern as ``_bot_loop_admitted``) so they can only be applied after auth.
             event._hermes_runtime_override_directives = _runtime_override_directives
         return event
+
+    async def _hm_apply_producer_runtime_overrides(self, event: MessageEvent) -> None:
+        """Producer ingress (webhook/relay ``admit_producer``): apply the staged ``runtime_override``
+        directives before the commit, in ``_handle_message``'s order. The committed admission payload
+        does not carry them and the hook never runs again when the row executes, so this is their one
+        chance. Authorization already ran (preparing the payload); the emergency-stop gate decides as
+        on the messaging path, and a paused delivery applies nothing."""
+        if not getattr(event, "_hermes_runtime_override_directives", None):
+            return
+        if self._hm_estop_gate(event, event.source, False) is not None:
+            return
+        await self._hm_apply_runtime_override_directives(event, event.source)
 
     async def _hm_apply_runtime_override_directives(self, event: MessageEvent, source: SessionSource) -> None:
         """Apply ``runtime_override`` directives staged by ``_hm_pre_gateway_dispatch_hook``. Called only

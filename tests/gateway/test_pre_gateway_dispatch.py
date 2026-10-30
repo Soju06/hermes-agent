@@ -1147,3 +1147,83 @@ async def test_hook_prepend_with_runtime_override(monkeypatch):
 
     assert "[Dev routing applied]" in dispatched["text"]
     assert "build it" in dispatched["text"]
+
+
+def _runtime_override_plugin(directive):
+    from hermes_cli.plugins import get_plugin_manager
+
+    manager = get_plugin_manager()
+    manager._discovered = True
+    manager._hooks.setdefault("pre_gateway_dispatch", []).append(
+        lambda event, **_kwargs: {"action": "runtime_override", **directive})
+
+
+async def _run_webhook_delivery(client, adapter, text, delivery_id, *, capture=None):
+    from tests.waiting import async_wait_until
+
+    runner = adapter._message_handler.__self__
+    authority = runner.session_authority
+    authority.__dict__.pop("_schedule", None)  # the real drain executes the admitted row
+    runner._handle_message_with_agent = capture or AsyncMock(return_value="agent-ok")
+    assert (await _post_webhook(client, text, delivery_id)).status == 202
+
+    def settled():
+        rows = authority.db._read_all("SELECT status FROM session_admissions")
+        return rows if rows and all(row["status"] == "terminal" for row in rows) else None
+
+    await async_wait_until(settled, what="the admitted delivery executed")
+    return runner
+
+
+@pytest.mark.asyncio
+async def test_webhook_runtime_override_applies_at_producer_ingress_before_commit(monkeypatch):
+    """Receipt-only producer ingress (webhook/relay ``admit_producer``) runs the hook before the
+    commit and never at execution; a ``runtime_override`` staged on the in-memory event used to be
+    dropped at commit. It now applies at ingress (after authorization, which preparing the payload
+    ran), so the executed turn runs the selected route (2026-10-30 sync review)."""
+    from aiohttp.test_utils import TestClient, TestServer
+
+    switch_calls = []
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model",
+                        lambda **kwargs: switch_calls.append(kwargs) or _fake_switch_result())
+    monkeypatch.setattr("gateway.slash_commands_model._model_switch_skew_guard", lambda: None)
+    _runtime_override_plugin({"model": "gpt-5.5", "provider": "codex-nekos", "reasoning_effort": "high"})
+    adapter, app = _webhook_app()
+    seen = {}
+
+    async with TestClient(TestServer(app)) as client:
+        runner = adapter._message_handler.__self__
+
+        async def _capture(event, source, _quick_key, _run_generation):
+            session_key = runner._session_key_for_source(source)  # noqa: SLF001
+            seen["model_override"] = runner._session_model_overrides.get(session_key)  # noqa: SLF001
+            seen["reasoning_override"] = runner._session_reasoning_overrides.get(session_key)  # noqa: SLF001
+            return "agent-ok"
+
+        await _run_webhook_delivery(client, adapter, "route me", "d-route", capture=_capture)
+
+    assert len(switch_calls) == 1 and switch_calls[0]["raw_input"] == "gpt-5.5"
+    assert (seen["model_override"] or {}).get("model") == "gpt-5.5", seen
+    assert seen["reasoning_override"] == {"enabled": True, "effort": "high"}
+
+
+@pytest.mark.asyncio
+async def test_webhook_runtime_override_is_not_applied_under_the_emergency_stop(monkeypatch):
+    """The producer path keeps ``_handle_message``'s order: a delivery the emergency-stop gate pauses
+    applies no route (its execution is answered by the same gate)."""
+    from aiohttp.test_utils import TestClient, TestServer
+
+    switch_calls = []
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model",
+                        lambda **kwargs: switch_calls.append(kwargs) or _fake_switch_result())
+    monkeypatch.setattr("gateway.slash_commands_model._model_switch_skew_guard", lambda: None)
+    monkeypatch.setattr("agent.estop.paused_reply", lambda: "paused")
+    _runtime_override_plugin({"model": "gpt-5.5", "provider": "codex-nekos", "reasoning_effort": "high"})
+    adapter, app = _webhook_app()
+
+    async with TestClient(TestServer(app)) as client:
+        runner = await _run_webhook_delivery(client, adapter, "route me", "d-paused")
+        session_keys = list(runner.__dict__.get("_sessions") or {})
+
+    assert switch_calls == []
+    assert all(runner._session_reasoning_overrides.get(key) is None for key in session_keys)  # noqa: SLF001
