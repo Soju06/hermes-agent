@@ -315,6 +315,26 @@ class TestManagerIntegration:
         stats = mm._pending_wal.scan_and_gc()
         assert stats["unconsumed_entries"] == 1
 
+    def test_gate_skipped_ingest_leaves_entry_unacked(self, tmp_path):
+        """A provider the stuck-call gate skips never received the turn, so its entry stays unconsumed."""
+        class _ClosedGate:
+            def enter(self, key, token, timeout):
+                return 4, 4, 1  # (stuck, in_flight, skips): the call is skipped
+
+            def leave(self, key, token, *, ok):
+                raise AssertionError("a skipped call is never registered")
+
+        provider = _RecordingProvider()
+        mm = _manager_with_wal(tmp_path, provider)
+        mm._BACKGROUND_GATE = _ClosedGate()
+
+        mm.sync_all("hello", "world", session_id="sess-1")
+        assert mm.flush_pending(timeout=5)
+
+        assert provider.synced == []
+        recs = _records(tmp_path / "memory-pending" / "sess-1.jsonl")
+        assert [r["type"] for r in recs] == ["turn"]
+
     def test_broken_wal_never_blocks_sync(self, tmp_path):
         provider = _RecordingProvider()
         mm = MemoryManager()

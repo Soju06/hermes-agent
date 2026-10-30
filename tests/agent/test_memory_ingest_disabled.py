@@ -374,6 +374,36 @@ class TestSyncChokepoint:
         kinds = [c[0] for c in provider.write_calls()]
         assert "on_session_end" in kinds
 
+    def test_fork_shutdown_leaves_owner_teardown_intact(self):
+        """The fork's shutdown neither tears down nor claims the shared manager, so the owner's soft
+        release (gateway cache eviction) still shuts the providers down afterwards."""
+        from run_agent import AIAgent
+
+        agent = _bare_agent()
+        agent._memory_manager, provider = _make_manager()
+        agent._memory_ingest_disabled = True
+
+        AIAgent.shutdown_memory_provider(agent, [{"role": "user", "content": "x"}])
+        agent._memory_manager.release_soft()
+
+        assert [c[0] for c in provider.calls] == ["shutdown"]
+
+    @pytest.mark.parametrize("disabled", [True, False])
+    def test_release_clients_soft_releases_only_an_owned_manager(self, disabled):
+        """A fork's release_clients must not soft-release the parent's rebound manager."""
+        from run_agent import AIAgent
+
+        agent = _bare_agent()
+        agent._memory_manager, provider = _make_manager()
+        agent._memory_ingest_disabled = disabled
+        for name in ("_close_active_children", "_drop_shared_client", "_close_request_clients",
+                     "_close_codex_session"):
+            setattr(agent, name, lambda *_a, **_k: None)
+
+        AIAgent.release_clients(agent)
+
+        assert [c[0] for c in provider.calls] == ([] if disabled else ["shutdown"])
+
     def test_memory_search_read_stays_allowed(self):
         """Reads are deliberately NOT gated: the whole point of rebinding the
         manager onto the fork is memory_search access."""
