@@ -2039,8 +2039,8 @@ class GatewayTurnMixin(
                 if (
                     _heartbeat_msg_id
                     and _long_running_mode == "recap"
-                    and type(_notify_adapter).delete_message
-                    is not BasePlatformAdapter.delete_message
+                    and getattr(type(_notify_adapter), "delete_message", None)
+                    not in (None, BasePlatformAdapter.delete_message)
                 ):
                     with suppress(Exception):
                         await _notify_adapter.delete_message(source.chat_id, _heartbeat_msg_id)

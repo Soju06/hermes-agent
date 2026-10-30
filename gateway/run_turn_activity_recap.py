@@ -3,6 +3,10 @@
 ``GatewayTurnMixin._run_agent_notify_long_running`` asks this mixin for a one-line, present-tense
 recap of what the running agent is doing instead of the terse "Working — N min" heartbeat. The
 agent side of the snapshot is ``AIAgent.get_activity_recap_context`` (``agent/activity_recap.py``).
+
+The aux call runs from the notify task on the event loop, outside the turn's ``policy_scope``: a
+LOCAL policy-bound session resolves ``auxiliary.activity_recap`` from live config.yaml, not from its
+frozen auxiliary section. Messaging platforms carry no session policy, so they are unaffected.
 """
 
 from __future__ import annotations
@@ -12,6 +16,18 @@ import logging
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
+
+
+def _recap_main_runtime(agent) -> dict:
+    """The agent's live main runtime, as the compression rail passes it (``auth_mode`` and
+    ``session_id`` included, for aux session affinity and prompt-cache scope). An agent without
+    ``_current_main_runtime`` falls back to its plain route attributes."""
+    current = getattr(agent, "_current_main_runtime", None)
+    if callable(current):
+        runtime = current()
+        if isinstance(runtime, dict):
+            return runtime
+    return {key: getattr(agent, key, None) for key in ("model", "provider", "base_url", "api_key", "api_mode")}
 
 
 class GatewayTurnActivityRecapMixin:
@@ -81,13 +97,7 @@ class GatewayTurnActivityRecapMixin:
             )
             response = call_llm(
                 task="activity_recap",
-                main_runtime={
-                    "model": getattr(agent, "model", None),
-                    "provider": getattr(agent, "provider", None),
-                    "base_url": getattr(agent, "base_url", None),
-                    "api_key": getattr(agent, "api_key", None),
-                    "api_mode": getattr(agent, "api_mode", None),
-                },
+                main_runtime=_recap_main_runtime(agent),
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=80,
                 timeout=8,
