@@ -1090,6 +1090,42 @@ def test_has_unhealthy_verdicts_memo(monkeypatch, tmp_path, health_test_env, pas
     assert mr.has_unhealthy_verdicts(health=health) is True
 
 
+def test_passive_hot_path_reads_only_the_health_section(monkeypatch, tmp_path, health_test_env, passive_state):
+    """The success gate runs on every API call, and the recorder and key mapping run on every
+    success while a verdict is open. They read the active profile's config from the shared
+    read-only cache: no deepcopying load_config() and no full route parse."""
+    home = Path(os.environ["HERMES_HOME"])
+    home.mkdir(parents=True, exist_ok=True)
+    cache = tmp_path / "health.json"
+    (home / "config.yaml").write_text(
+        "providers:\n"
+        "  claude-lb:\n"
+        "    base_url: http://10.0.0.114:2455\n"
+        "model_routes:\n"
+        "  routes:\n"
+        "    dev:\n"
+        "      provider: claude-lb\n"
+        "      model: model-a\n"
+        "  health:\n"
+        f"    cache_path: {cache}\n",
+        encoding="utf-8",
+    )
+
+    def boom(*args, **kwargs):
+        raise AssertionError("passive hot path must not deepcopy the config or parse routes")
+
+    monkeypatch.setattr(mr, "load_config", boom)
+    monkeypatch.setattr(mr, "_parse_routes", boom)
+    monkeypatch.setattr(mr, "_now", _Clock(1000.0))
+
+    assert mr.has_unhealthy_verdicts() is False
+    key = mr.provider_key_for_runtime(provider="", base_url="http://10.0.0.114:2455")
+    assert key == "claude-lb"
+    mr.record_provider_outcome(key, False, "server_error")
+    assert json.loads(cache.read_text(encoding="utf-8"))["claude-lb"]["healthy"] is False
+    assert mr.has_unhealthy_verdicts() is True
+
+
 def test_provider_key_for_runtime_matching():
     cfg = {
         "providers": {

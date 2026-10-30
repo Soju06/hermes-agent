@@ -64,9 +64,9 @@ def note_runtime_abandoned(agent, reason) -> None:
 def note_provider_success(agent) -> None:
     """Completion succeeded on the current runtime — clear any unhealthy verdict.
 
-    Runs on every successful API call, so it is gated to one os.stat in
-    steady state (has_unhealthy_verdicts memo); config load + key mapping
-    only happen while some provider is actually marked unhealthy.
+    Runs on every successful API call, so it is gated by has_unhealthy_verdicts:
+    a read-only config lookup plus one os.stat in steady state. Key mapping and
+    the clear only happen while some provider is actually marked unhealthy.
     """
     try:
         from hermes_cli.model_routes import has_unhealthy_verdicts
@@ -74,5 +74,6 @@ def note_provider_success(agent) -> None:
         if not has_unhealthy_verdicts():
             return
     except Exception:
+        logger.debug("passive provider health gate failed", exc_info=True)
         return
     record_passive_provider_outcome(agent, True, "recovered (live completion succeeded)")

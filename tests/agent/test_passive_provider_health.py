@@ -305,11 +305,17 @@ class TestSuccessHook:
         assert args[0] == "claude-lb"
         assert args[1] is True
 
-    def test_gate_failure_is_swallowed(self):
+    def test_gate_failure_is_swallowed_and_logged(self, caplog):
         agent = SimpleNamespace(provider="claude-lb", base_url="")
-        with patch("hermes_cli.model_routes.has_unhealthy_verdicts",
-                   side_effect=RuntimeError("boom")):
+        with (
+            caplog.at_level("DEBUG", logger="agent.passive_provider_health"),
+            patch("hermes_cli.model_routes.has_unhealthy_verdicts",
+                  side_effect=RuntimeError("boom")),
+        ):
             note_provider_success(agent)  # must not raise
+        records = [r for r in caplog.records if r.name == "agent.passive_provider_health"]
+        assert records and records[-1].exc_info is not None
+        assert "boom" in str(records[-1].exc_info[1])
 
 
 # ── Success sites ──────────────────────────────────────────────────────────

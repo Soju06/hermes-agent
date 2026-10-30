@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_constants import get_hermes_home, parse_reasoning_effort, VALID_REASONING_EFFORTS
-from hermes_cli.config import get_compatible_custom_providers, load_config
+from hermes_cli.config import get_compatible_custom_providers, load_config, load_config_readonly
 from hermes_cli.config_issues import ConfigIssue
 from utils import atomic_json_write
 
@@ -1208,9 +1208,19 @@ _PASSIVE_WRITE_SUPPRESS_SECONDS = 5.0
 _last_passive_unhealthy_write: Dict[Tuple[str, str], float] = {}
 
 # mtime-keyed memo for has_unhealthy_verdicts() — the completion-success hook
-# runs per API call, so it must cost one os.stat in steady state, not a JSON
-# parse.
+# runs per API call, so steady state costs the read-only config lookup plus one
+# os.stat, not a JSON parse.
 _unhealthy_memo: Dict[str, Any] = {"mtime": None, "value": False}
+
+
+def _passive_health_config() -> HealthConfig:
+    """``model_routes.health`` for the passive hooks, from the shared read-only config.
+
+    Same value as ``load_routes(None).health`` without its per-call config deepcopy and full
+    route/provider parse; the success gate runs on every API call. Never mutate the dict.
+    """
+    section = load_config_readonly().get("model_routes")
+    return _parse_health(section.get("health") if isinstance(section, dict) else None, [])
 
 
 def provider_key_for_runtime(
@@ -1231,7 +1241,7 @@ def provider_key_for_runtime(
 
     if cfg is None:
         try:
-            cfg = load_config()
+            cfg = load_config_readonly()  # read-only: runs per success while a verdict is open
         except Exception:
             logger.debug("model_routes: config load failed during provider-key mapping", exc_info=True)
             return ""
@@ -1288,7 +1298,7 @@ def record_provider_outcome(
         return
     try:
         if health is None:
-            health = load_routes(None).health
+            health = _passive_health_config()
         if not _health_checks_enabled(health):
             return
         if "PYTEST_CURRENT_TEST" in os.environ and not os.environ.get(_HEALTH_TEST_ENV):
@@ -1318,13 +1328,14 @@ def record_provider_outcome(
 def has_unhealthy_verdicts(health: Optional[HealthConfig] = None) -> bool:
     """True when the health cache currently holds any unhealthy verdict.
 
-    Cheap gate for the per-completion success hook: one ``os.stat`` per call
-    in steady state (memo keyed on the cache file's mtime), a JSON parse only
-    when the file actually changed.
+    Cheap gate for the per-completion success hook: in steady state one read-only
+    config lookup (cache hit, no deepcopy, no route parse) plus one ``os.stat`` of
+    the health cache (memo keyed on its mtime), a JSON parse only when the file
+    actually changed.
     """
     try:
         if health is None:
-            health = load_routes(None).health
+            health = _passive_health_config()
         if not _health_checks_enabled(health):
             return False
         if "PYTEST_CURRENT_TEST" in os.environ and not os.environ.get(_HEALTH_TEST_ENV):
