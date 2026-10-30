@@ -54,6 +54,8 @@ def test_memory_tool_counts_each_operation_with_its_outcome_and_origin(home):
     memory_tool("remove", store=store)  # refused before the store: no old_text
     memory_tool("remove", old_text="no such entry", store=store)  # the store could not apply it
     memory_tool("explode", store=store)  # unknown action
+    memory_tool("add", content="no reason given", store=store)  # reason gate, single op
+    memory_tool(operations=[{"action": "add", "content": "no reason either"}], store=store)  # reason gate, batch
     token = set_current_write_origin(BACKGROUND_REVIEW)
     try:
         memory_tool(operations=[{"action": "add", "content": "a"}, {"action": "add", "content": "b"}],
@@ -68,6 +70,7 @@ def test_memory_tool_counts_each_operation_with_its_outcome_and_origin(home):
         tuple(sorted({**base, "op": "remove", "outcome": "rejected", "failure_class": "missing_old_text"}.items())): 1,
         tuple(sorted({**base, "op": "remove", "outcome": "failed", "failure_class": "no_match"}.items())): 1,
         tuple(sorted({**base, "op": "other", "outcome": "rejected", "failure_class": "invalid_args"}.items())): 1,
+        tuple(sorted({**base, "op": "add", "outcome": "rejected", "failure_class": "invalid_args"}.items())): 2,
         tuple(sorted({
             **base, "origin": "background_review", "op": "add", "outcome": "success", "failure_class": "none",
         }.items())): 2,
