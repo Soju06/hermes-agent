@@ -1,0 +1,64 @@
+{
+  "_provenance": {
+    "what": "Classifier core of the skill-gate bench winner (ADR-003): gateway/model_router.py must stay byte-identical (PATCHES.md #34; changing it requires the 230+120 bench rerun).",
+    "source": "skill-gate repo 22c735f77f3f2f61567eb547dd44af16bd33693b: policy_router.py (blob 8041cf27fa22) and __init__.py (blob c96bd7fe0df2), read statically (AST literals, never imported).",
+    "regex": "{pattern, flags} with flags as re.compile reports them (str patterns include re.UNICODE)."
+  },
+  "CONTINUATION_RE": {
+    "flags": 34,
+    "pattern": "^(?:\\\\s)*(?:진행(?:해|해줘|해봐)?|계속(?:해|해줘)?|이어(?:서)?\\\\s*(?:해|해줘)?|좋아\\\\s*진행해|go\\\\s+ahead|continue|proceed|carry\\\\s+on)(?:[.!?。！؟\\u3160-\\u3163\\\\s]*)$"
+  },
+  "DEV_CANDIDATE_RE": {
+    "flags": 34,
+    "pattern": "(코드\\s*(수정|변경|작성|리뷰|개선)|패치\\s*(스택|수정|추가|관리|고장|깨짐|복구)|(?:hermes|delegate_task|model_switch|model_status|skill-gate|gateway|runtime)[^\\n]{0,80}(?:업데이트|패치|고장|깨짐|원인\\s*파악|디버깅|debug|fix|troubleshoot)|(?:업데이트|패치|고장|깨짐|원인\\s*파악|디버깅|debug|fix|troubleshoot)[^\\n]{0,80}(?:hermes|delegate_task|model_switch|model_status|skill-gate|gateway|runtime)|디버깅|리팩터|구현해|핫픽스|버그\\s*(수정|고쳐|잡아)|오류\\s*(수정|고쳐)|\\b(fix|debug|implement|refactor|patch|write\\s+code|code\\s+review|PR\\s+review|run\\s+tests?|pytest|git\\s+diff)\\b|traceback|stacktrace|\\bgh\\s+pr\\b|\\bgh\\s+issue\\b|\\bPR\\s*#?\\d{2,}\\b|\\b[\\w./-]+\\.(?:py|ts|tsx|js|jsx|go|rs|java|rb|php|css|html)\\b.*(?:고쳐|수정|fix|debug|refactor)|\\bbug\\b.*(?:고쳐|수정|fix)|프론트엔드|frontend|React|CSS|HTML|UI\\s*(수정|구현|변경)|컴포넌트\\s*(수정|작성|추가))"
+  },
+  "DEV_RESPONSE_SCHEMA": {
+    "properties": {
+      "confidence": {
+        "description": "Calibrated probability that switching to this route is correct.",
+        "maximum": 1,
+        "minimum": 0,
+        "type": "number"
+      },
+      "evidence": {
+        "description": "Matched step (S1-S7) + decisive cue from the message/context, e.g. 'S2 status question'. Write this first.",
+        "maxLength": 120,
+        "type": "string"
+      },
+      "label": {
+        "enum": [
+          "NORMAL",
+          "DOCUMENT_WORK",
+          "FRONTEND_DEV",
+          "SYSTEM_DEV"
+        ],
+        "type": "string"
+      }
+    },
+    "propertyOrdering": [
+      "evidence",
+      "label",
+      "confidence"
+    ],
+    "required": [
+      "evidence",
+      "label",
+      "confidence"
+    ],
+    "type": "object"
+  },
+  "DEV_SYSTEM_PROMPT": "Router for a bilingual (KO/EN) personal assistant. Context: current message + recent dialogue (most recent first) + platform. Decide what the assistant must DO next.\n\nLabels: NORMAL, DOCUMENT_WORK, FRONTEND_DEV, SYSTEM_DEV.\nCore law: TOPIC ≠ TASK. An engineering topic never makes a turn dev; only commissioned code/config work does.\n\nApply steps IN ORDER; first match wins.\n\nS1 CONTINUATION — bare go-ahead (\"ㄱㄱ\",\"진행해\",\"좋아 그렇게 해줘\",\"continue\"): inherit from recent dialogue. Prior turn proposed a code/config/schema implementation plan or dev work is ongoing → that DEV label — never downgrade it. Proposed a document draft → DOCUMENT_WORK. Proposed an ops action (restart/rerun/cleanup) or context unclear → NORMAL.\n\nS2 QUESTION/DISCUSSION — user wants an answer, not an edit: status (\"잘 돌아가?\"), metrics (\"속도 어때?\"), verification (\"이 수치 맞아?\"), explain existing behavior (\"어떻게 동작해?\"), opinion (\"어떻게 생각해?\",\"이 디자인 어때?\"), ideas/plan-only/brainstorm (\"어떻게 할까?\",\"플랜 알려줘\",\"구상해보자\") → NORMAL. But \"플랜대로 구현해/고쳐줘/만들어줘\" → S5.\n\nS3 LOOKUP/RETRIEVAL — deliverable is fetched/listed info: page/DB content (\"찾아줘\",\"가져와\"), web research (\"조사해줘\"), listing existing things (\"나열해줘\") → NORMAL. Retrieval ≠ DOCUMENT_WORK (needs authoring). EXCEPTION: reading SOURCE CODE, diffs, PRs, or CI/incident logs to inspect/review/root-cause is NOT lookup → S5.\n\nS4 OPS COMMAND — restart/relaunch/rerun/kill/cleanup of a service/job (\"다시 띄워줘\",\"재시작해줘\") with no debugging engagement → NORMAL. SYSTEM_DEV only if inside an active debugging/implementation thread.\n\nS5 CODE WORK — next turn must create/edit source/config/tests/schema, debug with logs/tracebacks, or do PR/diff/security review; includes product asks plainly implying repo/schema/DB/API/migration changes even without dev words (\"주문에 배송지 여러 개 붙게 해줘\"). Deep debugging counts even with a user-facing symptom. READ-ONLY counts too: source inspection (\"이 모듈 구조 봐줘\"), code/spec-compliance review, code audit, merge-conflict inspection, CI-failure root-causing — reviewing code IS code work, never DOCUMENT_WORK, even with zero edits.\n• work mainly in UI source (React/Vue, HTML/CSS/Tailwind, components, layout, browser-UI behavior) → FRONTEND_DEV\n• otherwise → SYSTEM_DEV\n\nS6 PROSE DELIVERABLE — write/edit/summarize/restructure a doc, Notion page, spec, memo, ticket, table → DOCUMENT_WORK even in technical domains, unless source edits are asked.\n\nS7 Else → NORMAL.\n\nOutput JSON per schema. evidence: matched step + decisive cue (≤120 chars), written BEFORE label. confidence: probability this route is correct; lower it on thin continuations or S2-vs-S5 near-misses.\n\nExamples:\n\"결제 서버 배포 잘 됐어?\" → {evidence:\"S2 status Q\",label:NORMAL}\n\"ㄱㄱ\" after a dropdown-component plan → {evidence:\"S1 inherit UI plan\",label:FRONTEND_DEV}\n\"온보딩 가이드 노션 페이지로 정리해줘\" → {evidence:\"S6 author doc\",label:DOCUMENT_WORK}",
+  "FRONTEND_FALLBACK_RE": {
+    "flags": 34,
+    "pattern": "프론트엔드|frontend|React|CSS|HTML|UI\\s*(수정|구현|변경)|컴포넌트\\s*(수정|작성|추가)"
+  },
+  "_OWNER_ENV_MAP": {
+    "discord": "DISCORD_ALLOWED_USERS",
+    "email": "EMAIL_ALLOWED_USERS",
+    "matrix": "MATRIX_ALLOWED_USERS",
+    "signal": "SIGNAL_ALLOWED_USERS",
+    "slack": "SLACK_ALLOWED_USERS",
+    "telegram": "TELEGRAM_ALLOWED_USERS",
+    "whatsapp": "WHATSAPP_ALLOWED_USERS"
+  }
+}

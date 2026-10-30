@@ -29,7 +29,8 @@ from hermes_cli.model_routes import load_routes
 
 # Opt-in byte-parity source: a skill-gate plugin checkout OUTSIDE the live Hermes home (the test
 # suite's home I/O guard refuses every read under the real ~/.hermes, and importing the live plugin
-# would execute production code). Unset = the parity test skips.
+# would execute production code). Unset = the live parity test skips; the hermetic snapshot pin
+# (tests/fixtures/skill_gate_classifier_core.json) always runs.
 SKILL_GATE_DIR = Path(os.environ.get("HERMES_TEST_SKILL_GATE_DIR") or "/nonexistent/skill-gate")
 
 EXPECTED_RECORD_FIELDS = {
@@ -164,8 +165,9 @@ def _evaluate(
 
 
 # ---------------------------------------------------------------------------
-# Byte-identity parity with the skill-gate porting source (skipped unless
-# HERMES_TEST_SKILL_GATE_DIR names a read-only plugin checkout)
+# Byte-identity parity with the skill-gate porting source: a vendored snapshot
+# (always), and a live checkout (skipped unless HERMES_TEST_SKILL_GATE_DIR names
+# a read-only plugin checkout)
 # ---------------------------------------------------------------------------
 
 
@@ -198,6 +200,21 @@ def test_verbatim_parity_with_skill_gate_plugin():
     match = _re.search(r"_OWNER_ENV_MAP = \{(.*?)\}", init_src, _re.DOTALL)
     assert match is not None
     assert eval("{" + match.group(1) + "}") == mr_mod._OWNER_ENV_MAP
+
+
+def test_classifier_core_matches_the_benched_snapshot():
+    """The classifier core is pinned to the skill-gate bench winner (PATCHES.md #34: changing it requires
+    the 230+120 bench rerun). The snapshot in tests/fixtures was read statically from the skill-gate repo
+    (provenance inside), so this hermetic check runs in every suite run; the opt-in test above compares
+    a live checkout. A deliberate change after a bench rerun updates the snapshot with it."""
+    fixture = Path(__file__).resolve().parents[1] / "fixtures" / "skill_gate_classifier_core.json"
+    core = json.loads(fixture.read_text(encoding="utf-8"))
+    assert mr_mod.DEV_SYSTEM_PROMPT == core["DEV_SYSTEM_PROMPT"]
+    assert mr_mod.DEV_RESPONSE_SCHEMA == core["DEV_RESPONSE_SCHEMA"]
+    for name in ("DEV_CANDIDATE_RE", "FRONTEND_FALLBACK_RE", "CONTINUATION_RE"):
+        regex = getattr(mr_mod, name)
+        assert {"pattern": regex.pattern, "flags": int(regex.flags)} == core[name], name
+    assert mr_mod._OWNER_ENV_MAP == core["_OWNER_ENV_MAP"]
 
 
 # ---------------------------------------------------------------------------
