@@ -1375,7 +1375,7 @@ class GatewayInboundMixin(
 
         # Trusted pre-dispatch runtime directives apply only after auth and after the
         # emergency-stop gate has decided this event may proceed.
-        self._hm_apply_runtime_override_directives(event, source)
+        await self._hm_apply_runtime_override_directives(event, source)
 
         _quick_key = self._session_key_for_source(source)
         _reply = None if is_internal else await self._hm_pending_reply_intercepts(event, source, _quick_key)

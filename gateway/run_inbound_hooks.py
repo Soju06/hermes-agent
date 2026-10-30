@@ -155,14 +155,31 @@ class GatewayInboundHooksMixin:
             event._hermes_runtime_override_directives = _runtime_override_directives
         return event
 
-    def _hm_apply_runtime_override_directives(self, event: MessageEvent, source: SessionSource) -> None:
+    async def _hm_apply_runtime_override_directives(self, event: MessageEvent, source: SessionSource) -> None:
         """Apply ``runtime_override`` directives staged by ``_hm_pre_gateway_dispatch_hook``. Called only
-        after auth and after the emergency-stop gate decided this event may proceed."""
+        after auth and after the emergency-stop gate decided this event may proceed.
+
+        Off the owner loop like ``/model``: ``switch_model`` can hit a synchronous models.dev fetch on a
+        cold cache and the durable runtime_* write is a routing-index save (``to_thread`` carries the
+        profile ContextVars). The code-skew guard ``/model`` runs first refuses the model half of a
+        directive on a stale process; its reasoning half still applies."""
         directives = getattr(event, "_hermes_runtime_override_directives", None)
         if not directives:
             return
+        from gateway.slash_commands_model import _model_switch_skew_guard
+        _model_keys = ("model", "raw_input", "provider", "explicit_provider")
+        with contextlib.suppress(Exception):
+            # Created here, on the loop: the worker below only sets this session's fields.
+            self._session_state(self._session_key_for_source(source))
+        _skew = None
         for _directive in directives:
-            self._apply_gateway_runtime_override(_directive, source)
+            if isinstance(_directive, dict) and any(str(_directive.get(k) or "").strip() for k in _model_keys):
+                if _skew is None:
+                    _skew = _model_switch_skew_guard() or ""
+                if _skew:
+                    logger.warning("pre_gateway_dispatch runtime_override model switch refused: %s", _skew)
+                    _directive = {k: v for k, v in _directive.items() if k not in _model_keys}
+            await asyncio.to_thread(self._apply_gateway_runtime_override, _directive, source)
 
     def _hm_quick_commands(self) -> dict:
         """User-defined ``quick_commands`` mapping from config (empty dict when unset/malformed)."""

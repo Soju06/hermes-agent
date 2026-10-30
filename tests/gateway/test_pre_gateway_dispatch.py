@@ -207,6 +207,86 @@ async def test_hook_runtime_override_does_not_apply_before_auth(monkeypatch):
     assert runner._session_model_overrides == {}
 
 
+def _runtime_override_hook(**directive):
+    async def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            return [{"action": "runtime_override", **directive}]
+        return []
+    return _fake_hook
+
+
+def _fake_switch_result(**_kwargs):
+    return SimpleNamespace(
+        success=True, new_model="gpt-5.5", target_provider="codex-nekos", api_key="test-key",
+        base_url="https://codex.nekos.me/v1", api_mode="codex_responses", provider_label="codex-nekos",
+        error_message="",
+    )
+
+
+@pytest.mark.asyncio
+async def test_hook_runtime_override_resolves_and_persists_off_the_owner_loop(monkeypatch):
+    """Bug class of tests/gateway/test_owner_loop_writes_class.py: the directive's ``switch_model``
+    (a cold models.dev fetch) and its durable runtime_* write (a routing-index save) run off the
+    owner loop, as upstream's ``/model`` resolves its switch (2026-10-30 sync review)."""
+    import threading
+
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+    threads = {}
+
+    def _switch(**kwargs):
+        threads["switch_model"] = threading.get_ident()
+        return _fake_switch_result(**kwargs)
+
+    monkeypatch.setattr("hermes_cli.plugins.ainvoke_hook", _runtime_override_hook(
+        model="gpt-5.5", provider="codex-nekos", reasoning_effort="high"))
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", _switch)
+    monkeypatch.setattr("gateway.slash_commands_model._model_switch_skew_guard", lambda: None)
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner.session_store.update_runtime_override.side_effect = (
+        lambda *a, **k: threads.setdefault("persist", threading.get_ident()))
+
+    async def _capture(event, source, _quick_key, _run_generation):
+        threads["loop"] = threading.get_ident()
+        return "ok"
+
+    runner._handle_message_with_agent = _capture  # noqa: SLF001
+    await runner._handle_message(_make_event("route me"))
+
+    assert threads["switch_model"] != threads["loop"]
+    assert threads["persist"] != threads["loop"]
+    session_key = runner._session_key_for_source(_make_event().source)  # noqa: SLF001
+    assert runner._session_model_overrides[session_key]["model"] == "gpt-5.5"  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_hook_runtime_override_model_half_is_refused_under_code_skew(monkeypatch):
+    """The ``/model`` code-skew guard covers the directive's model switch; its reasoning half applies."""
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+    switch_calls = []
+    monkeypatch.setattr("hermes_cli.plugins.ainvoke_hook", _runtime_override_hook(
+        model="gpt-5.5", provider="codex-nekos", reasoning_effort="high"))
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model",
+                        lambda **kwargs: switch_calls.append(kwargs) or _fake_switch_result())
+    monkeypatch.setattr("gateway.slash_commands_model._model_switch_skew_guard", lambda: "stale code")
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    captured = {}
+
+    async def _capture(event, source, _quick_key, _run_generation):
+        session_key = runner._session_key_for_source(source)  # noqa: SLF001
+        captured["model_override"] = runner._session_model_overrides.get(session_key)  # noqa: SLF001
+        captured["reasoning_override"] = runner._session_reasoning_overrides.get(session_key)  # noqa: SLF001
+        return "ok"
+
+    runner._handle_message_with_agent = _capture  # noqa: SLF001
+    await runner._handle_message(_make_event("route me"))
+
+    assert switch_calls == []
+    assert captured["model_override"] is None
+    assert captured["reasoning_override"] == {"enabled": True, "effort": "high"}
+
+
 @pytest.mark.asyncio
 async def test_hook_allow_falls_through_to_auth(monkeypatch):
     """A plugin returning {'action': 'allow'} continues to normal dispatch."""
