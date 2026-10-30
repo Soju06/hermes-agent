@@ -1016,6 +1016,9 @@ class TestShadowRunEndToEnd:
         allowed |= {f for f in new_files
                     if f.endswith(".curator-watermark.json")}
         allowed |= {f for f in new_files if f.startswith("logs/")}
+        # Hermes' own temp space (hermes_constants.get_scratch_dir): its first use in a process
+        # stamps cache/scratch/.last_prune. Housekeeping, not curator output.
+        allowed |= {f for f in new_files if f.startswith("cache/scratch/")}
         assert new_files <= allowed, f"unexpected writes: {new_files - allowed}"
         assert not (home / "notes").exists()
 
@@ -1025,6 +1028,36 @@ class TestShadowRunEndToEnd:
             parent, session_id=sid, trigger="test", mode="cold",
         )
         assert second["result"] == "skipped-no-spans"
+
+    def test_fork_teardown_releases_clients_without_closing_the_shared_session(self, shadow_run_env, monkeypatch):
+        """The fork shares the parent's live session_id, so close() / shutdown_memory_provider() would
+        tear down that session's processes, VM, browser and context-engine state (the hazard upstream
+        fcd5bbb3fb fixed for the background review fork): only the fork's clients are released."""
+        parent, mm, provider, handler, home = shadow_run_env
+        sid = parent.session_id
+        PendingTurnWAL().append_turn(sid, "배포는 금요일에 하지 않는다", "알겠어")
+        calls = []
+        real_build = ic._build_curator_fork
+
+        def _build(agent, **kwargs):
+            fork, routed, model_used = real_build(agent, **kwargs)
+            assert fork is not parent and fork.session_id == sid
+            release = fork.release_clients
+            fork.close = lambda: calls.append("close")
+            fork.shutdown_memory_provider = lambda *_a, **_k: calls.append("shutdown_memory_provider")
+            fork.release_clients = lambda: (calls.append("release_clients"), release())
+            return fork, routed, model_used
+
+        monkeypatch.setattr(ic, "_build_curator_fork", _build)
+        handler.response_queue.append(_text_resp(json.dumps({
+            "spans": [{"span_ref": "turn:whatever", "verdict": "NOOP"}]
+        })))
+
+        record = ic.run_ingest_curation(parent, session_id=sid, trigger="test", mode="cold")
+
+        assert record["result"] == "verdict"
+        assert calls == ["release_clients"]
+        assert provider.write_calls() == []
 
     def test_memory_search_read_stays_callable_from_fork_recipe(self, shadow_run_env):
         parent, mm, provider, handler, home = shadow_run_env

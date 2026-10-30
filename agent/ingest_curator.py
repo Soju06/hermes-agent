@@ -1285,12 +1285,12 @@ def _run_curator_fork(
                 "cache_read": getattr(fork, "session_cache_read_tokens", None),
                 "total": getattr(fork, "session_total_tokens", None),
             }
+            # The fork shares the parent's live session_id: shutdown_memory_provider() and close()
+            # are session-bound (close() kills that session's terminal processes and tears down
+            # its VM/browser), so release only the fork's own clients, as upstream's background
+            # review fork does (fcd5bbb3fb).
             try:
-                fork.shutdown_memory_provider()
-            except Exception:
-                pass
-            try:
-                fork.close()
+                fork.release_clients()
             except Exception:
                 pass
             fork = None
@@ -1307,11 +1307,7 @@ def _run_curator_fork(
             try:
                 with thread_scoped_silence():
                     try:
-                        fork.shutdown_memory_provider()
-                    except Exception:
-                        pass
-                    try:
-                        fork.close()
+                        fork.release_clients()
                     except Exception:
                         pass
             except Exception:

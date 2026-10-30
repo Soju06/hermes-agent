@@ -60,6 +60,8 @@ FANOUTS = {
     "on_memory_write": lambda m, t: m.on_memory_write("add", "memory", _LEAK, metadata={"old_text": _LEAK}),
     # Fork: ADR-004 notes-tier backfill (agent.memory_pipeline) is a provider fan-out too.
     "sync_note_backfill": lambda m, t: m.sync_note_backfill("decision/db.md", f"note {_LEAK}", metadata={"quote": _LEAK}),
+    # Fork: ADR-004 ingest-curator cutover seam (agent.ingest_curator.submit_curated).
+    "sync_curated_episode": lambda m, t: m.sync_curated_episode(f"episode {_LEAK}", metadata={"quote": _LEAK}),
 }
 
 

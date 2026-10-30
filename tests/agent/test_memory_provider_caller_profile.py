@@ -341,6 +341,17 @@ def test_note_backfill_from_another_profiles_scope_is_refused(homes, caplog):
     assert _refused_hooks(caplog) == {"note_backfill"}
 
 
+def test_curated_ingest_from_another_profiles_scope_is_refused(homes, caplog):
+    # Fork: the ADR-004 ingest-curator cutover seam is a provider write with its own guard.
+    alpha_home, beta_home = homes
+    alpha = _manager(alpha_home)
+    with _Scope(beta_home):
+        alpha.sync_curated_episode("a curated episode", session_id="s")
+        _drain(alpha)
+    assert _InstanceScopedProvider.events == []
+    assert _refused_hooks(caplog) == {"curated_ingest"}
+
+
 def test_multiplexed_lifecycle_hooks_without_a_caller_scope_are_refused(homes, multiplexed, monkeypatch, caplog):
     alpha_home, _ = homes
     monkeypatch.setenv("HERMES_HOME", str(alpha_home))
