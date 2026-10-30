@@ -14,6 +14,8 @@ Real completion traffic feeds the model-routes health cache:
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from agent.passive_provider_health import (
     PASSIVE_UNHEALTHY_REASONS,
     note_provider_success,
@@ -308,6 +310,115 @@ class TestSuccessHook:
         with patch("hermes_cli.model_routes.has_unhealthy_verdicts",
                    side_effect=RuntimeError("boom")):
             note_provider_success(agent)  # must not raise
+
+
+# ── Success sites ──────────────────────────────────────────────────────────
+
+
+def _chunk(content=None, finish_reason=None):
+    delta = SimpleNamespace(content=content, tool_calls=None, reasoning_content=None, reasoning=None)
+    return SimpleNamespace(
+        choices=[SimpleNamespace(index=0, delta=delta, finish_reason=finish_reason)],
+        model=None, usage=None,
+    )
+
+
+def _good_anthropic_stream():
+    stream = MagicMock()
+    stream.__iter__ = MagicMock(return_value=iter([SimpleNamespace(type="message_stop")]))
+    message = MagicMock(content=[], stop_reason="end_turn")
+    message.usage = SimpleNamespace(input_tokens=10, output_tokens=5)
+    stream.get_final_message = MagicMock(return_value=message)
+    cm = MagicMock()
+    cm.__enter__ = MagicMock(return_value=stream)
+    cm.__exit__ = MagicMock(return_value=False)
+    return cm
+
+
+class TestEveryCompletionSuccessSiteClearsVerdicts:
+    """Each production success path calls note_provider_success exactly once for the agent
+    that just completed. Patched where production reads it (the module attribute behind
+    ``_passive_health.``), because under pytest the real gate is closed and a dropped
+    hook would otherwise pass unnoticed."""
+
+    @pytest.fixture
+    def note(self):
+        with patch("agent.passive_provider_health.note_provider_success") as note_mock:
+            yield note_mock
+
+    def test_nonstream_request(self, note):
+        agent = _make_agent()
+        agent.client.chat.completions.create.return_value = MagicMock(choices=[MagicMock()])
+        assert agent._interruptible_api_call({"model": "m", "messages": []}) is not None
+        note.assert_called_once_with(agent)
+
+    def test_nonstream_failure_does_not_count_as_success(self, note):
+        agent = _make_agent()
+        agent.client.chat.completions.create.side_effect = RuntimeError("HTTP 503")
+        with pytest.raises(RuntimeError):
+            agent._interruptible_api_call({"model": "m", "messages": []})
+        note.assert_not_called()
+
+    def test_direct_api_call(self, note):
+        agent = _make_agent()
+        agent.platform = "cron"  # cron turns run the request inline (direct_api_call)
+        client = MagicMock()
+        client.chat.completions.create.return_value = SimpleNamespace(id="direct", choices=[])
+        with (
+            patch.object(agent, "_create_request_openai_client", return_value=client),
+            patch.object(agent, "_close_request_openai_client"),
+        ):
+            assert agent._interruptible_api_call({"model": "m", "messages": []}).id == "direct"
+        note.assert_called_once_with(agent)
+
+    def test_streaming_call_success(self, note):
+        agent = _make_agent()
+        agent.api_mode = "anthropic_messages"
+        agent._anthropic_client = MagicMock()
+        agent._anthropic_client.messages.stream.return_value = _good_anthropic_stream()
+        agent._create_request_anthropic_client = lambda *a, **k: agent._anthropic_client
+        assert agent._interruptible_streaming_api_call({}) is not None
+        note.assert_called_once_with(agent)
+
+    def test_streaming_partial_delivery_stub(self, note, monkeypatch):
+        """Deltas reached the user before the stream died: the provider was responsive, so
+        the partial-stream stub path counts as a success."""
+        from hermes_constants import PARTIAL_STREAM_STUB_ID
+
+        def _dies_mid_answer(*_args, **_kwargs):
+            def _stream():
+                yield _chunk(content="Partial answer so far")
+                raise RuntimeError("simulated upstream stall")
+            return _stream()
+
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "0")
+        agent = _make_agent()
+        agent.api_mode = "chat_completions"
+        agent.stream_delta_callback = lambda _text: None
+        client = MagicMock()
+        client.chat.completions.create.side_effect = _dies_mid_answer
+        with (
+            patch.object(agent, "_create_request_openai_client", return_value=client),
+            patch.object(agent, "_close_request_openai_client"),
+        ):
+            response = agent._interruptible_streaming_api_call({})
+        assert response.id == PARTIAL_STREAM_STUB_ID
+        note.assert_called_once_with(agent)
+
+    def test_bedrock_stream(self, note):
+        agent = _make_agent()
+        agent.api_mode = "bedrock_converse"
+        client = MagicMock()
+        client.converse_stream.return_value = {"stream": [
+            {"messageStart": {"role": "assistant"}},
+            {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"text": "hi"}}},
+            {"messageStop": {"stopReason": "end_turn"}},
+            {"metadata": {"usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}}},
+        ]}
+        with patch("agent.bedrock_adapter._get_bedrock_runtime_client", return_value=client):
+            response = agent._interruptible_streaming_api_call({"modelId": "m", "messages": []})
+        assert response.choices[0].message.content == "hi"
+        note.assert_called_once_with(agent)
 
 
 # ── Helper robustness ──────────────────────────────────────────────────────
