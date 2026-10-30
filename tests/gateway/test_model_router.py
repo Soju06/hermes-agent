@@ -2471,7 +2471,15 @@ def test_enforce_apply_model_path_parity(monkeypatch, tmp_path):
     (``_record_model_switch``): the session-DB write carries the route (provider, base_url, api_mode;
     resume must not send the new model to the old host), the override keeps request_overrides and
     capabilities, the store write-through matches, and a pending ``/model --once`` restore is dropped
-    so the turn end does not revert the switch. The router's own note names the route."""
+    so the turn end does not revert the switch. The router's own note names the route.
+
+    The ``dev`` route carries ``reasoning_effort: xhigh``, so the typed twin is upstream's
+    ``/model model-a --reasoning xhigh`` messaging commit (``_record_model_switch``, then
+    ``_apply_reasoning_selection``; see ``_commit_model_switch_locked``). Both leave the same session
+    reasoning override. The router's write-through additionally carries that reasoning as
+    ``reasoning_config`` so it survives a restart with the route (#80); that key is the only
+    difference from the typed record."""
+    from gateway.run import _platform_config_key
     from gateway.slash_commands_model import _ModelSwitchContext
     from hermes_cli.model_switch import ModelSwitchResult
 
@@ -2515,6 +2523,7 @@ def test_enforce_apply_model_path_parity(monkeypatch, tmp_path):
         current_model="model-b",
     )
     asyncio.run(typed._record_model_switch(result, ctx, source=_source(), one_turn=False, picker=False))
+    typed._apply_reasoning_selection("tg:c1", _platform_config_key(_source().platform), "xhigh")
 
     routed_write = routed.session_store.persistence.aio.sessions.update_model
     typed_write = typed.session_store.persistence.aio.sessions.update_model
@@ -2525,8 +2534,17 @@ def test_enforce_apply_model_path_parity(monkeypatch, tmp_path):
     assert routed_override.pop("router_applied") is True
     assert "router_applied" not in typed._session_model_overrides["tg:c1"]
     assert routed_override == typed._session_model_overrides["tg:c1"]
-    assert routed.session_store.set_model_override.call_args.args[1]["router_applied"] is True
-    assert "router_applied" not in typed.session_store.set_model_override.call_args.args[1]
+    reasoning = typed._session_reasoning_overrides["tg:c1"]
+    assert reasoning == {"enabled": True, "effort": "xhigh"}
+    assert routed._session_reasoning_overrides["tg:c1"] == reasoning
+    routed_write = routed.session_store.set_model_override.call_args
+    typed_write = typed.session_store.set_model_override.call_args
+    assert routed_write.kwargs == typed_write.kwargs == {}
+    routed_key, routed_record = routed_write.args
+    typed_key, typed_record = typed_write.args
+    assert routed_key == typed_key == "tg:c1"
+    assert "reasoning_config" not in typed_record and "router_applied" not in typed_record
+    assert routed_record == {**typed_record, "reasoning_config": reasoning, "router_applied": True}
     for runner in (routed, typed):
         assert not runner._peek_session_state("tg:c1").conversation.one_turn_restore
     note = routed._pending_model_notes["tg:c1"]
