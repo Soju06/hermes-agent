@@ -124,3 +124,19 @@ def test_runtime_toolset_rides_every_selection_but_an_explicit_empty_one():
     assert "runtime" in enabled(["hermes-cli"])
     assert "runtime" in enabled(["memory"])
     assert enabled([]) == set()
+
+
+def test_a_create_time_pick_carries_runtime_only_when_it_picks_it():
+    """A session's create-time ``toolsets`` pick is frozen as exactly what was picked, as upstream's
+    ``test_follow_session_runs_the_profiles_current_toolsets_and_a_frozen_one_does_not`` pins: ``runtime``
+    rides the profile's selection (no pick) but is not recovered onto a pick that does not cover its
+    tools (2026-10-30 sync regression)."""
+    from gateway.session_policy import _resolve_toolsets
+
+    def frozen(params):
+        return _resolve_toolsets(params, {}, "cli", False)
+
+    assert "runtime" in frozen({})
+    assert "runtime" not in frozen({"toolsets": ["web"]})
+    assert "runtime" in frozen({"toolsets": ["web", "runtime"]})
+    assert "runtime" in frozen({"toolsets": ["all"]})  # a composite that covers model_status / model_switch

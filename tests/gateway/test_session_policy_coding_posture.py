@@ -9,7 +9,8 @@ FOCUS = {'agent': {'coding_context': 'focus'}, 'platform_toolsets': {'cli': ['te
 
 def picked(toolsets):
     """Fork (runtime-control): the non-configurable ``runtime`` toolset rides every non-empty profile
-    selection or pick (never the posture's own ``focus_toolsets``); these assertions are about the rest."""
+    selection (never a create-time pick that does not name it, nor the posture's own ``focus_toolsets``);
+    these assertions are about the rest."""
     return tuple(name for name in toolsets if name != 'runtime')
 
 
@@ -49,7 +50,7 @@ def test_profile_default_outside_a_workspace_or_without_focus(project, tmp_path)
 
 def test_an_explicit_pick_wins_over_the_posture(project):
     policy = create({'source': 'cli', 'cwd': str(project), 'toolsets': ['terminal']}, FOCUS)
-    assert picked(policy.toolsets) == ('terminal',)
+    assert policy.toolsets == ('terminal',)
 
 
 def test_a_following_session_keeps_the_posture_for_its_own_cwd(project):
