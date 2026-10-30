@@ -191,6 +191,47 @@ class TestFailFastLoop:
         assert calls["n"] >= 5
 
 
+class TestTerminalResultContract:
+    """The fail-fast is a terminal result like retry exhaustion: same verdict fields, same
+    status rail, so kanban recovery and the warning opt-out treat it the same way."""
+
+    def _fail_fast(self, monkeypatch):
+        import openai
+
+        def _boom(*a, **k):
+            raise openai.APIConnectionError(request=MagicMock())
+
+        monkeypatch.setenv("HERMES_FAST_CONN_FAIL_LIMIT", "3")
+        agent = _make_agent(monkeypatch)
+        agent._api_max_retries = 12
+        statuses = []
+        agent.status_callback = lambda kind, message: statuses.append((kind, message))
+        monkeypatch.setattr(agent, "_interruptible_api_call", _boom)
+        result = agent.run_conversation(user_message="hi")
+        assert "unreachable" in result["error"].lower()
+        return result, statuses
+
+    def test_result_carries_the_retryable_verdict_kanban_recovery_reads(self, monkeypatch):
+        from agent.kanban_turn_recovery import should_recover_turn
+
+        monkeypatch.delenv("HERMES_KANBAN_TURN_RECOVERY", raising=False)
+        result, _ = self._fail_fast(monkeypatch)
+
+        assert (result["failure_reason"], result["failure_retryable"]) == ("timeout", True)
+        # A briefly refused endpoint is retried in place, not cold-respawned.
+        assert should_recover_turn(result, attempt=0, task_id="t_probe") is True
+
+    def test_terminal_status_line_rides_the_diagnostic_rail(self, monkeypatch):
+        from gateway.warning_notifications import is_warning_status
+
+        _, statuses = self._fail_fast(monkeypatch)
+
+        terminal = [(k, m) for k, m in statuses if "unreachable" in str(m).lower()]
+        assert terminal, statuses
+        # display.suppress_warning_notifications hides exactly these.
+        assert all(is_warning_status(k, m) for k, m in terminal)
+
+
 class TestStreamingPath:
     """The streaming call reconnects inside one loop attempt (``HERMES_STREAM_RETRIES``,
     default 2) with a 1s/2s backoff between connects: the instant window is per connect."""

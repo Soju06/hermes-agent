@@ -17,6 +17,7 @@ import time
 from typing import Any, Optional
 
 from agent.message_sanitization import close_interrupted_tool_sequence
+from agent.turn_failure_copy import stamp_failure
 from agent.turn_recovery import _TRANSPORT_FAILURE_REASONS
 from agent.turn_retry_state import TurnRetryState
 
@@ -93,7 +94,8 @@ def fast_transport_failure_result(
         f"({agent._summarize_api_error(api_error)}). Giving up early — the endpoint "
         f"appears to be down and no fallback provider is available."
     )
-    agent._emit_status(f"❌ {msg}")
+    # Diagnostic rail, like the retry-exhaustion line: display.suppress_warning_notifications hides it.
+    agent._emit_diagnostic_status(f"❌ {msg}")
     logger.error(
         "Fail-fast after %d instant transport failures %s error=%s",
         retry.fast_transport_failures,
@@ -102,12 +104,9 @@ def fast_transport_failure_result(
     )
     close_interrupted_tool_sequence(messages, f"[System: API call aborted — {msg}]")
     agent._persist_session(messages, conversation_history)
-    return {
-        "final_response": msg,
-        "messages": messages,
-        "api_calls": api_call_count,
-        "completed": False,
-        "failed": True,
-        "error": msg,
-        "failure_reason": classified.reason.value,
-    }
+    # The classifier's retry verdict, as on retry exhaustion: kanban in-place recovery and the
+    # error surfaces key on ``failure_retryable``.
+    return stamp_failure({
+        "final_response": msg, "messages": messages, "api_calls": api_call_count,
+        "completed": False, "failed": True, "error": msg,
+    }, classified.reason.value, bool(classified.retryable))
