@@ -181,7 +181,7 @@ def handle_api_error(
         ))
 
     # Instant deaths (refused/reset before any bytes) build a fail-fast streak; slow timeouts reset it.
-    track_instant_transport_failure(_retry, classified)
+    track_instant_transport_failure(agent, _retry, classified)
     _ce = route_classified_error(
         agent, api_error, classified, _retry, error_msg=error_msg, error_context=error_context,
         recovered_with_pool=recovered_with_pool, base_url=_base, model=_model, messages=messages,

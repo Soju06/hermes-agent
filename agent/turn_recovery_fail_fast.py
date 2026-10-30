@@ -26,13 +26,29 @@ logger = logging.getLogger("agent.conversation_loop")
 _INSTANT_FAILURE_SECONDS = 2.0
 
 
-def track_instant_transport_failure(retry: TurnRetryState, classified: Any) -> None:
+def _failed_connect_seconds(agent: Any, retry: TurnRetryState) -> float:
+    """How long the failed attempt's last physical connect lived.
+
+    On the streaming wire one loop attempt is up to ``HERMES_STREAM_RETRIES + 1`` connects with
+    an interruptible reconnect backoff (1s, 2s, ...) between them, so the attempt's wall time
+    against an endpoint that refuses every connect is that backoff, not the endpoint. The
+    streaming call stamps a fresh ``_last_stream_diag`` per connect: one opened inside this
+    attempt is the measure; otherwise (non-streaming, codex passthrough) the attempt is."""
+    started = retry.attempt_started_at
+    diag = getattr(agent, "_last_stream_diag", None)
+    connect_started = diag.get("started_at") if isinstance(diag, dict) else None
+    if started and isinstance(connect_started, (int, float)) and connect_started >= started:
+        started = connect_started
+    return time.time() - started
+
+
+def track_instant_transport_failure(agent: Any, retry: TurnRetryState, classified: Any) -> None:
     """Extend the instant-failure streak on ``retry``, or reset it on any other outcome.
 
     ``attempt_started_at`` is stamped by the retry loop right before the API call; a slow
     timeout (or an unstamped attempt) resets the streak like a non-transport error does."""
     is_transport_failure = classified.reason in _TRANSPORT_FAILURE_REASONS
-    if is_transport_failure and (time.time() - retry.attempt_started_at) < _INSTANT_FAILURE_SECONDS:
+    if is_transport_failure and _failed_connect_seconds(agent, retry) < _INSTANT_FAILURE_SECONDS:
         retry.fast_transport_failures += 1
     else:
         retry.fast_transport_failures = 0
