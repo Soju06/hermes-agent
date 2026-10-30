@@ -12,9 +12,11 @@ from types import SimpleNamespace
 
 import pytest
 
-import agent.anthropic_message_convert as adapter
+import agent.anthropic_thinking_policy as policy
 from agent.anthropic_adapter import convert_messages_to_anthropic
+from agent.anthropic_thinking_replay import tracks_rejected_thinking
 from agent.transports import get_transport
+from hermes_constants import hermes_home_key, reset_hermes_home_override, set_hermes_home_override
 
 SIG = "sig-lb"
 LB = "http://10.0.0.114:2455"
@@ -22,10 +24,10 @@ OTHER_PROXY = "https://foundry.example.com/anthropic"
 
 
 @pytest.fixture(autouse=True)
-def _passthrough_urls(monkeypatch):
-    """Pin the trusted-passthrough set to the LB URL (no config.yaml I/O)."""
+def _passthrough_urls(_isolate_hermes_home, monkeypatch):
+    """Pin the active profile's trusted-passthrough set to the LB URL (no config.yaml I/O)."""
     monkeypatch.setattr(
-        adapter, "_signature_passthrough_urls_cache", frozenset({LB.lower()})
+        policy, "_signature_passthrough_urls_cache", {hermes_home_key(): frozenset({LB.lower()})}
     )
 
 
@@ -85,24 +87,42 @@ def test_unflagged_third_party_still_strips():
     assert not _latest_assistant_thinking(OTHER_PROXY)
 
 
-def test_passthrough_still_strips_non_latest_assistant_turns():
-    """Parity with direct Anthropic: only the LATEST assistant turn keeps
-    signed thinking; earlier turns are stripped (the API ignores them and
-    upstream mutation of old turns must never 400 the whole request)."""
-    messages = _tool_loop_messages() + [
-        {"role": "assistant", "content": "done: a.py is fine"},
-        {"role": "user", "content": "now check b.py"},
-    ]
-    _sys, out = convert_messages_to_anthropic(
-        messages, base_url=LB, model="claude-fable-5"
+@pytest.mark.parametrize("model", ["claude-fable-5", "claude-sonnet-4-5"])
+def test_passthrough_matches_direct_anthropic_on_earlier_turns(model):
+    """Parity with direct Anthropic on assistant turns before the in-flight
+    tool loop: a model that keeps prior thinking replays them signed, a
+    last-turn-only generation strips them, exactly as api.anthropic.com."""
+
+    def first_turn_thinking(base_url):
+        messages = _tool_loop_messages() + [
+            {"role": "assistant", "content": "done: a.py is fine"},
+            {"role": "user", "content": "now check b.py"},
+        ]
+        _sys, out = convert_messages_to_anthropic(messages, base_url=base_url, model=model)
+        assistants = [m for m in out if m.get("role") == "assistant"]
+        assert len(assistants) == 2
+        return [
+            b for b in assistants[0]["content"]
+            if isinstance(b, dict) and b.get("type") in ("thinking", "redacted_thinking")
+        ]
+
+    assert first_turn_thinking(LB) == first_turn_thinking(None)
+    assert bool(first_turn_thinking(LB)) == policy.model_preserves_prior_thinking(model)
+
+
+def test_passthrough_shares_the_native_route_with_accounting_and_signature_recovery():
+    """The flag selects the ``native`` route itself, so context accounting and the
+    signature-400 recovery (which suppresses every replay carrier) follow the
+    converter instead of treating the LB as an unknown relay."""
+    assert policy.anthropic_thinking_route(LB, "claude-fable-5") == "native"
+    assert policy.native_anthropic_preserves_prior_thinking(LB, "claude-fable-5")
+    assert tracks_rejected_thinking(
+        SimpleNamespace(api_mode="anthropic_messages", base_url=LB, model="claude-fable-5")
     )
-    assistants = [m for m in out if m.get("role") == "assistant"]
-    assert len(assistants) == 2
-    first_turn_thinking = [
-        b for b in assistants[0]["content"]
-        if isinstance(b, dict) and b.get("type") in ("thinking", "redacted_thinking")
-    ]
-    assert not first_turn_thinking
+    assert policy.anthropic_thinking_route(OTHER_PROXY, "claude-fable-5") == "third_party"
+    assert not tracks_rejected_thinking(
+        SimpleNamespace(api_mode="anthropic_messages", base_url=OTHER_PROXY, model="claude-fable-5")
+    )
 
 
 def test_config_loader_normalizes_urls(monkeypatch, tmp_path):
@@ -120,13 +140,37 @@ providers:
 """,
         encoding="utf-8",
     )
-    monkeypatch.setattr(adapter, "_signature_passthrough_urls_cache", None)
+    monkeypatch.setattr(policy, "_signature_passthrough_urls_cache", {})
     monkeypatch.setattr(
         "hermes_constants.get_config_path", lambda: cfg
     )
-    urls = adapter._get_signature_passthrough_urls()
+    urls = policy._get_signature_passthrough_urls()
     assert urls == frozenset({"http://10.0.0.114:2455"})
-    assert adapter._is_signature_passthrough_endpoint("http://10.0.0.114:2455/")
-    assert not adapter._is_signature_passthrough_endpoint(
+    assert policy._is_signature_passthrough_endpoint("http://10.0.0.114:2455/")
+    assert not policy._is_signature_passthrough_endpoint(
         "https://api.minimax.io/anthropic"
     )
+
+
+def test_flag_is_scoped_to_the_profile_that_set_it(monkeypatch, tmp_path):
+    """One process serves many profiles: a flag in one profile's config.yaml
+    never makes the same URL trusted for another profile."""
+    monkeypatch.setattr(policy, "_signature_passthrough_urls_cache", {})
+    flagged, plain = tmp_path / "profiles" / "flagged", tmp_path / "profiles" / "plain"
+    for home, flag in ((flagged, "true"), (plain, "false")):
+        home.mkdir(parents=True)
+        (home / "config.yaml").write_text(
+            f"providers:\n  claude-lb:\n    base_url: {LB}\n    anthropic_signature_passthrough: {flag}\n",
+            encoding="utf-8",
+        )
+
+    def route_under(home):
+        token = set_hermes_home_override(home)
+        try:
+            return policy.anthropic_thinking_route(LB, "claude-fable-5")
+        finally:
+            reset_hermes_home_override(token)
+
+    assert route_under(flagged) == "native"
+    assert route_under(plain) == "third_party"
+    assert route_under(flagged) == "native"
