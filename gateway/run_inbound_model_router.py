@@ -110,6 +110,11 @@ class GatewayInboundModelRouterMixin:
 
         Evaluation order:
 
+        0. a LOCAL session (CLI, TUI, Desktop served by this gateway) — return with zero work. It runs
+           its frozen launch policy: ``_resolve_session_agent_runtime`` answers from the policy before
+           any messaging override is read (``gateway/session_runtime_switch.py``), so an enforce apply
+           would be a no-op logged as applied, repeated every turn. The router routes messaging
+           sessions, the traffic its plugin-era classifier was benched on.
         1. empty/whitespace text — return with zero work (no catalog parse, no runtime snapshot, no
            thread hop, no log record).
         2. static rules match on the RAW text + source only; only a match takes the runtime snapshot
@@ -134,9 +139,12 @@ class GatewayInboundModelRouterMixin:
         every decision record.
         """
         from gateway import model_router as _model_router
+        from gateway.config import Platform
         from gateway.run import _load_gateway_config
         from hermes_cli.model_routes import load_routes as _load_model_routes
 
+        if getattr(source, "platform", None) == Platform.LOCAL:  # (0) policy-bound: see docstring
+            return
         # Route on the PRE-HOOK text: plugin hooks may have prepended advisories or rewritten
         # event.text before this stage runs, but the classifier was benched on (and the plugin-era
         # router classified) the original message — injected advisories are label noise.

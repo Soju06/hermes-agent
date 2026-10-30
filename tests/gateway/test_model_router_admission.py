@@ -2,9 +2,9 @@
 
 Every gateway boot installs a session authority, so an ordinary message is admitted to the durable
 FIFO at ingress and executed by the drain (``gateway/session_ingress.py::execute_admission``) on an
-event restored from the committed row, re-entering ``_handle_message``. Real GatewayRunner,
-adapters, SessionAuthority and drain over a real SessionDB; only the classifier, the model switch
-and the agent leg are stand-ins.
+event restored from the committed row, re-entering ``_handle_message``. Local CLI/TUI/Desktop turns
+take the same drain. Real GatewayRunner, adapters, SessionAuthority and drain over a real SessionDB;
+only the classifier, the model switch and the agent leg are stand-ins.
 """
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -125,3 +125,52 @@ async def test_a_hooked_webhook_delivery_is_classified_as_received(tmp_path, mon
 
     assert agent_saw == [f"{ADVISORY}\n\n{MESSAGE}"]
     assert classified == [MESSAGE]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["shadow", "enforce"])
+async def test_a_local_session_turn_is_never_routed(tmp_path, monkeypatch, mode):
+    """A LOCAL session (CLI, TUI, Desktop served by the gateway) runs its frozen launch policy:
+    ``_resolve_session_agent_runtime`` answers from it before any messaging override is read
+    (gateway/session_runtime_switch.py). An enforce apply into the messaging override slot would be
+    a no-op logged ``applied: true`` with a false "model was just switched" note and an agent
+    eviction on every routed turn, and shadow would pay a classifier call per local turn. Red before
+    the fix: the drained local turn was classified and, in enforce, "applied"."""
+    from gateway.config import GatewayConfig
+    from gateway.run import GatewayRunner
+    from gateway.session_authority import initialize_session_authority
+    from gateway.session_contract import Principal, Submission
+    from gateway.session_local import create_local_session
+    from gateway.session_policy import policy_for_source
+    from hermes_state import SessionDB
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    classified, switch = _router(monkeypatch, tmp_path, mode)
+    runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / "sessions"))
+    db = SessionDB(tmp_path / "state.db")
+    runner.session_store._db = runner._session_db = db
+    authority = await initialize_session_authority(runner, profile_id="default", instance_id="owner", db=db)
+    ran = []
+
+    async def turn(event, source, quick_key, run_generation):
+        ran.append(event.text)
+        return "ok"
+    monkeypatch.setattr(runner, "_handle_message_with_agent", turn)
+    try:
+        viewer = Principal("test-owner", "default", frozenset(
+            {"session:create", "session:submit", "session:read"}), "viewer")
+        ref = create_local_session(authority, viewer, dict(request_id="cli", source="cli", model="fixture",
+                                                          toolsets=[]))
+        live = authority.sessions[ref.session_id]
+        assert policy_for_source(runner, live.source) is not None  # its runtime is the frozen policy's
+        await authority.attach(viewer, ref)
+        await authority.submit(viewer, Submission("typed", ref, {"text": MESSAGE}, "queue"))
+        await async_wait_until(lambda: ran, timeout=10, what="the local turn")
+    finally:
+        db.close()
+
+    assert ran == [MESSAGE]
+    assert classified == []
+    switch.assert_not_called()
+    assert runner._session_model_overrides.get(live.route) is None
+    assert live.route not in (getattr(runner, "_pending_model_notes", None) or {})
