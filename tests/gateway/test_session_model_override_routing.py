@@ -246,10 +246,13 @@ def test_persisted_runtime_override_survives_gateway_restart(tmp_path, monkeypat
     runner = _make_runner()
     runner.session_store = store2
 
+    resolve_calls = []
+
     def fake_resolve_runtime_provider(*, requested=None, target_model=None, explicit_base_url=None, explicit_api_key=None):
         assert requested == "codex-nekos"
         assert explicit_base_url is None
         assert explicit_api_key is None
+        resolve_calls.append(target_model)
         return {
             "api_key": "runtime-secret",
             "base_url": "https://codex.nekos.me/v1",
@@ -277,6 +280,10 @@ def test_persisted_runtime_override_survives_gateway_restart(tmp_path, monkeypat
     assert runtime_kwargs["base_url"] == "https://codex.nekos.me/v1"
     assert runtime_kwargs["api_mode"] == "codex_responses"
     assert reasoning == {"enabled": True, "effort": "high"}
+    # The persisted provider is re-resolved for the persisted model, not config's model.default:
+    # model-keyed rungs (api_mode, relay base_url, pool entry) must see what the turn will send.
+    # (A later provider-only call is upstream's credential-pool lookup on the fast path.)
+    assert resolve_calls[0] == "gpt-5.5"
 
     restored = store2.get_entry(session_key)
     persisted = restored.to_dict()

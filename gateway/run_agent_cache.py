@@ -393,10 +393,13 @@ class GatewayAgentCacheMixin:
             return
         resolved: Dict[str, Any] = {"model": runtime_model or "", "provider": runtime_provider or ""}
         if runtime_provider:
-            # Re-resolve credentials/endpoint for the persisted provider id (never stored); on
-            # failure keep the credential-less override so env-based resolution layers on top.
+            # Re-resolve credentials/endpoint for the persisted provider id (never stored), keyed off
+            # the persisted model the turn will send (api_mode, relay base_url, pool entry), as the
+            # /model rehydrate above does; on failure keep the credential-less override so env-based
+            # resolution layers on top.
             try:
-                runtime = _resolve_runtime_agent_kwargs_for_provider(runtime_provider)
+                runtime = _resolve_runtime_agent_kwargs_for_provider(
+                    runtime_provider, target_model=runtime_model or None)
                 resolved.update(runtime)
                 resolved["model"] = runtime_model or runtime.get("model", "")
                 resolved["provider"] = runtime_provider
