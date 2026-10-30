@@ -318,19 +318,27 @@ class GatewayTurnProgressMixin:
         """Render a completed todo result (task statuses) into the progress bubble, replacing the
         "📋 planning N task(s)" line its tool.started event queued, so editable platforms show the
         tasks instead of only item counts."""
+        ctx = self._ctx
+        # Only where tool.started lines render as text: a queue that exists for thinking_progress
+        # alone (tool_progress off/log) or for native task cards must not grow a lone task block.
+        if not ctx.tool_progress_enabled or ctx._native_slack_task_cards:
+            return
         from tools.todo_tool import is_todo_tool_name
         if not is_todo_tool_name(tool_name):
             return
         try:
-            from agent.display import format_todo_result_for_progress, get_tool_emoji, get_tool_verb
+            from agent.display import (
+                TODO_PROGRESS_HEADER, format_todo_result_for_progress, get_tool_emoji, get_tool_verb,
+            )
             todo_progress = format_todo_result_for_progress(kwargs.get("result") or "")
             if todo_progress:
                 # Same emoji/verb resolution as _progress_build_message so the prefix matches the
-                # queued tool.started line whichever emoji the registry/skin resolved.
+                # queued tool.started line whichever emoji the registry/skin resolved. An earlier
+                # block is a target too: "new" mode drops a repeated todo call's started line.
                 emoji = get_tool_emoji(tool_name, default="⚙️")
                 verb = get_tool_verb(tool_name)
                 prefix = f"{emoji} {verb}" if verb else f"{emoji} {tool_name}"
-                self._ctx.progress_queue.put(("__replace_last_matching__", prefix, todo_progress))
+                ctx.progress_queue.put(("__replace_last_matching__", (prefix, TODO_PROGRESS_HEADER), todo_progress))
         except Exception:
             logger.debug("todo progress formatting failed", exc_info=True)
 
@@ -855,13 +863,14 @@ class GatewayTurnProgressMixin:
             st.progress_lines[-1] = _append_progress_repeat_count(base_msg, count + 1)
             return st.progress_lines[-1]
         if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__replace_last_matching__":
-            # Swap the newest line starting with ``prefix`` (e.g. the todo tool's "📋 planning ..."
-            # line) for ``replacement``; append when no such line is in the current bubble.
-            _, prefix, replacement = raw
+            # Swap the newest line starting with one of ``prefixes`` (e.g. the todo tool's
+            # "📋 planning ..." line or its earlier task block) for ``replacement``; append when no
+            # such line is in the current bubble.
+            _, prefixes, replacement = raw
             msg = str(replacement)
             replace_idx = next(
                 (idx for idx in range(len(st.progress_lines) - 1, -1, -1)
-                 if str(st.progress_lines[idx]).startswith(str(prefix))),
+                 if str(st.progress_lines[idx]).startswith(prefixes)),
                 None,
             )
             if replace_idx is None:

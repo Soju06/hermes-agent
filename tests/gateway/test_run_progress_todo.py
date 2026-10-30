@@ -2,7 +2,7 @@
 
 import pytest
 
-import tools.todo_tool  # noqa: F401  (registers the todo_list emoji the started line resolves)
+import tools.todo_tool  # registers the todo_list emoji the started line resolves
 from tests.gateway.test_run_progress_topics import _ACTIVE_ADAPTER, _run_with_agent
 from tests.waiting import wait_until
 
@@ -57,3 +57,74 @@ async def test_run_agent_progress_renders_todo_completed_result(monkeypatch, tmp
     assert "planning 2 task(s)" not in final_progress
     assert "▸ doing" in final_progress and "○ todo" in final_progress
     assert final_progress.index("📋 tasks:") < final_progress.index("pytest focused suite")
+
+
+_TODO_RESULT_UPDATED = (
+    '{"todos":[{"id":"1","content":"Inspect code","status":"completed"},'
+    '{"id":"2","content":"Run tests","status":"in_progress"}],'
+    '"summary":{"total":2,"pending":0,"in_progress":1,"completed":1,"cancelled":0}}'
+)
+
+
+class ThinkingOnlyTodoAgent:
+    """Plans with the todo tool while only thinking_progress feeds the progress queue."""
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
+        cb = self.tool_progress_callback
+        assert cb is not None
+        adapter = _ACTIVE_ADAPTER["adapter"]
+        cb("tool.started", "todo_list", "planning 2 task(s)", {"todos": [{}, {}]})
+        cb("tool.completed", "todo_list", None, None, duration=0.1, is_error=False, result=_TODO_RESULT)
+        # FIFO queue: once this later thinking line is delivered, anything queued before it was too.
+        cb("_thinking", "weighing the next step")
+        wait_until(lambda: any("weighing the next step" in m["content"] for m in adapter.sent + adapter.edits),
+                   what="the thinking line was delivered")
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+@pytest.mark.asyncio
+async def test_todo_result_stays_silent_when_tool_progress_is_off(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch, tmp_path, ThinkingOnlyTodoAgent, session_id="sess-todo-off",
+        config_data={"display": {"tool_progress": "off", "thinking_progress": True}},
+    )
+    assert result["final_response"] == "done"
+    delivered = [m["content"] for m in adapter.sent + adapter.edits]
+    assert any("weighing the next step" in content for content in delivered)
+    assert not any("📋" in content for content in delivered)
+
+
+class RepeatedTodoAgent:
+    """Calls the todo tool twice in a row; "new" mode suppresses the second started line."""
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
+        cb = self.tool_progress_callback
+        assert cb is not None
+        adapter = _ACTIVE_ADAPTER["adapter"]
+        cb("tool.started", "todo_list", "planning 2 task(s)", {"todos": [{}, {}]})
+        cb("tool.completed", "todo_list", None, None, duration=0.1, is_error=False, result=_TODO_RESULT)
+        cb("tool.started", "todo_list", "updating 2 task(s)", {"todos": [{}, {}], "merge": True})
+        cb("tool.completed", "todo_list", None, None, duration=0.1, is_error=False, result=_TODO_RESULT_UPDATED)
+        wait_until(lambda: any("1 done" in edit["content"] for edit in adapter.edits),
+                   what="the updated todo result was edited into the progress bubble")
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+@pytest.mark.asyncio
+async def test_repeated_todo_result_updates_its_block_in_new_mode(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch, tmp_path, RepeatedTodoAgent, session_id="sess-todo-new",
+        config_data={"display": {"tool_progress": "new"}},
+    )
+    assert result["final_response"] == "done"
+    final_progress = adapter.edits[-1]["content"]
+    assert final_progress.count("📋 tasks:") == 1
+    assert "1 done" in final_progress and "✓ done" in final_progress

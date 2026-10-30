@@ -512,6 +512,11 @@ def _primary_arg_preview(tool_name: str, args: dict, max_len: int) -> str | None
     return _tail_trunc(preview, max_len) if preview else None
 
 
+# First line of every block format_todo_result_for_progress renders; the gateway finds an earlier
+# block by it so a repeated todo call updates that block instead of stacking a stale one.
+TODO_PROGRESS_HEADER = "📋 tasks:"
+
+
 def format_todo_result_for_progress(
     result: str, *, max_items: int = 12, max_content_len: int = 88
 ) -> str | None:
@@ -547,7 +552,7 @@ def format_todo_result_for_progress(
         for label, count in counts.items()
         if label != "total" and count
     )
-    header = f"📋 tasks: {' · '.join(parts)}"
+    header = f"{TODO_PROGRESS_HEADER} {' · '.join(parts)}"
     markers = {
         "in_progress": ("▸", "doing"),
         "pending": ("○", "todo"),
