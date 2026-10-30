@@ -10,6 +10,7 @@ from model_tools import (
     handle_function_call,
     get_tool_definitions,
     _AGENT_LOOP_TOOLS,
+    _apply_toolset_selection,
 )
 
 
@@ -35,22 +36,39 @@ class TestDisabledToolsetsAcceptsToolNames:
         assert base - after == {"skill_view"}
 
     def test_multiple_tool_names_removed(self):
-        after = self._names(["skill_view", "memory_propose"])
-        assert "skill_view" not in after
-        assert "memory_propose" not in after
+        # Two default-surface tools that are not toolset names: every listed name leaves, nothing else.
+        wanted = {"skill_view", "search_files"}
+        base = self._names()
+        assert wanted <= base, "precondition: both tools on the default surface"
+        assert base - self._names(sorted(wanted)) == wanted
 
     def test_unknown_name_is_graceful_noop(self):
         base = self._names()
         after = self._names(["definitely_not_a_real_tool_or_toolset"])
         assert after == base
 
-    def test_toolset_name_still_takes_precedence_over_tool_name(self):
-        # `memory` is BOTH a toolset and a tool. The toolset match must win,
-        # removing the whole bundle (memory + notes_write + notes_read + …),
-        # never just the single `memory` tool.
-        after = self._names(["memory"])
-        assert "memory" not in after
-        assert "notes_read" not in after, "toolset subtraction should remove the bundle"
+    @pytest.mark.parametrize("name", ["memory", "terminal"])
+    def test_toolset_name_still_takes_precedence_over_tool_name(self, name, capsys):
+        # The names model_tools cites as BOTH a toolset and a tool. The toolset match must win,
+        # removing the whole bundle (with the memory chain: memory + notes_write + notes_read + …),
+        # never just the single same-named tool. The bundle comes from the toolset, so this does
+        # not depend on which of its tools a base registers.
+        from toolsets import resolve_toolset, validate_toolset
+        from tools.registry import registry
+
+        assert validate_toolset(name) and registry.get_entry(name) is not None, (
+            f"precondition: {name} is both a toolset and a registered tool"
+        )
+        base = self._names()
+        bundle = set(resolve_toolset(name)) & base
+        assert name in bundle, f"precondition: {name} on the default surface"
+        assert not bundle & self._names([name]), "toolset subtraction should remove the bundle"
+        # Which branch took the name, even where the bundle is the one same-named tool.
+        capsys.readouterr()
+        _apply_toolset_selection(set(base), [name], False, disable=True)
+        out = capsys.readouterr().out
+        assert f"Disabled toolset '{name}'" in out
+        assert f"Disabled tool '{name}'" not in out
 
     def test_tool_name_removes_one_tool_toolset_name_removes_bundle(self):
         # `terminal` is both a toolset (terminal + process_manage) and a tool; `process_manage`

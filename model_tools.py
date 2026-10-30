@@ -326,7 +326,7 @@ def _apply_toolset_selection(tools: set, names: list[str], quiet_mode: bool, *, 
             # tool. This lets `disabled_toolsets` turn off an individual tool
             # (e.g. `text_to_speech`, a browser action) without having to own
             # a one-tool toolset. Toolset names are matched first above, so a
-            # name that is BOTH a toolset and a tool (e.g. `memory`, `todo_list`)
+            # name that is BOTH a toolset and a tool (e.g. `memory`, `terminal`)
             # always resolves as the toolset; disable such a tool by its
             # toolset. Because every surface (CLI, gateway, cron, delegate
             # children, the tool_search bridge scope) already threads
