@@ -83,3 +83,78 @@ async def test_busy_followup_trace_is_finished_once(monkeypatch, tmp_path):
     assert len(records) == 2, f'expected one trace per turn, got {len(records)}'
     assert len({record['trace_id'] for record in records}) == 2
     assert all(record['tags']['status'] == 'ok' for record in records)
+    # The observer that sends the follow-up's reply times it like the adapter lifecycle does.
+    assert all('transport.delivery' in [span['n'] for span in record['spans']] for record in records)
+
+
+@pytest.mark.asyncio
+async def test_rewritten_turn_trace_is_finished_after_delivery(monkeypatch, tmp_path):
+    """A ``pre_gateway_dispatch`` rewrite admits a ``dataclasses.replace`` copy, which drops the
+    adapter event's ``_turn_marker_handoff`` (no marker adopter) but keeps its source: the adapter
+    lifecycle still finishes the trace after the send, and the source carries nothing afterwards."""
+    from agent import turn_trace
+    from gateway.platforms.event import MessageEvent
+
+    async def rewrite(name, **_kwargs):
+        return [{'action': 'rewrite', 'text': 'rewritten'}] if name == 'pre_gateway_dispatch' else []
+    monkeypatch.setattr('hermes_cli.lifecycle.ainvoke_hook', rewrite)
+    _authority, adapter, source, sink = await _owner(monkeypatch, tmp_path)
+    await adapter.handle_message(MessageEvent(text='one', source=source, message_id='m1'))
+    await _wait_for(lambda: adapter.sent and not adapter._background_tasks, 15)
+
+    assert adapter.sent == ['reply to rewritten']
+    records = _records(sink)
+    assert len(records) == 1
+    spans = [span['n'] for span in records[0]['spans']]
+    assert 'gateway.session_resolve' in spans
+    assert 'transport.delivery' in spans, 'the drain finished the rewritten turn before its delivery'
+    assert records[0]['tags']['status'] == 'ok'
+    assert turn_trace.get_bound(source) is None
+
+
+@pytest.mark.parametrize('raised, status', [(asyncio.CancelledError, 'cancelled'), (RuntimeError, 'error')])
+def test_raised_admission_finishes_its_trace_with_the_exit_status(monkeypatch, tmp_path, raised, status):
+    """A turn that raised in the drain has no lifecycle left to deliver it; the drain finishes the
+    trace with the adapter lifecycle's status vocabulary (a cancelled turn is not an error)."""
+    from types import SimpleNamespace
+
+    from agent import turn_trace
+    from gateway.session_ingress import _hand_over_turn_trace
+
+    sink = tmp_path / 'turn_traces.jsonl'
+    monkeypatch.setenv('HERMES_TURN_TRACE', '1')
+    monkeypatch.setenv('HERMES_TURN_TRACE_FILE', str(sink))
+    source = SimpleNamespace()
+    event = SimpleNamespace(source=source)
+    trace = turn_trace.TurnTrace(key='raised')
+    turn_trace.bind(event, trace)
+    turn_trace.bind(source, trace)
+    authority = SimpleNamespace(marker_adopters={'a1': SimpleNamespace()})
+    with pytest.raises(raised):
+        try:
+            raise raised()
+        finally:
+            _hand_over_turn_trace(authority, 'a1', event, handed=False)
+
+    assert [record['tags']['status'] for record in _records(sink)] == [status]
+    assert turn_trace.get_bound(event) is None and turn_trace.get_bound(source) is None
+
+
+def test_trace_hand_over_never_raises_into_the_drain(monkeypatch, tmp_path):
+    """It runs first in ``execute_admission``'s ``finally``, ahead of the crash-marker release and
+    the admission ContextVar resets: tracing must never break a turn."""
+    from types import SimpleNamespace
+
+    from agent import turn_trace
+    from gateway.session_ingress import _hand_over_turn_trace
+
+    class Authority:
+        @property
+        def marker_adopters(self):
+            raise RuntimeError('adopter registry unavailable')
+
+    monkeypatch.setenv('HERMES_TURN_TRACE', '1')
+    monkeypatch.setenv('HERMES_TURN_TRACE_FILE', str(tmp_path / 'turn_traces.jsonl'))
+    event = SimpleNamespace(source=SimpleNamespace())
+    turn_trace.bind(event, turn_trace.TurnTrace(key='broken'))
+    _hand_over_turn_trace(Authority(), 'a1', event, handed=True)

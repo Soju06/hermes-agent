@@ -1,6 +1,7 @@
 """Trusted messaging admission and the existing TurnRunner invocation boundary."""
 import asyncio
 import logging
+import sys
 from contextvars import ContextVar
 from contextlib import asynccontextmanager, nullcontext
 from dataclasses import replace
@@ -90,6 +91,7 @@ async def admit_message(authority, event):
         # The adapter lifecycle that sends this reply releases the turn's crash marker only once
         # the reply is in the delivery ledger; the drain hands its marker to this event.
         adopters[receipt.admission_id] = event
+    _carry_turn_trace(authority, receipt.admission_id, event)
     # A drain already running can claim, run and settle the row before this caller resumes; one
     # that settled it already sent (or owes) the reply itself and resolves no waiter registered now.
     admissions = authority_persistence(authority).admissions
@@ -102,6 +104,7 @@ async def admit_message(authority, event):
             del authority.waiters[receipt.admission_id]
         if adopters.get(receipt.admission_id) is event:
             del adopters[receipt.admission_id]
+        _trace_carriers(authority).pop(receipt.admission_id, None)
         return None if status == 'terminal' else pause_notice(authority, receipt.ref, 'unknown_execution')
     if accepted is not None and not accepted.done():
         accepted.set_result(None)
@@ -119,6 +122,7 @@ async def admit_message(authority, event):
     finally:
         if adopters.get(receipt.admission_id) is event:
             del adopters[receipt.admission_id]
+        _trace_carriers(authority).pop(receipt.admission_id, None)
 
 
 def _marker_adopters(authority):
@@ -260,27 +264,60 @@ def _hand_over_turn_trace(authority, admission_id, event, *, handed):
     """The executed turn's waterfall trace (``agent/turn_trace.py``, None unless HERMES_TURN_TRACE)
     was begun on this restored event by ``_handle_message_with_agent``; the adapter lifecycle that
     sends the reply finishes it after delivery. The waiting adopter takes it, like the crash marker;
-    with no adopter (recovered no-waiter reply, API or automation execution, a raised turn) nothing
-    else can reach it, so it is finished here."""
-    from agent import turn_trace
-    trace = _bound_turn_trace(event)
-    if trace is None:
-        return
-    turn_trace.bind(event, None)
-    turn_trace.bind(event.source, None)
-    adopter = _marker_adopters(authority).get(admission_id) if handed else None
-    if adopter is None:
-        trace.finish(status='ok' if handed else 'error')
-        return
+    without one, the source the waiter's event kept (``_carry_turn_trace``) carries it. With
+    neither (recovered no-waiter reply, API or automation execution) or a raised turn nothing else
+    can reach it, so it is finished here. Runs ahead of the drain's marker release and ContextVar
+    resets, so it never raises: tracing must never break a turn."""
     try:
-        # The restored event lost the adapter's debounce stamp; the adopter still carries it.
-        debounce_ts = getattr(adopter, '_hermes_debounce_enqueue_ts', None)
-        if debounce_ts:
-            trace.mark('transport.inbound_debounce', at=float(debounce_ts))
-            trace.tag(debounce_ms=round((trace.started_at - float(debounce_ts)) * 1000.0, 1))
+        from agent import turn_trace
+        trace = _bound_turn_trace(event)
+        if trace is None:
+            return
+        turn_trace.bind(event, None)
+        turn_trace.bind(getattr(event, 'source', None), None)
+        if not handed:
+            # Raised (``handed`` is set only on the way out of a returning turn): the adapter
+            # lifecycle's status for the same exit.
+            raised = sys.exc_info()[1]
+            trace.finish(status='cancelled' if isinstance(raised, asyncio.CancelledError) else 'error')
+            return
+        adopter = _marker_adopters(authority).get(admission_id)
+        if adopter is not None:
+            try:
+                # The restored event lost the adapter's debounce stamp; the adopter still carries it.
+                debounce_ts = getattr(adopter, '_hermes_debounce_enqueue_ts', None)
+                if debounce_ts:
+                    trace.mark('transport.inbound_debounce', at=float(debounce_ts))
+                    trace.tag(debounce_ms=round((trace.started_at - float(debounce_ts)) * 1000.0, 1))
+            except Exception:
+                pass
+            turn_trace.bind(adopter, trace)
+            return
+        carrier = _trace_carriers(authority).get(admission_id)
+        if carrier is not None and turn_trace.get_bound(carrier) is None:
+            # The waiter's lifecycle resolves event-then-source; a source still carrying another
+            # turn's trace keeps it, and this one is finished here instead.
+            turn_trace.bind(carrier, trace)
+            return
+        trace.finish(status='ok')
     except Exception:
-        pass
-    turn_trace.bind(adopter, trace)
+        logger.debug('Turn trace hand-over of admission %s failed', admission_id, exc_info=True)
+
+
+def _carry_turn_trace(authority, admission_id, event):
+    """Record the source this waiter's adapter lifecycle resolves the turn's trace from. A
+    ``pre_gateway_dispatch`` rewrite admits a ``dataclasses.replace`` copy, which drops the adapter
+    event's ``_turn_marker_handoff`` (so no marker adopter) but keeps its ``source`` object."""
+    from agent import turn_trace
+    source = getattr(event, 'source', None)
+    if source is not None and turn_trace.enabled():
+        _registry(authority, 'turn_trace_carriers')[admission_id] = source
+
+
+def _trace_carriers(authority):
+    """admission -> the waiting event's source, only while ``admit_message`` waits (never
+    created unless HERMES_TURN_TRACE is on)."""
+    return getattr(authority, 'turn_trace_carriers', {})
 
 
 def _bound_turn_trace(event):
@@ -289,13 +326,22 @@ def _bound_turn_trace(event):
     return turn_trace.get_bound(event) or turn_trace.get_bound(getattr(event, 'source', None))
 
 
+def _delivery_span(event, response):
+    """A busy follow-up observer's send, timed as the adapter lifecycle's ``transport.delivery``."""
+    trace = _bound_turn_trace(event) if response else None
+    return trace.span('transport.delivery') if trace is not None else nullcontext()
+
+
 def _finish_adopted_turn_trace(event):
     """Finish (idempotent) the trace a busy follow-up's observer adopted from the drain."""
-    from agent import turn_trace
-    trace = _bound_turn_trace(event)
-    if trace is not None:
-        trace.finish(status='ok')
-        turn_trace.bind(getattr(event, 'source', None), None)
+    try:
+        from agent import turn_trace
+        trace = _bound_turn_trace(event)
+        if trace is not None:
+            trace.finish(status='ok')
+            turn_trace.bind(getattr(event, 'source', None), None)
+    except Exception:
+        logger.debug('Finishing a busy follow-up turn trace failed', exc_info=True)
 
 
 def pause_notice(authority, ref, reason):
@@ -610,20 +656,21 @@ async def dispatch_shared_busy(adapter, event, session_key, *, durable=False):
             # The ledgered send releases the marker off the event it sends.
             _move_marker(event, delivery_event)
             delivery_event._turn_marker_handoff = event._turn_marker_handoff
-            delivered = await deliver_response(adapter, delivery_event, session_key, response)
+            with _delivery_span(event, response):  # the drain handed this turn's trace to ``event``
+                delivered = await deliver_response(adapter, delivery_event, session_key, response)
         except Exception as exc:
             if not accepted.done():
                 raise  # nothing was queued: the receive loop sees the failure as before
             logger.error('[%s] Queued busy follow-up failed: %s', adapter.name, exc, exc_info=True)
             await adapter._notify_turn_error(delivery_event, exc)
         finally:
+            _finish_adopted_turn_trace(event)  # first: the awaited releases below may raise
             settle_busy_arrival(event)
             await close_observed_turn(event, delivered)
             # Clears the marker if no ledgered send did, then wakes the drain's bounded wait,
             # which listens on the adopter (``event``).
             await adapter._release_turn_marker(delivery_event)
             await adapter._release_turn_marker(event)
-            _finish_adopted_turn_trace(event)  # the drain handed this turn's trace to ``event``
             await _run_own_post_delivery(adapter, session_key, event)
 
     token, commit_token = busy_acceptance.set(accepted), busy_commit.set(committed)
