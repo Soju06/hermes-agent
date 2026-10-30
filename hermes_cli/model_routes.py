@@ -1207,7 +1207,7 @@ def provider_health(
 _PASSIVE_WRITE_SUPPRESS_SECONDS = 5.0
 _last_passive_unhealthy_write: Dict[Tuple[str, str], float] = {}
 
-# mtime-keyed memo for has_unhealthy_verdicts() — the completion-success hook
+# stat-keyed memo for has_unhealthy_verdicts() — the completion-success hook
 # runs per API call, so steady state costs the read-only config lookup plus one
 # os.stat, not a JSON parse.
 _unhealthy_memo: Dict[str, Any] = {"mtime": None, "value": False}
@@ -1330,8 +1330,8 @@ def has_unhealthy_verdicts(health: Optional[HealthConfig] = None) -> bool:
 
     Cheap gate for the per-completion success hook: in steady state one read-only
     config lookup (cache hit, no deepcopy, no route parse) plus one ``os.stat`` of
-    the health cache (memo keyed on its mtime), a JSON parse only when the file
-    actually changed.
+    the health cache (memo keyed on its mtime, inode and size), a JSON parse only
+    when the file actually changed.
     """
     try:
         if health is None:
@@ -1342,17 +1342,20 @@ def has_unhealthy_verdicts(health: Optional[HealthConfig] = None) -> bool:
             return False
         path = health.resolved_cache_path()
         try:
-            mtime = path.stat().st_mtime_ns
+            st = path.stat()
         except OSError:
             return False
-        if _unhealthy_memo["mtime"] == (str(path), mtime):
+        # mtime alone misses a rewrite inside one coarse timestamp tick; every
+        # atomic_json_write also swaps the inode (and usually the size).
+        signature = (str(path), st.st_mtime_ns, st.st_ino, st.st_size)
+        if _unhealthy_memo["mtime"] == signature:
             return bool(_unhealthy_memo["value"])
         cache = _read_health_cache(path)
         value = any(
             isinstance(entry, dict) and not entry.get("healthy")
             for entry in cache.values()
         )
-        _unhealthy_memo["mtime"] = (str(path), mtime)
+        _unhealthy_memo["mtime"] = signature
         _unhealthy_memo["value"] = value
         return value
     except Exception:

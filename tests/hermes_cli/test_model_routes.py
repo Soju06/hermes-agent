@@ -1090,6 +1090,22 @@ def test_has_unhealthy_verdicts_memo(monkeypatch, tmp_path, health_test_env, pas
     assert mr.has_unhealthy_verdicts(health=health) is True
 
 
+def test_has_unhealthy_verdicts_sees_a_rewrite_within_one_mtime_tick(tmp_path, health_test_env, passive_state):
+    """Filesystem mtimes are coarse (one kernel tick, milliseconds), so a verdict written right
+    after the gate memoised the file can carry the SAME mtime. The gate must still see it, or a
+    live success would leave a fresh unhealthy verdict standing until fail_ttl."""
+    health = _health(tmp_path)
+    path = health.resolved_cache_path()
+    mr._store_health_verdict(path, "p1", {"healthy": True, "reason": "seeded", "ts": 1000.0})
+    assert mr.has_unhealthy_verdicts(health=health) is False
+    before = path.stat()
+
+    mr._store_health_verdict(path, "p2", {"healthy": False, "reason": "passive: overloaded", "ts": 1000.0})
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))  # same tick as the memoised read
+    assert path.stat().st_mtime_ns == before.st_mtime_ns
+    assert mr.has_unhealthy_verdicts(health=health) is True
+
+
 def test_passive_hot_path_reads_only_the_health_section(monkeypatch, tmp_path, health_test_env, passive_state):
     """The success gate runs on every API call, and the recorder and key mapping run on every
     success while a verdict is open. They read the active profile's config from the shared
