@@ -140,3 +140,67 @@ PY
         script_command = f"python3 <<PY\nimport os\nos.system('{script}')\nPY\n"
         assert scan_gateway_lifecycle(data_command, cwd=str(tmp_path)) == (False, None)
         assert scan_gateway_lifecycle(script_command, cwd=str(tmp_path)) == (True, None)
+
+    @pytest.mark.parametrize("command", [
+        # The masked payload keeps its quotes, so the rest of its line still tokenizes.
+        "python3 -c 'print(1)'; pkill python",
+        'python3 -c "print(1)" && pkill -9 python3',
+        "python3 -c 'print(1)'; taskkill /F /IM python.exe",
+        "python3 -c 'print(1)'; kill $(pidof python3)",
+        "python3 -c 'print(1)'; hermes gate\"way\" restart",
+        "python3 -c 'print(1)'; launchctl kick\"start\" -k gui/501/ai.hermes.gateway",
+        "python3 -c 'print(1)'; bash -c 'hermes gate\"way\" restart'",
+        # `python3 -c '` that the shell reads as quoted data, a comment or an argument.
+        "echo \"run python3 -c '\"; hermes gateway restart; echo \"'\"",
+        "echo hi # python3 -c '\nhermes gateway restart\necho done # '",
+        "echo python3 -c '; hermes gateway restart' | bash",
+        "echo $(date) python3 -c '; hermes gateway restart' | bash",
+        "su python3 -c '; hermes gateway restart'",
+        "x=(python3 -c '; hermes gateway restart'); eval \"${x[@]}\"",
+        "python3() { bash \"$@\"; }; python3 -c 'hermes gateway restart'",
+        "function python3 { bash \"$@\"; }; python3 -c 'hermes gateway restart'",
+        # Payload ends follow the shell's quoting rules.
+        "echo $'\\'; python3 -c '; hermes gateway restart; echo 'x'",
+        "python3 -c \"x\\\" python3 -c '\" ; hermes gateway restart ; echo '\"'",
+        "python3 -c 'python3 -c \"x' ; hermes gateway restart ; echo \"'\"",
+        # The shell runs command substitutions before Python starts.
+        "python3 -c \"print('$(hermes gateway restart)')\"",
+        "python3 <<PY\nprint(\"$(hermes gateway restart)\")\nPY\n",
+        # A python heredoc opener inside a quoted string opens no heredoc.
+        "echo \"\npython3 <<PY\n\" ; hermes gateway restart ; echo \"\nPY\n\"",
+        "su python3 <<PY\nhermes gateway restart\nPY\n",
+        # Branch E (#113667) still reads Python argv lists in a python heredoc body.
+        "python3 <<PY\nimport subprocess\nsubprocess.run([\"pkill\", \"-f\", \"python\"])\nPY\n",
+        "python3 <<PY\nimport subprocess\nsubprocess.run([\"taskkill\", \"/IM\", \"python.exe\", \"/F\"])\nPY\n",
+    ])
+    def test_shell_outside_proven_python_payloads_stays_blocked(self, tmp_path, command):
+        """Only a payload the shell lexer proves is Python is masked; every shell command around
+        it, or in text that merely looks like a payload, is still scanned."""
+        from cron.lifecycle_guard import scan_gateway_lifecycle
+
+        assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (True, None)
+
+    def test_script_after_python_payload_is_still_walked(self, tmp_path):
+        from cron.lifecycle_guard import scan_gateway_lifecycle
+
+        big = tmp_path / "big.sh"
+        big.write_text("#" * (2 * 1024 * 1024))
+
+        unsafe, refusal = scan_gateway_lifecycle(f"python3 -c 'print(1)'; {big}", cwd=str(tmp_path))
+        assert unsafe is True
+        assert refusal is not None and "scan cap" in refusal
+
+    @pytest.mark.parametrize("command", [
+        "cd /tmp && FOO=1 python3 -c \"print('run: hermes gateway restart')\"",
+        "sudo -u bob python3 -u -c 'print(\"hermes gateway restart\")'",
+        "if python3 -c 'print(\"hermes gateway stop\")'; then echo ok; fi",
+        "x=$(python3 -c \"print(\\\"hermes gateway restart\\\")\")",
+        "python3 -c 'print(1)'\npython3 - <<PY\nprint('hermes gateway restart')\nPY\n",
+        "cd /tmp && timeout 5 python3 <<PY\nprint('hermes gateway restart')\nPY\n",
+    ])
+    def test_python_payload_text_is_masked_in_every_command_position(self, tmp_path, command):
+        """Python source after env assignments, wrappers, reserved words, list operators and
+        inside `$(...)` is still interpreter data, not a shell lifecycle command."""
+        from cron.lifecycle_guard import scan_gateway_lifecycle
+
+        assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (False, None)

@@ -416,7 +416,6 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
     """
     if not text:
         return False
-    text = _shell_source_without_python_payloads(text)
     # Provably inert heredoc bodies (quoted delimiter, data-sink consumer like `cat > f <<'EOF'`)
     # are documentation, not commands. The stripper fails open on ANY ambiguity (unquoted delimiter,
     # shell consumer, unterminated body), so executable heredocs are still scanned.
@@ -428,7 +427,11 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
     # lifecycle command hide in the blanked body (#127698).
     from tools.shell_heredoc import strip_inert_heredoc_bodies
 
-    text = strip_inert_heredoc_bodies(text, mask_code_consumers=False)
+    # Branch E reads `shell_view`; every other pass also masks proven Python payloads (see
+    # `_shell_source_without_python_payloads`).
+    shell_view = strip_inert_heredoc_bodies(text, mask_code_consumers=False)
+    python_masked = _shell_source_without_python_payloads(text)
+    text = shell_view if python_masked == text else strip_inert_heredoc_bodies(python_masked, mask_code_consumers=False)
     normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
     if _GATEWAY_LIFECYCLE_PATTERN.search(normalized):
         return True
@@ -462,7 +465,7 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
     # "gui/$uid/$label"`), so neither the same-span regex nor same-segment tokenization sees verb and label
     # together. Check "verb anywhere AND label anywhere" instead.
     # Branch E (#113667): killers aimed at the interpreter image itself carry no hermes/gateway token.
-    return _contains_launchctl_gateway_lifecycle(normalized) or contains_host_interpreter_kill(normalized)
+    return _contains_launchctl_gateway_lifecycle(normalized) or contains_host_interpreter_kill(shell_view)
 
 
 def first_gateway_lifecycle_match(text: str) -> Optional[str]:
@@ -670,50 +673,234 @@ def _split_segments(tokens: list[str], *, keep_controls: bool = False) -> Iterat
         yield segment
 
 
-_PYTHON_C_RE = re.compile(
-    r"(?<!\S)(?:python|python\d+(?:\.\d+)*)\s+(?:-[^\s]+\s+)*-c\s+(['\"])",
+# --- Python payload masking -------------------------------------------------------------------
+# Python `-c` sources and Python heredoc bodies are interpreter data: shell-tokenizing them read
+# `sys.path.insert(0, '<dir>')` as a referenced script and Python strings as commands. They are
+# masked only where a shell lexer PROVES the region is such a payload, and the guard reads two views:
+# - Python-masked: the Branch A-D regex (raw and per-token), the profile-flag form and the
+#   order-independent launchctl pass in `contains_gateway_lifecycle_command`, plus the EXECUTED
+#   walk (`sh -c` payloads, referenced scripts) in `_contains_unsafe_gateway_action`;
+# - unmasked: Branch E (`contains_host_interpreter_kill` exists for Python argv-list kills too),
+#   launchctl submit/bootstrap, and the mention pass that still reads scripts named in a body.
+# Never mask inside `_iter_command_segments`: that tokenizer feeds both views.
+_PYTHON_PAYLOAD_PLACEHOLDER = "__HERMES_PYTHON_PAYLOAD__"
+_PYTHON_EXECUTABLE_RE = re.compile(r"python(?:\d+(?:\.\d+)*)?")
+# Lexer events: escapes, quotes (incl. ANSI-C `$'`), backticks, comments, control operators,
+# heredoc openers, and word starts of `python` and of `function`/`alias` (which can rebind it).
+_PAYLOAD_LEX_EVENT_RE = re.compile(
+    r"[\\'\"`#\n;&|()<]|\$'|(?<![^ \t\n;&|()])(?:python|function[ \t]|alias[ \t])"
 )
-_PYTHON_HEREDOC_RE = re.compile(
-    r"(?m)(?P<prefix>(?:^|[;&|]\s*)(?:python|python\d+(?:\.\d+)*)\s+[^\n]*<<-?\s*)(?P<quote>['\"]?)(?P<delim>[A-Za-z_][A-Za-z0-9_]*)\2\s*$"
+# `name()` / `name ()`: a function definition, which can make `python3` run a shell.
+_FUNCTION_PARENS_RE = re.compile(r"\([ \t]*\)")
+_DOUBLE_QUOTE_EVENT_RE = re.compile(r'[\\"`]|\$[({]')
+_SHELL_WORD_GAP = r"(?:[ \t]|\\\n)+"
+# From the end of the executable word: `[-opt ...] -c <opening quote>`.
+_PYTHON_C_ARGS_RE = re.compile(
+    rf"(?:{_SHELL_WORD_GAP}-[^\s'\"\\`$;&|()<>]+)*?{_SHELL_WORD_GAP}-c{_SHELL_WORD_GAP}(['\"])"
 )
+# Reserved words after which the next word is still in command position (`if python3 -c ...`).
+_SHELL_RESERVED_PREFIXES = frozenset({"!", "{", "if", "then", "elif", "else", "do", "while", "until", "time"})
+# A command-position proof tokenizes at most this much of the simple command before the word.
+_MAX_COMMAND_PREFIX_CHARS = 512
+# Wrappers whose first operand is a USER and whose `-c` / stdin is shell source (`su python3 -c ...`).
+_USER_SHELL_WRAPPERS = frozenset({"su", "runuser"})
+
+
+# Backslash-escaped spans: ANSI-C `$'...'` and backtick substitutions.
+_ESCAPED_SPAN_EVENT_RES = {"'": re.compile(r"[\\']"), "`": re.compile(r"[\\`]")}
+
+
+def _escaped_span_end(text: str, start: int, closer: str) -> Optional[int]:
+    """Index of the first unescaped *closer* at or after *start*."""
+    while (match := _ESCAPED_SPAN_EVENT_RES[closer].search(text, start)) is not None:
+        if text[match.start()] == closer:
+            return match.start()
+        start = match.start() + 2
+    return None
+
+
+def _double_quote_end(text: str, start: int) -> Optional[int]:
+    """Index of the `"` closing a double-quoted word whose body starts at *start*; None when it is
+    unclosed or its body holds a construct this lexer does not model (`$(`, a backtick, or a
+    `${...}` carrying quotes/escapes/nesting): the shell EXECUTES command substitutions there."""
+    while (match := _DOUBLE_QUOTE_EVENT_RE.search(text, start)) is not None:
+        index = match.start()
+        char = text[index]
+        if char == '"':
+            return index
+        if char == "\\":
+            start = index + 2
+            continue
+        if char == "`" or text[index + 1] == "(":
+            return None
+        close = text.find("}", index + 2)
+        if close < 0 or any(c in text[index + 2:close] for c in "'\"`$\\"):
+            return None
+        start = close + 1
+    return None
+
+
+class _PythonPayloadMasker:
+    """One pass of a small shell lexer: quotes, escapes, comments, control operators, `(`/`)`
+    nesting and heredoc bodies. A `python -c '<src>'` argument is masked only when the executable
+    word is in command position (after env assignments, transparent wrappers and reserved words);
+    a heredoc body only when its own simple command executes python and, for an unquoted
+    delimiter, the body holds no command substitution. All or nothing: an unclosed quote, a
+    heredoc without its terminator, or anything else the lexer does not model returns the command
+    unchanged, so a lexing mistake can never hide shell source from the guard."""
+
+    def __init__(self, command: str) -> None:
+        self.text = command
+        self.out: list[str] = []
+        self.copied = 0  # text[:copied] is already in `out`
+        self.command_start = 0  # start of the current simple command
+        self.enclosing: list[int] = []  # command starts suspended by an open `(`
+        # Heredocs opened on the current line: (delimiter, strip_tabs, quoted delimiter, python owner).
+        self.heredocs: list[tuple[str, bool, bool, bool]] = []
+
+    def run(self) -> str:
+        cursor: Optional[int] = 0
+        while (event := _PAYLOAD_LEX_EVENT_RE.search(self.text, cursor)) is not None:
+            cursor = self._step(event.start())
+            if cursor is None:
+                return self.text
+        if self.heredocs or not self.out:
+            return self.text
+        return "".join(self.out) + self.text[self.copied:]
+
+    def _step(self, index: int) -> Optional[int]:
+        """Consume the lexer event at *index*; the next scan offset, or None to give up."""
+        text = self.text
+        char = text[index]
+        if char == "\\":
+            return index + 2
+        if char == "'":
+            end = text.find("'", index + 1)
+            return None if end < 0 else end + 1
+        if char in "$`":  # `$'...'` (the only `$` event) or a backtick substitution
+            end = _escaped_span_end(text, index + (2 if char == "$" else 1), "'" if char == "$" else "`")
+            return None if end is None else end + 1
+        if char == '"':
+            end = _double_quote_end(text, index + 1)
+            return None if end is None else end + 1
+        if char == "#":
+            if index and text[index - 1] not in " \t\n;&|()":
+                return index + 1  # not a word start: literal
+            newline = text.find("\n", index)
+            return len(text) if newline < 0 else newline
+        if char == "\n":
+            return self._end_of_line(index)
+        if char == "<":
+            return self._heredoc_operator(index)
+        if char == "p":
+            return self._python_word(index)
+        if char in "fa":
+            return None  # `function`/`alias` may rebind `python3` (`python3() { bash; }` likewise)
+        return self._control_operator(index)
+
+    def _control_operator(self, index: int) -> Optional[int]:
+        char = self.text[index]
+        if char == "(":
+            if self.text[index - 1:index] == "=" or _FUNCTION_PARENS_RE.match(self.text, index):
+                return None  # `name=(...)` array words / a function definition: not modelled
+            self.enclosing.append(self.command_start)
+        elif char == ")" and self.enclosing:
+            # `$(...)` / `(...)` closed: the enclosing simple command resumes (`echo $(date) python3`
+            # keeps python3 an echo argument).
+            self.command_start = self.enclosing.pop()
+            return index + 1
+        elif char == "&" and (self.text[index - 1:index] in ("<", ">") or self.text[index + 1:index + 2] == ">"):
+            return index + 1  # `>&2` / `&>file` redirection, not a list operator
+        self.command_start = index + 1
+        return index + 1
+
+    def _command_words(self, end: int) -> Optional[list[str]]:
+        """Words of the current simple command before *end*, leading reserved words dropped; None
+        when they cannot be read exactly."""
+        if end - self.command_start > _MAX_COMMAND_PREFIX_CHARS:
+            return None
+        try:
+            words = _shlex_tokens(self.text[self.command_start:end].replace("\\\n", ""))
+        except ValueError:
+            return None
+        while words and words[0] in _SHELL_RESERVED_PREFIXES:
+            words.pop(0)
+        return words
+
+    @staticmethod
+    def _executed_python_index(words: Optional[list[str]]) -> Optional[int]:
+        """Index of the bare `python`/`pythonN[.M]` word the simple command *words* executes."""
+        if not words or any(_executable_name(word) in _USER_SHELL_WRAPPERS for word in words):
+            return None
+        index = _executed_command_index(words)
+        if index is None or not _PYTHON_EXECUTABLE_RE.fullmatch(words[index]):
+            return None
+        return index
+
+    def _python_word(self, index: int) -> Optional[int]:
+        text = self.text
+        word = _PYTHON_EXECUTABLE_RE.match(text, index)
+        arguments = _PYTHON_C_ARGS_RE.match(text, word.end())
+        if arguments is None:
+            return word.end()
+        words = self._command_words(index)
+        if words is None or self._executed_python_index(words + [word.group()]) != len(words):
+            return word.end()  # unprovable, or an argument (`echo python3 -c '...' | bash`)
+        quote, opening = arguments.group(1), arguments.start(1)
+        if quote == "'":
+            end = text.find("'", opening + 1)
+            end = None if end < 0 else end
+        else:
+            end = _double_quote_end(text, opening + 1)
+        if end is None:
+            return None
+        # Keep both quotes so the rest of the line still tokenizes (`python3 -c 'x'; pkill python`).
+        self.out += [text[self.copied:opening + 1], _PYTHON_PAYLOAD_PLACEHOLDER + quote]
+        self.copied = end + 1
+        return end + 1
+
+    def _heredoc_operator(self, index: int) -> Optional[int]:
+        from tools.shell_heredoc import _parse_heredoc_operator
+
+        text = self.text
+        if text.startswith("<<<", index):
+            return index + 3
+        if not text.startswith("<<", index):
+            return index + 1
+        parsed = _parse_heredoc_operator(text, index)
+        if parsed is None:
+            return None
+        end, delimiter, strip_tabs, quoted = parsed
+        python_owner = self._executed_python_index(self._command_words(index)) is not None
+        self.heredocs.append((delimiter, strip_tabs, quoted, python_owner))
+        return end
+
+    def _end_of_line(self, index: int) -> Optional[int]:
+        """An unquoted newline ends the command line; the bodies of its heredocs follow in order."""
+        from tools.shell_heredoc import _find_heredoc_close
+
+        text = self.text
+        body = index + 1
+        for delimiter, strip_tabs, quoted, python_owner in self.heredocs:
+            close = _find_heredoc_close(text, body, delimiter, strip_tabs)
+            if close is None:
+                return None
+            # An unquoted delimiter expands the body: `$(...)` / backticks there run as shell.
+            if python_owner and (quoted or not any(m in text[body:close] for m in ("$(", "`"))):
+                self.out += [text[self.copied:body], "\n" * text.count("\n", body, close)]
+                self.copied = close
+            body = close
+        self.heredocs = []
+        self.command_start = body
+        return body
 
 
 def _shell_source_without_python_payloads(command: str) -> str:
-    """Remove only complete Python ``-c``/heredoc payloads before shell scans."""
-    if not command:
+    """*command* with every PROVEN Python ``-c`` source / Python heredoc body masked (quotes and
+    line count kept), or *command* itself when nothing is provable (see ``_PythonPayloadMasker``)."""
+    if not command or "python" not in command:
         return command
-    text = command
-    # Complete quoted -c arguments are Python source, not shell commands.
-    out: list[str] = []
-    cursor = 0
-    for match in _PYTHON_C_RE.finditer(text):
-        quote = match.group(1)
-        end = text.find(quote, match.end())
-        if end < 0:
-            continue  # fail closed on ambiguous/unclosed syntax
-        out.append(text[cursor:match.end()])
-        out.append("__HERMES_PYTHON_PAYLOAD__")
-        cursor = end + 1
-    out.append(text[cursor:])
-    text = "".join(out)
-    # Complete Python heredoc bodies are similarly opaque; preserve line
-    # boundaries so surrounding shell statements remain visible.
-    lines = text.splitlines(keepends=True)
-    sanitized: list[str] = []
-    i = 0
-    while i < len(lines):
-        m = _PYTHON_HEREDOC_RE.match(lines[i].rstrip("\r\n"))
-        if not m:
-            sanitized.append(lines[i]); i += 1; continue
-        delim = m.group("delim"); j = i + 1
-        while j < len(lines) and lines[j].strip() != delim:
-            j += 1
-        if j >= len(lines):
-            sanitized.append(lines[i]); i += 1; continue
-        sanitized.append(lines[i])
-        sanitized.extend("\n" if line.endswith("\n") else "" for line in lines[i+1:j+1])
-        i = j + 1
-    return "".join(sanitized)
+    return _PythonPayloadMasker(command).run()
 
 
 def _iter_command_segments(command: str) -> Iterator[list[str]]:
