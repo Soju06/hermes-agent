@@ -1658,6 +1658,21 @@ def _translate_anthropic_response_format(anthropic_kwargs: dict[str, Any], respo
     output_config["format"] = {"type": "json_schema", "schema": schema}
 
 
+def _anthropic_native_shape(response: Any) -> Optional[Dict[str, Any]]:
+    """Content-free shape of a native Anthropic response: raw ``stop_reason`` and block-type counts.
+    The chat.completions shim below drops both, and failure diagnostics (an empty compression
+    summary) need them to tell a structured refusal from a reasoning-only turn. Never carries block
+    text. ``None`` when unreadable."""
+    try:
+        counts: Dict[str, int] = {}
+        for block in getattr(response, "content", None) or []:
+            kind = str(_field(block, "type") or "unknown")[:40]
+            counts[kind] = counts.get(kind, 0) + 1
+        return {"stop_reason": str(getattr(response, "stop_reason", None) or "")[:40] or None, "block_types": counts}
+    except Exception:
+        return None
+
+
 class _AnthropicCompletionsAdapter:
     """OpenAI-client-compatible adapter for Anthropic Messages API."""
 
@@ -1770,7 +1785,9 @@ class _AnthropicCompletionsAdapter:
             message=SimpleNamespace(content=_nr.content, tool_calls=_nr.tool_calls, reasoning=_nr.reasoning),
             finish_reason=_nr.finish_reason,
         )
-        return SimpleNamespace(choices=[choice], model=model, usage=usage)
+        return SimpleNamespace(
+            choices=[choice], model=model, usage=usage, native_shape=_anthropic_native_shape(response),
+        )
 
 
 class AnthropicAuxiliaryClient:

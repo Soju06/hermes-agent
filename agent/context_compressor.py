@@ -177,6 +177,40 @@ def _response_finish_reason(response: Any) -> str:
         return ""
 
 
+def _empty_summary_response_shape(response: Any) -> str:
+    """Content-free shape of a summary response judged empty: why it ended and what it held.
+
+    Kinds, counts, lengths and token totals only, never summary, reasoning or prompt text. One line of
+    this tells a structured refusal (``content_filter`` / ``stop_reason=refusal``) from a reasoning-only
+    turn (``stop`` / ``end_turn`` with only thinking blocks). ``native_shape`` is set by the Anthropic
+    aux adapter; other wires report ``unknown`` there and the char lengths still apply.
+    """
+    def field(obj: Any, name: str) -> Any:
+        return obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
+
+    def chars(value: Any) -> Any:
+        return len(value) if isinstance(value, str) else ("none" if value is None else type(value).__name__)
+
+    native = field(response, "native_shape")
+    native = native if isinstance(native, dict) else {}
+    blocks = native.get("block_types")
+    if isinstance(blocks, dict):
+        blocks = ",".join(f"{kind}:{count}" for kind, count in sorted(blocks.items())) or "none"
+    else:
+        blocks = "unknown"
+    tokens = field(field(response, "usage"), "completion_tokens")
+    choices = field(response, "choices")
+    msg = field(choices[0], "message") if isinstance(choices, (list, tuple)) and choices else None
+    tool_calls = field(msg, "tool_calls")
+    return (
+        f"finish_reason={_response_finish_reason(response)[:40] or 'unknown'} "
+        f"stop_reason={native.get('stop_reason') or 'unknown'} "
+        f"output_tokens={tokens if isinstance(tokens, int) else 'unknown'} blocks={blocks} "
+        f"content_chars={chars(field(msg, 'content'))} reasoning_chars={chars(field(msg, 'reasoning'))} "
+        f"tool_calls={len(tool_calls) if isinstance(tool_calls, (list, tuple)) else 0}"
+    )
+
+
 # Marker for a length-stopped (PARTIAL) summary; the except-branch classifier keys
 # on this exact substring, so keep raise sites and classifier in sync.
 # RuntimeError marker raised when the summarizer's generation stopped on the output-token cap
@@ -3559,6 +3593,16 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         # failure so it routes through the same main-model fallback + cooldown machinery as a transport
         # error, rather than replacing real context with an empty summary.
         if not content.strip():
+            # Diagnostics only. The exception text below is matched by the failure classifier and shown
+            # to users, so the response shape goes to its own log line; it must never mask the failure.
+            try:
+                logger.warning(
+                    "Context compression summary response had no usable content: %s provider=%s model=%s",
+                    _empty_summary_response_shape(response),
+                    _aux_route.get("provider") or self.provider or "auto", _aux_model or "unknown",
+                )
+            except Exception:
+                logger.debug("Empty-summary diagnostics failed", exc_info=True)
             raise RuntimeError(f"Context compression LLM returned empty content {where}")
         if _is_refusal_response(response, content):
             # Treat a refusal as unusable content. This deliberately reuses the
