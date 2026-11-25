@@ -782,9 +782,10 @@ def _is_temporary_file_failure(failure) -> bool:
 
 
 def _retired_cjk_snapshot_health(db_path: Path, conn: sqlite3.Connection) -> Optional[str]:
-    """``_db_opens_cleanly`` for a store that still holds the retired CJK index, judged on a disposable copy
-    with the index retired. A copy that cannot be made or does not fit the temporary volume yields
-    ``HealthCheckUnavailable``; a source SQLite cannot read is still reported as damage."""
+    """``_db_opens_cleanly`` for a store that still holds the retired CJK index or the ``messages_fts_v2`` index
+    before it, judged on a disposable copy with both retired. A copy that cannot be made or does not fit the
+    temporary volume yields ``HealthCheckUnavailable``; a source SQLite cannot read is still reported as damage."""
+    from persistence.sqlite._fts_v2_retirement import drop_retired_fts_v2
     from persistence.sqlite._schema import drop_retired_cjk_index
 
     try:
@@ -802,6 +803,7 @@ def _retired_cjk_snapshot_health(db_path: Path, conn: sqlite3.Connection) -> Opt
             with contextlib.closing(probe):
                 try:
                     drop_retired_cjk_index(probe.cursor())
+                    drop_retired_fts_v2(probe.cursor())
                 except sqlite3.Error as exc:
                     # Retiring is what the next open runs, so a failure is the store's state (a damaged base
                     # FTS index trips the rename's trigger validation) unless the temporary file itself failed.
@@ -831,6 +833,7 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
 
     See #50502.
     """
+    from persistence.sqlite._fts_v2_retirement import retired_fts_v2_present
     from persistence.sqlite._schema import _is_fts5_unavailable_error, retired_cjk_index_present
     # ── Strategy 0.5: rebuild stale B-tree indexes (#63386) ── PRAGMA integrity_check can report "wrong #
     # of entries in index" when a B-tree index (e.g. idx_sessions_handoff_state) falls out of sync with its
@@ -841,7 +844,7 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
         with contextlib.closing(conn):
             conn.execute("PRAGMA journal_mode").fetchone()
             # Retirement must not hold the live write lock across a full integrity scan.
-            if retired_cjk_index_present(conn.cursor()):
+            if retired_cjk_index_present(conn.cursor()) or retired_fts_v2_present(conn.cursor()):
                 return _retired_cjk_snapshot_health(db_path, conn)
             rows = conn.execute("PRAGMA integrity_check").fetchall()
             problems = [str(r[0]) for r in rows if r and str(r[0]).lower() != "ok"]

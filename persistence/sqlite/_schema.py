@@ -1073,6 +1073,7 @@ def _init_schema(holder: StoreHolder):
     # the lease duration. Per-chunk renewal would shrink that, but adds complexity to the migration
     # loops for a rare failure mode.
     report_startup_progress(600.0, phase="state_db_init_schema")
+    from persistence.sqlite._fts_v2_retirement import drop_retired_fts_v2
     from persistence.sqlite.conversation._store.legacy_refusal import (
         LEGACY_REFUSAL_REPAIR_DONE, advance_legacy_refusal_repair,
     )
@@ -1086,6 +1087,9 @@ def _init_schema(holder: StoreHolder):
             "`hermes sessions optimize-storage` reclaims its disk space. "
             "%s is no longer loaded and can be deleted.", holder.db_path.parent / "lib" / "libfts5_cjk.so",
         )
+    if drop_retired_fts_v2(cursor):  # same tokenizer, the generation before messages_fts_cjk
+        logger.warning("Removed the retired messages_fts_v2 index. "
+                       "`hermes sessions optimize-storage` reclaims its disk space.")
 
     # Column reconciliation, then the two table-shape repairs ADD COLUMN cannot express.
     _reconcile_columns(cursor, holder.db_path.parent)
