@@ -34,7 +34,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_constants import get_hermes_home, parse_reasoning_effort, VALID_REASONING_EFFORTS
-from hermes_cli.config import ConfigIssue, get_compatible_custom_providers, load_config
+from hermes_cli.config import get_compatible_custom_providers, load_config
+from hermes_cli.config_issues import ConfigIssue
 from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
