@@ -253,12 +253,12 @@ class TestTranscriptSettlement:
     boundary closers instead of a model-visible error row."""
 
     def test_tool_round_tail_is_closed_by_the_failed_turn_boundary(self, monkeypatch, tmp_path):
-        from hermes_state import SessionDB
         from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND, PARTIAL_FAILED_TURN_NOTICE
+        from persistence_assembly import open_persistence, profile_scope
 
         monkeypatch.setenv("HERMES_FAST_CONN_FAIL_LIMIT", "3")
-        db = SessionDB(db_path=tmp_path / "state.db")
-        agent = _make_agent(monkeypatch, session_db=db, session_id="fail-fast-tool-tail")
+        db = open_persistence(profile_scope(home=tmp_path))
+        agent = _make_agent(monkeypatch, persistence=db, session_id="fail-fast-tool-tail")
         agent._api_max_retries = 12
         tool_call = SimpleNamespace(
             id="call_1", type="function", function=SimpleNamespace(name="web_search", arguments="{}"),
@@ -276,7 +276,8 @@ class TestTranscriptSettlement:
         assert (tail["role"], tail.get("display_kind"), tail["content"]) == (
             "assistant", FAILED_TURN_DISPLAY_KIND, PARTIAL_FAILED_TURN_NOTICE)
         assert not any("API call aborted" in str(m.get("content")) for m in result["messages"])
-        assert db.latest_conversation_role("fail-fast-tool-tail") == "assistant"
+        assert db.messages.latest_conversation_role("fail-fast-tool-tail") == "assistant"
+        db.close()
 
     def test_continuation_trail_collapses_into_the_delivered_partial(self, monkeypatch):
         partial = "Here is the first half of the report, already shown to the user."
