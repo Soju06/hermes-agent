@@ -1,5 +1,5 @@
-"""Tests for the slow-tool perf advisor (tools/perf_advisor.py) and its executor
-wiring (agent/tool_executor.py ``_with_perf_advisory`` / ``_commit_tool_result``)."""
+"""Tests for the slow-tool perf advisor (tools/perf_advisor.py ``perf_advisory`` /
+``with_perf_advisory``) and its executor wiring (agent/tool_executor.py ``_commit_tool_result``)."""
 
 import json
 from types import SimpleNamespace
@@ -7,8 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agent.tool_executor import _with_perf_advisory
-from tools.perf_advisor import perf_advisory
+from tools.perf_advisor import perf_advisory, with_perf_advisory
 
 
 RGLOB_CMD = (
@@ -182,7 +181,7 @@ def test_advisories_teach_only_advertised_interface(monkeypatch):
         assert "process(" not in hint
 
 
-# ── executor wiring (agent/tool_executor.py) ────────────────────────
+# ── result append and executor wiring (agent/tool_executor.py) ──────
 
 
 def _envelope(text: str) -> dict:
@@ -198,21 +197,21 @@ def _envelope(text: str) -> dict:
 
 def test_with_perf_advisory_appends_to_slow_string_result(monkeypatch):
     _no_env(monkeypatch)
-    out = _with_perf_advisory("out", "terminal", {"command": "find / -name x"}, 30.0)
+    out = with_perf_advisory("out", "terminal", {"command": "find / -name x"}, 30.0)
     assert out.startswith("out\n\n[perf-advisor]")
     assert "search_files" in out
 
 
 def test_with_perf_advisory_leaves_fast_result_unchanged(monkeypatch):
     _no_env(monkeypatch)
-    assert _with_perf_advisory("out", "terminal", {"command": "ls"}, 0.2) == "out"
-    assert _with_perf_advisory("out", "terminal", {"command": "find / -name x"}, 0.2) == "out"
+    assert with_perf_advisory("out", "terminal", {"command": "ls"}, 0.2) == "out"
+    assert with_perf_advisory("out", "terminal", {"command": "find / -name x"}, 0.2) == "out"
 
 
 def test_with_perf_advisory_multimodal_lands_on_text_part(monkeypatch):
     _no_env(monkeypatch)
     envelope = _envelope("done")
-    out = _with_perf_advisory(envelope, "terminal", {"command": "sleep 30"}, 31.0)
+    out = with_perf_advisory(envelope, "terminal", {"command": "sleep 30"}, 31.0)
     assert out is envelope
     image, text = out["content"]
     assert image == {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}}

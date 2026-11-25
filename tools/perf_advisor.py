@@ -28,13 +28,16 @@ from __future__ import annotations
 import logging
 import os
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
-__all__ = ["perf_advisory"]
+from agent.tool_dispatch_helpers import _append_subdir_hint_to_multimodal
+from session_rules.turns import _is_multimodal_tool_result
+
+__all__ = ["perf_advisory", "with_perf_advisory"]
 
 logger = logging.getLogger(__name__)
 
-_RGLOB_WALK = re.compile(r"\brglob\s*\(|\bos\.walk\s*\(|\biterdir\s*\(\s*\).*recursive", re.S)
+_RGLOB_WALK = re.compile(r"\brglob\s*\(|\bos\.walk\s*\(|\biterdir\s*\(\s*\).*recursive", re.DOTALL)
 # find rooted at a broad path (absolute, ~, or .) — pruning flags exempt it.
 _FIND_BROAD = re.compile(r"(?:^|[|;&(\s])find\s+(?:/(?!tmp\b)|~|\$HOME|\.(?:\s|$))")
 _FIND_EXEMPT = re.compile(r"-prune\b|-maxdepth\b|node_modules")
@@ -71,7 +74,7 @@ def _sleep_poll_hint(command: str) -> bool:
 
 def perf_advisory(
     tool_name: str,
-    tool_args: Dict[str, Any],
+    tool_args: dict[str, Any],
     duration_s: float,
     result_text: Optional[str] = None,
 ) -> Optional[str]:
@@ -123,3 +126,16 @@ def perf_advisory(
     except Exception:
         logger.debug("perf advisory failed; no advisory appended", exc_info=True)
         return None
+
+
+def with_perf_advisory(result: Any, tool_name: str, tool_args: dict[str, Any], duration_s: float) -> Any:
+    """``result`` with the advisory appended, as ``agent.tool_executor._commit_tool_result`` persists
+    it: on a string result, or on the first text part (and ``text_summary``) of a multimodal
+    envelope, the same way subdirectory hints land. Unchanged when no advisory applies."""
+    perf_hint = perf_advisory(tool_name, tool_args, duration_s)
+    if perf_hint:
+        if _is_multimodal_tool_result(result):
+            _append_subdir_hint_to_multimodal(result, perf_hint)
+        elif isinstance(result, str):
+            result += perf_hint
+    return result
