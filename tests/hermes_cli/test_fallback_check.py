@@ -22,13 +22,13 @@ def _config(chain):
     (get_hermes_home() / "config.yaml").write_text(yaml.safe_dump(data), encoding="utf-8")
 
 
-def _route_to(monkeypatch, client, sent_model=None, seen=None):
+def _route_to(monkeypatch, client, sent_model=None, seen=None, api_mode="chat_completions"):
     from agent.route_binding import RouteEntryClient
 
     def route(entry, provider, model, raw_codex=True):
         if seen is not None:
             seen.append((provider, model, raw_codex))
-        return RouteEntryClient(client, sent_model or model, False, "chat_completions")
+        return RouteEntryClient(client, sent_model or model, False, api_mode)
     monkeypatch.setattr("agent.route_binding.resolve_route_entry_client", route)
 
 
@@ -150,6 +150,17 @@ def test_live_passes_the_swap_shape_and_provider_timeout(monkeypatch):
     result = fc.check_entry_live({"provider": "Local-OAI", "model": "m"}, static)
     assert result.provider == "local-oai" and result.status == "ready"
     assert seen == [("local-oai", "m", False)] and sent["timeout"] == 7.0
+
+
+@pytest.mark.parametrize("api_mode,cap", [("anthropic_messages", fc._LIVE_MAX_TOKENS), ("chat_completions", None)])
+def test_live_cap_follows_the_route_wire_on_a_plain_host(monkeypatch, api_mode, cap):
+    """A declared anthropic_messages route on a host the provider/URL gate does not recognise keeps
+    the probe cap (the Messages adapter would otherwise fill the model's full output limit); a
+    chat-completions route there still sends none."""
+    calls: list = []
+    _route_to(monkeypatch, _openai_client(lambda request: _completion("m"), calls), api_mode=api_mode)
+    result = fc.check_entry_live({"provider": "local-oai", "model": "m", "api_mode": api_mode}, _ready())
+    assert result.status == "ready" and [c.get("max_tokens") for c in calls] == [cap]
 
 
 def test_live_compares_against_the_model_actually_sent(monkeypatch):
