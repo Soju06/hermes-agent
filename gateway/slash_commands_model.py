@@ -710,6 +710,9 @@ class GatewayModelCommandsMixin:
             await self.async_session_store.set_model_override(session_key, None)
         except Exception:
             logger.warning("Failed to clear persisted session model override", exc_info=True)
+        # Fork (runtime-control): the pin's durable twin, the SessionEntry runtime route of an agent
+        # model_switch / plugin runtime_override, would otherwise come back on the next rehydrate.
+        await asyncio.to_thread(self._clear_persisted_session_runtime_overrides, session_key, reasoning=False)
         shown = default_model or t("gateway.shared.unknown_value")
         if previous is None:
             return t("gateway.model.reset_none", model=shown)

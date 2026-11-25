@@ -30,8 +30,10 @@ def commit_local_runtime_switch(runner, source, model_override, reasoning_config
         defer_local_model_pick(authority, live, picked, effort)
     elif effort:
         # A level alone: what ``/reasoning <level>`` on a busy local session does (the handler's
-        # in-memory level for the next turn, then ``apply_pending_reasoning`` at the boundary).
-        from hermes_state_local import local_receipt
+        # in-memory level for the next turn, then ``apply_pending_reasoning`` at the boundary),
+        # committed as the session's owner, the principal ``defer_local_model_pick`` reads too.
+        from gateway.session_persistence import authority_persistence
+        owner = authority_persistence(authority).bindings.receipt(live.source.chat_id).principal_id
         runner._set_session_reasoning_override(live.route, reasoning_config)
-        live.pending_reasoning = (local_receipt(authority.db, live.source.chat_id)['principal_id'], effort)
+        live.pending_reasoning = (owner, effort)
     return True

@@ -34,8 +34,8 @@ def _route_catalog_pairs_safe() -> list:
 _MODEL_STATUS_SCHEMA = {
     "name": "model_status",
     "description": (
-        "Inspect the current agent runtime: active route (purpose category), "
-        "model, and reasoning state. Secret values such as API keys are never "
+        "Inspect the active route (purpose category), model, and reasoning "
+        "state. Secret values such as API keys are never "
         "returned. Use this when you need to know your effective runtime "
         "before deciding whether to switch routes."
     ),
@@ -48,7 +48,7 @@ _MODEL_STATUS_SCHEMA = {
 _MODEL_SWITCH_SCHEMA = {
     "name": "model_switch",
     "description": (
-        "Switch the current agent runtime by selecting a declared route "
+        "Switch the agent runtime by selecting a declared route "
         "(purpose category). The route picks the provider, model, and "
         "reasoning effort from the config-declared catalog with "
         "health-checked fallbacks — these are not model inputs. "

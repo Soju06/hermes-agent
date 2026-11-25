@@ -142,14 +142,20 @@ class GatewayInboundHooksMixin:
                 break
 
         if _hook_prepends:
-            from gateway.session_ingress_context import carry_callback
             _combined = "\n\n".join(_hook_prepends)
             _original = event.text or ""
-            prepended = dataclasses.replace(
-                event, text=f"{_combined}\n\n{_original}" if _original else _combined,
-            )
-            carry_callback(event, prepended)
-            event = prepended
+            _prepended_text = f"{_combined}\n\n{_original}" if _original else _combined
+            # The same event handling as ``rewrite`` above. A prepend adds agent context and leaves the
+            # user's own words as they were, so a typed answer to a voice note stays the typed text.
+            if getattr(event, '_busy_observed', False):
+                event.text = _prepended_text
+            else:
+                from gateway.session_ingress_context import carry_callback
+                prepended = dataclasses.replace(event, text=_prepended_text)
+                carry_callback(event, prepended)
+                prepended._rewritten_from = event  # accept_interrupt reaches the adapter's event
+                _carry_replied_voice_answer(event, prepended, event.text)
+                event = prepended
         if _runtime_override_directives:
             # Trusted plugins may pick a session route before the first LLM call; the directives ride
             # the event (same pattern as ``_bot_loop_admitted``) so they can only be applied after auth.

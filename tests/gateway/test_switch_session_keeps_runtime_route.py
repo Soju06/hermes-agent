@@ -95,3 +95,48 @@ async def test_resume_clears_the_runtime_route(tmp_path):
         db.close()
     runner.session_store.switch_session.assert_called_once()
     runner.session_store.clear_runtime_overrides.assert_called_once_with(key, model=True, reasoning=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("authority_cwd_in_tmp")  # symbolic profile ids are relative homes
+async def test_model_reset_clears_the_runtime_model_route(tmp_path, monkeypatch):
+    """``/model reset`` (upstream 5bb7bdc7c4) drops the /model pin. The runtime route is that pin's
+    durable twin, so its model half goes too, or the next read rehydrates the agent-picked model and
+    the reset is undone. The level is not a model pick and stays."""
+    import json
+
+    import gateway.run as gateway_run
+    from gateway.platforms.event import MessageType
+    from gateway.run import GatewayRunner
+
+    home = tmp_path / "home"
+    home.mkdir()
+    # JSON is valid YAML; CI ships no pyyaml for test fixtures.
+    (home / "config.yaml").write_text(json.dumps({"model": {"default": "cfg-model", "provider": "cfg-prov"}}))
+    monkeypatch.setattr(gateway_run, "_hermes_home", home)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs_for_provider",
+                        lambda provider, target_model=None: {})
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="c1", user_id="u1", chat_type="dm")
+    key = build_session_key(source)
+    store = SessionStore(tmp_path / "sessions", GatewayConfig())
+    store.get_or_create_session(source)
+    assert store.update_runtime_override(key, model=RUNTIME[0], provider=RUNTIME[1], reasoning_effort=RUNTIME[2])
+
+    # A fresh runner: the route exists only in the store, as after a gateway restart.
+    runner = object.__new__(GatewayRunner)
+    runner.config = SimpleNamespace(multiplex_profiles=False)
+    runner.session_store = store
+    runner._session_db = None
+    runner._evict_cached_agent = lambda k, **_kw: None
+    runner._normalize_source_for_session_key = lambda s: s
+    runner._session_key_for_source = lambda s: build_session_key(s)
+    try:
+        reply = await runner._handle_model_command(
+            MessageEvent(text="/model reset", message_type=MessageType.TEXT, source=source))
+
+        assert "cfg-model" in reply
+        assert RUNTIME[0] in runner._pending_model_notes[key]  # the runtime route was the active override
+        assert _route(store.get_entry(key)) == (None, None, RUNTIME[2])
+        assert runner._get_session_model_override(key) is None  # nothing comes back on the next read
+    finally:
+        store.close_all_db_handles()

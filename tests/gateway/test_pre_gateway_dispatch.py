@@ -1246,3 +1246,55 @@ async def test_webhook_runtime_override_is_not_applied_under_the_emergency_stop(
 
     assert switch_calls == []
     assert reasoning_overrides == {}
+
+
+@pytest.mark.asyncio
+async def test_hook_prepend_copy_keeps_the_rewrite_chain_and_the_typed_voice_answer(monkeypatch):
+    """A prepend rebuilds the event the way ``rewrite`` does, so it keeps what upstream's rewrite keeps
+    (4a0143fd68, 643d285d2f): ``accept_interrupt`` reaches the event the adapter dispatched, and a typed
+    reply to a voice note still answers with the typed text, since the prepend is agent context."""
+    from gateway.run import GatewayRunner
+
+    async def _fake_hook(name, **kwargs):
+        return [{"action": "prepend", "text": "[CONTEXT]"}] if name == "pre_gateway_dispatch" else []
+
+    monkeypatch.setattr("hermes_cli.plugins.ainvoke_hook", _fake_hook)
+    runner = object.__new__(GatewayRunner)
+    event = _make_event("replied-to speech\n\ntyped answer")
+    event._telegram_replied_voice_typed_text = "typed answer"
+
+    prepended = await runner._hm_pre_gateway_dispatch_hook(event, event.source)
+
+    assert prepended is not event and prepended.text == "[CONTEXT]\n\nreplied-to speech\n\ntyped answer"
+    assert getattr(prepended, "_telegram_replied_voice_typed_text", None) == "typed answer"
+    prepended.accept_interrupt()
+    assert getattr(event, "_interrupt_accepted", False) is True
+
+
+@pytest.mark.asyncio
+async def test_prepended_busy_followup_preserves_processing_hooks(monkeypatch):
+    """A prepend on a busy follow-up keeps its executor-owned lifecycle, as upstream's rewrite does
+    (d8eff5f6aa): the observed event is changed in place, never replaced by a copy."""
+    import asyncio
+
+    from gateway.platforms.event import ProcessingOutcome
+    from tests.gateway.test_busy_followup_processing_hooks import HookAdapter, _busy_hook_owner
+    from tests.gateway.test_shared_busy_receive_loop import _statuses, _wait_for
+
+    async def prepend(name, **kwargs):
+        if name == "pre_gateway_dispatch" and kwargs["event"].text == "two":
+            return [{"action": "prepend", "text": "[ctx]"}]
+        return []
+
+    monkeypatch.setattr("hermes_cli.lifecycle.ainvoke_hook", prepend)
+    adapter = HookAdapter()
+    authority, source, gate = await _busy_hook_owner(monkeypatch, adapter)
+    await adapter.handle_message(MessageEvent(text="one", source=source, message_id="m1"))
+    await _wait_for(lambda: _statuses(authority).get("one") == "started")
+    await asyncio.wait_for(adapter.handle_message(MessageEvent(text="two", source=source, message_id="m2")), 5)
+    await _wait_for(lambda: _statuses(authority).get("[ctx]\n\ntwo") == "queued")
+    assert not any(h[0] == "m2" for h in adapter.hooks)
+    gate.set()
+    await _wait_for(lambda: "reply to [ctx]\n\ntwo" in adapter.sent and not adapter._background_tasks, 15)
+    assert [h for h in adapter.hooks if h[0] == "m2"] == [
+        ("m2", "start"), ("m2", "complete", ProcessingOutcome.SUCCESS)]

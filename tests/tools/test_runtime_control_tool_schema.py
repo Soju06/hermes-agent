@@ -124,6 +124,9 @@ def test_runtime_toolset_rides_every_selection_but_an_explicit_empty_one():
     assert "runtime" in enabled(["hermes-cli"])
     assert "runtime" in enabled(["memory"])
     assert enabled([]) == set()
+    # A list naming only the ``no_mcp`` sentinel is the same zero-tool state (upstream c5211e4cc3).
+    assert enabled(["no_mcp"]) == set()
+    assert "runtime" in enabled(["memory", "no_mcp"])
 
 
 def test_a_create_time_pick_carries_runtime_only_when_it_picks_it():
