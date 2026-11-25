@@ -17,9 +17,10 @@ def _gated_memory_call() -> str:
     """The memory(...) form the contract must name: every content-writing action the tool offers.
 
     Derived from the tool schema so an upstream verb change (e.g. 'replace' -> 'patch') fails here
-    instead of leaving the gate naming an action the model can no longer call.
+    instead of leaving the gate naming an action the model can no longer call. The schema advertises
+    ``action`` once, inside each ``operations[]`` item.
     """
-    actions = MEMORY_SCHEMA["parameters"]["properties"]["action"]["enum"]
+    actions = MEMORY_SCHEMA["parameters"]["properties"]["operations"]["items"]["properties"]["action"]["enum"]
     return "memory(" + "|".join(a for a in actions if a != "remove") + ")"
 
 
