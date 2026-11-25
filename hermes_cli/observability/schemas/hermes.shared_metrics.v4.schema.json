@@ -4747,6 +4747,8 @@
                 "manage_catalog",
                 "manage_connections",
                 "memory",
+                "model_status",
+                "model_switch",
                 "patch",
                 "process_manage",
                 "react_to_message",
