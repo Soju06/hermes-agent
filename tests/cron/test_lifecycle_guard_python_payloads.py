@@ -164,6 +164,11 @@ PY
         # Branch E (#113667) still reads Python argv lists in a python heredoc body.
         "python3 <<PY\nimport subprocess\nsubprocess.run([\"pkill\", \"-f\", \"python\"])\nPY\n",
         "python3 <<PY\nimport subprocess\nsubprocess.run([\"taskkill\", \"/IM\", \"python.exe\", \"/F\"])\nPY\n",
+        # The masked body keeps its terminator line, so the walk's inert-heredoc stripper pairs the
+        # opener with its own terminator, not with a later line equal to the delimiter.
+        "python3 <<'PY'\nprint(1)\nPY\nbash -c 'hermes gate\"way\" restart'\nPY\n",
+        "python3 <<'PY'\nprint(1)\nPY\nbash <<'PY'\nbash -c 'hermes gate\"way\" restart'\nPY\n",
+        "python3 <<'PY'\nPY\nbash -c 'hermes gate\"way\" restart'\nPY\n",
     ])
     def test_shell_outside_proven_python_payloads_stays_blocked(self, tmp_path, command):
         """Only a payload the shell lexer proves is Python is masked; every shell command around
@@ -200,3 +205,29 @@ PY
         big.write_text("x" * (2 * 1024 * 1024))
 
         assert scan_gateway_lifecycle(command.format(big=big), cwd=str(tmp_path)) == (False, None)
+
+    def test_python_c_payload_is_masked_when_its_line_misparses(self, tmp_path):
+        """The walk's logical-line splitter does not model `#` comments: the apostrophe in
+        `don't` shifts its quote state, so the lines of a multi-line single-quoted `-c` payload
+        are tokenized as shell and `open("<data file>")` reads as an executed script. The lexer
+        reads the comment and masks the payload, so a >1 MiB data file there is not a script to
+        fail closed on (v0.23.4 refuses this command on the scan cap)."""
+        from cron.lifecycle_guard import scan_gateway_lifecycle
+
+        big = tmp_path / "big_blob.txt"
+        big.write_text("x" * (2 * 1024 * 1024))
+        command = f"# don't scan the logs\npython3 -c '\nprint(open(\"{big}\").read(1))\n'\n"
+
+        assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (False, None)
+
+    def test_quoted_doc_heredoc_after_python_heredoc_stays_masked(self, tmp_path):
+        """The python body's terminator line survives the mask, so a later quoted `cat` heredoc is
+        still a documentation body for the walk (#88336, #110422): a >1 MiB path it names is a
+        mention, not an executed script."""
+        from cron.lifecycle_guard import scan_gateway_lifecycle
+
+        big = tmp_path / "big.sh"
+        big.write_text("#" * (2 * 1024 * 1024))
+        command = f"python3 <<PY\nprint(1)\nPY\ncat > notes.md <<'EOF'\n{big}\nEOF\n"
+
+        assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (False, None)

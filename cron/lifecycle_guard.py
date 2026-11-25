@@ -881,10 +881,14 @@ class _PythonPayloadMasker:
             close = _find_heredoc_close(text, body, delimiter, strip_tabs)
             if close is None:
                 return None
+            # Mask the body only, never its terminator line: an opener left without it pairs with a
+            # later line equal to its delimiter in `strip_inert_heredoc_bodies`, which then hides the
+            # shell in between from the walk (or finds it unterminated and masks nothing at all).
+            terminator = max(body, text.rfind("\n", body, close - 1) + 1)
             # An unquoted delimiter expands the body: `$(...)` / backticks there run as shell.
             if python_owner and (quoted or not any(m in text[body:close] for m in ("$(", "`"))):
-                self.out += [text[self.copied:body], "\n" * text.count("\n", body, close)]
-                self.copied = close
+                self.out += [text[self.copied:body], "\n" * text.count("\n", body, terminator)]
+                self.copied = terminator
             body = close
         self.heredocs = []
         self.command_start = body
