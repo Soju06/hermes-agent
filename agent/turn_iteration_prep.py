@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Tuple
 from agent.display import KawaiiSpinner
 from agent.interrupt_control import interrupt_issuer, interrupted_during_api_call_reason
 from agent.turn_context_compaction import _reanchor
+from agent.turn_todo_reminder import _maybe_inject_todo_reminder
 from agent.turn_truncation import boosted_output_cap
 
 logger = logging.getLogger("agent.conversation_loop")
@@ -148,7 +149,6 @@ def prepare_iteration(
     cache-safe by construction: steer text is appended as a new (not yet persisted) user row, the ghost-row
     filter neutralises copies of hidden interrupt placeholders, and repair runs BEFORE the request build."""
     from agent.conversation_loop import _maybe_inject_run_budget_wrapup
-    from agent.turn_todo_reminder import _maybe_inject_todo_reminder
 
     # nous.anthropic_wire=auto: a wire switch decided from the previous response lands here,
     # before this iteration's request is built and with nothing in flight.

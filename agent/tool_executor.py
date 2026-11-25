@@ -54,6 +54,7 @@ from agent.tool_dispatch_helpers import (
     _NEVER_PARALLEL_TOOLS, _is_destructive_command, _append_subdir_hint_to_multimodal,
     _context_pruned_argument_paths, _plan_tool_batch_segments, make_tool_result_message,
 )
+from agent.turn_todo_reminder import _maybe_inject_todo_reminder
 from session_rules.turns import _is_multimodal_tool_result, _multimodal_text_summary
 from tools.terminal_tool_lifecycle import get_active_env
 from tools.thread_context import propagate_context_to_thread
@@ -214,7 +215,6 @@ def _flush_session_db_after_tool_progress(agent, messages: list, *, stage: str) 
     effects can kill/restart the process before turn-end persistence runs."""
     from agent.conversation_loop import _maybe_inject_run_budget_wrapup
     from agent.turn_iteration_prep import _maybe_inject_iteration_budget_warning
-    from agent.turn_todo_reminder import _maybe_inject_todo_reminder
 
     # Persist exactly the checkpoint text the next model call will see, before stamping
     # this tool result as durable. Already-written rows must never be rewritten later.

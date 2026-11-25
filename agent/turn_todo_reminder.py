@@ -20,6 +20,9 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from session_rules.turns import _DB_PERSISTED_MARKER
+from tools.todo_tool import TODO_INJECTION_HEADER
+
 logger = logging.getLogger("agent.conversation_loop")  # same channel as the other loop notices
 
 TODO_REMINDER_TURNS_SINCE_WRITE = 10
@@ -68,9 +71,6 @@ def _maybe_inject_todo_reminder(agent: Any, messages: list[dict[str, Any]]) -> b
         return False
     # Strip the compression header line — this is a live nudge, not a
     # post-compaction snapshot restore.
-    from agent.context_compressor import _DB_PERSISTED_MARKER
-    from tools.todo_tool import TODO_INJECTION_HEADER
-
     body = snapshot
     if body.startswith(TODO_INJECTION_HEADER):
         body = body[len(TODO_INJECTION_HEADER):].lstrip("\n")
