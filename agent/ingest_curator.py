@@ -68,6 +68,7 @@ from agent.memory_journal import (
     _safe_session_filename,
     _scrub,
 )
+from tools.hosted_tool_policy import host_feature_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -948,7 +949,7 @@ def _build_curator_fork(
     """
     from run_agent import AIAgent
     from agent.background_review import _resolve_review_runtime
-    from agent.memory_manager import inject_memory_provider_tools
+    from agent.memory_manager_tools import inject_memory_provider_tools
 
     _rt = _resolve_review_runtime(agent, aux_task="ingest_curator")
     routed = bool(_rt.get("routed"))
@@ -978,6 +979,13 @@ def _build_curator_fork(
     )
     fork._memory_write_origin = "ingest_curator"
     fork._memory_write_context = "ingest_curator"
+    # Fork identity, as upstream's build_cache_parity_fork sets it: the fork shares the
+    # parent's session id, so turn-start state keyed on that id belongs to the live session.
+    # ``_turn_origin`` keeps the bot-to-bot chain from being reset (agent/bot_chain.py) and a
+    # pending ``/delegation --now`` tool rebuild from being taken (agent/delegation_backends.py),
+    # and tags the fork's turn log lines. The parent keeps the shared prefix warm itself.
+    fork._turn_origin = "ingest_curator"
+    fork._skip_prompt_cache_warming = True
     # ADR-004 Phase 0 flag FIRST, before the manager rebind below makes any
     # ingest path reachable: every sync/prefetch/session-hook call site gates
     # on memory_ingest_allowed(), so the fork's harness prompt can never
@@ -1427,12 +1435,15 @@ def reset_trigger_state_for_tests() -> None:
 
 def _observation_allowed(agent: Any) -> bool:
     """Live foreground agents only: forks (ingest-disabled or
-    persistence-isolated) must never feed the accumulator."""
+    persistence-isolated) must never feed the accumulator. Off in a hosted
+    scope too: the curator reads this host's memory journals and writes its
+    ledger, which upstream's deny-by-default host-feature switch forbids
+    (the agent's memory manager is not built there either)."""
     if getattr(agent, "_memory_ingest_disabled", False):
         return False
     if getattr(agent, "_persist_disabled", False):
         return False
-    return True
+    return host_feature_enabled("builtin_memory")
 
 
 def _turn_slice(messages: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:

@@ -573,6 +573,18 @@ class TestTriggers:
         ic.observe_turn_completed(agent2, _turn_messages(proposes=5))
         assert _triggers_enabled == []
 
+    def test_hosted_scope_is_never_observed(self, _triggers_enabled, monkeypatch):
+        """A hosted scope is deny-by-default for features that read or write this host's profile
+        state (tools/hosted_tool_policy.py): no trigger state, no run, at any boundary."""
+        monkeypatch.setattr("tools.environments.sandbox_scope.hosted_scope", lambda: object())
+        agent = _FakeLiveAgent("hosted-sess")
+        for _ in range(3):
+            ic.observe_turn_completed(agent, _turn_messages(proposes=5, tools=3))
+        ic.observe_pre_compress(agent, _turn_messages(proposes=5))
+        ic.observe_session_end(agent, _turn_messages(proposes=5))
+        assert _triggers_enabled == []
+        assert ic._states == {}
+
     def test_accumulator_fires_at_threshold(self, _triggers_enabled):
         agent = _FakeLiveAgent("acc-sess")
         # Each turn: +3 (propose) + 2 (tool-success) + 1 = 6 → fires on turn 2.
@@ -716,6 +728,28 @@ class TestTriggers:
         ic.observe_turn_completed(_FakeLiveAgent(), _turn_messages())  # no raise
         ic.observe_session_end(_FakeLiveAgent(), [])
         ic.observe_pre_compress(_FakeLiveAgent(), [])
+
+    @pytest.mark.parametrize("vetoed", [False, True])
+    def test_turn_finalizer_observes_after_the_sync_and_never_a_vetoed_turn(self, monkeypatch, vetoed):
+        """The chat-completions hook sits in turn_finalizer._mirror_turn_to_memory between the
+        external-memory sync and the background review; a prompt a pre_llm_call hook vetoed
+        never leaves the host, so the curator does not observe it either."""
+        from types import SimpleNamespace
+
+        from agent import turn_finalizer
+
+        calls = []
+        monkeypatch.setattr(ic, "observe_turn_completed", lambda agent, messages: calls.append("curator"))
+        agent = SimpleNamespace(
+            skip_background_review=False,
+            _sync_external_memory_for_turn=lambda **_k: calls.append("sync"),
+            _spawn_background_review=lambda **_k: calls.append("review"),
+        )
+        turn_finalizer._mirror_turn_to_memory(
+            agent, original_user_message="u", final_response="done", interrupted=False,
+            messages=_turn_messages(), review_memory=True, review_skills=False, vetoed=vetoed,
+        )
+        assert calls == ([] if vetoed else ["sync", "curator", "review"])
 
 
 # ---------------------------------------------------------------------------
@@ -1058,6 +1092,41 @@ class TestShadowRunEndToEnd:
         assert record["result"] == "verdict"
         assert calls == ["release_clients"]
         assert provider.write_calls() == []
+
+    def test_fork_neither_resets_the_bot_chain_nor_takes_the_sessions_tool_rebuild(self, shadow_run_env, monkeypatch):
+        """The fork shares the parent's session id, so turn-start state keyed on it is the live
+        session's: upstream's forks carry ``_turn_origin`` so the bot-to-bot chain is neither reset
+        nor advanced and a pending ``/delegation --now`` rebuild stays for the live session. The
+        parent keeps its own prompt-cache prefix warm, so the fork never arms keep-alives."""
+        from agent import bot_chain, delegation_backends
+
+        parent, mm, provider, handler, home = shadow_run_env
+        sid = parent.session_id
+        PendingTurnWAL().append_turn(sid, "배포는 금요일에 하지 않는다", "알겠어")
+        chain_state = bot_chain._new_state(time.monotonic())
+        chain_state["hops"] = chain_state["sent"] = 3
+        monkeypatch.setattr(bot_chain, "_CHAINS", {sid: chain_state})
+        monkeypatch.setattr(delegation_backends, "_rebuild_requests", {sid})
+        forks = []
+        real_build = ic._build_curator_fork
+
+        def _build(agent, **kwargs):
+            built = real_build(agent, **kwargs)
+            forks.append(built[0])
+            return built
+
+        monkeypatch.setattr(ic, "_build_curator_fork", _build)
+        handler.response_queue.append(_text_resp(json.dumps({
+            "spans": [{"span_ref": "turn:whatever", "verdict": "NOOP"}]
+        })))
+
+        record = ic.run_ingest_curation(parent, session_id=sid, trigger="test", mode="cold")
+
+        assert record["result"] == "verdict"
+        assert bot_chain._CHAINS.get(sid) is chain_state and chain_state["hops"] == 3
+        assert delegation_backends._rebuild_requests == {sid}
+        assert forks and forks[0]._turn_origin == "ingest_curator"
+        assert forks[0]._skip_prompt_cache_warming is True
 
     def test_memory_search_read_stays_callable_from_fork_recipe(self, shadow_run_env):
         parent, mm, provider, handler, home = shadow_run_env
