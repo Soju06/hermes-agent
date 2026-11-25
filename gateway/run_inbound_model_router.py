@@ -1,7 +1,9 @@
 """Dynamic model router (ADR-003 Phase 2): the pre-dispatch routing stage of the inbound pipeline.
 
 Bound onto ``GatewayRunner`` through ``GatewayInboundMixin``; ``_handle_message`` calls
-``_model_router_stage`` after the running-agent PRIORITY block and before idle slash dispatch.
+``_hm_model_router_gate`` (which runs ``_model_router_stage``) after the running-agent PRIORITY block
+and before idle slash dispatch, and ``_hm_admit_event`` takes ``router_pre_hook_text`` before the
+``pre_gateway_dispatch`` hook.
 ``gateway.run`` internals are imported lazily inside function bodies (import cycle), so
 ``patch("gateway.run._load_gateway_config")`` keeps intercepting them at call time.
 """
@@ -46,8 +48,43 @@ def _model_router_mode() -> str:
     return mode if mode in ("shadow", "enforce") else "off"
 
 
+def router_pre_hook_text(event: "MessageEvent") -> str:
+    """The message text the router classifies, snapshot before ``pre_gateway_dispatch`` runs.
+
+    Plugin hooks may rewrite (or prepend to) ``event.text``, but the router must classify the same text
+    the plugin-era classifier saw: injected advisories are label noise the bench dataset had to strip.
+    An admission the drain executes keeps the snapshot its ingress committed (``restore_native``).
+    ``_hm_admit_event`` sets the result on the post-hook event as ``_hermes_router_pre_hook_text``, a
+    private attribute like the runtime override directives.
+    """
+    snapshot = getattr(event, "_hermes_router_pre_hook_text", None)
+    return str(getattr(event, "text", None) or "") if snapshot is None else snapshot
+
+
 class GatewayInboundModelRouterMixin:
     """Route evaluation and enforce-mode apply for the dynamic model router."""
+
+    async def _hm_model_router_gate(
+        self, event: "MessageEvent", source: SessionSource, session_key: str, is_internal: bool,
+    ) -> None:
+        """``_handle_message``'s router step for authorized, non-internal messages on the fresh-agent
+        dispatch leg. Placed AFTER the running-agent PRIORITY block so steer/interrupt/stop messages
+        against a running agent gain zero latency and no suspension point precedes the running-session
+        check, and BEFORE slash-command dispatch so static rules still apply to slash commands (see
+        ``_model_router_stage``). mode=off (the default) costs a single config check. Always fails
+        open: routing must never block dispatch."""
+        if is_internal:
+            return
+        mode = _model_router_mode()
+        if mode == "off":
+            return
+        try:
+            await self._model_router_stage(
+                event, source, session_key, mode=mode,
+                original_text=getattr(event, "_hermes_router_pre_hook_text", None),
+            )
+        except Exception:
+            logger.warning("model router stage failed open", exc_info=True)
 
     def _model_router_runtime_snapshot(self, source: SessionSource, session_key: str) -> dict:
         """Non-secret {provider, model, base_url, reasoning_effort} snapshot.
@@ -59,10 +96,12 @@ class GatewayInboundModelRouterMixin:
         Callers must take this snapshot ON THE EVENT LOOP (never inside asyncio.to_thread):
         ``_resolve_session_agent_runtime`` runs ``_rehydrate_session_model_override``, whose
         check-then-assign on ``_session_model_overrides`` is only safe because every writer of that
-        dict runs loop-atomically between awaits.
+        dict runs loop-atomically between awaits. A read-only lookup (``record_notice=False``, as
+        /status): the runner-wide pre-agent fallback notice is another turn's one-shot slot.
         """
         try:
-            model, runtime_kwargs = self._resolve_session_agent_runtime(source=source, session_key=session_key)
+            model, runtime_kwargs = self._resolve_session_agent_runtime(
+                source=source, session_key=session_key, record_notice=False)
         except Exception:
             logger.debug("model router: runtime snapshot failed", exc_info=True)
             return {}
@@ -282,11 +321,11 @@ class GatewayInboundModelRouterMixin:
 
         # Persist the new model to the session DB so the dashboard shows the updated model — same
         # persist the slash path performs (#34850).
-        _sess_db = getattr(self, "_session_db", None)
-        if _sess_db is not None and source is not None:
+        _store = getattr(self, "persistence", None)
+        if _store is not None and source is not None:
             try:
                 _sess_entry = await self.async_session_store.get_or_create_session(source)
-                await _sess_db.update_session_model(
+                await _store.aio.sessions.update_model(
                     _sess_entry.session_id, result.new_model, provider=result.target_provider,
                     base_url=result.base_url, api_mode=result.api_mode,
                 )
@@ -309,11 +348,12 @@ class GatewayInboundModelRouterMixin:
         self._session_model_overrides[session_key] = {
             "model": result.new_model, "provider": result.target_provider, "api_key": result.api_key,
             "base_url": result.base_url, "api_mode": result.api_mode,
+            "owns_credentials": result.alias_endpoint_applied,
             "request_overrides": dict(result.request_overrides or {}),
             "capabilities": dict(result.runtime_capabilities or {}),
         }
-        if hasattr(self, "_pending_one_turn_model_restores"):  # a standing switch, as a typed /model
-            self._pending_one_turn_model_restores.pop(session_key, None)
+        if (_otr_state := self._peek_session_state(session_key)) is not None:  # a standing switch, as a typed /model
+            _otr_state.conversation.one_turn_restore = None
         # Mark this session as freshly router-applied so the was_auto_reset conversation-boundary
         # cleanup later in this same inbound turn does not silently revert the switch (#48031 class)
         # — see _consume_auto_reset_boundary, which consumes the flag. A dict (not a set) so the

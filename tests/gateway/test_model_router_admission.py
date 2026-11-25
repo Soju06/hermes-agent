@@ -3,8 +3,8 @@
 Every gateway boot installs a session authority, so an ordinary message is admitted to the durable
 FIFO at ingress and executed by the drain (``gateway/session_ingress.py::execute_admission``) on an
 event restored from the committed row, re-entering ``_handle_message``. Local CLI/TUI/Desktop turns
-take the same drain. Real GatewayRunner, adapters, SessionAuthority and drain over a real SessionDB;
-only the classifier, the model switch and the agent leg are stand-ins.
+take the same drain. Real GatewayRunner, adapters, SessionAuthority and drain over the real storage
+interface of a temp HERMES_HOME; only the classifier, the model switch and the agent leg are stand-ins.
 """
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -54,7 +54,6 @@ async def test_an_admitted_message_is_classified_on_its_pre_hook_text(tmp_path, 
     from gateway.run import GatewayRunner
     from gateway.session_authority import initialize_session_authority
     from gateway.session_envelope import restore_native
-    from hermes_state_runtime import list_session_admissions
     from plugins.platforms.discord.adapter import DiscordAdapter
 
     monkeypatch.setenv("DISCORD_ALLOWED_USERS", "42")
@@ -91,11 +90,11 @@ async def test_an_admitted_message_is_classified_on_its_pre_hook_text(tmp_path, 
     assert agent_saw == [f"{ADVISORY}\n\n{MESSAGE}", "plain hello"]  # the prepend reached the agent
     assert classified == [MESSAGE, "plain hello"]
     owner = runner.session_store.peek_session_id(runner.session_store._generate_session_key(source))
-    rows = {row["request_id"]: row for row in list_session_admissions(authority.db, session_id=owner,
-                                                                          pending_only=False)}
+    rows = {row.request_id: row for row in authority.persistence.admissions.list(session_id=owner,
+                                                                                 pending_only=False)}
     # Committed with the row, so a replay after an owner restart still classifies the sent text.
-    assert restore_native(rows["hooked"]["payload"], runner)._hermes_router_pre_hook_text == MESSAGE
-    assert "router_pre_hook_text" not in rows["plain"]["payload"]["native_text_v1"]
+    assert restore_native(rows["hooked"].payload, runner)._hermes_router_pre_hook_text == MESSAGE
+    assert "router_pre_hook_text" not in rows["plain"].payload["native_text_v1"]
 
 
 @pytest.mark.asyncio
@@ -139,17 +138,14 @@ async def test_a_local_session_turn_is_never_routed(tmp_path, monkeypatch, mode)
     from gateway.config import GatewayConfig
     from gateway.run import GatewayRunner
     from gateway.session_authority import initialize_session_authority
-    from gateway.session_contract import Principal, Submission
+    from gateway.session_contract import SessionActor, Submission
     from gateway.session_local import create_local_session
     from gateway.session_policy import policy_for_source
-    from hermes_state import SessionDB
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     classified, switch = _router(monkeypatch, tmp_path, mode)
     runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / "sessions"))
-    db = SessionDB(tmp_path / "state.db")
-    runner.session_store._db = runner._session_db = db
-    authority = await initialize_session_authority(runner, profile_id="default", instance_id="owner", db=db)
+    authority = await initialize_session_authority(runner, profile_id="default", instance_id="owner")
     ran = []
 
     async def turn(event, source, quick_key, run_generation):
@@ -157,7 +153,7 @@ async def test_a_local_session_turn_is_never_routed(tmp_path, monkeypatch, mode)
         return "ok"
     monkeypatch.setattr(runner, "_handle_message_with_agent", turn)
     try:
-        viewer = Principal("test-owner", "default", frozenset(
+        viewer = SessionActor("test-owner", "default", frozenset(
             {"session:create", "session:submit", "session:read"}), "viewer")
         ref = create_local_session(authority, viewer, dict(request_id="cli", source="cli", model="fixture",
                                                           toolsets=[]))
@@ -167,7 +163,7 @@ async def test_a_local_session_turn_is_never_routed(tmp_path, monkeypatch, mode)
         await authority.submit(viewer, Submission("typed", ref, {"text": MESSAGE}, "queue"))
         await async_wait_until(lambda: ran, timeout=10, what="the local turn")
     finally:
-        db.close()
+        runner.session_store.close_all_db_handles()
 
     assert ran == [MESSAGE]
     assert classified == []

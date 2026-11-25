@@ -374,16 +374,14 @@ def _message_content_text(content: Any) -> str:
 def _recent_turns(session_store: Any, session_id: str, limit: int) -> list[Turn]:
     if not session_store or not session_id or limit <= 0:
         return []
-    db = getattr(session_store, "_db", None)  # noqa: SLF001 gateway-internal integration
-    if db is None:
-        return []
     try:
-        messages = db.get_messages_as_conversation(session_id, include_ancestors=False)
-    except Exception:
-        try:
-            messages = db.get_messages(session_id)
-        except Exception:
+        # The session's own active rows (no lineage, no alternation repair) on the store that owns it.
+        store = session_store._persistence_for_session_id(session_id)  # noqa: SLF001 gateway-internal integration
+        if store is None:
             return []
+        messages = [m.as_openai_message() for m in store.messages.read_conversation(session_id)]
+    except Exception:
+        return []
     turns: list[Turn] = []
     for msg in messages:
         role = str(msg.get("role") or "")

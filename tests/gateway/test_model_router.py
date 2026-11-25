@@ -14,6 +14,7 @@ model_routes pytest guard. Decision logs go to tmp via
 import asyncio
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -104,25 +105,33 @@ def _event(text="hermes gateway 고장났어 디버깅해줘", **kwargs) -> Mess
     return MessageEvent(text=text, message_id="m1", source=source, **kwargs)
 
 
-class _FakeDB:
-    def __init__(self, messages):
-        self.messages = list(messages)
+class _FakeMessages:
+    """``persistence.messages`` stand-in: ``read_conversation`` rows answering ``as_openai_message``."""
 
-    def get_messages_as_conversation(self, session_id, include_ancestors=False):
-        return list(self.messages)
+    def __init__(self, messages):
+        self._messages = list(messages)
+
+    def read_conversation(self, session_id):
+        return [SimpleNamespace(as_openai_message=lambda m=m: dict(m)) for m in self._messages]
 
 
 class _FakeStore:
     def __init__(self, key="tg:c1", session_id="sid-1", messages=()):
         self._key = key
         self._sid = session_id
-        self._db = _FakeDB(messages)
+        self._store = SimpleNamespace(messages=_FakeMessages(messages))
 
     def _generate_session_key(self, source):
         return self._key
 
     def peek_session_id(self, session_key):
         return self._sid
+
+    def _persistence_for_session_id(self, session_id):
+        return self._store
+
+    def _profile_home_for_key(self, session_key):
+        return None  # no named owner: the /new hooks bind the source's routed profile
 
 
 def _complete(label, confidence=0.9, evidence="S5 test"):
@@ -774,11 +783,16 @@ def _make_runner(monkeypatch, cfg, *, runtime=("model-a", {"provider": "p1", "ba
     # persistence through the underlying sync method.
     runner.session_store.set_model_override = MagicMock()
     runner._session_model_overrides = {}
-    runner._session_reasoning_overrides = {}
     runner._model_router_state = {}
     runner._evict_cached_agent = MagicMock()
     runner._resolve_session_agent_runtime = MagicMock(return_value=runtime)
     return runner
+
+
+def _reasoning_override(runner, session_key):
+    """The session reasoning override (``SessionState.conversation``, ``_set_session_reasoning_override``)."""
+    state = runner._peek_session_state(session_key)
+    return None if state is None else state.conversation.reasoning_override
 
 
 def test_shadow_mode_mutates_nothing_but_logs(monkeypatch, tmp_path):
@@ -850,6 +864,7 @@ def test_enforce_mode_applies_override_and_persists(monkeypatch, tmp_path):
         "api_key": "sk-test",
         "base_url": "https://p1.example/v1",
         "api_mode": "chat_completions",
+        "owns_credentials": False,
         "request_overrides": {},
         "capabilities": {},
     }
@@ -860,7 +875,7 @@ def test_enforce_mode_applies_override_and_persists(monkeypatch, tmp_path):
     runner._evict_cached_agent.assert_called_once_with("tg:c1")
     # Route carries reasoning_effort=xhigh and this base has session reasoning
     # override plumbing → applied and recorded.
-    assert runner._session_reasoning_overrides["tg:c1"] == {"enabled": True, "effort": "xhigh"}
+    assert _reasoning_override(runner, "tg:c1") == {"enabled": True, "effort": "xhigh"}
 
     record = json.loads(log_path.read_text().splitlines()[0])
     assert record["mode"] == "enforce"
@@ -1052,6 +1067,31 @@ def test_runtime_snapshot_reasoning_follows_the_effective_model(monkeypatch):
                         "reasoning_effort": "xhigh"}
 
 
+def test_runtime_snapshot_leaves_another_turns_fallback_notice_untouched():
+    """The snapshot is a read-only lookup, like /status's (upstream 226898a6cb): the runner-wide
+    ``_pre_agent_fallback_notice`` is one turn's one-shot slot (the turn runner reads and clears it), so
+    the router's lookup for this message neither clears another chat's notice nor leaves its own."""
+    from unittest.mock import patch
+
+    from gateway.session import SessionEntry, build_session_key
+    from tests.gateway.test_status_command import _make_runner as _status_runner, _make_source
+
+    source = _make_source()
+    entry = SessionEntry(session_key=build_session_key(source), session_id="sess-1", created_at=datetime.now(),
+                         updated_at=datetime.now(), platform=source.platform, chat_type="dm")
+    runner = _status_runner(entry)
+    runner.session_store.get_model_override.return_value = None
+    runner._pre_agent_fallback_notice = "other chat's turn fell back"
+    with patch("gateway.run._load_gateway_config", return_value={"model": {"default": "model-b", "provider": "p2"}}), \
+            patch("gateway.run._resolve_runtime_agent_kwargs",
+                  return_value={"provider": "p2", "base_url": "https://p2.example/v1",
+                                "_fallback_notice": "router lookup fell back"}):
+        snapshot = runner._model_router_runtime_snapshot(source, entry.session_key)
+
+    assert snapshot["model"] == "model-b" and snapshot["provider"] == "p2"
+    assert runner._pre_agent_fallback_notice == "other chat's turn fell back"
+
+
 def test_stage_routes_on_pre_hook_original_text(monkeypatch, tmp_path):
     """Plugin hooks may prepend advisories / rewrite event.text before the
     stage runs; the classifier must see the pre-hook original (bench inputs
@@ -1107,11 +1147,13 @@ def test_enforce_apply_model_path_parity(monkeypatch, tmp_path):
         runner = _make_runner(
             monkeypatch, cfg, runtime=("model-b", {"provider": "p2", "base_url": "https://p2.example/v1"}),
         )
-        runner._session_db = SimpleNamespace(update_session_model=AsyncMock())
+        # ``runner.persistence`` is the session store's storage interface handle (``aio.sessions``).
+        runner.session_store.persistence = SimpleNamespace(
+            aio=SimpleNamespace(sessions=SimpleNamespace(update_model=AsyncMock())))
         runner.session_store.get_or_create_session = MagicMock(
             return_value=SimpleNamespace(session_id="sid-1"),
         )
-        runner._pending_one_turn_model_restores = {"tg:c1": {"had_override": False}}
+        runner._claim_one_turn_restore("tg:c1", {"had_override": False})
         return runner
 
     routed, typed = _runner_with_pending_once(), _runner_with_pending_once()
@@ -1124,13 +1166,14 @@ def test_enforce_apply_model_path_parity(monkeypatch, tmp_path):
     )
     asyncio.run(typed._record_model_switch(result, ctx, source=_source(), one_turn=False, picker=False))
 
-    assert (routed._session_db.update_session_model.await_args
-            == typed._session_db.update_session_model.await_args)
+    routed_write = routed.session_store.persistence.aio.sessions.update_model
+    typed_write = typed.session_store.persistence.aio.sessions.update_model
+    assert routed_write.await_args is not None and routed_write.await_args == typed_write.await_args
     assert routed._session_model_overrides["tg:c1"] == typed._session_model_overrides["tg:c1"]
     assert (routed.session_store.set_model_override.call_args
             == typed.session_store.set_model_override.call_args)
     for runner in (routed, typed):
-        assert not runner._pending_one_turn_model_restores.get("tg:c1")
+        assert not runner._peek_session_state("tg:c1").conversation.one_turn_restore
     note = routed._pending_model_notes["tg:c1"]
     assert "switched" in note and "model-a" in note
     assert "route 'dev'" in note  # mentions the route name
@@ -1185,7 +1228,7 @@ def test_auto_reset_boundary_preserves_router_fresh_apply(monkeypatch, tmp_path)
     assert runner._session_model_overrides["tg:c1"] == override
     runner.session_store.set_model_override.assert_called_once_with("tg:c1", override)
     # Router-applied reasoning override and pending note survive with it.
-    assert runner._session_reasoning_overrides["tg:c1"] == {"enabled": True, "effort": "xhigh"}
+    assert _reasoning_override(runner, "tg:c1") == {"enabled": True, "effort": "xhigh"}
     assert "tg:c1" in runner._pending_model_notes
     # Flag consumed (protects exactly one boundary), streak cleared (A5).
     assert "tg:c1" not in runner._model_router_fresh_applies
@@ -1198,7 +1241,7 @@ def test_auto_reset_boundary_without_fresh_apply_clears_everything(monkeypatch):
     drops overrides, reasoning, notes, and the router streak (A5)."""
     runner = _make_runner(monkeypatch, _cfg())
     runner._session_model_overrides["tg:c1"] = {"model": "old"}
-    runner._session_reasoning_overrides["tg:c1"] = {"enabled": True, "effort": "low"}
+    runner._set_session_reasoning_override("tg:c1", {"enabled": True, "effort": "low"})
     runner._pending_model_notes = {"tg:c1": "stale note"}
     runner._model_router_state["tg:c1"] = {"normal_streak": 2}
 
@@ -1206,7 +1249,7 @@ def test_auto_reset_boundary_without_fresh_apply_clears_everything(monkeypatch):
     asyncio.run(runner._consume_auto_reset_boundary(entry, "tg:c1"))
 
     assert runner._session_model_overrides == {}
-    assert "tg:c1" not in runner._session_reasoning_overrides
+    assert _reasoning_override(runner, "tg:c1") is None
     assert "tg:c1" not in runner._pending_model_notes
     assert "tg:c1" not in runner._model_router_state
     runner.session_store.set_model_override.assert_not_called()

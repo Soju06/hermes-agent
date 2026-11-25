@@ -28,7 +28,7 @@ from gateway.run_busy import approval_input_words
 from gateway.run_inbound_media import rehome_inbound_media
 from gateway.run_inbound_hooks import GatewayInboundHooksMixin
 from gateway.run_inbound_moa import GatewayInboundMoaMixin
-from gateway.run_inbound_model_router import GatewayInboundModelRouterMixin
+from gateway.run_inbound_model_router import GatewayInboundModelRouterMixin, router_pre_hook_text
 from gateway.run_inbound_transcription import GatewayInboundTranscriptionMixin
 from gateway.run_plugin_injection import GatewayPluginInjectionMixin
 from gateway.run_turn_setup_guard import cancel_preagent_setup, pending_setup_busy_notice
@@ -222,20 +222,12 @@ class GatewayInboundMixin(
         # scale-to-zero: only real user-originated inbound stamps the last-inbound clock;
         # counting internal/system events would keep a genuinely idle gateway awake.
         self._scale_to_zero_note_real_inbound()
-        # Snapshot the pre-hook message text for the dynamic model router: plugin hooks may rewrite
-        # (or prepend to) event.text, but the router must classify the same text the plugin-era
-        # classifier saw — injected advisories are label noise the bench dataset had to strip. An
-        # admission the drain executes keeps the snapshot its ingress committed (``restore_native``).
-        _pre_hook_router_text = getattr(event, "_hermes_router_pre_hook_text", None)
-        if _pre_hook_router_text is None:
-            _pre_hook_router_text = str(getattr(event, "text", None) or "")
+        _pre_hook_router_text = router_pre_hook_text(event)  # fork model router: the text as sent
         event = await self._hm_pre_gateway_dispatch_hook(event, source)
         if event is None:
             return None
         source = event.source
-        # Private event attribute, same pattern as the runtime override directives; set on the
-        # post-hook event since ``rewrite`` may have replaced it. ``_admit_native`` commits it.
-        with suppress(Exception):
+        with suppress(Exception):  # on the post-hook event (``rewrite`` may replace it); ``_admit_native`` commits it
             event._hermes_router_pre_hook_text = _pre_hook_router_text
 
         if not self._is_user_authorized_for_source(source):
@@ -1406,24 +1398,8 @@ class GatewayInboundMixin(
         if self._is_session_running(_quick_key):
             return await self._hm_handle_running_session_message(event, source, _quick_key)
 
-        # Dynamic model router (ADR-003 Phase 2): route evaluation for authorized, non-internal
-        # messages that reached the fresh-agent dispatch leg. Placed AFTER the running-agent
-        # PRIORITY block so steer/interrupt/stop messages against a running agent gain zero latency and
-        # no suspension point precedes the running-session check — and BEFORE slash-command dispatch
-        # so static rules still apply to slash commands (see _model_router_stage docstring).
-        # mode=off (the default) costs a single config check. Always fail open — routing must never
-        # block dispatch.
-        if not is_internal:
-            from gateway.run_inbound_model_router import _model_router_mode
-            _router_mode = _model_router_mode()
-            if _router_mode != "off":
-                try:
-                    await self._model_router_stage(
-                        event, source, _quick_key, mode=_router_mode,
-                        original_text=getattr(event, "_hermes_router_pre_hook_text", None),
-                    )
-                except Exception:
-                    logger.warning("model router stage failed open", exc_info=True)
+        # Dynamic model router (ADR-003): after the running-agent PRIORITY block, before slash dispatch.
+        await self._hm_model_router_gate(event, source, _quick_key, is_internal)
 
         _handled, _result = await self._hm_dispatch_idle_commands(event, source, _quick_key)
         if _handled:

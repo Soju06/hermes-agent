@@ -2161,6 +2161,9 @@ class TestDelegateRouteSchema(unittest.TestCase):
         # still isolates the route injection (the only thing this test is about).
         with patch("tools.delegate_tool_config._get_independent_completions", return_value=True):
             overrides = _build_dynamic_schema_overrides()
+            with patch("tools.delegate_tool_model_routes.inject_route_param",
+                       lambda _params, description: description):
+                upstream = _build_dynamic_schema_overrides()
         props = overrides["parameters"]["properties"]
         static_props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
         # No route param anywhere; property set matches the upstream shape.
@@ -2171,9 +2174,9 @@ class TestDelegateRouteSchema(unittest.TestCase):
             overrides["parameters"]["required"],
             DELEGATE_TASK_SCHEMA["parameters"]["required"],
         )
-        # tasks.items is the SAME object as the static schema's — proof the
-        # dormant schema is byte-identical to upstream, not a lookalike copy.
-        self.assertIs(props["tasks"]["items"], static_props["tasks"]["items"])
+        # The dormant schema is exactly the one upstream builds without the route hook (upstream
+        # rebuilds tasks.items itself since 2026-11: ``group`` is required with independent completions).
+        self.assertEqual(overrides, upstream)
         self.assertNotIn("route", overrides["description"])
 
     @patch(
@@ -2227,7 +2230,7 @@ class TestDelegateRouteResolution(unittest.TestCase):
     ):
         parent = parent or _make_mock_parent()
         with patch(
-            "tools.delegate_tool._load_config",
+            "tools.delegate_tool_config._load_config",
             return_value=deleg_cfg if deleg_cfg is not None else {"max_iterations": 5},
         ), patch(
             "tools.delegate_tool_model_routes._load_full_config", return_value=_ROUTES_FULL_CFG
@@ -2319,8 +2322,8 @@ class TestDelegateRouteResolution(unittest.TestCase):
         self.assertEqual(inherited["provider"], _make_mock_parent().provider)
 
     @patch("tools.delegate_tool_model_routes._load_full_config")
-    @patch("tools.delegate_tool._resolve_delegation_credentials")
-    @patch("tools.delegate_tool._load_config", return_value={"max_iterations": 5})
+    @patch("tools.delegate_tool_routes._resolve_delegation_credentials")
+    @patch("tools.delegate_tool_config._load_config", return_value={"max_iterations": 5})
     def test_no_route_no_default_keeps_upstream_config_path(
         self, mock_cfg, mock_creds, mock_full
     ):
@@ -2376,7 +2379,7 @@ class TestDelegateRouteResolution(unittest.TestCase):
             {"enabled": True, "effort": "low"},
         )
 
-    @patch("tools.delegate_tool._load_config", return_value={"reasoning_effort": "low"})
+    @patch("tools.delegate_tool_config._load_config", return_value={"reasoning_effort": "low"})
     @patch("run_agent.AIAgent")
     def test_build_child_route_effort_beats_config(self, MockAgent, mock_cfg):
         MockAgent.return_value = MagicMock()
@@ -2392,7 +2395,7 @@ class TestDelegateRouteResolution(unittest.TestCase):
             {"enabled": True, "effort": "xhigh"},
         )
 
-    @patch("tools.delegate_tool._load_config", return_value={"reasoning_effort": "low"})
+    @patch("tools.delegate_tool_config._load_config", return_value={"reasoning_effort": "low"})
     @patch("run_agent.AIAgent")
     def test_build_child_route_effort_none_disables_thinking(self, MockAgent, mock_cfg):
         MockAgent.return_value = MagicMock()
@@ -2418,8 +2421,9 @@ class TestDelegateRouteHardening(unittest.TestCase):
         """A broken delegation.provider must not fail calls that route every
         task — default creds resolve lazily, only for route-less tasks."""
         import tools.delegate_tool as dt
+        import tools.delegate_tool_routes as dt_routes
 
-        real = dt._resolve_delegation_credentials
+        real = dt_routes._resolve_delegation_credentials
 
         def guard(cfg, parent_agent, **kw):
             # Routes always pin a provider; the config-driven default route here does not.
@@ -2429,12 +2433,12 @@ class TestDelegateRouteHardening(unittest.TestCase):
 
         parent = _make_mock_parent()
         with patch(
-            "tools.delegate_tool._load_config",
+            "tools.delegate_tool_config._load_config",
             return_value={"max_iterations": 5},
         ), patch(
             "tools.delegate_tool_model_routes._load_full_config", return_value=_ROUTES_FULL_CFG
         ), patch(
-            "tools.delegate_tool._resolve_delegation_credentials", side_effect=guard
+            "tools.delegate_tool_routes._resolve_delegation_credentials", side_effect=guard
         ), patch(
             "hermes_cli.model_routes.provider_health",
             side_effect=_health_for({"p1", "p2"}),
@@ -2479,7 +2483,7 @@ class TestDelegateRouteHardening(unittest.TestCase):
         }
         parent = _make_mock_parent()
         with patch(
-            "tools.delegate_tool._load_config", return_value={"max_iterations": 5}
+            "tools.delegate_tool_config._load_config", return_value={"max_iterations": 5}
         ), patch(
             "tools.delegate_tool_model_routes._load_full_config", return_value=full_cfg
         ), patch.object(

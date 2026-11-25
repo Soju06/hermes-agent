@@ -4,9 +4,10 @@ When ``model_routes.routes`` declares at least one route, ``delegate_task`` grow
 (top-level, and per task in ``tasks[]``) built from the catalog at ``get_definitions()`` time; with
 no routes declared the schema and the spawn path are upstream's. Precedence for one task: its own
 ``route`` > the top-level ``route`` > ``delegation.default_route`` > the active delegation provider
-(``delegation.backend``). ``default_route`` answers only for the DEFAULT backend: a session's
-``/delegation`` pick or a configured non-default ``delegation.backend`` is an explicit backend choice,
-and a session override beats config, so that backend answers unrouted tasks. A routed task runs on
+(``delegation.backend``). ``default_route`` answers only for the DEFAULT backend: the backend a
+session's ``delegate_task`` was built from (``agent._delegation_backend``, which a ``/delegation`` save
+reaches at ``/new`` or ``--now``) or a configured non-default ``delegation.backend`` is an explicit backend
+choice, so that backend answers unrouted tasks. A routed task runs on
 the route's health-checked provider/model (the default → fallbacks walk of
 ``hermes_cli.model_routes.resolve_route``) and the route's ``reasoning_effort`` beats
 ``delegation.reasoning_effort``. An unknown route, or one whose whole chain is unhealthy, fails the
@@ -131,11 +132,12 @@ def _declared_route(name: str, cfg: dict, full_cfg: dict, catalog: Any) -> dict[
 
 def _default_route(cfg: dict[str, Any], parent_agent: Any) -> str:
     """``delegation.default_route`` while the calling session delegates on the default backend, else
-    ``""``: a chosen backend (the session's ``/delegation`` pick, else ``delegation.backend``) answers."""
-    from agent.delegation_backends import session_delegation_config
+    ``""``: a chosen backend answers. The session's backend is the one ``resolve_task_routes`` routes on:
+    the backend its ``delegate_task`` was built from (``pinned_backend``), else ``delegation.backend``."""
+    from agent.delegation_backends import pinned_backend
     from agent.delegation_registry import DEFAULT_BACKEND, configured_backend
     name = str(cfg.get("default_route") or "").strip()
-    if name and configured_backend(session_delegation_config(cfg, parent_agent)) != DEFAULT_BACKEND:
+    if name and (pinned_backend(parent_agent) or configured_backend(cfg)) != DEFAULT_BACKEND:
         return ""
     return name
 

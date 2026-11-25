@@ -2046,8 +2046,9 @@ delegation:
   # default_route: ""                         # model_routes route used when a delegate_task call names no
   #                                           # route (empty/absent = delegation.model/provider above).
   #                                           # Must name a route declared under model_routes.routes.
-  #                                           # Applies on the default backend only: a /delegation session
-  #                                           # pick or a non-default delegation.backend answers instead.
+  #                                           # Applies on the default backend only: a non-default
+  #                                           # delegation.backend (or the backend a session's delegate_task
+  #                                           # was built from) answers instead.
   #                                           # When routes are declared, delegate_task also grows a 'route'
   #                                           # enum param (top-level and per-task in tasks[]; per-task wins):
   #                                           # the child runs on the route's health-checked provider/model,
