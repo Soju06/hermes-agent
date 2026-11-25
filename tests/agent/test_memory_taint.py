@@ -660,6 +660,50 @@ class TestLifecycle:
         assert digest["count"] == mt._MAX_ENTRIES_PER_SESSION
 
 
+class TestPerProfileRegistry:
+    """One process serves many profiles: each home keeps its own registry."""
+
+    def test_registrations_land_in_the_calling_profiles_home(self, tmp_path):
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        home_a, home_b = tmp_path / "a", tmp_path / "b"
+        home_a.mkdir()
+        home_b.mkdir()
+        mt.set_registry(None)
+        try:
+            token = set_hermes_home_override(home_a)
+            try:
+                reg_a = mt.get_registry()
+                mt.record_injected_text(SESSION, INJECTED_KO, source="prefetch")
+            finally:
+                reset_hermes_home_override(token)
+            token = set_hermes_home_override(home_b)
+            try:
+                reg_b = mt.get_registry()
+                # B never saw A's recall: B's paraphrase stays clean.
+                assert mt.span_taint(
+                    {"role": "assistant", "content": PARAPHRASE_KO,
+                     "session_id": SESSION}
+                ) is False
+            finally:
+                reset_hermes_home_override(token)
+            assert reg_a is not reg_b
+            reg_a.drain_io()
+            taint_rel = ("state", "memory-pending", "taint", f"{SESSION}.jsonl")
+            assert home_a.joinpath(*taint_rel).exists()
+            assert not home_b.joinpath(*taint_rel).exists()
+            token = set_hermes_home_override(home_a)
+            try:
+                assert mt.get_registry() is reg_a
+            finally:
+                reset_hermes_home_override(token)
+        finally:
+            mt.set_registry(None)
+
+
 # ---------------------------------------------------------------------------
 # Phase-3 corroboration API + curator rendering hook
 # ---------------------------------------------------------------------------

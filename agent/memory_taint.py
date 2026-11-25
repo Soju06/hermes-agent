@@ -97,6 +97,7 @@ from agent.memory_journal import (
     _scrub,
     journals_disabled,
 )
+from hermes_constants import get_hermes_home, hermes_home_key
 
 logger = logging.getLogger(__name__)
 
@@ -318,8 +319,6 @@ class TaintRegistry:
         if base_dir is not None:
             self._base_dir = Path(base_dir)
         else:
-            from hermes_constants import get_hermes_home
-
             self._base_dir = (
                 get_hermes_home() / "state" / "memory-pending" / "taint"
             )
@@ -766,38 +765,52 @@ class TaintRegistry:
 
 
 # ---------------------------------------------------------------------------
-# Module-level default registry (process singleton)
+# Module-level registries (one per profile home)
 # ---------------------------------------------------------------------------
 
-_default_registry: Optional[TaintRegistry] = None
+# One process serves many profiles, so the registry is looked up per call
+# under the caller's HERMES_HOME (hermes_home_key()), like MemoryManager.
+# Registration runs on the turn thread inside the profile scope and WAL
+# tagging runs on the mem-sync worker under in_owner_home, so both land in
+# the owning profile's registry and sidecar directory. A single process-wide
+# instance would write profile B's recalled text under profile A's state/.
+_registries: dict[str, TaintRegistry] = {}
+_override_registry: Optional[TaintRegistry] = None
 _default_registry_lock = threading.Lock()
-_gc_ran = False
 
 
 def get_registry() -> TaintRegistry:
-    """Process-default registry, lazily pinned to the active HERMES_HOME."""
-    global _default_registry, _gc_ran
-    if _default_registry is None:
-        with _default_registry_lock:
-            if _default_registry is None:
-                _default_registry = TaintRegistry()
-    if not _gc_ran:
-        with _default_registry_lock:
-            if not _gc_ran:
-                _gc_ran = True
-                try:
-                    _default_registry.gc_stale_files()
-                except Exception:
-                    pass
-    return _default_registry
+    """Registry of the active HERMES_HOME, created and GC'd on first use."""
+    override = _override_registry
+    if override is not None:
+        return override
+    home = get_hermes_home()
+    key = hermes_home_key(home)
+    registry = _registries.get(key)
+    if registry is not None:
+        return registry
+    with _default_registry_lock:
+        registry = _registries.get(key)
+        if registry is not None:
+            return registry
+        registry = TaintRegistry(
+            base_dir=home / "state" / "memory-pending" / "taint"
+        )
+        _registries[key] = registry
+    registry.gc_stale_files()
+    return registry
 
 
 def set_registry(registry: Optional[TaintRegistry]) -> None:
-    """Swap the process-default registry (tests / multi-profile setups)."""
-    global _default_registry, _gc_ran
+    """Pin one registry for every home (tests); None restores per-home lookup.
+
+    A supplied registry manages its own GC. Clearing also drops the per-home
+    registries, so the next lookup re-reads each sidecar directory.
+    """
+    global _override_registry
     with _default_registry_lock:
-        _default_registry = registry
-        _gc_ran = registry is not None  # a supplied registry manages its own GC
+        _override_registry = registry
+        _registries.clear()
 
 
 # ---------------------------------------------------------------------------
