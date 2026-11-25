@@ -326,9 +326,9 @@ _EVIDENCE_SCHEMA = {
 NOTES_WRITE_SCHEMA = {
     "name": "notes_write",
     "description": (
-        "Save a durable DECLARATIVE fact (user-independent knowledge: "
-        "decisions, incidents, preferences, relationships, project facts) as "
-        "a curated note with cited evidence. Two mandatory steps:\n"
+        "Save a durable DECLARATIVE fact as a curated note with cited evidence. "
+        "Declarative means user-independent knowledge: decisions, incidents, "
+        "preferences, relationships, project facts. Two mandatory steps:\n"
         "1. step='propose' with content + kind + evidence → returns existing "
         "NEIGHBOR notes and a short-lived token.\n"
         "2. step='confirm' with token + verdict: NOOP if a neighbor already "
@@ -423,9 +423,9 @@ NOTES_READ_SCHEMA = {
 MEMORY_PROPOSE_SCHEMA = {
     "name": "memory_propose",
     "description": (
-        "Flag a fact from THIS conversation as memory-worthy without writing "
-        "anything yet: queues a durable proposal for the background memory "
-        "curator (zero cost, non-blocking). Use when something seems worth "
+        "Flag a fact from THIS conversation as memory-worthy, writing nothing yet. "
+        "It queues a durable proposal for the background memory curator "
+        "(zero cost, non-blocking). Use when something seems worth "
         "remembering but doesn't merit an immediate note/memory write — the "
         "curator will weigh it with full-session context."
     ),
