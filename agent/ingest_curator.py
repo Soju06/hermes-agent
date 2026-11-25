@@ -990,6 +990,7 @@ def _build_curator_fork(
         enabled_toolsets=getattr(agent, "enabled_toolsets", None),
         disabled_toolsets=getattr(agent, "disabled_toolsets", None),
         skip_memory=True,
+        persist_disabled=True,
         **fork_kwargs,
     )
     fork._memory_write_origin = "ingest_curator"
@@ -1054,8 +1055,7 @@ def _build_curator_fork(
     fork._skill_nudge_interval = 0
     # Persistence isolation (the curator-takeover root cause — see
     # background_review.py): shares the parent's session_id for cache
-    # warmth, so it must never write that session's DB rows.
-    fork._persist_disabled = True
+    # warmth, so it must never write that session's DB rows (``persist_disabled`` above).
     fork._session_db = None
     fork._session_json_enabled = False
     fork.suppress_status_output = True

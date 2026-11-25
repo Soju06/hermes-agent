@@ -523,8 +523,7 @@ _SESSION_STATE: dict[str, Any] = {
     # False on helper agents (compression / hygiene / review forks) that hand the session to
     # a continuation row that must stay open.
     "_end_session_on_close": True,
-    # True on the background review fork: never persist or publish session lifecycle hooks,
-    # so its harness turn can't hijack or appear under the live session.
+    # Detached forks (``persist_disabled``) never persist or publish session lifecycle hooks.
     "_persist_disabled": False,
 }
 
@@ -2079,7 +2078,7 @@ def init_agent(
     platform: str | None = None, user_id: str | None = None, user_id_alt: str | None = None, user_name: str | None = None,
     chat_id: str | None = None, chat_name: str | None = None, chat_type: str | None = None, thread_id: str | None = None,
     gateway_session_key: str | None = None, skip_context_files: bool = False,
-    load_soul_identity: bool = False, skip_memory: bool = False,
+    load_soul_identity: bool = False, skip_memory: bool = False, persist_disabled: bool = False,
     skip_background_review: bool = False, session_db=None, persistence=None, parent_session_id: str | None = None,
     iteration_budget: IterationBudget = None, run_budget_seconds: Optional[float] = None,
     fallback_model: dict[str, Any] | None = None, credential_pool=None, checkpoints_enabled: bool = False,
@@ -2171,6 +2170,7 @@ def init_agent(
         agent, session_id, session_db, parent_session_id, reasoning_config, max_tokens,
         checkpoints_enabled, checkpoint_max_snapshots, checkpoint_max_total_size_mb, checkpoint_max_file_size_mb,
         persistence=persistence)
+    agent._persist_disabled = persist_disabled  # declared before the startup checks read it
 
     # Load config once for memory, skills, and compression sections
     try:

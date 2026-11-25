@@ -60,6 +60,14 @@ def _checkpoint_incapable(reason: str) -> CompressionCheckpointUnavailable:
     return _checkpoint_blocked(f"{reason}. Recover by {_CHECKPOINT_REQUIRED_REMEDIATION}")
 
 
+def owns_no_durable_memory(agent: Any, memory_manager: Any) -> bool:
+    """A persistence-detached fork (review, /btw, ingest curator: no memory manager, session DB or
+    persistence) discards its transcript, so compression has nothing to checkpoint for it; every
+    other agent is held to ``compression.checkpoint_required``."""
+    return (getattr(agent, "_persist_disabled", False) is True and memory_manager is None
+            and getattr(agent, "_session_db", None) is None)
+
+
 def _warn_checkpoint_required_without_capable_provider(agent: Any) -> None:
     """Startup warning when fail-closed compress will block (init itself must not refuse).
 
@@ -68,9 +76,10 @@ def _warn_checkpoint_required_without_capable_provider(agent: Any) -> None:
     Probe failures log at DEBUG so a flaky probe can be diagnosed without
     refusing init or emitting the incapable-provider WARNING.
     """
-    if getattr(agent, "compression_checkpoint_required", False) is not True:
-        return
     memory_manager = getattr(agent, "_memory_manager", None)
+    if getattr(agent, "compression_checkpoint_required", False) is not True or owns_no_durable_memory(
+            agent, memory_manager):
+        return
     if memory_manager is not None:
         supports_checkpoint = getattr(memory_manager, "supports_pre_compress_checkpoint", None)
         if callable(supports_checkpoint):

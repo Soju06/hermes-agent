@@ -1079,6 +1079,7 @@ def _fork_init_kwargs(agent: Any, rt: dict[str, Any], routed: bool, max_iteratio
         "request_overrides": rt.get("request_overrides") or {}, "parent_session_id": agent.session_id,
         "enabled_toolsets": getattr(agent, "enabled_toolsets", None),
         "disabled_toolsets": getattr(agent, "disabled_toolsets", None), "skip_memory": True,
+        "persist_disabled": True,
     }
     if isinstance(rt.get("max_tokens"), int):
         kwargs["max_tokens"] = rt["max_tokens"]
@@ -1160,7 +1161,7 @@ def build_cache_parity_fork(
     # which the next live turn re-reads as a standing instruction; close() must likewise not
     # finalize the parent's still-active session row. suppress_status_output: fork status/warning
     # emits go via _print_fn/status_callback, which bypass the stdout redirect.
-    review_agent._skip_mcp_refresh = review_agent._persist_disabled = review_agent.suppress_status_output = True
+    review_agent._skip_mcp_refresh = review_agent.suppress_status_output = True  # persist_disabled: at init
     review_agent._end_session_on_close = False
     review_agent._session_db = review_agent.persistence = None
     review_agent.session_id = agent.session_id
