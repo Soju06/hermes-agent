@@ -1766,7 +1766,7 @@ def _rearm_idle_timer(agent: Any, st: _SessionTriggerState) -> None:
                     # re-armed timer captures the same profile scope.
                     timer = threading.Timer(
                         max(idle_s - idle_for, 0.001),
-                        propagate_context_to_thread(_idle_fire),
+                        propagate_context_to_thread(_idle_fire, inherit_delegated_child=False),
                     )
                     timer.daemon = True
                     st.idle_timer = timer
@@ -1796,8 +1796,11 @@ def _rearm_idle_timer(agent: Any, st: _SessionTriggerState) -> None:
         # A Timer thread starts with an empty context. Bind the turn's
         # profile scope, so the config gate, the WAL and ledger paths and the
         # fork's memory_search all resolve the owning profile, not the
-        # launch profile.
-        timer = threading.Timer(idle_s, propagate_context_to_thread(_idle_fire))
+        # launch profile. It fires after the turn: a detached daemon, so the
+        # delegated-child marker stays behind.
+        timer = threading.Timer(
+            idle_s, propagate_context_to_thread(_idle_fire, inherit_delegated_child=False)
+        )
         timer.daemon = True
         st.idle_timer = timer
         timer.start()

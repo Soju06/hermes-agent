@@ -135,8 +135,8 @@ def reset_delegated_child_context_in(ctx: Context) -> None:
     parent's but is NOT flagged as delegated-child. Used by
     ``tools.thread_context.propagate_context_to_thread``: the marker is a scope
     around one synchronous child run, not an inheritable identity, and detached
-    daemon threads (ingest-curator, bg-review, async delegation, execute_code
-    RPC loops) outlive that scope.
+    daemon threads (ingest-curator, bg-review, async delegation) outlive that
+    scope. In-turn workers such as the execute_code RPC loops keep the marker.
     """
     ctx.run(_DELEGATED_CHILD_CONTEXT.set, False)
 

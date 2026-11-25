@@ -158,6 +158,36 @@ def test_detached_daemon_does_not_inherit_the_delegated_child_marker():
         assert _flag_seen_on_worker(detached) is False
 
 
+def test_curator_idle_timer_does_not_inherit_the_delegated_child_marker(monkeypatch):
+    """The ingest curator's idle timer is armed inside a turn and fires after it,
+    so its wake is a detached daemon too."""
+    from types import SimpleNamespace
+
+    import agent.ingest_curator as ic
+    from agent.delegation_context import delegated_child_context, is_delegated_child_context
+
+    seen: dict[str, bool] = {}
+    fired = threading.Event()
+
+    def _capture(agent, **kwargs):
+        seen["flag"] = is_delegated_child_context()
+        fired.set()
+
+    monkeypatch.setattr(ic, "ingest_curator_enabled", lambda: True)
+    monkeypatch.setattr(ic, "_idle_seconds", lambda: 0.05)
+    monkeypatch.setattr(ic, "spawn_curation_thread", _capture)
+    agent = SimpleNamespace(session_id="latch-idle", _memory_ingest_disabled=False, _persist_disabled=False)
+    turn = [{"role": "user", "content": "status?"}, {"role": "assistant", "content": "done"}]
+    ic.reset_trigger_state_for_tests()
+    try:
+        with delegated_child_context("child-idle"):
+            ic.observe_turn_completed(agent, turn)
+        assert fired.wait(timeout=5.0), "idle timer did not fire"
+        assert seen["flag"] is False
+    finally:
+        ic.reset_trigger_state_for_tests()
+
+
 def test_no_marker_leaks_without_any_child_context():
     from tools.thread_context import propagate_context_to_thread
 
