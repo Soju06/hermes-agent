@@ -1,0 +1,76 @@
+{
+  "description": "Save a durable DECLARATIVE fact as a curated note with cited evidence. Declarative means user-independent knowledge: decisions, incidents, preferences, relationships, project facts. Two mandatory steps:\n1. step='propose' with content + kind + evidence → returns existing NEIGHBOR notes, a grounding_preview, and a short-lived token.\n2. step='confirm' with token + verdict: NOOP if a neighbor already covers the fact (this should be your most common verdict), UPDATE/SUPERSEDE a listed neighbor (target='kind/topic.key'), or ADD with a new topic_key.\nNotes are NOT for: instructions to yourself (memory tool), procedures/workflows (skills — separately gated), raw logs or task progress (session_search/graph). Every write must cite evidence; quotes are machine-checked verbatim against local journals. If a grounding_preview item fails but offers candidates, either select one at confirm with evidence_overrides={ref_index:candidate_id}, or fix the quote and propose again. Confirming without resolving a failed preview is rejected. A structurally valid wal/l0 quote for the current session may be accepted as status=unconfirmed when its turn has not reached the journal yet; it is re-verified lazily and promoted or removed fail-closed. Include session_id on l0 refs when citing the current turn so that race can be identified safely.",
+  "name": "notes_write",
+  "parameters": {
+    "properties": {
+      "content": {
+        "description": "propose: the gist text to save (<=4KB).",
+        "type": "string"
+      },
+      "evidence": {
+        "description": "Evidence references (>=1 for writes). Each item: {type:'episode', uuid} for a graph episode UUID, or {type:'wal', session_id, entry_id, quote} / {type:'l0', month:'YYYY-MM', quote, wal_entry_id?, session_id?} for a local journal record — the quote must be a VERBATIM substring of that record, substantive (a phrase, not a 2-word fragment), and must never contain secret material. Set tainted:true on any span that came from injected memory context (it will be refused — memory citing itself is not evidence).",
+        "items": {
+          "properties": {},
+          "required": [],
+          "type": "object"
+        },
+        "type": "array"
+      },
+      "evidence_overrides": {
+        "additionalProperties": {
+          "type": "string"
+        },
+        "description": "confirm: map a zero-based evidence-ref index to a candidate_id returned in that ref's grounding_preview. The server substitutes its cached exact journal excerpt and source coordinates; caller-provided quote text is never accepted here.",
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "kind": {
+        "description": "propose: declarative kind of the fact.",
+        "enum": [
+          "decision",
+          "incident",
+          "preference",
+          "relationship",
+          "project",
+          "fact"
+        ],
+        "type": "string"
+      },
+      "step": {
+        "description": "Which pipeline step to run.",
+        "enum": [
+          "propose",
+          "confirm"
+        ],
+        "type": "string"
+      },
+      "target": {
+        "description": "confirm UPDATE/SUPERSEDE: the neighbor to act on, as 'kind/topic.key' — must be one of the proposed neighbors.",
+        "type": "string"
+      },
+      "token": {
+        "description": "confirm: the token returned by propose.",
+        "type": "string"
+      },
+      "topic_key": {
+        "description": "Dotted lowercase topic key, e.g. 'nas.nfs.access'. Optional hint at propose; required for confirm ADD.",
+        "type": "string"
+      },
+      "verdict": {
+        "description": "confirm: your verdict against the returned neighbors. NOOP when already covered.",
+        "enum": [
+          "ADD",
+          "UPDATE",
+          "SUPERSEDE",
+          "NOOP"
+        ],
+        "type": "string"
+      }
+    },
+    "required": [
+      "step"
+    ],
+    "type": "object"
+  }
+}

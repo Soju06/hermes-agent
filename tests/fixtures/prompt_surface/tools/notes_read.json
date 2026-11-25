@@ -1,0 +1,42 @@
+{
+  "description": "Read curated notes (the declarative memory tier). action='list' shows the one-line index (optionally filtered by kind/status); action='read' loads one full note by kind + topic_key.",
+  "name": "notes_read",
+  "parameters": {
+    "properties": {
+      "action": {
+        "enum": [
+          "read",
+          "list"
+        ],
+        "type": "string"
+      },
+      "kind": {
+        "enum": [
+          "decision",
+          "incident",
+          "preference",
+          "relationship",
+          "project",
+          "fact"
+        ],
+        "type": "string"
+      },
+      "status": {
+        "enum": [
+          "active",
+          "unconfirmed",
+          "demoted",
+          "tombstoned"
+        ],
+        "type": "string"
+      },
+      "topic_key": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "action"
+    ],
+    "type": "object"
+  }
+}

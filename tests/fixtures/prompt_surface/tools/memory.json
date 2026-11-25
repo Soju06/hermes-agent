@@ -32,6 +32,10 @@
         },
         "type": "array"
       },
+      "reason": {
+        "description": "Required for 'add' and 'patch'. Briefly explain why this belongs in USER/MEMORY rather than a skill, Graphiti, or session history. This reason is used only as a guardrail and is not stored.",
+        "type": "string"
+      },
       "target": {
         "description": "Which memory store: 'memory' for personal notes, 'user' for user profile.",
         "enum": [

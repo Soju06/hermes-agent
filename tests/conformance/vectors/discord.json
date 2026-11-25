@@ -139,8 +139,8 @@
       "category": "grid",
       "expect": "divergent",
       "input": "| name | value |\n|------|-------|\n| a    | 1     |\n| b    | 2     |",
-      "native_output": "**a**\n• value: 1\n\n**b**\n• value: 2",
-      "note": "native converts GFM tables to bullet groups; connector passes raw markdown through (port deferred — parity report Phase 4/oracle section)"
+      "native_output": "```\n┌──────┬───────┐\n│ name │ value │\n├──────┼───────┤\n│ a    │ 1     │\n│ b    │ 2     │\n└──────┴───────┘\n```",
+      "note": "native renders GFM tables as fenced box-drawing tables; connector passes raw markdown through (port deferred — parity report Phase 4/oracle section)"
     },
     {
       "id": "emoji",
@@ -245,7 +245,7 @@
       "category": "scar",
       "expect": "divergent",
       "input": "| 名前 | 値 |\n|------|----|\n| 中文 | 42 |\n| b    | 2  |",
-      "native_output": "**中文**\n• 値: 42\n\n**b**\n• 値: 2",
+      "native_output": "```\n┌──────┬─────┐\n│ 名前 │ 値  │\n├──────┼─────┤\n│ 中文 │ 42  │\n│ b    │ 2   │\n└──────┴─────┘\n```",
       "note": "same as table-simple"
     },
     {

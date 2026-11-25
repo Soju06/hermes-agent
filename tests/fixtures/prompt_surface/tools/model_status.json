@@ -1,0 +1,9 @@
+{
+  "description": "Inspect the active route (purpose category), model, and reasoning state. Secret values such as API keys are never returned. Use this when you need to know your effective runtime before deciding whether to switch routes.",
+  "name": "model_status",
+  "parameters": {
+    "properties": {},
+    "required": [],
+    "type": "object"
+  }
+}

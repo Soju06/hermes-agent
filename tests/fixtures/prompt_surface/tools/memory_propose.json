@@ -1,0 +1,29 @@
+{
+  "description": "Flag a fact from THIS conversation as memory-worthy, writing nothing yet. It queues a durable proposal for the background memory curator (zero cost, non-blocking). Use when something seems worth remembering but doesn't merit an immediate note/memory write — the curator will weigh it with full-session context.",
+  "name": "memory_propose",
+  "parameters": {
+    "properties": {
+      "content": {
+        "description": "The candidate fact, stated declaratively.",
+        "type": "string"
+      },
+      "evidence": {
+        "description": "Evidence references (>=1 for writes). Each item: {type:'episode', uuid} for a graph episode UUID, or {type:'wal', session_id, entry_id, quote} / {type:'l0', month:'YYYY-MM', quote, wal_entry_id?, session_id?} for a local journal record — the quote must be a VERBATIM substring of that record, substantive (a phrase, not a 2-word fragment), and must never contain secret material. Set tainted:true on any span that came from injected memory context (it will be refused — memory citing itself is not evidence).",
+        "items": {
+          "properties": {},
+          "required": [],
+          "type": "object"
+        },
+        "type": "array"
+      },
+      "kind_hint": {
+        "description": "Optional routing hint: decision|incident|preference|relationship|project|fact|instruction|procedural|evidence.",
+        "type": "string"
+      }
+    },
+    "required": [
+      "content"
+    ],
+    "type": "object"
+  }
+}
