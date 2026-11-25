@@ -304,3 +304,51 @@ def test_persisted_reasoning_rehydrates_only_valid_values(persisted, expected):
         # ``_session_reasoning_overrides`` dict view is gone upstream): a bogus level writes none.
         state = runner._peek_session_state(SESSION_KEY)
         assert state is None or state.conversation.reasoning_override is None
+
+
+@pytest.mark.parametrize("provider", ["openai-codex", "xai-oauth"])
+def test_managed_oauth_runtime_route_follows_the_auth_store_each_turn(monkeypatch, provider):
+    """A rehydrated route on an official Codex/xAI host keeps upstream's managed-OAuth contract
+    (``_session_override_uses_managed_oauth``): its bearer is a snapshot, so every turn re-resolves
+    it for the route's own provider instead of replaying the rehydrate-time key, and the route
+    never falls back to the configured default."""
+    from hermes_cli.auth import PROVIDER_REGISTRY
+
+    # Given: a persisted route whose one resolution lands on the managed host.
+    endpoint = PROVIDER_REGISTRY[provider].inference_base_url
+    runner = _runner(_FakeStore(runtime_model="selected-model", runtime_provider=provider))
+    tokens = iter(["fixture-A", "fixture-B", "fixture-C", "fixture-D"])
+    calls = []
+
+    def resolve_provider(**kwargs):
+        calls.append(kwargs)
+        return {
+            "api_key": next(tokens),
+            "base_url": endpoint,
+            "provider": provider,
+            "api_mode": "codex_responses",
+            "command": None,
+            "args": [],
+            "credential_pool": None,
+        }
+
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", resolve_provider)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: pytest.fail("a managed runtime route must stay on its own provider"),
+    )
+    monkeypatch.setattr(gateway_run, "_credential_pool_for_provider", lambda *_: None)
+
+    # When: two turns resolve the session runtime.
+    first_model, first = _resolve(runner)
+    second_model, second = _resolve(runner)
+
+    # Then: each turn carries a freshly resolved bearer on the same route.
+    assert (first_model, second_model) == ("selected-model", "selected-model")
+    assert first["api_key"] != "fixture-A"
+    assert second["api_key"] not in ("fixture-A", first["api_key"])
+    for runtime in (first, second):
+        assert (runtime["provider"], runtime["base_url"], runtime["api_mode"]) == (
+            provider, endpoint, "codex_responses")
+    assert all(call == {"requested": provider, "target_model": "selected-model"} for call in calls)

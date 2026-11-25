@@ -239,9 +239,11 @@ class GatewayTurnPrepareMixin:
         if override:
             override_model = override.get("model", model)
             override_runtime = _session_override_snapshot(override)
-            if override.get("_runtime_bundle_complete") is True:
+            if override.get("_runtime_bundle_complete") is True and not managed_oauth:
                 # Rehydrated runtime route: one atomic provider-resolution bundle (endpoint, mode,
                 # credentials, command, args, pool) — never mixed with the configured default.
+                # A managed OAuth bundle's key is a snapshot like any other: it takes the
+                # per-turn auth-store resolution below, still on its own provider.
                 bundle_runtime = _persisted_runtime_bundle(override)
                 logger.debug(
                     "Persisted runtime bundle (fast): session=%s config_model=%s -> override_model=%s provider=%s",
