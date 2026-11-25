@@ -92,7 +92,6 @@ def _make_runner(store):
 
     runner = object.__new__(GatewayRunner)
     runner._session_model_overrides = {}
-    runner._session_reasoning_overrides = {}
     runner.session_store = store
     return runner
 
@@ -270,7 +269,7 @@ def test_router_reasoning_survives_store_and_runner_restart(store_factory):
         restarted._rehydrate_session_model_override(session_key)
 
     assert restarted._session_model_overrides[session_key]["model"] == "claude-fable-5"
-    assert restarted._session_reasoning_overrides[session_key] == {
+    assert restarted._session_state(session_key).conversation.reasoning_override == {
         "enabled": True,
         "effort": "xhigh",
     }
@@ -288,7 +287,7 @@ def test_legacy_override_without_reasoning_rehydrates_without_inventing_it(store
     ):
         restarted._rehydrate_session_model_override(entry.session_key)
 
-    assert entry.session_key not in restarted._session_reasoning_overrides
+    assert restarted._session_state(entry.session_key).conversation.reasoning_override is None
 
 
 def test_live_reasoning_override_wins_over_rehydrated_router_reasoning(store_factory):
@@ -307,7 +306,7 @@ def test_live_reasoning_override_wins_over_rehydrated_router_reasoning(store_fac
     ):
         restarted._rehydrate_session_model_override(entry.session_key)
 
-    assert restarted._session_reasoning_overrides[entry.session_key] == {
+    assert restarted._session_state(entry.session_key).conversation.reasoning_override == {
         "enabled": True,
         "effort": "low",
     }

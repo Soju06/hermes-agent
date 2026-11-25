@@ -114,7 +114,7 @@ def _runner_with_cached_agent(agent):
     runner._init_cached_agent_for_turn = lambda *args, **kwargs: None
     runner._resolve_session_service_tier = lambda **kwargs: None
     runner._get_system_prompt_for_channel = lambda *args, **kwargs: ""
-    runner._resolve_turn_agent_config = lambda message, model, runtime: {
+    runner._resolve_turn_agent_config = lambda message, model, runtime, **kw: {
         "model": model,
         "runtime": runtime,
         "request_overrides": {},

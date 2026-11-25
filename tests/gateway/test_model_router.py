@@ -2534,9 +2534,9 @@ def test_enforce_apply_model_path_parity(monkeypatch, tmp_path):
     assert routed_override.pop("router_applied") is True
     assert "router_applied" not in typed._session_model_overrides["tg:c1"]
     assert routed_override == typed._session_model_overrides["tg:c1"]
-    reasoning = typed._session_reasoning_overrides["tg:c1"]
+    reasoning = typed._session_state("tg:c1").conversation.reasoning_override
     assert reasoning == {"enabled": True, "effort": "xhigh"}
-    assert routed._session_reasoning_overrides["tg:c1"] == reasoning
+    assert routed._session_state("tg:c1").conversation.reasoning_override == reasoning
     routed_write = routed.session_store.set_model_override.call_args
     typed_write = typed.session_store.set_model_override.call_args
     assert routed_write.kwargs == typed_write.kwargs == {}
