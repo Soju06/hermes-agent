@@ -262,9 +262,10 @@ TODO_SCHEMA = {
     "description": (
         # Claude Code TodoWrite's when-to-use / when-not-to-use / state-management guidance
         # (v2.1.226), adapted to this tool's read/merge calling convention (#95681 keeps it
-        # static so the cached prompt prefix survives).
-        "Use this tool to create and manage a structured task list for your "
-        "current coding session. This helps you track progress, organize "
+        # static so the cached prompt prefix survives). The first sentence leads with the
+        # capability and fits the tool_search catalog line (CATALOG_SUMMARY_MAX_CHARS).
+        "Create and manage a structured task list for your current coding "
+        "session. This helps you track progress, organize "
         "complex tasks, and demonstrate thoroughness to the user.\n"
         "It also helps the user understand the progress of the task and "
         "overall progress of their requests.\n\n"
