@@ -1710,6 +1710,10 @@ def test_soft_refusal_masks_current_turn_and_stages_force(monkeypatch, tmp_path)
     assert entry["force_refusal_reason"] == "prior_turn_refused"
     assert entry["refusal_recovery_count"] == 1
     probe.assert_called_once()
+    # Only the soft path hides a reply itself, so only its notice carries the count.
+    runner._deliver_platform_notice.assert_awaited_once_with(
+        _source(), "⚠️ 응답 거절 감지 → 메시지 가림(1) · 다음 턴 PERMISSIVE_CHAT(grok-4.5)",
+    )
 
 
 def test_soft_refusal_below_threshold_does_not_mask_or_stage(monkeypatch, tmp_path):
