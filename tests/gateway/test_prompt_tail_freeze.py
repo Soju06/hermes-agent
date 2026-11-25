@@ -676,7 +676,9 @@ class TestRuntimeOverrideEvictionGuard:
 
         assert changed is True
         assert evictions == []
-        assert runner._session_reasoning_overrides["sess-key"] == {
+        # The session reasoning override lives on ``SessionState.conversation`` (the legacy
+        # ``_session_reasoning_overrides`` dict view is gone upstream).
+        assert runner._peek_session_state("sess-key").conversation.reasoning_override == {
             "enabled": True,
             "effort": "max",
         }
