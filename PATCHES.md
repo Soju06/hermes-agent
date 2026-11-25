@@ -1421,7 +1421,7 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 
 ### 93. sync-20261030-test-seams
 - **branch:** `soju/patches/sync-20261030-test-seams`
-- **stacked-on:** `soju/patches/slack-stale-reconnect-task` (2026-10-30 chronological tip stack — this is the tip of the whole production stack)
+- **stacked-on:** `soju/patches/slack-stale-reconnect-task` (2026-10-30 chronological tip stack; #94 is stacked on it since 2026-11-25)
 - **origin:** `local-author`
 - **upstream_pr:** _(none — generated fixtures and test seams for fork gates)_
 - **state:** `local-only`
@@ -1430,6 +1430,19 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
   - `9676072162` test: re-render generated fixtures and re-seam upstream tests to fork gates (2026-10-30 sync)
 - **touches:** `scripts/ci/docs_drift_baseline.json`, `tests/conformance/vectors/discord.json`, `tests/fixtures/prompt_surface/surfaces.json`, `tests/fixtures/prompt_surface/tools/*.json`, `tests/fixtures/skill_gate_classifier_core.json`
 - **v0.22.5-sync:** DONE-WITH-NOTES — created 2026-10-30; see `~/work/hermes/upstream-sync-20261030/reports/sync-20261030-test-seams.md`.
+
+
+### 94. summary-empty-finish-reason
+- **branch:** `soju/patches/summary-empty-finish-reason`
+- **stacked-on:** `soju/patches/sync-20261030-test-seams` (chronological tip stack; tip of the whole production stack)
+- **origin:** `local-author`
+- **upstream_pr:** none
+- **state:** `local-only`
+- **rationale:** 72 of 127 compression summary attempts between 2026-11-10 and 2026-11-14 failed with "Context compression LLM returned empty content", all on claude-fable-5-2, and nothing in the log told a structured refusal (`stop_reason=refusal`) from a reasoning-only turn. When the summary response is judged empty, `ContextCompressor._call_summary_llm` now logs one content-free WARNING (`finish_reason`, `stop_reason`, `output_tokens`, block-type counts, content/reasoning lengths, tool-call count, resolved aux provider/model) before raising the unchanged RuntimeError; the Anthropic aux shim (`_AnthropicCompletionsAdapter.create`) attaches a content-free `native_shape` (raw `stop_reason`, block-type counts) to the response it returns. The failure text, classifier and user warning are untouched. Deployed to the live v0.21.2 tree 2026-11-16 as 48ab645561 (fork-policy source commit 8b6c867785, branch `soju/hotfix-live/summary-empty-finish-reason`). Fork-only diagnostics, no upstream PR.
+- **commits:**
+  - `edb23b9c9b` fix(agent): log why a compression summary came back empty
+- **touches:** `agent/auxiliary_client.py`, `agent/context_compressor.py`, `tests/agent/test_summary_empty_content_diagnostics.py`
+- **v0.22.5-sync:** DONE — added 2026-11-25 by `cherry-pick -x 8b6c867785` onto `soju/patches/sync-20261030-test-seams` (9676072162); applied clean, both hunks still land in the owning modules at v0.22.5 (`_call_summary_llm` in `agent/context_compressor.py`, `_AnthropicCompletionsAdapter` in `agent/auxiliary_client.py`); no prompt/tool-schema change, so #93's generated fixtures stay valid. Record: `~/work/hermes/update-20261125/PREP-REPORT.md` § 3.
 
 
 ## State Vocabulary
@@ -1518,7 +1531,8 @@ soju/patches/todo-continuity-parity
 soju/patches/aux-anthropic-mode-max-tokens
 soju/patches/session-store-lock-offload
 soju/patches/slack-stale-reconnect-task
-soju/patches/sync-20261030-test-seams (tip of the stack)
+soju/patches/sync-20261030-test-seams
+soju/patches/summary-empty-finish-reason (tip of the stack)
 # dropped 2026-10-30 (merged upstream / folded / moot): gateway-worker-pool, background-first-waits, model-switch-provider-dedupe, daemon-pool-py314-compat, approval-grep-escaped-quote, elision-marker-imitation, kanban-board-env-precedence, kanban-goal-judge-unavailable, conversation-started-date-stable, sync-20260914-test-seams, sync-20260914-fixups, sync-20260914-kanban-seams, startup-integrity-check-offload, cron-fire-fence-heartbeat
 ```
 
