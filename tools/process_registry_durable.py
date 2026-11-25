@@ -3,8 +3,11 @@
 An opted-in non-PTY local background command runs in its own ``hermes-bg-<id>`` transient
 user scope and writes stdout+stderr to a private log (``<HERMES_HOME>/bg-logs/<id>.log``), so
 it survives a gateway service restart: the shutdown sweep skips it
-(``kill_all(exclude_durable=True)``) and checkpoint recovery re-attaches its log. Without a
-usable systemd user manager the spawn falls back to the ordinary local path.
+(``kill_all(exclude_durable=True)``), so does the sweep after a forced update kill
+(``hermes_cli/update_cmd_force_stop.py``), and checkpoint recovery re-attaches its log. Only a
+host whose jobs outlive it (a gateway, see ``ProcessOwnershipMixin._owns_job``) spawns durably; a
+host that owns its jobs keeps them owned. Without a usable systemd user manager the spawn falls
+back to the ordinary local path.
 """
 
 import codecs
@@ -19,6 +22,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
+from agent.memory_provider import spawn_context_thread
 from hermes_constants import get_hermes_home
 from hermes_platform.resolver import locate_command
 
@@ -263,10 +267,11 @@ class ProcessDurableMixin:
             session.log_path = str(get_hermes_home() / "bg-logs" / f"{session.id}.log")
         self._read_durable_output(session)
         try:
-            reader = threading.Thread(
-                target=self._recovered_durable_reader_loop,
+            # The reader finishes the session (checkpoint, completed result) in the recovering
+            # profile's home, so it keeps the recovering caller's profile scope.
+            reader = spawn_context_thread(
+                self._recovered_durable_reader_loop,
                 args=(session,),
-                daemon=True,
                 name=f"proc-recovered-reader-{session.id}",
             )
             session._reader_thread = reader

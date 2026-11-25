@@ -1232,10 +1232,11 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
         # session (observed as dead TUIs in state T). Cgroup isolation is unaffected —
         # the scope attaches to the invoked process, not the spawning session.
         proc = None
-        if log is None and self._durable_background_enabled():
+        if log is None and not self._owns_job(persist_on_release) and self._durable_background_enabled():
             # Opted-in (terminal.durable_background): sibling transient scope + file-backed log so the
-            # job survives a gateway restart. A worker spawn keeps its own output log. Falls back to
-            # the ordinary spawn below when scopes are unavailable.
+            # job survives a gateway restart. A worker spawn keeps its own output log, and a host that
+            # owns its jobs (not a gateway, see _owns_job) keeps them owned. Falls back to the ordinary
+            # spawn below when scopes are unavailable.
             proc = self._spawn_durable_local(session, safe_command, spawn_env, dict(
                 text=True, cwd=session.cwd, encoding="utf-8", errors="replace", stdout=subprocess.PIPE,
                 # detached-spawn: ok - a durable job outlives the gateway on purpose (terminal.durable_background)

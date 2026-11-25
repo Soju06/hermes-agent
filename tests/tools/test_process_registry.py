@@ -1140,6 +1140,7 @@ class TestDurableLocalSpawn:
             return self._fake_process()
 
         fake_thread = MagicMock()
+        registry._jobs_outlive_host = True  # a gateway: recover_from_checkpoint ran
         with patch.object(registry, "_durable_background_enabled", return_value=True), \
              patch.object(registry, "_durable_scope_launcher", return_value="/usr/bin/systemd-run"), \
              patch.object(registry, "_prepare_durable_log", return_value=str(log_path)), \
@@ -1174,6 +1175,7 @@ class TestDurableLocalSpawn:
             return self._fake_process()
 
         fake_thread = MagicMock()
+        registry._jobs_outlive_host = True  # a gateway: recover_from_checkpoint ran
         monkeypatch.setattr("tools.process_registry_durable._DURABLE_WARNING_EMITTED", False)
         with patch.object(registry, "_durable_background_enabled", return_value=True), \
              patch("tools.process_registry.platform.system", return_value="Linux"), \
@@ -1201,6 +1203,7 @@ class TestDurableLocalSpawn:
             return self._fake_process(pid=5000 + len(captured))
 
         fake_thread = MagicMock()
+        registry._jobs_outlive_host = True  # a gateway: recover_from_checkpoint ran
         monkeypatch.setattr("tools.process_registry_durable._DURABLE_WARNING_EMITTED", False)
         with patch.object(registry, "_durable_background_enabled", return_value=True), \
              patch.object(registry, "_durable_scope_launcher", return_value="/usr/bin/systemd-run"), \
@@ -1220,6 +1223,49 @@ class TestDurableLocalSpawn:
         assert session.pid == 5002
         assert session.durable is False
         discard_scope.assert_called_once()
+
+    def test_enabled_in_a_host_that_owns_its_jobs_keeps_the_job_owned(self, registry):
+        """Not a gateway (no checkpoint re-adoption): upstream's owner-death contract wins, so the
+        job is spawned owned and never in a scope that outlives its owner."""
+        owned = []
+
+        def fake_spawn_owned(argv, **kwargs):
+            owned.append(argv)
+            return self._fake_process(pid=6001)
+
+        with patch.object(registry, "_durable_background_enabled", return_value=True), \
+             patch.object(registry, "_spawn_durable_local") as durable_spawn, \
+             patch("tools.process_registry_ownership.spawn_owned", side_effect=fake_spawn_owned), \
+             patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
+             patch("tools.process_registry.threading.Thread", return_value=MagicMock()), \
+             patch.object(registry, "_write_checkpoint"):
+            assert registry._owns_job(False)
+            session = registry.spawn_local("echo owned", cwd="/tmp")
+
+        durable_spawn.assert_not_called()
+        assert owned and owned[0][-1] == "set +m; echo owned"
+        assert session.durable is False
+        assert session._owned_pgid == 6001
+
+    def test_recovered_durable_reader_keeps_the_recovering_profile_scope(self, registry, tmp_path, monkeypatch):
+        """The recovered reader finishes the session (checkpoint, completed result) in the home of
+        the profile that recovered it, not the launch profile's."""
+        from hermes_constants import get_hermes_home, reset_hermes_home_override, set_hermes_home_override
+        seen = []
+        monkeypatch.setattr(registry, "_recovered_durable_reader_loop", lambda session: seen.append(get_hermes_home()))
+        log_path = tmp_path / "served.log"
+        log_path.write_text("tail\n")
+        session = _make_session(sid="proc_served", durable=True)
+        session.log_path = str(log_path)
+        served = tmp_path / "profiles" / "served"
+        token = set_hermes_home_override(served)
+        try:
+            registry._resume_recovered_durable_session(session)
+        finally:
+            reset_hermes_home_override(token)
+        session._reader_thread.join(timeout=5)
+        assert seen == [served]
+        assert session.output_buffer == "tail\n"
 
 
 # =========================================================================
@@ -1342,7 +1388,7 @@ class TestCheckpoint:
             "log_path": str(log_path),
         }]))
 
-        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint), \
+        with patch("tools.process_registry._checkpoint_path", return_value=checkpoint), \
              patch("tools.process_registry.threading.Thread"):
             assert registry.recover_from_checkpoint() == 1
             result = registry.read_log("proc_durable")
@@ -1365,7 +1411,7 @@ class TestCheckpoint:
             "task_id": "t1",
         }]))
 
-        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+        with patch("tools.process_registry._checkpoint_path", return_value=checkpoint):
             assert registry.recover_from_checkpoint() == 1
 
         session = registry.get("proc_legacy")
@@ -1392,7 +1438,7 @@ class TestCheckpoint:
         }]))
 
         try:
-            with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            with patch("tools.process_registry._checkpoint_path", return_value=checkpoint):
                 assert registry.recover_from_checkpoint() == 1
                 with log_path.open("a", encoding="utf-8") as stream:
                     stream.write("READY after restart\n")

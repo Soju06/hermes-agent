@@ -176,6 +176,19 @@ def test_the_sweep_never_touches_a_process_another_interpreter_recorded(monkeypa
                 proc.wait(timeout=5)
 
 
+def test_the_sweep_leaves_a_durable_session_for_the_next_gateway(monkeypatch, tmp_path):
+    """``stop()`` spares durable sessions (``kill_all(exclude_durable=True)``), so the sweep after a
+    kill does too, and does not report them as another interpreter's."""
+    swept = []
+    monkeypatch.setattr(force_stop, "_sweep_one", lambda record: swept.append(record["session_id"]) or (True, None))
+    (tmp_path / "processes.json").write_text(json.dumps([
+        {"session_id": "proc_durable", "pid": 4242, "pid_scope": "host", "owner_pid": 77, "durable": True,
+         "systemd_unit": "hermes-bg-proc_durable.scope", "command": "long-build"},
+        {"session_id": "proc_plain", "pid": 4343, "pid_scope": "host", "owner_pid": 77, "command": "npm run dev"}]))
+    assert force_stop._sweep_left_behind([tmp_path], 77) == (1, 0, [])
+    assert swept == ["proc_plain"]
+
+
 def test_a_worker_scope_that_will_not_stop_aborts_the_update(monkeypatch, tmp_path, no_record):
     """The killed gateway's worker scope holds a child ignoring SIGTERM and its stop fails even
     after the scope is SIGKILLed: that is an unsettled stop naming the scope, never a clean sweep."""

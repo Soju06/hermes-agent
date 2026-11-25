@@ -92,13 +92,16 @@ def _sweep_left_behind(homes: list[Path], owner_pid: int) -> tuple[int, int, lis
     persisted jobs included): the host processes its checkpoints name as written by *owner_pid*.
     ``processes.json`` is shared by every interpreter on the home (an ACP editor's background
     commands too), so an entry another process wrote, or one with no ``owner_pid`` (written before
-    it was recorded), is not this gateway's and is left alone.
+    it was recorded), is not this gateway's and is left alone. A durable session
+    (``terminal.durable_background``) is not in that sweep either (``exclude_durable=True``): it
+    keeps running for the next gateway to re-adopt.
     ``(stopped, skipped, leftover scopes)``."""
     records, skipped = [], 0
     for home in homes:
         with suppress(OSError, ValueError):
             listed = json.loads((home / "processes.json").read_text(encoding="utf-8-sig"))
-            host = [r for r in listed if isinstance(r, dict) and (r.get("pid_scope") or "host") == "host"]
+            host = [r for r in listed if isinstance(r, dict) and (r.get("pid_scope") or "host") == "host"
+                    and not r.get("durable")]
             owned = [r for r in host if r.get("owner_pid") == owner_pid]
             records += owned
             skipped += len(host) - len(owned)
