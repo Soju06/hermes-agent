@@ -129,6 +129,19 @@ def _assert_stale(system: str) -> None:
     assert "Project rules revision one." in system
 
 
+def _assert_persisted_as_sent(stored: str, sent: str) -> None:
+    """The persisted prompt is the bytes the model was sent. Fork (runtime-route-awareness): the
+    live Runtime/Route State block is appended at the API boundary only
+    (``compose_effective_system_prompt``) and never persisted, so it is the one tail the sent
+    system message adds after the stored bytes."""
+    assert "# Runtime/Route State" not in stored
+    assert sent.startswith(stored)
+    tail = sent[len(stored):]
+    assert tail.startswith("\n\n# Runtime/Route State\n")
+    block_lines = tail.removeprefix("\n\n# Runtime/Route State\n").split("\n")
+    assert [line.split(":", 1)[0] for line in block_lines] == ["CurrentRuntime", "DesiredRoute", "Policy"]
+
+
 def test_without_the_verb_a_continuing_session_keeps_its_stored_prompt(profile):
     srv, home, project = profile
     history, first = _turn(srv, home, "chat-a", "hello", [])
@@ -163,7 +176,8 @@ def test_the_verb_makes_the_next_turn_adopt_soul_skills_and_project_files_once(p
     assert after == refreshed and builds == []
     assert len(_user_texts(srv.main_requests()[-1])) == 4
 
-    assert session_row(storage_handle(home), "chat-a")["system_prompt"] == refreshed  # persisted for the next restore
+    # Persisted for the next restore.
+    _assert_persisted_as_sent(session_row(storage_handle(home), "chat-a")["system_prompt"], refreshed)
 
 
 def test_session_flag_refreshes_only_that_session(profile, monkeypatch):
