@@ -29,7 +29,10 @@ logger = logging.getLogger(__name__)
 # v0.22.5 additions, upstream_blocked (WAF/CDN 403) stays out for probe parity
 # (the probe counts a 403 healthy); model_entitlement, data_policy_denied,
 # incomplete_response and role_alternation are account/model/request-scoped.
-# tests/agent/test_passive_provider_health.py partitions the whole enum.
+# v0.23.4's guardrail_blocked (OpenRouter's prompt-injection guardrail judging
+# this payload under an account setting) is a policy refusal, like
+# content_policy_blocked. tests/agent/test_passive_provider_health.py
+# partitions the whole enum.
 PASSIVE_UNHEALTHY_REASONS = frozenset({
     FailoverReason.billing,
     FailoverReason.rate_limit,

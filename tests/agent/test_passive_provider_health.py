@@ -73,6 +73,7 @@ _NOT_A_PROVIDER_OUTAGE = frozenset({
     FailoverReason.model_not_found,
     # this request's content or shape
     FailoverReason.content_policy_blocked,
+    FailoverReason.guardrail_blocked,  # v0.23.4: account guardrail judged this payload
     FailoverReason.context_overflow,
     FailoverReason.payload_too_large,
     FailoverReason.image_too_large,
@@ -111,7 +112,8 @@ class TestUnhealthyReasonSet:
         """Each FailoverReason either files an unhealthy verdict or is excluded on purpose.
         A member upstream adds lands in neither set and fails here until it is classified
         (v0.22.5 added upstream_blocked, model_entitlement, incomplete_response,
-        data_policy_denied and role_alternation; all excluded)."""
+        data_policy_denied and role_alternation, v0.23.4 added guardrail_blocked; all
+        excluded)."""
         assert not (_NOT_A_PROVIDER_OUTAGE & PASSIVE_UNHEALTHY_REASONS)
         assert _NOT_A_PROVIDER_OUTAGE | PASSIVE_UNHEALTHY_REASONS == set(FailoverReason)
 
