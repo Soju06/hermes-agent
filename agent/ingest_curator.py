@@ -68,7 +68,9 @@ from agent.memory_journal import (
     _safe_session_filename,
     _scrub,
 )
+from hermes_constants import hermes_home_key
 from tools.hosted_tool_policy import host_feature_enabled
+from tools.thread_context import propagate_context_to_thread
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +106,9 @@ SKILL_PROPOSE_CAP = 1
 
 _CFG_TTL_S = 15.0
 _cfg_lock = threading.Lock()
-_cfg_cache: Dict[str, Any] = {"ts": 0.0, "curator": {}}
+# hermes_home_key() -> (read ts, curator section). One process serves many
+# profiles, so each home's config.yaml is cached on its own.
+_cfg_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 
 
 def _curator_cfg() -> Dict[str, Any]:
@@ -114,9 +118,11 @@ def _curator_cfg() -> Dict[str, Any]:
     cheap and can never raise (fail-open to the disabled default).
     """
     now = time.time()
+    home = hermes_home_key()
     with _cfg_lock:
-        if now - _cfg_cache["ts"] < _CFG_TTL_S:
-            return _cfg_cache["curator"]
+        hit = _cfg_cache.get(home)
+        if hit is not None and now - hit[0] < _CFG_TTL_S:
+            return hit[1]
     section: Dict[str, Any] = {}
     try:
         from hermes_cli.config import load_config
@@ -127,14 +133,13 @@ def _curator_cfg() -> Dict[str, Any]:
     except Exception:
         section = {}
     with _cfg_lock:
-        _cfg_cache["ts"] = now
-        _cfg_cache["curator"] = section
+        _cfg_cache[home] = (now, section)
     return section
 
 
 def _invalidate_cfg_cache() -> None:
     with _cfg_lock:
-        _cfg_cache["ts"] = 0.0
+        _cfg_cache.clear()
 
 
 def ingest_curator_enabled() -> bool:
@@ -948,7 +953,10 @@ def _build_curator_fork(
     guarantee), persistence isolation, compression off, cache-parity pins.
     """
     from run_agent import AIAgent
-    from agent.background_review import _resolve_review_runtime
+    from agent.background_review import (
+        _resolve_review_runtime,
+        _same_model_parity_kwargs,
+    )
     from agent.memory_manager_tools import inject_memory_provider_tools
 
     _rt = _resolve_review_runtime(agent, aux_task="ingest_curator")
@@ -959,6 +967,13 @@ def _build_curator_fork(
     if isinstance(_rt.get("command"), str) and _rt["command"]:
         fork_kwargs["acp_command"] = _rt["command"]
         fork_kwargs["acp_args"] = _rt.get("args") or []
+    if not routed:
+        # Same model as the parent: carry its provider-routing pins (an
+        # OpenRouter only/ignore list, data_collection: deny) so the replayed
+        # transcript goes where the parent's would, plus reasoning, the
+        # ephemeral system prompt and prefill for prefix-cache parity. This
+        # is upstream's review-fork rule (build_cache_parity_fork).
+        fork_kwargs.update(_same_model_parity_kwargs(agent))
 
     fork = AIAgent(
         model=_rt.get("model") or agent.model,
@@ -1744,8 +1759,11 @@ def _rearm_idle_timer(agent: Any, st: _SessionTriggerState) -> None:
                 if idle_for < idle_s:
                     # Activity happened while we slept — re-arm for the
                     # remainder of the idle window (single-timer discipline).
+                    # This runs inside the arming turn's context, so the
+                    # re-armed timer captures the same profile scope.
                     timer = threading.Timer(
-                        max(idle_s - idle_for, 0.001), _idle_fire
+                        max(idle_s - idle_for, 0.001),
+                        propagate_context_to_thread(_idle_fire),
                     )
                     timer.daemon = True
                     st.idle_timer = timer
@@ -1772,7 +1790,11 @@ def _rearm_idle_timer(agent: Any, st: _SessionTriggerState) -> None:
         st.agent_ref = agent
         if st.idle_timer is not None:
             return  # pending timer will honor the refreshed activity ts
-        timer = threading.Timer(idle_s, _idle_fire)
+        # A Timer thread starts with an empty context. Bind the turn's
+        # profile scope, so the config gate, the WAL and ledger paths and the
+        # fork's memory_search all resolve the owning profile, not the
+        # launch profile.
+        timer = threading.Timer(idle_s, propagate_context_to_thread(_idle_fire))
         timer.daemon = True
         st.idle_timer = timer
         timer.start()

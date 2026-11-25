@@ -720,6 +720,71 @@ class TestTriggers:
         # It fired a full idle window after the REFRESH, not the first arm.
         assert fired_at["t"] - refreshed_at >= 0.4
 
+    def test_idle_timer_keeps_the_arming_profile_scope(self, monkeypatch, tmp_path):
+        """A Timer thread starts with an empty context. The idle wake, its
+        re-arm and the spawn must all resolve the profile whose turn armed
+        the timer, not the launch profile."""
+        from hermes_constants import (
+            get_hermes_home,
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        gate_homes = []
+
+        def _gate():
+            gate_homes.append(get_hermes_home())
+            return True
+
+        monkeypatch.setattr(ic, "ingest_curator_enabled", _gate)
+        monkeypatch.setattr(ic, "_idle_seconds", lambda: 0.2)
+        fired = threading.Event()
+        spawn_home = {}
+
+        def _capture(agent, **kwargs):
+            spawn_home["home"] = get_hermes_home()
+            fired.set()
+
+        monkeypatch.setattr(ic, "spawn_curation_thread", _capture)
+        profile_home = tmp_path / "profile-b"
+        profile_home.mkdir()
+        token = set_hermes_home_override(profile_home)
+        try:
+            ic.observe_turn_completed(_FakeLiveAgent("idle-scope"), _turn_messages())
+            st = ic._state_for("idle-scope")
+            with st.lock:
+                # Activity "after" arming: the first wake must re-arm.
+                st.last_activity_ts = time.time() + 0.1
+        finally:
+            reset_hermes_home_override(token)
+        assert fired.wait(timeout=5.0), "idle timer never fired"
+        # observe + first wake (re-arm) + second wake (spawn).
+        assert gate_homes == [profile_home] * 3
+        assert spawn_home["home"] == profile_home
+
+    def test_config_cache_is_per_profile_home(self, tmp_path):
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        homes = {}
+        for name, enabled in (("on", "true"), ("off", "false")):
+            home = tmp_path / name
+            home.mkdir()
+            (home / "config.yaml").write_text(
+                f"curator:\n  ingest_enabled: {enabled}\n", encoding="utf-8"
+            )
+            homes[name] = home
+        seen = []
+        for name in ("on", "off", "on"):
+            token = set_hermes_home_override(homes[name])
+            try:
+                seen.append(ic.ingest_curator_enabled())
+            finally:
+                reset_hermes_home_override(token)
+        assert seen == [True, False, True]
+
     def test_observe_never_raises(self, monkeypatch):
         monkeypatch.setattr(
             ic, "ingest_curator_enabled",
@@ -1127,6 +1192,22 @@ class TestShadowRunEndToEnd:
         assert delegation_backends._rebuild_requests == {sid}
         assert forks and forks[0]._turn_origin == "ingest_curator"
         assert forks[0]._skip_prompt_cache_warming is True
+
+    def test_same_model_fork_keeps_the_parents_provider_routing_pins(self, shadow_run_env):
+        """An un-routed fork replays the parent's transcript on the parent's model, so it must
+        carry the parent's provider-routing pins (upstream's _same_model_parity_kwargs)."""
+        parent, mm, provider, handler, home = shadow_run_env
+        parent.providers_allowed = ["anthropic"]
+        parent.providers_ignored = ["deepinfra"]
+        parent.provider_data_collection = "deny"
+        fork, routed, _model = ic._build_curator_fork(parent, mode="cold", micro=False)
+        try:
+            assert routed is False
+            assert fork.providers_allowed == ["anthropic"]
+            assert fork.providers_ignored == ["deepinfra"]
+            assert fork.provider_data_collection == "deny"
+        finally:
+            fork.release_clients()
 
     def test_memory_search_read_stays_callable_from_fork_recipe(self, shadow_run_env):
         parent, mm, provider, handler, home = shadow_run_env
