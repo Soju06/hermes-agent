@@ -125,7 +125,7 @@ _KNOWN_PROVIDER_KEYS = {
     "discover_models", "extra_body", "extra_headers", "capabilities", "ssl_ca_cert", "ssl_verify",
     "catalog_provider", "session_affinity_header",
     "gemini_api",  # read by the gemini provider plugin (which Gemini API a model's calls use)
-    # Trusted Anthropic passthrough proxy — read directly from config.yaml
+    # Trusted Anthropic passthrough proxy — read from the loaded config (load_config_readonly)
     # by agent/anthropic_thinking_policy._get_signature_passthrough_urls (thinking
     # signature replay trust), not from the normalized runtime entry.
     "anthropic_signature_passthrough",

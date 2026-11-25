@@ -77,21 +77,19 @@ _signature_passthrough_urls_cache: dict[str, frozenset[str]] = {}
 
 
 def _read_signature_passthrough_urls() -> frozenset[str]:
+    from hermes_cli.config_backend import ConfigBackendUnavailable
     try:
-        from hermes_constants import get_config_path
-        from utils import fast_safe_load
+        from hermes_cli.config import load_config_readonly
 
-        config_path = get_config_path()
-        cfg = fast_safe_load(config_path.read_text(encoding="utf-8-sig")) if config_path.exists() else None
-        providers = (cfg or {}).get("providers") or {}
+        providers = load_config_readonly().get("providers") or {}
         entries = providers.values() if isinstance(providers, dict) else ()
         return frozenset(
             url for pcfg in entries
             if isinstance(pcfg, dict) and pcfg.get("anthropic_signature_passthrough")
             and (url := _normalized_lower(pcfg.get("base_url")))
         )
-    except Exception:
-        # Fail closed: an unreadable config trusts no endpoint, which keeps the third-party stripping.
+    # A refused backend read is a SystemExit subclass: it must not end the turn that asked for a route.
+    except (Exception, ConfigBackendUnavailable):  # health: allow BLE001 -- an unreadable config trusts no endpoint (fails closed)
         logger.debug("signature-passthrough config read failed", exc_info=True)
         return frozenset()
 
@@ -99,7 +97,8 @@ def _read_signature_passthrough_urls() -> frozenset[str]:
 def _get_signature_passthrough_urls() -> frozenset[str]:
     """Base URLs of Anthropic passthrough proxies that preserve thinking signatures.
 
-    A provider opts in with ``anthropic_signature_passthrough: true`` in ``config.yaml``. The flag
+    A provider opts in with ``anthropic_signature_passthrough: true`` under ``providers.<name>`` in
+    ``config.yaml``, read through the config loader (``load_config_readonly``). The flag
     asserts that the endpoint forwards message content blocks to real Anthropic verbatim (no
     reordering, merging or block mutation), so thinking signatures generated through it validate on
     replay. Read once per profile home: provider base URLs are static for the process lifetime.

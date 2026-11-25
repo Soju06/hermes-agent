@@ -131,7 +131,9 @@ def test_passthrough_shares_the_native_route_with_accounting_and_signature_recov
 
 
 def test_config_loader_normalizes_urls(monkeypatch, tmp_path):
-    """The config reader picks up flagged providers and normalizes base URLs."""
+    """The config reader picks up flagged providers and normalizes base URLs. The flag is read
+    through the config loader (``load_config_readonly``), so it is set in the profile's own
+    config.yaml rather than handed to a patched path helper."""
     cfg = tmp_path / "config.yaml"
     cfg.write_text(
         """
@@ -146,15 +148,31 @@ providers:
         encoding="utf-8",
     )
     monkeypatch.setattr(policy, "_signature_passthrough_urls_cache", {})
-    monkeypatch.setattr(
-        "hermes_constants.get_config_path", lambda: cfg
-    )
-    urls = policy._get_signature_passthrough_urls()
-    assert urls == frozenset({"http://10.0.0.114:2455"})
-    assert policy._is_signature_passthrough_endpoint("http://10.0.0.114:2455/")
-    assert not policy._is_signature_passthrough_endpoint(
-        "https://api.minimax.io/anthropic"
-    )
+    token = set_hermes_home_override(tmp_path)
+    try:
+        urls = policy._get_signature_passthrough_urls()
+        assert urls == frozenset({"http://10.0.0.114:2455"})
+        assert policy._is_signature_passthrough_endpoint("http://10.0.0.114:2455/")
+        assert not policy._is_signature_passthrough_endpoint(
+            "https://api.minimax.io/anthropic"
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_unreadable_config_trusts_no_endpoint(monkeypatch):
+    """Fail closed: a config the loader cannot read, including a refused backend read (a
+    ``SystemExit`` subclass), trusts no endpoint and never ends the turn."""
+    from hermes_cli.config_backend import ConfigBackendUnavailable
+
+    for exc in (OSError("unreadable"), ConfigBackendUnavailable("backend refused")):
+        def boom(exc=exc):
+            raise exc
+
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", boom)
+        monkeypatch.setattr(policy, "_signature_passthrough_urls_cache", {})
+        assert policy._read_signature_passthrough_urls() == frozenset()
+        assert policy.anthropic_thinking_route(LB, "claude-fable-5") == "third_party"
 
 
 def test_flag_is_scoped_to_the_profile_that_set_it(monkeypatch, tmp_path):
