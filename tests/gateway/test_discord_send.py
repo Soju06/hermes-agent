@@ -46,7 +46,7 @@ def _ensure_discord_mock():
 _ensure_discord_mock()
 
 from plugins.platforms.discord.adapter import DiscordAdapter
-from plugins.platforms.discord.adapter_tables import _display_width
+from gateway.platforms.helpers import display_width
 
 
 # ---------------------------------------------------------------------------
@@ -108,9 +108,35 @@ def test_format_message_aligns_cjk_wide_characters():
         line for line in formatted.splitlines()
         if line and line[0] in "┌├└│"
     ]
-    assert len({_display_width(line) for line in table_lines}) == 1
+    assert len({display_width(line) for line in table_lines}) == 1
     assert "│ CPU  │ 중앙처리장치 │" in formatted
     assert "│ RAM  │ 메모리       │" in formatted
+
+
+def test_format_message_keeps_a_code_span_pipe_in_its_cell():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+
+    formatted = adapter.format_message(
+        "| Feature | Example |\n"
+        "|---------|---------|\n"
+        "| Table   | `| table |` |\n"
+        "| pipe    | `ls | grep x` |"
+    )
+
+    assert "│ Table   │ `| table |`   │" in formatted
+    assert "│ pipe    │ `ls | grep x` │" in formatted
+
+
+def test_format_message_keeps_an_escaped_pipe_in_its_cell():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+
+    formatted = adapter.format_message(
+        "| Operator | Meaning |\n"
+        "|----------|---------|\n"
+        "| a \\| b    | or      |"
+    )
+
+    assert "│ a | b    │ or      │" in formatted
 
 
 def test_format_message_leaves_non_table_pipe_text_unchanged():
