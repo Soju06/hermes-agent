@@ -147,8 +147,11 @@ _SUMMARY_MISSING_CREDENTIAL_MARKERS: tuple[str, ...] = (
     "no api key was found", "no api key found", "no credentials were found",
 )
 
+# The durable row a protected-tail no-op writes for the gateway hygiene pass; the in-agent compressor has its backoff.
+_NO_PROGRESS_COOLDOWN_ERROR = "no_progress: protected tail spans the whole transcript"
 _HYGIENE_PREAGENT_ONLY_COOLDOWN_MARKERS: tuple[str, ...] = (
     "session hygiene compression timed out", "hygiene compression deferred: turn-hold budget expired",
+    _NO_PROGRESS_COOLDOWN_ERROR,
 )
 
 

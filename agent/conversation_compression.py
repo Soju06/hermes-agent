@@ -3448,15 +3448,15 @@ def _candidate_rejected(
         _strip_marker_for_comparison(compressed) == _strip_marker_for_comparison(messages_before_compression)
     ):
         agent._last_compression_no_progress = True
-        _no_progress_error = "no_progress: protected tail spans the whole transcript"
-        # The structural backoff below is in-memory only; the gateway hygiene path rebuilds the
-        # agent every attempt and consults the DURABLE compression-failure cooldown, so persist one
-        # too or hygiene re-runs the same no-op every turn (force=/compress still overrides).
+        # Gateway hygiene rebuilds the agent every attempt, so the in-memory backoff below never reaches it: persist
+        # the durable row its pre-agent check honours, or hygiene re-runs this no-op every turn. Only the row, with a
+        # hygiene-only error: this compressor keeps the backoff a grown transcript lifts (force=/compress overrides).
         with _swallow('no-progress compression cooldown persist failed', exc_info=True):
-            from agent.context_compressor import _SUMMARY_FAILURE_COOLDOWN_SECONDS
+            from agent.context_compressor import _NO_PROGRESS_COOLDOWN_ERROR, _SUMMARY_FAILURE_COOLDOWN_SECONDS
 
-            if callable(_record_cooldown := getattr(agent.context_compressor, "_record_compression_failure_cooldown", None)):
-                _record_cooldown(float(_SUMMARY_FAILURE_COOLDOWN_SECONDS), _no_progress_error)
+            if callable(_persist := getattr(agent.context_compressor, "_durable_write", None)):
+                _persist("record_compression_failure_cooldown", "no-progress compression cooldown",
+                         time.time() + _SUMMARY_FAILURE_COOLDOWN_SECONDS, _NO_PROGRESS_COOLDOWN_ERROR)
         logger.info(
             "Compression made no progress (session=%s) — skipping boundary rewrite.", agent.session_id or "none"
         )

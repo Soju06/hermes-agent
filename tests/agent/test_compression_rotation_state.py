@@ -1187,13 +1187,7 @@ class TestAutomaticCompressionStateRefreshAfterLock:
             )
 
         assert returned is messages
-        # Fork seam: the mocked compress() returns the transcript UNCHANGED, which in the fork
-        # legitimately records a fresh DURABLE no-progress cooldown (hygiene-noprogress-cooldown);
-        # upstream only arms an in-memory structural backoff here. That write replaces the error
-        # text, so this check cannot see a leftover "rate limited" row: the stale-cooldown guard is
-        # compress.assert_called_once() below (the initial gate let compress() run).
-        cooldown = compressor.get_active_compression_failure_cooldown()
-        assert cooldown is None or str(cooldown.get("error", "")).startswith("no_progress"), cooldown
+        assert compressor.get_active_compression_failure_cooldown() is None
         compress.assert_called_once()
         assert db.coordination.get_compression_lock_holder(session_id=session_id) is None
 

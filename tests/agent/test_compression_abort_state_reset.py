@@ -134,7 +134,9 @@ class TestAbortPathsResetPerAttemptState:
             db.close()
 
     def test_no_progress_records_durable_cooldown_but_force_still_runs(self):
-        """A protected-tail no-op cools automatic retries, not /compress."""
+        """A protected-tail no-op writes the durable row the gateway hygiene pass honours. This compressor keeps
+        only the structural backoff: the same transcript waits, /compress runs, and a grown transcript compacts
+        again while the row is still live (2026-11-25 sync regression)."""
         from agent.conversation_compression import compress_context
         from persistence_assembly import open_persistence, profile_scope
         from tests.fixtures.storage_seed import seed_session
@@ -174,6 +176,9 @@ class TestAbortPathsResetPerAttemptState:
             assert cooldown.error == (
                 "no_progress: protected tail spans the whole transcript"
             )
+            # The row is hygiene-only: the in-agent cooldown gate does not honour it.
+            compressor = agent.context_compressor
+            assert compressor.get_active_compression_failure_cooldown(refresh=True) is None
 
             compressor_call.reset_mock()
             returned, _ = compress_context(
@@ -193,6 +198,17 @@ class TestAbortPathsResetPerAttemptState:
                 approx_tokens=100_000,
                 force=True,
             )
+            compressor_call.assert_called_once()
+
+            # The turn preflight lifts the backoff once the transcript grew; the live row must not block it.
+            grown = messages + [
+                {"role": "user", "content": "next request"},
+                {"role": "assistant", "content": "next response"},
+            ]
+            assert db.messages.read_compression_cooldown("abort-state-session", time.time()) is not None
+            compressor.lift_structural_backoff_if_grown(len(grown))
+            compressor_call.reset_mock()
+            compress_context(agent, grown, "system", approx_tokens=100_000)
             compressor_call.assert_called_once()
             db.close()
 
