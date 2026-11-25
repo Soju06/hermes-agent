@@ -51,6 +51,16 @@ def test_message_only_scoped_model_exhaustion_is_upstream_rate_limit():
     assert result.should_rotate_credential is False
 
 
+def test_message_only_scoped_model_exhaustion_beats_long_quota_window_wording():
+    """Status-less claude-lb text can also say "weekly limit": the scoped-exhaustion check runs
+    before the long-quota-window wording, which would route it to billing with key rotation."""
+    e = MockAPIError("Weekly limit reached: 3 model-quota-exhausted")
+    result = classify_api_error(e, provider="claude-lb", model="claude-fable-5")
+    assert result.reason == FailoverReason.upstream_rate_limit
+    assert result.should_rotate_credential is False
+    assert result.should_fallback is True
+
+
 def test_429_scoped_model_exhaustion_stays_rate_limit():
     e = MockAPIError(
         "Rate limit exceeded: 3 model-quota-exhausted",
