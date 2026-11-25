@@ -46,7 +46,9 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+from agent.safe_worker_policy import safe_worker_enabled
 from hermes_constants import get_hermes_home
+from tools.hosted_tool_policy import host_feature_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +116,13 @@ def _modes_yaml_path() -> Path:
 
 
 def _load_modes_config() -> Optional[Dict[str, Any]]:
-    """Read and parse ``personas/modes.yaml``.  Any problem → ``None`` (off)."""
+    """Read and parse ``personas/modes.yaml``.  Any problem → ``None`` (off).
+
+    Off in a safe worker and in a hosted scope, the same gate as SOUL.md (``prompt_builder.load_soul_md``):
+    the persona pack is this host's profile state under the ``context_files`` host feature. Every entry
+    point reads the pack through here, so the build path and the staleness resolver agree."""
+    if safe_worker_enabled() or not host_feature_enabled("context_files"):
+        return None
     path = _modes_yaml_path()
     try:
         if not path.is_file():

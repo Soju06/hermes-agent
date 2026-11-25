@@ -12,7 +12,8 @@ Covers:
     identity, before HERMES_AGENT_HELP_GUIDANCE), ``AudienceMode:`` line in
     the volatile tail only while active, deterministic no-op when off, and
     the SOUL-parity injection gate (``skip_context_files`` without
-    ``load_soul_identity`` suppresses the persona — batch_runner).
+    ``load_soul_identity`` suppresses the persona — batch_runner), and the
+    SOUL.md host gate (no persona in a hosted scope or a safe worker).
   * ``current_speaker_user_id`` — gateway session-context speaker wins over
     the cached ``agent._user_id`` (shared discord threads), with fallback.
   * ``_stored_prompt_matches_runtime`` — accept/reject matrix for the
@@ -32,6 +33,7 @@ import pytest
 
 from agent.audience_persona import (
     current_speaker_user_id,
+    expected_audience_mode,
     load_audience_persona,
     persona_injection_enabled,
     resolve_audience_mode,
@@ -43,7 +45,9 @@ from agent.prompt_builder import (
     HERMES_AGENT_HELP_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS,
 )
+from agent.runtime_scope import bind_state
 from agent.system_prompt import build_system_prompt_parts
+from tests.tools.test_sandbox_scope_conformance import A
 
 
 # ---------------------------------------------------------------------------
@@ -570,6 +574,38 @@ class TestInjectionGate:
         # Stored-prompt restore paths may see bare agents; missing attrs
         # behave like a normal interactive agent (gate open).
         assert persona_injection_enabled(SimpleNamespace()) is True
+
+
+class TestHostGate:
+    """The persona pack is this host's profile state, so it follows SOUL.md's gate
+    (``prompt_builder.load_soul_md``): off in a hosted scope (the ``context_files`` host feature)
+    and in a safe worker. The loader, the staleness resolver and the build path agree."""
+
+    @staticmethod
+    def _assert_off(agent):
+        inputs = dict(platform="discord", chat_type="dm", user_id="370452451406381057")
+        assert load_audience_persona(**inputs) is None
+        assert resolve_audience_mode(**inputs) is None
+        assert expected_audience_mode(agent) == ""
+        with (
+            patch("agent.prompt_builder.load_soul_md", return_value=""),
+            patch("agent.prompt_builder.build_environment_hints", return_value=""),
+            patch("agent.prompt_builder.build_context_files_prompt", return_value=""),
+        ):
+            parts = build_system_prompt_parts(agent)
+        assert "PERSONA BODY" not in parts["stable"]
+        assert "AudienceMode" not in parts["volatile"]
+        assert agent._audience_mode == ""
+
+    def test_hosted_scope_gets_no_persona(self, persona_home):
+        agent = _make_agent()
+        with bind_state(A):
+            self._assert_off(agent)
+        assert expected_audience_mode(agent) == "private"  # the same agent outside the scope
+
+    def test_safe_worker_gets_no_persona(self, persona_home, monkeypatch):
+        monkeypatch.setattr("agent.audience_persona.safe_worker_enabled", lambda: True)
+        self._assert_off(_make_agent())
 
 
 # ---------------------------------------------------------------------------
