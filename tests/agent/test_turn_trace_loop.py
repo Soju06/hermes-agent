@@ -111,3 +111,49 @@ def test_gateway_bound_trace_is_adopted_not_finished(sink):
     (turn,) = _span(record, "turn")
     assert turn["tags"]["exit_reason"] == "text_response(stop)"
     assert len(_span(record, "iteration")) == 1
+
+
+def test_tool_batch_records_tools_call_spans_from_both_executors(sink):
+    """A mixed batch runs its parallel-safe prefix on the concurrent executor and its barrier on
+    the sequential one (``agent/tool_executor.py``); every call is one ``tools.call`` span inside
+    the batch's ``tools.batch`` span, and the sequential call also times its publish
+    (``flush_ms``)."""
+    from run_agent import AIAgent
+    from tests.agent.test_run_agent import _mock_tool_call
+
+    tool_defs = [{"type": "function", "function": {
+        "name": name, "description": name, "parameters": {"type": "object", "properties": {}}}}
+        for name in ("web_search", "terminal")]
+    with (
+        patch("model_tools.get_tool_definitions", return_value=tool_defs),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+    ):
+        agent = AIAgent(api_key="test-key-1234567890", base_url="https://openrouter.ai/api/v1",
+                        quiet_mode=True, skip_context_files=True, skip_memory=True)
+    agent.client = MagicMock()
+    trace = turn_trace.TurnTrace(key="agent:main:telegram:dm:1")
+    turn_trace.bind(agent, trace)
+    calls = [
+        _mock_tool_call("web_search", '{"query":"a"}', call_id="s1"),
+        _mock_tool_call("web_search", '{"query":"b"}', call_id="s2"),
+        _mock_tool_call("terminal", '{"command":"echo done"}', call_id="t1"),
+    ]
+    messages = []
+    with patch("model_tools.handle_function_call",
+               side_effect=lambda name, args, task_id, **kwargs: json.dumps({"ok": name})):
+        agent._execute_tool_calls(SimpleNamespace(content="", tool_calls=calls), messages, "task-1")
+
+    assert [m["tool_call_id"] for m in messages] == ["s1", "s2", "t1"]
+    record = trace.finish(status="ok")
+    (batch,) = _span(record, "tools.batch")
+    assert batch["tags"] == {"count": 3, "mode": "segmented", "segments": 2}
+    tool_spans = _span(record, "tools.call")
+    assert sorted(span["tags"]["tool"] for span in tool_spans) == ["terminal", "web_search", "web_search"]
+    for span in tool_spans:
+        assert "execute_ms" in span["tags"]
+        assert batch["t0"] <= span["t0"] and span["t0"] + span["d"] <= batch["t0"] + batch["d"] + 0.05
+    assert [("flush_ms" in span["tags"]) for span in tool_spans if span["tags"]["tool"] == "web_search"] == [
+        False, False]
+    (sequential,) = [span for span in tool_spans if span["tags"]["tool"] == "terminal"]
+    assert sequential["tags"]["flush_ms"] >= 0
