@@ -114,8 +114,12 @@ async def test_model_reset_clears_the_runtime_model_route(tmp_path, monkeypatch)
     # JSON is valid YAML; CI ships no pyyaml for test fixtures.
     (home / "config.yaml").write_text(json.dumps({"model": {"default": "cfg-model", "provider": "cfg-prov"}}))
     monkeypatch.setattr(gateway_run, "_hermes_home", home)
+    # The route resolves (runtime-override-rehydrate-credentials keeps a route whose resolution
+    # names no provider dormant, and a dormant route is no active override to reset).
     monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs_for_provider",
-                        lambda provider, target_model=None: {})
+                        lambda provider, target_model=None: {
+                            "provider": provider, "api_key": "runtime-key",
+                            "base_url": "https://runtime.example/v1", "api_mode": "codex_responses"})
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="c1", user_id="u1", chat_type="dm")
     key = build_session_key(source)
     store = SessionStore(tmp_path / "sessions", GatewayConfig())

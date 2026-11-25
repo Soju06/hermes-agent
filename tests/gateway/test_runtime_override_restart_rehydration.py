@@ -53,7 +53,6 @@ def _runner(store: _FakeStore) -> gateway_run.GatewayRunner:
     runner.session_store = store
     runner.config = None
     runner._session_model_overrides = {}
-    runner._session_reasoning_overrides = {}
     runner._reasoning_config = {"enabled": True, "effort": "medium"}
     runner._load_reasoning_config = lambda model="": {
         "enabled": True,
@@ -301,4 +300,7 @@ def test_persisted_reasoning_rehydrates_only_valid_values(persisted, expected):
     # Then
     assert reasoning == expected
     if persisted == "bogus":
-        assert runner._session_reasoning_overrides == {}
+        # The session reasoning override lives on ``SessionState.conversation`` (the legacy
+        # ``_session_reasoning_overrides`` dict view is gone upstream): a bogus level writes none.
+        state = runner._peek_session_state(SESSION_KEY)
+        assert state is None or state.conversation.reasoning_override is None

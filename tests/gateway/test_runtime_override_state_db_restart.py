@@ -5,7 +5,6 @@ import json
 import pytest
 
 import gateway.run as gateway_run
-import hermes_state
 from gateway.config import GatewayConfig, Platform
 from gateway.session import SessionSource, SessionStore
 
@@ -27,7 +26,6 @@ def _runner(store: SessionStore) -> gateway_run.GatewayRunner:
     runner.session_store = store
     runner.config = None
     runner._session_model_overrides = {}
-    runner._session_reasoning_overrides = {}
     runner._load_reasoning_config = lambda model="": {
         "enabled": True,
         "effort": "medium",
@@ -36,8 +34,7 @@ def _runner(store: SessionStore) -> gateway_run.GatewayRunner:
 
 
 def test_runtime_route_rehydrates_from_state_db_without_json(tmp_path, monkeypatch):
-    # Given
-    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+    # Given: the profile's state.db is the test's isolated HERMES_HOME store.
     sessions_dir = tmp_path / "sessions"
     config = GatewayConfig(write_sessions_json=False)
     first_store = SessionStore(sessions_dir=sessions_dir, config=config)
@@ -50,12 +47,12 @@ def test_runtime_route_rehydrates_from_state_db_without_json(tmp_path, monkeypat
         reasoning_effort="high",
     )
     assert not (sessions_dir / "sessions.json").exists()
-    # Upstream (2026-09) keeps the gateway routing index on a dedicated state.db handle
-    # (``SessionStore._routing_db``), separate from the transcript ``_db``.
-    first_db = first_store._routing_db
+    # Upstream (v0.23) keeps the gateway routing index on the storage interface handle of the
+    # one store that owns it (``SessionStore._routing_persistence``).
+    first_db = first_store._routing_persistence
     assert first_db is not None
-    rows = first_db.load_gateway_routing_entries(
-        scope=first_store._routing_scope()
+    rows = first_db.routing.load_routing_entries(
+        routing_scope=first_store._routing_scope()
     )
     durable = json.loads(rows[session_key])
     assert durable["runtime_model"] == "restart-model"
@@ -65,11 +62,9 @@ def test_runtime_route_rehydrates_from_state_db_without_json(tmp_path, monkeypat
     assert "base_url" not in durable
     assert "api_mode" not in durable
     assert "fake-runtime-key" not in rows[session_key]
-    first_db.close()
+    first_store.close_all_db_handles()
 
     restarted_store = SessionStore(sessions_dir=sessions_dir, config=config)
-    restarted_db = restarted_store._routing_db
-    assert restarted_db is not None
     runner = _runner(restarted_store)
 
     def resolve_provider(**kwargs):
@@ -117,4 +112,4 @@ def test_runtime_route_rehydrates_from_state_db_without_json(tmp_path, monkeypat
     assert runtime["api_key"] == "fake-runtime-key"
     assert runtime["api_mode"] == "codex_responses"
     assert reasoning == {"enabled": True, "effort": "high"}
-    restarted_db.close()
+    restarted_store.close_all_db_handles()

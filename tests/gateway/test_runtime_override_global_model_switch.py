@@ -72,14 +72,16 @@ def isolated_home(tmp_path, monkeypatch):
 
 def _store_runner(sessions_dir, monkeypatch) -> GatewayRunner:
     """Bare runner over a real JSON-backed SessionStore (the durable runtime route lives there)."""
-    import hermes_state
+    import persistence_assembly
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
 
     def _no_sqlite(*_a, **_k):
         raise RuntimeError("SQLite disabled in test")
 
-    monkeypatch.setattr(hermes_state, "SessionDB", _no_sqlite)
+    # The storage interface opens state.db through ``persistence_assembly.open_persistence``
+    # (the old ``hermes_state.SessionDB`` store is gone upstream).
+    monkeypatch.setattr(persistence_assembly, "open_persistence", _no_sqlite)
     runner = object.__new__(GatewayRunner)
     runner.adapters = {Platform.TELEGRAM: object()}
     runner._voice_mode = {}
