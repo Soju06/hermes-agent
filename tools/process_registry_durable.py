@@ -164,18 +164,15 @@ class ProcessDurableMixin:
         proc: subprocess.Popen,
         scope_unit: str,
     ) -> None:
-        """Best-effort cleanup for a scope launcher that never reached payload."""
-        try:
-            subprocess.run(
-                ["systemctl", "--user", "stop", f"{scope_unit}.scope"],
-                check=False,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=5,
-            )
-        except Exception:
-            pass
+        """Best-effort cleanup for a scope launcher that never reached payload.
+
+        The stop goes through upstream's helper, which passes the same user-bus
+        env the launch needed: a system-level gateway unit does not inherit
+        XDG_RUNTIME_DIR or the bus address, so a bare ``systemctl --user`` fails.
+        """
+        from tools.process_registry import _stop_systemd_unit
+
+        _stop_systemd_unit(f"{scope_unit}.scope")
         try:
             cls._terminate_host_pid(
                 proc.pid,
@@ -428,18 +425,27 @@ class ProcessDurableMixin:
             self._move_to_finished(session)
 
     def _reset_failed_durable_scope(self, session) -> None:
-        """Clear a finished durable scope's failed state so its unit name can be reused."""
+        """Clear a finished durable scope's failed state so its unit name can be reused.
+
+        Runs with the launch's user-bus env (see :meth:`_discard_failed_scope`).
+        """
         if not session.durable or platform.system() != "Linux":
+            return
+        from tools.process_registry import systemd_user_bus_env
+
+        found = locate_command("systemctl").command
+        if not found:
             return
         try:
             subprocess.run(
                 [
-                    "systemctl",
+                    found[0],
                     "--user",
                     "reset-failed",
                     f"{self._durable_scope_unit(session.id)}.scope",
                 ],
                 check=False,
+                env=systemd_user_bus_env(),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,

@@ -400,6 +400,29 @@ hermes_home = Path(os.environ["HERMES_HOME"])
 real_home = Path(os.environ.get("HERMES_REAL_HOME", os.environ["HOME"]))
 ```
 
+#### `terminal.durable_background`
+
+```yaml
+terminal:
+  durable_background: true   # default: false
+```
+
+Opt-in. With it on, a local background command without a PTY starts in its own
+transient systemd user scope (`hermes-bg-<id>.scope`) and writes its output to a
+log file instead of a pipe. The process then survives a restart of the gateway
+service: shutdown leaves it running, and the next gateway start re-adopts it from
+the process checkpoint and keeps reading its log. `process` kill still stops it.
+
+- Linux only, with systemd as PID 1 and a user manager the gateway's user can reach.
+  A system-level gateway unit needs that user's lingering manager
+  (`loginctl enable-linger <user>`).
+- Applies where background jobs are not owned by the process that started them,
+  which is the gateway host that the CLI, TUI, Desktop and messaging run their tools
+  in. A process that owns its jobs keeps stopping them with itself.
+- PTY sessions and remote backends are unchanged.
+- When a scope cannot start (no `systemd-run`, no user bus, or the scope does not
+  report ready in time), Hermes logs one warning and starts the command the ordinary way.
+
 :::warning
 The agent has the same filesystem access as your user account. Use `hermes tools` to disable tools you don't want, or switch to Docker for sandboxing.
 :::
