@@ -3193,12 +3193,10 @@ class TestRunConversation:
         assert result["completed"] is True
         system = agent.client.chat.completions.create.call_args.kwargs["messages"][0]
         assert system["role"] == "system"
-        # Fork (runtime-route-awareness): the live Runtime/Route State block rides the volatile tier,
-        # after the session context; the static prefix block is unchanged.
-        volatile_text = system["content"][1]["text"]
-        assert volatile_text == "\n\nsession context" or volatile_text.startswith(
-            "\n\nsession context\n\n# Runtime/Route State\n")
-        assert system["content"] == [
+        # Fork (runtime-route-awareness): the live Runtime/Route State block is an API-time tail
+        # after the session prompt, so upstream's three-part layout applies (static prefix,
+        # session context, tail). The static and session parts are upstream's exact blocks.
+        assert system["content"][:2] == [
             {
                 "type": "text",
                 "text": "stable instructions",
@@ -3206,10 +3204,15 @@ class TestRunConversation:
             },
             {
                 "type": "text",
-                "text": volatile_text,
+                "text": "\n\nsession context",
                 "cache_control": {"type": "ephemeral"},
             },
         ]
+        assert len(system["content"]) == 3
+        tail = system["content"][2]
+        assert tail["type"] == "text"
+        assert tail["text"].startswith("\n\n# Runtime/Route State\n")
+        assert tail["cache_control"] == {"type": "ephemeral"}
 
     def test_codex_content_filter_incomplete_routes_to_policy_fallback(self, agent):
         self._setup_agent(agent)
