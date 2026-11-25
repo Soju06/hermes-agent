@@ -1,8 +1,10 @@
 """Python ``-c`` sources and Python heredoc bodies are interpreter data, not shell source.
 
-The lifecycle guard must not shell-tokenize them (a ``sys.path.insert(0, '<dir>')`` line read as a
-referenced script, a lifecycle-looking Python string read as a command), while every real shell
-lifecycle command around them stays blocked.
+The executed referenced-script walk must not shell-tokenize them (a ``sys.path.insert(0, '<dir>')``
+or ``open('<data file>')`` line read as a referenced script), while every real shell lifecycle
+command around them stays blocked. The direct lifecycle scan still reads them unmasked: a Python
+payload reaches a shell at runtime (``os.system``), so an inline lifecycle command in it is blocked
+(#127698).
 """
 
 import pytest
@@ -55,21 +57,6 @@ sys.path.insert(0, os.path.expanduser("{real_directory}"))
 import os, sys
 sys.path.insert(0, os.path.expanduser('{real_directory}'))
 PY
-"""
-
-        assert contains_gateway_lifecycle_command_or_referenced_script(
-            command, cwd=str(tmp_path)
-        ) is False
-
-    def test_python_heredoc_lifecycle_string_not_blocked(self, tmp_path):
-        """Lifecycle-looking Python string data is not an executed command."""
-        from cron.lifecycle_guard import (
-            contains_gateway_lifecycle_command_or_referenced_script,
-        )
-        command = """python3 << 'EOF'
-message = "hermes gateway restart"
-print(message)
-EOF
 """
 
         assert contains_gateway_lifecycle_command_or_referenced_script(
@@ -169,6 +156,11 @@ PY
         # A python heredoc opener inside a quoted string opens no heredoc.
         "echo \"\npython3 <<PY\n\" ; hermes gateway restart ; echo \"\nPY\n\"",
         "su python3 <<PY\nhermes gateway restart\nPY\n",
+        # The direct scan reads Python payloads unmasked: os.system() runs them in a shell (#127698).
+        "python3 -c 'import os; os.system(\"hermes gateway restart\")'",
+        "FOO=1 python3 -c \"import os; os.system('hermes gateway stop')\"",
+        "python3 <<PY\nimport os\nos.system('launchctl bootout gui/501/ai.hermes.gateway')\nPY\n",
+        "python3 << 'EOF'\nimport os\nmessage = \"hermes gateway restart\"\nos.system(message)\nEOF\n",
         # Branch E (#113667) still reads Python argv lists in a python heredoc body.
         "python3 <<PY\nimport subprocess\nsubprocess.run([\"pkill\", \"-f\", \"python\"])\nPY\n",
         "python3 <<PY\nimport subprocess\nsubprocess.run([\"taskkill\", \"/IM\", \"python.exe\", \"/F\"])\nPY\n",
@@ -191,16 +183,20 @@ PY
         assert refusal is not None and "scan cap" in refusal
 
     @pytest.mark.parametrize("command", [
-        "cd /tmp && FOO=1 python3 -c \"print('run: hermes gateway restart')\"",
-        "sudo -u bob python3 -u -c 'print(\"hermes gateway restart\")'",
-        "if python3 -c 'print(\"hermes gateway stop\")'; then echo ok; fi",
-        "x=$(python3 -c \"print(\\\"hermes gateway restart\\\")\")",
-        "python3 -c 'print(1)'\npython3 - <<PY\nprint('hermes gateway restart')\nPY\n",
-        "cd /tmp && timeout 5 python3 <<PY\nprint('hermes gateway restart')\nPY\n",
+        "cd /tmp && FOO=1 python3 <<PY\nprint(open('{big}').read(1))\nPY\n",
+        "sudo -u bob python3 -u <<PY\nprint(open('{big}').read(1))\nPY\n",
+        "if python3 <<PY\nprint(open('{big}').read(1))\nPY\nthen echo ok; fi\n",
+        "x=$(python3 <<PY\nprint(open('{big}').read(1))\nPY\n)\n",
+        "python3 -c 'print(1)'\npython3 - <<PY\nprint(open('{big}').read(1))\nPY\n",
+        "cd /tmp && timeout 5 python3 <<PY\nprint(open('{big}').read(1))\nPY\n",
     ])
     def test_python_payload_text_is_masked_in_every_command_position(self, tmp_path, command):
-        """Python source after env assignments, wrappers, reserved words, list operators and
-        inside `$(...)` is still interpreter data, not a shell lifecycle command."""
+        """A Python heredoc body after env assignments, wrappers, reserved words, list operators
+        and inside `$(...)` is still interpreter data for the executed walk: a >1 MiB data file
+        it opens is not a shell script to fail closed on."""
         from cron.lifecycle_guard import scan_gateway_lifecycle
 
-        assert scan_gateway_lifecycle(command, cwd=str(tmp_path)) == (False, None)
+        big = tmp_path / "big_blob.txt"
+        big.write_text("x" * (2 * 1024 * 1024))
+
+        assert scan_gateway_lifecycle(command.format(big=big), cwd=str(tmp_path)) == (False, None)

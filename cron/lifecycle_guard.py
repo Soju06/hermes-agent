@@ -427,11 +427,7 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
     # lifecycle command hide in the blanked body (#127698).
     from tools.shell_heredoc import strip_inert_heredoc_bodies
 
-    # Branch E reads `shell_view`; every other pass also masks proven Python payloads (see
-    # `_shell_source_without_python_payloads`).
-    shell_view = strip_inert_heredoc_bodies(text, mask_code_consumers=False)
-    python_masked = _shell_source_without_python_payloads(text)
-    text = shell_view if python_masked == text else strip_inert_heredoc_bodies(python_masked, mask_code_consumers=False)
+    text = strip_inert_heredoc_bodies(text, mask_code_consumers=False)
     normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
     if _GATEWAY_LIFECYCLE_PATTERN.search(normalized):
         return True
@@ -465,7 +461,7 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
     # "gui/$uid/$label"`), so neither the same-span regex nor same-segment tokenization sees verb and label
     # together. Check "verb anywhere AND label anywhere" instead.
     # Branch E (#113667): killers aimed at the interpreter image itself carry no hermes/gateway token.
-    return _contains_launchctl_gateway_lifecycle(normalized) or contains_host_interpreter_kill(shell_view)
+    return _contains_launchctl_gateway_lifecycle(normalized) or contains_host_interpreter_kill(normalized)
 
 
 def first_gateway_lifecycle_match(text: str) -> Optional[str]:
@@ -674,14 +670,14 @@ def _split_segments(tokens: list[str], *, keep_controls: bool = False) -> Iterat
 
 
 # --- Python payload masking -------------------------------------------------------------------
-# Python `-c` sources and Python heredoc bodies are interpreter data: shell-tokenizing them read
-# `sys.path.insert(0, '<dir>')` as a referenced script and Python strings as commands. They are
-# masked only where a shell lexer PROVES the region is such a payload, and the guard reads two views:
-# - Python-masked: the Branch A-D regex (raw and per-token), the profile-flag form and the
-#   order-independent launchctl pass in `contains_gateway_lifecycle_command`, plus the EXECUTED
-#   walk (`sh -c` payloads, referenced scripts) in `_contains_unsafe_gateway_action`;
-# - unmasked: Branch E (`contains_host_interpreter_kill` exists for Python argv-list kills too),
-#   launchctl submit/bootstrap, and the mention pass that still reads scripts named in a body.
+# Python `-c` sources and Python heredoc bodies are not shell source for the EXECUTED walk: walking
+# them as shell lines read `open('<2 MiB data file>')` or `sys.path.insert(0, '<dir>')` as a
+# referenced script and failed closed. They are masked only where a shell lexer PROVES the region is
+# such a payload, and only in the executed walk's view (`sh -c` payloads, referenced scripts) in
+# `_contains_unsafe_gateway_action`; a path they name stays a mention that is still read. This mask
+# never reaches the direct scans (`contains_gateway_lifecycle_command`, launchctl submit/bootstrap,
+# the gateway-PID check): a Python payload reaches a shell at runtime (`os.system`), so an inline
+# lifecycle command in it must stay visible (#127698).
 # Never mask inside `_iter_command_segments`: that tokenizer feeds both views.
 _PYTHON_PAYLOAD_PLACEHOLDER = "__HERMES_PYTHON_PAYLOAD__"
 _PYTHON_EXECUTABLE_RE = re.compile(r"python(?:\d+(?:\.\d+)*)?")
@@ -1728,7 +1724,8 @@ def _contains_unsafe_gateway_action(
     # "script" (#110422). Code-bearing bodies do not need walk visibility: an inline payload in
     # them is already caught by the direct scan, and a path they merely mention must stay a
     # mention (#113944).
-    # Complete Python `-c`/heredoc payloads are masked the same way: Python source, not shell.
+    # Proven Python `-c` sources and Python heredoc bodies are masked from this view too: Python
+    # source, not shell (see `_shell_source_without_python_payloads`).
     from tools.shell_heredoc import strip_inert_heredoc_bodies
 
     walk_command = strip_inert_heredoc_bodies(_shell_source_without_python_payloads(command))
