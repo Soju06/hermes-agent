@@ -325,7 +325,6 @@ class GatewayInboundModelRouterMixin:
             )
             return 0
 
-        masked = 0
         state = getattr(self, "_model_router_state", None)
         if state is None:
             state = {}
@@ -346,15 +345,15 @@ class GatewayInboundModelRouterMixin:
                 )
                 route = str((directive or {}).get("route") or route_name or "PERMISSIVE")
                 model = str((directive or {}).get("model") or "staged")
+                # No hidden-message count: upstream already hid the whole turn, so a "0" would mislead.
                 await self._deliver_platform_notice(
-                    source,
-                    f"⚠️ 거절 감지 → 메시지 가림({masked}) · 다음 턴 {route}({model})",
+                    source, f"⚠️ 거절 감지 → 다음 턴 {route}({model})",
                 )
             except Exception:
                 logger.debug(
                     "model router: hard-refusal notice send failed", exc_info=True,
                 )
-        return masked
+        return 0
 
     async def _apply_model_router_directive(
         self, session_key: str, directive: dict, cfg: dict, source: Optional[SessionSource] = None,

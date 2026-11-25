@@ -1652,6 +1652,10 @@ def test_hard_refusal_leaves_the_refused_turn_to_upstream_and_stages_force(
     entry = runner._model_router_state["tg:c1"]
     assert entry["force_refusal_route"] is True
     assert entry["force_refusal_reason"] == "prior_turn_refused"
+    # Upstream hid the whole turn, so the notice carries no hidden-message count.
+    runner._deliver_platform_notice.assert_awaited_once_with(
+        source, "⚠️ 거절 감지 → 다음 턴 PERMISSIVE_CHAT(grok-4.5)",
+    )
 
 
 def test_refusal_notify_suppressed_by_config(monkeypatch, tmp_path):
