@@ -297,6 +297,11 @@ def _tool_defs_cache_key(
     )
 
 
+def _is_tool_entry(name: str) -> bool:
+    """Whether a ``disabled_toolsets`` entry names one registered tool, not a toolset or legacy name."""
+    return not validate_toolset(name) and name not in _LEGACY_TOOLSET_MAP and registry.get_entry(name) is not None
+
+
 def _apply_toolset_selection(tools: set, names: list[str], quiet_mode: bool, *, disable: bool) -> None:
     """Add (or subtract) every toolset in *names* to/from *tools*, printing the selection unless quiet."""
     from toolsets import bundle_non_core_tools, get_toolset
@@ -321,7 +326,7 @@ def _apply_toolset_selection(tools: set, names: list[str], quiet_mode: bool, *, 
         elif name in _LEGACY_TOOLSET_MAP:
             label = f"{verb} legacy toolset"
             resolved = _LEGACY_TOOLSET_MAP[name]
-        elif disable and registry.get_entry(name) is not None:
+        elif disable and _is_tool_entry(name):
             # Not a toolset — but a registered tool name. Subtract the single
             # tool. This lets `disabled_toolsets` turn off an individual tool
             # (e.g. `text_to_speech`, a browser action) without having to own

@@ -1647,7 +1647,9 @@ platform_toolsets:
 # Toolset names take precedence when a name is both (e.g. "memory"): disable
 # such a tool by its owning toolset instead. Disabling unused tools trims the
 # model-visible schema surface (fewer distractors, smaller prompt) without
-# unregistering anything — flip the list to re-enable.
+# unregistering anything — flip the list to re-enable. `hermes tools` keeps a
+# per-tool entry while its toolset stays on, and clears it when you check a
+# toolset that the entry had switched off entirely.
 # agent:
 #   disabled_toolsets:
 #     - text_to_speech        # drop voice output if unused
