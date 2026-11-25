@@ -516,6 +516,17 @@ def test_external_interpreter_keeps_its_owned_dependencies(tmp_path, monkeypatch
     assert result.stdout.strip() == "external-runtime-ready"
 
 
+def test_external_tree_beside_a_store_runs_detached_commands_on_its_own_environment(tmp_path, monkeypatch):
+    # A tree stamped ``external`` owns its environment; PM's store Python beside it holds no generation
+    # of it. Detached children (boot step install_default_plugins, restart watcher) must not run there.
+    repo, _home, _store_python = fixture_tree(tmp_path, monkeypatch)
+    (repo / "install-stamp.json").write_text(json.dumps({"updateMechanism": "external"}), encoding="utf-8")
+    command = _launchers.runtime_command(repo, code="import ruamel.yaml, sys; print(sys.executable)")
+    result = subprocess.run(command, cwd=tmp_path, capture_output=True, text=True, timeout=30, encoding="utf-8", check=False)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == sys.executable
+
+
 @pytest.mark.platforms("posix")
 @pytest.mark.spawns_gateway_lookalike
 def test_service_survives_python_tool_replacement(tmp_path, monkeypatch):
