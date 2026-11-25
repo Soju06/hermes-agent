@@ -9,7 +9,16 @@
 # runtime selection PM expects.
 #
 # Use after switching git branches in ~/.hermes/hermes-agent/ or after a sync.
-# DOES NOT restart any gateway. Stop the gateways first: the build removes and recreates $VENV.
+#
+# Writes outside $LIVE_TREE (all under the DEFAULT Hermes root, i.e. $HERMES_HOME when it is not a
+# profile dir; rehearsed 2026-11-25): tools/facts.json gains the `venv` fact (recorded extras + stamp,
+# --record-selection), installs/<sha256(tree)[:16]>/{.install.lock,pm-runtime/} (PM's manager
+# runtime, ~2.4 MB), cache/uv/ (wheel cache). The sanity import also creates the usual home skeleton
+# and rewrites cache/tool_discovery_cache.json plus a backups/config/config.yaml.good.* snapshot.
+# Inside the tree: venv/, venv.old/ (previous env), install-stamp.json (gitignored).
+# DOES NOT restart any gateway. Stop the gateways first. pm.build_env never overwrites an existing
+# tree, so the current $VENV is moved aside to $VENV.old (gitignored upstream) and moved back if the
+# build fails; delete $VENV.old once the new environment is accepted.
 
 set -euo pipefail
 
@@ -30,7 +39,7 @@ fi
 cd "$LIVE_TREE"
 echo "Live tree branch: $(git rev-parse --abbrev-ref HEAD) @ $(git rev-parse --short HEAD)"
 echo "Build python:     $PY314 ($("$PY314" --version))"
-echo "Extras:           ${EXTRAS[*]}  (+ dependency groups dev, test)"
+echo "Extras:           ${EXTRAS[*]}  (recorded as the PM selection; no dependency groups, see below)"
 
 if pgrep -f "$VENV/bin/python" >/dev/null 2>&1; then
     echo "FATAL: processes are still running from $VENV — stop the gateways first" >&2
@@ -38,20 +47,72 @@ if pgrep -f "$VENV/bin/python" >/dev/null 2>&1; then
     exit 2
 fi
 
+PREV="$VENV.old"
+if [[ -e "$PREV" || -L "$PREV" ]]; then
+    echo "FATAL: $PREV exists from an earlier rebuild — inspect and remove it first" >&2
+    exit 3
+fi
+
 extra_args=()
 for e in "${EXTRAS[@]}"; do extra_args+=(--extra "$e"); done
 # Fresh build (pm.build_env refuses an in-place sync); --record-selection publishes the extras as the
 # runtime selection so a later `hermes pm` sync extends rather than replaces the environment.
-nice -n 10 "$PY314" -m pm.build_env --source . --out "$VENV" --python "$PY314" \
-    --group dev --group test "${extra_args[@]}" --explicit --record-selection
+# No --group: pm/build_env.py::_check_record_selection rejects --record-selection together with any
+# --group (a recorded selection is an --extra list only), which is what rolled back the 2026-10-30
+# cutover. The live venv therefore carries no pytest; post-deploy tests run from a scratch venv
+# built with `--group dev --group test` and WITHOUT --record-selection (see the sync report).
+moved=0
+if [[ -e "$VENV" || -L "$VENV" ]]; then
+    mv "$VENV" "$PREV"
+    moved=1
+    echo "Previous environment moved aside: $PREV"
+fi
+if ! nice -n 10 "$PY314" -m pm.build_env --source . --out "$VENV" --python "$PY314" \
+        "${extra_args[@]}" --explicit --record-selection; then
+    echo "FATAL: pm.build_env failed" >&2
+    if [[ $moved == 1 && ! -e "$VENV" ]]; then
+        mv "$PREV" "$VENV"
+        echo "Previous environment restored to $VENV" >&2
+    fi
+    exit 4
+fi
 
-# Sanity
+# Stamp the tree as externally managed BEFORE anything imports Hermes. v0.22.5's hermes_bootstrap
+# (hermes_cli/venv_sync.py::prepare_launch) adopts a stampless checkout at $HERMES_HOME/hermes-agent
+# as `updateMechanism: self` (post_update.py::step_adopt_blessed_checkout). A self-managed tree is
+# re-exec'd into PM's store Python (~/.hermes/tools/python-*), which refuses to start without a
+# PM-committed generation ("no dependency environment is committed for this install"), and boot's
+# expose_cli would repoint ~/.local/bin/hermes at that store Python. This fork owns updates
+# (bin/hermes-patches + this script), so `external` is the true steward: prepare_launch,
+# check_runtime, publish_launchers and expose_cli then leave the tree and $VENV alone.
+head_sha=$(git rev-parse HEAD)
+stamp_args=(--output "$LIVE_TREE/install-stamp.json" --update-mechanism external --source git --commit "$head_sha")
+if base_tag=$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' --exclude '*+*' HEAD 2>/dev/null); then
+    stamp_args+=(--base-version "${base_tag#v}" --distance "$(git rev-list --count "$base_tag"..HEAD)")
+fi
+"$VENV/bin/python" -I scripts/write_install_stamp.py "${stamp_args[@]}"
+if [[ -d "$LIVE_TREE/.hermes/bin" ]]; then
+    echo "WARN: $LIVE_TREE/.hermes/bin exists (published by an earlier self-managed boot); its launchers exec PM's store Python" >&2
+fi
+
+# Sanity. The import runs hermes_bootstrap, so it must stay on $VENV (no re-exec into a store Python).
+# NOTE: it imports the tree under the caller's HERMES_HOME (tool discovery rewrites
+# $HERMES_HOME/cache/tool_discovery_cache.json). Do not run `hermes ...` CLI commands here: every
+# CLI dispatch runs boot home maintenance (config migration included) on the first launch of a revision.
 "$VENV/bin/python" --version
-"$VENV/bin/python" -c "import run_agent, gateway.run, tools.delegate_tool; print('import OK')"
+"$VENV/bin/python" -c "
+import os, sys
+import run_agent, gateway.run, tools.delegate_tool, hermes_yaml
+want = os.path.realpath('$VENV')
+assert os.path.realpath(sys.prefix) == want, f'interpreter switched to {sys.prefix} (expected {want})'
+print('import OK on', sys.prefix)
+"
 uv pip check --python "$VENV/bin/python" || echo "WARN: pip check reported problems (known on v0.22.5: browser-harness pins pillow==12.3.0 while the lock installs 13.0.0)"
 
 echo
-echo "Done. Next (one at a time, after reading the sync report's deploy notes):"
+echo "Done. Previous environment (if any): $PREV  (delete after the cutover is accepted)"
+echo "Next (one at a time, after reading the deploy notes):"
 echo "  venv/bin/python -c 'from hermes_state import SessionDB; SessionDB()'   # pre-warm the one-time FTS realign per profile"
-echo "  hermes config migrate  (per profile, on copies first)"
+echo "  the first \`hermes ...\` CLI call or gateway start per profile runs boot home maintenance:"
+echo "  config migration (backs up config.yaml/.env first), state.db guard, plugin catalog drop"
 echo "  hermes --profile <name> gateway --replace"
