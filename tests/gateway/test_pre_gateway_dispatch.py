@@ -59,8 +59,21 @@ def _make_runner(platform: Platform):
     runner.session_store = MagicMock()
     runner._running_agents = {}
     runner._session_model_overrides = {}
-    runner._session_reasoning_overrides = {}
     return runner, adapter
+
+
+def _reasoning_override(runner, session_key):
+    """The session's reasoning override, read from ``SessionState`` (the legacy
+    ``_session_reasoning_overrides`` dict view is gone upstream)."""
+    state = runner._peek_session_state(session_key)
+    return state.conversation.reasoning_override if state is not None else None
+
+
+def _reasoning_overrides(runner):
+    """Every session's reasoning override that is set, keyed by session key."""
+    sessions = runner.__dict__.get("_sessions") or {}
+    return {key: state.conversation.reasoning_override for key, state in sessions.items()
+            if state.conversation.reasoning_override is not None}
 
 
 @pytest.mark.asyncio
@@ -150,7 +163,7 @@ async def test_hook_runtime_override_applies_after_auth_before_agent(monkeypatch
     async def _capture(event, source, _quick_key, _run_generation):
         session_key = runner._session_key_for_source(source)  # noqa: SLF001
         captured["model_override"] = runner._session_model_overrides.get(session_key)  # noqa: SLF001
-        captured["reasoning_override"] = runner._session_reasoning_overrides.get(session_key)  # noqa: SLF001
+        captured["reasoning_override"] = _reasoning_override(runner, session_key)
         return "ok"
 
     monkeypatch.setattr("hermes_cli.plugins.ainvoke_hook", _fake_hook)
@@ -210,7 +223,7 @@ async def test_hook_runtime_override_does_not_apply_before_auth(monkeypatch):
     assert switch_calls == []
     assert runner._session_model_overrides == {}
     # The directive's reasoning half is the other state a pre-auth application would write.
-    assert runner._session_reasoning_overrides == {}
+    assert _reasoning_overrides(runner) == {}
 
 
 def _runtime_override_hook(**directive):
@@ -282,7 +295,7 @@ async def test_hook_runtime_override_model_half_is_refused_under_code_skew(monke
     async def _capture(event, source, _quick_key, _run_generation):
         session_key = runner._session_key_for_source(source)  # noqa: SLF001
         captured["model_override"] = runner._session_model_overrides.get(session_key)  # noqa: SLF001
-        captured["reasoning_override"] = runner._session_reasoning_overrides.get(session_key)  # noqa: SLF001
+        captured["reasoning_override"] = _reasoning_override(runner, session_key)
         return "ok"
 
     runner._handle_message_with_agent = _capture  # noqa: SLF001
@@ -1174,7 +1187,7 @@ async def _run_webhook_delivery(client, adapter, text, delivery_id, *, capture=N
     assert (await _post_webhook(client, text, delivery_id)).status == 202
 
     def settled():
-        rows = authority.db._read_all("SELECT status FROM session_admissions")
+        rows = raw_holder(authority.persistence)._read_all("SELECT status FROM session_admissions")
         return rows if rows and all(row["status"] == "terminal" for row in rows) else None
 
     await async_wait_until(settled, what="the admitted delivery executed")
@@ -1203,7 +1216,7 @@ async def test_webhook_runtime_override_applies_at_producer_ingress_before_commi
         async def _capture(event, source, _quick_key, _run_generation):
             session_key = runner._session_key_for_source(source)  # noqa: SLF001
             seen["model_override"] = runner._session_model_overrides.get(session_key)  # noqa: SLF001
-            seen["reasoning_override"] = runner._session_reasoning_overrides.get(session_key)  # noqa: SLF001
+            seen["reasoning_override"] = _reasoning_override(runner, session_key)
             return "agent-ok"
 
         await _run_webhook_delivery(client, adapter, "route me", "d-route", capture=_capture)
@@ -1229,7 +1242,7 @@ async def test_webhook_runtime_override_is_not_applied_under_the_emergency_stop(
 
     async with TestClient(TestServer(app)) as client:
         runner = await _run_webhook_delivery(client, adapter, "route me", "d-paused")
-        session_keys = list(runner.__dict__.get("_sessions") or {})
+        reasoning_overrides = _reasoning_overrides(runner)
 
     assert switch_calls == []
-    assert all(runner._session_reasoning_overrides.get(key) is None for key in session_keys)  # noqa: SLF001
+    assert reasoning_overrides == {}

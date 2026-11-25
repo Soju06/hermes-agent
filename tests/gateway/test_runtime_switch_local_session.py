@@ -12,6 +12,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.fixtures.storage_read import session_row
+from tests.gateway.fixtures.storage_handles import close_storage_handles, storage_handle  # noqa: F401
 from tests.waiting import async_wait_until
 
 
@@ -23,12 +25,11 @@ def _owner(tmp_path, monkeypatch, handle):
     from gateway.session_controls import AuthorityConnection
     from gateway.session_local import create_local_session
     from hermes_cli import model_switch
-    import hermes_state_runtime as rt
     monkeypatch.setattr(run, '_load_gateway_config', lambda *a: {})
     monkeypatch.setattr(model_switch, 'switch_model', lambda **k: model_switch.ModelSwitchResult(
         success=True, new_model=k['raw_input'], target_provider='custom', base_url='http://127.0.0.1:9/v1'))
     store = SessionStore(tmp_path / 'sessions', GatewayConfig())
-    db = store._db
+    db = store.persistence
     messaging_writes = []
     runner = SimpleNamespace(session_store=store, _session_db=db, adapters={}, _draining=False,
                              _evict_cached_agent=lambda route: None, _cached_agent_for=lambda route: None,
@@ -40,8 +41,9 @@ def _owner(tmp_path, monkeypatch, handle):
                                  conversation=SimpleNamespace(model_override=None, reasoning_override=None)),
                              _persist_session_runtime_override=lambda key, **k: messaging_writes.append(('persist', key)))
     runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
-    authority = SessionAuthority(runner, profile_id='owned', instance_id='owner', db=db,
-                                 epoch=rt.begin_runtime_epoch(db, instance_id='owner'))
+    authority = SessionAuthority(runner, profile_id='owned', instance_id='owner',
+                                 persistence=storage_handle(db.scope.profile_dir),
+                                 epoch=db.runtime.begin_epoch(instance_id='owner'))
     runner.session_authority = authority
     owner = AuthorityConnection(authority, object(), {'user_id': 'human'})
     ref = create_local_session(authority, owner.actor, dict(request_id='m', source='gui', cwd=str(tmp_path),
@@ -57,10 +59,9 @@ def _policy(authority, ref):
 
 async def _run_turn(authority, owner, db, ref, name):
     from gateway.session_contract import Submission
-    import hermes_state_runtime as rt
     turn = await authority.submit(owner.actor, Submission(name, ref, {'text': name}, 'queue'))
     await async_wait_until(
-        lambda: rt.get_session_admission(db, admission_id=turn.admission_id)['status'] == 'terminal',
+        lambda: db.admissions.get(admission_id=turn.admission_id).status == 'terminal',
         timeout=10, what=f'turn {name} settled')
 
 
@@ -85,12 +86,11 @@ async def _switch_during_a_turn(tmp_path, monkeypatch, *, model_override, reason
     try:
         await _run_turn(authority, owner, db, ref, 'RUNNING')
         await _run_turn(authority, owner, db, ref, 'NEXT')
-        from hermes_state_local import local_receipt
         live = authority.sessions[ref.session_id]
         entry = store.get_entry(live.route)
         # What a cold (restarted) owner restores the session's policy from.
-        receipt_policy = local_receipt(db, ref.session_id)['policy']
-        return seen, dict(db.get_session(ref.session_id), receipt_policy=receipt_policy), entry, messaging_writes
+        receipt_policy = db.bindings.receipt(ref.session_id).policy
+        return seen, dict(session_row(db, ref.session_id), receipt_policy=receipt_policy), entry, messaging_writes
     finally:
         await owner.close()
         store.close_all_db_handles()

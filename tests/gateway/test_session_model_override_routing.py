@@ -142,7 +142,7 @@ def test_run_agent_prefers_session_override_over_global_runtime(monkeypatch):
     )
     session_key = "agent:main:local:dm"
     runner._session_model_overrides[session_key] = _codex_override()
-    runner._session_reasoning_overrides[session_key] = {"enabled": True, "effort": "high"}
+    runner._session_state(session_key).conversation.reasoning_override = {"enabled": True, "effort": "high"}
 
     result = asyncio.run(
         runner._run_agent(
@@ -209,7 +209,7 @@ def test_runtime_update_callback_persists_session_overrides(monkeypatch):
         "base_url": "https://runtime.example/v1",
         "api_mode": "codex_responses",
     }
-    assert runner._session_reasoning_overrides[session_key] == {"enabled": True, "effort": "low"}
+    assert runner._session_state(session_key).conversation.reasoning_override == {"enabled": True, "effort": "low"}
     assert runtime_store.calls == [
         (
             session_key,
@@ -321,7 +321,7 @@ async def test_background_task_prefers_session_override_over_global_runtime(monk
     )
     session_key = runner._session_key_for_source(source)
     runner._session_model_overrides[session_key] = _codex_override()
-    runner._session_reasoning_overrides[session_key] = {"enabled": True, "effort": "high"}
+    runner._session_state(session_key).conversation.reasoning_override = {"enabled": True, "effort": "high"}
 
     await runner._run_background_task("say hello", source, "bg_test")
 

@@ -14,18 +14,19 @@ import pytest
 from gateway.config import GatewayConfig, Platform
 from gateway.platforms.event import MessageEvent
 from gateway.session import SessionSource, SessionStore, build_session_key
+from tests.fixtures.storage_seed import seed_session
 
 RUNTIME = ("gpt-5.5", "codex-nekos", "high")
 
 
 @pytest.fixture
 def store(tmp_path, monkeypatch):
-    import hermes_state
+    import persistence_assembly
 
-    def _raise():
+    def _raise(*_args, **_kwargs):
         raise RuntimeError("SQLite disabled in test")
 
-    monkeypatch.setattr(hermes_state, "SessionDB", _raise)
+    monkeypatch.setattr(persistence_assembly, "open_persistence", _raise)
     with patch("gateway.session.SessionStore._ensure_loaded"):
         s = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
     s._loaded = True
@@ -64,19 +65,23 @@ async def test_resume_clears_the_runtime_route(tmp_path):
     """/resume is a boundary: switch_session carried the route, so the handler clears it, as it clears
     the /model pin (``set_model_override(key, None)``)."""
     from gateway.run import GatewayRunner
-    from hermes_state import AsyncSessionDB, SessionDB
-    db = SessionDB(db_path=tmp_path / "state.db")
-    db.create_session("old_session_abc", "telegram", user_id="12345", chat_id="67890")
-    db.set_session_title("old_session_abc", "My Project")
-    db.create_session("current_session_001", "telegram", user_id="12345", chat_id="67890")
+    from persistence_assembly import open_persistence, profile_scope
+
+    class _Runner(GatewayRunner):
+        persistence = None  # the storage interface handle, set below (upstream's /resume harness)
+
+    db = open_persistence(profile_scope(home=tmp_path))
+    seed_session(db, "old_session_abc", "telegram", user_id="12345", chat_id="67890")
+    db.sessions.set_title("old_session_abc", "My Project")
+    seed_session(db, "current_session_001", "telegram", user_id="12345", chat_id="67890")
     event = MessageEvent(text="/resume My Project", source=SessionSource(
         platform=Platform.TELEGRAM, user_id="12345", chat_id="67890", user_name="testuser"))
     key = build_session_key(event.source)
-    runner = object.__new__(GatewayRunner)
+    runner = object.__new__(_Runner)
     runner.adapters = {}
     runner.config = SimpleNamespace(platforms={})
     runner._voice_mode = {}
-    runner._session_db = AsyncSessionDB(db)
+    runner._session_db = runner.persistence = db
     runner._running_agents = {}
     runner._is_user_authorized = lambda _source: True
     entry = MagicMock(session_id="current_session_001", session_key=key)
