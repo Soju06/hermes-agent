@@ -48,7 +48,7 @@ def _run_loop_stall_watchdog(
             if frame is None:
                 return "<loop thread frame unavailable>"
             return "".join(traceback.format_stack(frame))
-        except Exception as exc:  # pragma: no cover - diagnostics only
+        except Exception as exc:  # health: allow BLE001 -- diagnostics only: the stall ERROR must still log
             return f"<stack capture failed: {exc}>"
 
     def _psi_snapshot() -> str:
@@ -67,7 +67,7 @@ def _run_loop_stall_watchdog(
                 except OSError:
                     continue
             return "; ".join(parts) or "<unavailable>"
-        except Exception:  # pragma: no cover - diagnostics only
+        except Exception:  # health: allow BLE001 -- diagnostics only: the stall ERROR must still log
             return "<unavailable>"
 
     while not stop_event.wait(ping_interval):

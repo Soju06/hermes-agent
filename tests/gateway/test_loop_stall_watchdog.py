@@ -26,6 +26,26 @@ def _teardown_loop(loop, thread):
     loop.close()
 
 
+def _watch_pongs(loop, count=1):
+    """An Event set once ``count`` callbacks scheduled through ``call_soon_threadsafe`` (the watchdog's
+    pings) have run on the loop, so a test waits for the watchdog's progress instead of the clock."""
+    reached = threading.Event()
+    done = [0]
+    schedule = loop.call_soon_threadsafe
+
+    def _tracking(callback, *args, **kwargs):
+        def _pong_then_count(*cb_args):
+            callback(*cb_args)
+            done[0] += 1
+            if done[0] >= count:
+                reached.set()
+
+        return schedule(_pong_then_count, *args, **kwargs)
+
+    loop.call_soon_threadsafe = _tracking
+    return reached
+
+
 def test_stall_logs_error_and_recovery(caplog):
     loop, loop_thread = _spin_loop()
     stop = threading.Event()
@@ -35,13 +55,14 @@ def test_stall_logs_error_and_recovery(caplog):
         kwargs={"ping_interval": 0.05, "stall_threshold": 0.2},
         daemon=True,
     )
+    first_pong = _watch_pongs(loop)
     try:
         with caplog.at_level("WARNING", logger="gateway.run"):
             watchdog.start()
             # Let at least one clean ping/pong land so the watchdog has
             # recorded the loop thread's ident (mirrors production, where
             # the loop is healthy at startup).
-            time.sleep(0.2)
+            assert first_pong.wait(5.0), "the watchdog never pinged the loop"
             # Freeze the loop well past the threshold.
             loop.call_soon_threadsafe(time.sleep, 0.8)
             deadline = time.monotonic() + 4.0
@@ -82,10 +103,12 @@ def test_quiet_loop_stays_silent(caplog):
         kwargs={"ping_interval": 0.05, "stall_threshold": 0.5},
         daemon=True,
     )
+    # Twelve pings at 0.05s cover more than the 0.5s threshold of a healthy loop.
+    pings_landed = _watch_pongs(loop, count=12)
     try:
         with caplog.at_level("WARNING", logger="gateway.run"):
             watchdog.start()
-            time.sleep(0.6)
+            assert pings_landed.wait(10.0), "the watchdog stopped pinging the loop"
         assert not [
             r for r in caplog.records if "event loop" in r.getMessage()
         ]

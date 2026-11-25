@@ -272,6 +272,8 @@ class TestCheckpointFrequency:
 
     def test_maintenance_thread_lifecycle(self, tmp_path):
         db = StoreHolder(tmp_path / "maint.db")
+        assert db._maint_thread is None, "opening the store must not spawn the maintenance thread"
+        create_session(db, "s", "cli")  # the first committed write starts it
         thread = db._maint_thread
         assert thread is not None and thread.is_alive()
         db.close()
@@ -290,7 +292,9 @@ class TestCheckpointFrequency:
         import weakref
 
         db = StoreHolder(tmp_path / "leak.db")
+        create_session(db, "s", "cli")  # the first committed write starts the thread
         thread = db._maint_thread
+        assert thread is not None and thread.is_alive()
         ref = weakref.ref(db)
         del db  # no close() on purpose
         gc.collect()
@@ -344,11 +348,11 @@ class TestMaintenanceTickGenerationProbe:
 
 
 class TestMaintenanceThreadStartFailure:
-    """A maintenance thread that cannot start must not make state.db unopenable.
+    """A maintenance thread that cannot start must not fail, block or replay the write that starts it.
 
-    The thread is best-effort, like the checkpoint and FTS merge it runs, and opening the store never
-    depended on it while that work ran inline. A start failure (thread or pid limit, or a process-wide
-    ``threading.Thread`` stand-in that runs targets inline) used to abort ``StoreHolder.__init__``, so every
+    The thread is best-effort, like the checkpoint and FTS merge it runs, and neither opening the store nor a
+    write ever depended on it while that work ran inline. A start failure (thread or pid limit, or a
+    process-wide ``threading.Thread`` stand-in that runs targets inline) used to abort the open, so every
     caller reported storage as unavailable. That handle now keeps the inline per-Nth-write cadence.
     """
 
@@ -371,29 +375,32 @@ class TestMaintenanceThreadStartFailure:
             (session_id, "test", time.time()),
         ))
 
-    def test_open_survives_thread_start_failure_and_maintains_inline(self, tmp_path, monkeypatch, caplog):
+    def test_writes_survive_thread_start_failure_and_maintain_inline(self, tmp_path, monkeypatch, caplog):
         self._refuse_maintenance_thread(monkeypatch)
-        with caplog.at_level(logging.WARNING, logger="hermes_state"):
-            db = StoreHolder(db_path=tmp_path / "state.db")
+        db = StoreHolder(db_path=tmp_path / "state.db")
         try:
-            assert db._maint_thread is None
-            assert any("maintenance thread" in r.getMessage() for r in caplog.records), (
-                "a handle without its maintenance thread must leave a WARNING")
             calls = []
             monkeypatch.setattr(db, "_try_wal_checkpoint", lambda: calls.append("checkpoint"))
             monkeypatch.setattr(_maintenance_thread, "_try_incremental_merge_fts", lambda holder: calls.append("merge"))
             db._CHECKPOINT_EVERY_N_WRITES = 2
             db._FTS_MERGE_EVERY_N_WRITES = 4
-            for i in range(4):
+            with caplog.at_level(logging.WARNING, logger="hermes_state"):
+                self._insert_session(db, "sess_0")  # the first committed write tries to start the thread
+            assert db._maint_thread is None
+            assert db._maint_inline is True
+            assert any("maintenance thread" in r.getMessage() for r in caplog.records), (
+                "a handle without its maintenance thread must leave a WARNING")
+            for i in range(1, 4):
                 self._insert_session(db, f"sess_{i}")
             assert calls == ["checkpoint", "checkpoint", "merge"]
+            assert db._conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 4
         finally:
             db.close()
 
-    def test_inline_running_thread_stand_in_never_blocks_the_open(self, tmp_path, monkeypatch):
+    def test_inline_running_thread_stand_in_never_blocks_the_write(self, tmp_path, monkeypatch):
         """The TUI gateway tests swap ``server.threading.Thread`` (the process-wide class) for stand-ins
-        that run the target inline with its args. The maintenance loop then ran on the opener and
-        StoreHolder() never returned."""
+        that run the target inline with its args. The maintenance loop then ran on the thread that
+        started it and never returned."""
         real_thread = threading.Thread
 
         class _InlineMaintenanceThread(real_thread):
@@ -404,12 +411,16 @@ class TestMaintenanceThreadStartFailure:
                 super().start()
 
         opened = {}
-        opener = real_thread(
-            target=lambda: opened.setdefault("db", StoreHolder(db_path=tmp_path / "state.db")), daemon=True)
+
+        def _open_and_write():
+            db = opened.setdefault("db", StoreHolder(db_path=tmp_path / "state.db"))
+            self._insert_session(db, "first")
+
+        writer = real_thread(target=_open_and_write, daemon=True)
         monkeypatch.setattr(_maintenance_thread.threading, "Thread", _InlineMaintenanceThread)
-        opener.start()
-        opener.join(timeout=30)
-        assert not opener.is_alive(), "StoreHolder() blocked inside the inline-run maintenance loop"
+        writer.start()
+        writer.join(timeout=30)
+        assert not writer.is_alive(), "the first write blocked inside the inline-run maintenance loop"
         db = opened["db"]
         try:
             assert db._maint_thread is None

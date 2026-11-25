@@ -3,8 +3,9 @@
 ``StoreHolder._execute_write`` used to run the PASSIVE checkpoint and the bounded FTS merge inline on whichever
 thread crossed the Nth write. The checkpoint takes the holder's writer lock, so every other writer queued behind a
 multi-GB WAL flush (2026-07-28 event-loop stall ingredient). The write path now only advances ``_write_count``; a
-``session-db-maintenance`` daemon thread runs both on the same cadence. A holder whose thread cannot start keeps the
-inline cadence, so opening the store never depends on the thread.
+``session-db-maintenance`` daemon thread runs both on the same cadence. The first committed write starts it, like the
+holder's token writer: opening a store spawns nothing, and a read-only or read-mostly holder never needs the thread. A
+holder whose thread cannot start keeps the inline cadence, so a write never depends on the thread either.
 """
 
 from __future__ import annotations
@@ -28,12 +29,12 @@ MAINTENANCE_INTERVAL_S = 5.0
 
 
 def _maintenance_loop(
-    holder_ref: weakref.ReferenceType, stop_event: threading.Event, interval: float, opener_ident: int | None = None,
+    holder_ref: weakref.ReferenceType, stop_event: threading.Event, interval: float, starter_ident: int | None = None,
 ) -> None:
     """Drive checkpoint/FTS maintenance without retaining the holder: an unclosed holder stays collectable."""
-    # A ``threading.Thread`` stand-in that runs its target inline would run this loop on the thread
-    # that is inside StoreHolder() and block the open forever; only a separate thread may loop.
-    if threading.get_ident() == opener_ident:
+    # A ``threading.Thread`` stand-in that runs its target inline would run this loop on the writer
+    # that starts it and block that write forever; only a separate thread may loop.
+    if threading.get_ident() == starter_ident:
         return
     while not stop_event.wait(interval):
         holder = holder_ref()
@@ -41,24 +42,39 @@ def _maintenance_loop(
             return
         try:
             maintenance_tick(holder)
-        except Exception:  # health: allow BLE001 -- best-effort maintenance; the next tick retries
+        except Exception:  # best-effort maintenance; the next tick retries
             logger.debug("db maintenance tick failed", exc_info=True)
         finally:
             del holder
 
 
-def start_maintenance_thread(holder: StoreHolder) -> None:
-    """Start the holder's maintenance thread; a thread that cannot start never fails or blocks the open.
+def note_committed_write(holder: StoreHolder) -> None:
+    """After a committed write: start the maintenance thread on the first one, and tick inline on a holder
+    whose thread could not start. Never raises (see :func:`inline_maintenance_tick`)."""
+    if holder._maint_thread is None and not holder._maint_inline:
+        start_maintenance_thread(holder)
+    if holder._maint_inline:
+        inline_maintenance_tick(holder)
 
-    Runs inside ``StoreHolder.__init__``'s open block. A raise here (thread or pid limit) made the whole store
-    unopenable, so every caller reported "storage unavailable" because of a best-effort helper. A process-wide
-    ``threading.Thread`` stand-in that runs targets inline either raised the same way or ran the loop on the opener
-    and never returned. Opening never depended on a thread while this work ran inline, so a holder without a
-    running maintenance thread keeps that inline cadence instead."""
-    if holder.read_only or holder._maint_thread is not None:
-        return
+
+def start_maintenance_thread(holder: StoreHolder) -> None:
+    """Start the holder's maintenance thread once; a thread that cannot start never fails or blocks the write.
+
+    Runs right after a committed write, so a raise here (thread or pid limit) would reach ``_execute_write``'s
+    retry handlers and replay that write. A process-wide ``threading.Thread`` stand-in that runs targets inline
+    either raises the same way or runs the loop on the writer and never returns. A holder without a running
+    maintenance thread keeps the inline cadence instead. A closed holder (stop already set) starts nothing."""
+    with holder._maint_start_lock:
+        if holder.read_only or holder._maint_thread is not None or holder._maint_inline or holder._maint_stop.is_set():
+            return
+        _start_locked(holder)
+
+
+def _start_locked(holder: StoreHolder) -> None:
     try:
-        thread = threading.Thread(
+        # A bare thread on purpose: everything the tick touches derives from holder.db_path, and a copied
+        # context could pin the first writer's objects for the thread's lifetime.
+        thread = threading.Thread(  # health: allow HX012 -- holder-scoped work; no profile scope is read
             target=_maintenance_loop,
             args=(weakref.ref(holder), holder._maint_stop, MAINTENANCE_INTERVAL_S, threading.get_ident()),
             name="session-db-maintenance",
@@ -67,7 +83,7 @@ def start_maintenance_thread(holder: StoreHolder) -> None:
         holder._maint_thread = thread
         thread.start()
         # A real thread is alive here: start() waits for it, and the loop first waits one interval.
-        if thread.is_alive():
+        if thread.is_alive() or holder._maint_stop.is_set():  # stopped by a racing close(): not a failure
             return
         failure = "not running after start()"
     except Exception as exc:  # health: allow BLE001 -- any start failure falls back to the inline cadence
@@ -84,7 +100,7 @@ def inline_maintenance_tick(holder: StoreHolder) -> None:
     already committed, and an error reaching ``_execute_write``'s retry handlers would replay it."""
     try:
         maintenance_tick(holder)
-    except Exception:  # health: allow BLE001 -- the write has committed; no maintenance failure may escape
+    except Exception:  # the write has committed; no maintenance failure may escape
         logger.debug("inline db maintenance tick failed", exc_info=True)
 
 

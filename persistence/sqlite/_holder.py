@@ -63,7 +63,7 @@ from sqlite_support import _on_disk_journal_mode, apply_database_pragmas, apply_
 from storage_errors import is_malformed_db_error, is_sqlite_lock_error
 from storage_user_copy import set_last_init_error
 
-from ._maintenance_thread import inline_maintenance_tick, start_maintenance_thread, stop_maintenance_thread
+from ._maintenance_thread import note_committed_write, stop_maintenance_thread
 from ._schema import (
     _enter_fts_fail_open, _fts_table_probe, _init_schema, _is_fts_write_corruption_error, declared_schema_drift,
 )
@@ -373,7 +373,8 @@ class StoreHolder:
         # Write-count marks of the last background checkpoint / FTS merge (see _maintenance_thread).
         self._last_checkpoint_write_count = self._last_fts_merge_write_count = 0
         self._maint_stop = threading.Event()
-        self._maint_thread: Optional[threading.Thread] = None
+        self._maint_start_lock = threading.Lock()
+        self._maint_thread: Optional[threading.Thread] = None  # started by the first committed write
         self._maint_inline = False  # True only when that thread could not start
         initialization_complete = False
         try:
@@ -387,7 +388,6 @@ class StoreHolder:
                     self._retire_connection = _prepare_connection_retirement()
                 self._open_writer()
             self._record_db_file_identity()
-            start_maintenance_thread(self)
             initialization_complete = True
         except Exception as exc:
             # Surface WHY via /resume and friends; callers keep their ``_session_db = None`` path. A browse open
@@ -866,12 +866,11 @@ class StoreHolder:
                         except Exception:  # health: allow BLE001 S110 -- a failed rollback must not hide the error re-raised
                             pass
                         raise
-                # Maintenance is driven by the dedicated DB thread; the write
-                # hot path only advances the cadence counter (and ticks inline
-                # only on a handle whose maintenance thread could not start).
+                # Maintenance is driven by the dedicated DB thread (started by the
+                # first committed write); the write hot path only advances the cadence
+                # counter (and ticks inline only on a handle whose thread could not start).
                 self._write_count += 1
-                if self._maint_inline:
-                    inline_maintenance_tick(self)
+                note_committed_write(self)
                 return result
             except WriterMutexTimeout:
                 # No transaction began; preserve local contention attribution and never replay it.
