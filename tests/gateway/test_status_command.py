@@ -356,6 +356,10 @@ async def test_status_command_default_route_keeps_runtime_endpoint_and_context_p
         )
         session_entry.last_prompt_tokens = 9_000
         runner = _make_runner(session_entry)
+        # No /model switch persisted: the store has no override. A bare MagicMock answer is a truthy
+        # non-dict, which only upstream's rehydrate took for an override (skipping the cold path);
+        # the fork's runtime-control rehydrate reads it as "nothing persisted".
+        runner.session_store.get_model_override.return_value = None
         runner.persistence.aio.sessions.get.return_value = _row(**session_row) if session_row else None
         runner.persistence.aio.usage.recent_route.return_value = _route(**persisted_route) if persisted_route else None
 
@@ -369,7 +373,9 @@ async def test_status_command_default_route_keeps_runtime_endpoint_and_context_p
 
         assert "**Model:** `my-local-model` (custom)" in result
         assert "**Context:** 9,000 / 32,768 (27%)" in result
-        default_runtime.assert_called_once()
+        # Two default-runtime reads on the cold path: the next turn's route (_status_next_turn_route,
+        # upstream c8b603cafa) and the window lookup below.
+        assert default_runtime.call_count == 2
         kwargs = lookup.call_args.kwargs
         assert (kwargs["base_url"], kwargs["api_key"], kwargs["config_context_length"]) == (
             runtime["base_url"], runtime["api_key"], 32_768)
