@@ -323,6 +323,42 @@ def test_reset_clears_persisted_router_reasoning_with_model_override(store_facto
     assert store_factory().get_model_override(entry.session_key) is None
 
 
+def test_reasoning_reset_drops_router_reasoning_so_restart_does_not_reapply_it(store_factory):
+    source = _make_source()
+    store = store_factory()
+    entry = store.get_or_create_session(source)
+    session_key = entry.session_key
+    runner = _make_runner(store)
+    _apply_router_override(runner, source)
+    assert store.get_model_override(session_key)["reasoning_config"] == {
+        "enabled": True,
+        "effort": "xhigh",
+    }
+
+    runner._apply_reasoning_selection(session_key, "telegram", "reset")
+
+    # The model route stays, still marked as the router's own pick (model-routing re-promotion);
+    # only the routed effort the user reset is gone.
+    assert store_factory().get_model_override(session_key) == {
+        "model": "claude-fable-5",
+        "provider": "anthropic",
+        "base_url": "https://api.anthropic.com",
+        "router_applied": True,
+    }
+    assert "reasoning_config" not in runner._session_model_overrides[session_key]
+    assert runner._session_model_overrides[session_key]["model"] == "claude-fable-5"
+
+    restarted = _make_runner(store_factory())
+    with patch(
+        "gateway.run._resolve_runtime_agent_kwargs_for_provider",
+        return_value={"api_key": "sk-ant-fresh", "api_mode": "anthropic_messages"},
+    ):
+        restarted._rehydrate_session_model_override(session_key)
+
+    assert restarted._session_model_overrides[session_key]["model"] == "claude-fable-5"
+    assert restarted._session_state(session_key).conversation.reasoning_override is None
+
+
 def test_sanitize_model_override():
     assert sanitize_model_override(None) is None
     assert sanitize_model_override({}) is None

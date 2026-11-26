@@ -211,6 +211,26 @@ class GatewayAgentCacheMixin:
             session_key, override.get("model"), provider or "",
         )
 
+    def _drop_session_route_reasoning(self, session_key: str) -> None:
+        """Drop router-applied reasoning_config from the session /model override (in memory and the
+        persisted record) so a ``/reasoning reset`` is not undone by the restart rehydrate above.
+        The model route itself (model/provider/base_url) is left untouched."""
+        if not session_key:
+            return
+        override = self._session_model_override(session_key)
+        if isinstance(override, dict):
+            override.pop("reasoning_config", None)
+        store = getattr(self, "session_store", None)
+        if store is None:
+            return
+        try:
+            persisted = store.get_model_override(session_key)
+            if isinstance(persisted, dict) and "reasoning_config" in persisted:
+                persisted.pop("reasoning_config")
+                store.set_model_override(session_key, persisted)
+        except Exception:
+            logger.debug("Failed to drop persisted route reasoning", exc_info=True)
+
     # ---- session-scoped runtime overrides (agent model_switch / plugin runtime_override) ----
 
     @staticmethod
