@@ -30,7 +30,14 @@ Bump `base_commit` only through the DECISIONS.md ADR-004 procedure (own-commit c
 - **upstream_pr:** _(none — dogfood runtime control)_
 - **state:** `local-only`
 - **rationale:** Agent-callable `model_status` / `model_switch` tools. Session-only scope (turn scope removed — LLMs omitted scope ~29%, causing silent reversion). Phase 3c (2026-07-23): the LLM-facing switch surface is route-only — `route` + `reason`; raw model/provider ids and reasoning effort are catalog (config SoT) decisions and get a teaching error at the tool boundary (`dispatch_model_switch`, the single dispatch entry point for BOTH executors — the Phase 3b sequential-executor `route` omission was exactly per-executor kwarg drift). With no declared routes the switch tool goes dormant via check_fn instead of degrading to free-form. `model_status` speaks route language (route block + model + reasoning; raw provider/endpoint/api-mode stay in telemetry). Gateway session callback plus durable SessionEntry runtime fields so session-scoped model/reasoning overrides survive gateway restart without storing secrets. Trusted pre-dispatch plugin runtime overrides can select the session route after auth but before the first LLM call. Plugin `prepend` directives accumulate text before the original event message.
-- **commits:**
+- **absorbed (2026-11-26 cleanup):** one independent topic for the runtime hook, the route block and the prepend guard (fewer re-stacks: a #1 fix no longer re-stacks #8, #14, #18). #77's commit deletes two stale tests that #1's own 985c8b83eb adds (net zero, never upstream). members in commit order: #1 runtime-control, #8 runtime-route-awareness, #14 runtime-override-rehydrate-credentials, #18 prompt-tail-freeze, #7 runtime-state-session-split, #28 hook-prepend-command-safety, #77 sync-20260819-test-seams. Old member tips: `backup/cleanup-1126/soju/patches/<name>` and the bundle.
+  - #8 runtime-route-awareness: Inject an API-call-time Runtime/Route State block so the agent sees live CurrentRuntime plus current-turn DesiredRoute without calling `model_status`. Trusted pre-dispatch `runtime_override` metadata is normalized into one-shot route state for the routed gateway turn, preserving stale-route protection while leaving post-tool rerouting and NEED_CONTEXT scout mode for later phases.
+  - #14 runtime-override-rehydrate-credentials: Upstream owns live `switch_model` endpoint rollback and provider-header reapplication; this patch is limited to gateway restart/persistence. A persisted runtime route is eligible only when both `runtime_model` and `runtime_provider` labels exist, then resolves once with `target_model` into one authoritative provider bundle (normalized provider, endpoint, API mode, keyed or keyless credential, command/args, and credential pool). Incomplete or unresolved labels stay durable but dormant while the turn falls back wholly to coherent defaults. Persisted reasoning rehydrates independently, and the latest `/model` or runtime-route writer clears the other durable model-route store without clearing reasoning. State DB coverage verifies DB-only restart and that no secret bundle fields are persisted.
+  - #18 prompt-tail-freeze: Fork-only residue after the upstream merge of the original patch: (1) `agent/system_prompt.py` byte-stability for the Runtime/Route block — key-tuple cache, permanently static DesiredRoute line, always-emitted `reasoning_source=`, `format_routing_directive` one-shot delivery riding upstream's turn-sidecar channel; (2) `gateway/run.py` same-route re-selection eviction guard + `include_reasoning` persistence for runtime overrides; (3) fork-only test deltas rebased onto upstream's `test_prompt_tail_freeze.py`/`test_runtime_route_prompt.py`. The pinned session-context prompt, sidecar note staging/consume, VC note, multimodal fallback and sorted connected platforms are upstream now and are NOT re-added. Expiry-path inline sidecar-note pop dropped in favor of upstream's `_clear_conversation_scope` funnel.
+  - #7 runtime-state-session-split: Runtime hard gates must see the active session's actual model/provider after context compression rotates the session id. Compression split republishes runtime state for the new session while retaining the old session as task/parent scope, preventing fallback to stale cross-session runtime state.
+  - #28 hook-prepend-command-safety: A `pre_gateway_dispatch` `{"action": "prepend"}` rewrote `event.text` before slash dispatch, and `is_command()`/`get_command()` key off `text.startswith("/")` — so any plugin prepend on a command message demoted it into plain chat that fell through to the agent. Live incident 2026-07-15: the inbox-matter-coordinator advisory rewrite (plugin 9ed17c4) prepends an `[INBOX_MATTER ...]` marker on matter-linked threads; `/model` there was answered by the agent's `model_status` tool instead of the interactive picker, and every slash command in those threads broke the same way. Fix: drop prepends (debug log) when the event is a slash command — advisory context is agent-facing and command handlers can't consume it. Plain-chat prepend behavior unchanged.
+  - #77 sync-20260819-test-seams: The 2026-08-19 upstream seam refactor moved pre-tool plugin blocking from `resolve_pre_tool_block` to `_dispatch_pre_tool_call_hooks`, leaving two runtime-control tests monkeypatching a bypassed seam. Upstream now carries equivalent integration coverage for both agent-level and registry-dispatched blocked tools, so this sync patch deletes the stale duplicates instead of re-anchoring redundant tests.
+- **commits:** (own commits in order; `[#N]` names the absorbed topic each came from)
   - `985c8b83eb` feat(runtime): agent-callable model_switch / model_status (session-only)
   - `003ae6debb` fix(runtime): align runtime tool dispatch ownership
   - `4f71926902` feat(runtime): route-enum self model switching (ADR-003 Phase 3b)
@@ -53,7 +60,26 @@ Bump `base_commit` only through the DECISIONS.md ADR-004 procedure (own-commit c
   - `e8d6f3f988` fix(runtime): port runtime-control onto the v0.23.4 storage, ingress, /model reset and tool-catalog changes
   - `98288ec03b` fix(shared-metrics): list the fork's runtime tools in the v4 tool_unavailable enum
   - `806f97fe0f` test(runtime): cold /status reads the default runtime for the next-turn route and the window (2026-11-25 sync regression)
-- **touches:** `agent/agent_init.py`, `agent/agent_runtime_helpers.py`, `agent/inline_tool_executors.py`, `agent/runtime_control.py`, `agent/tool_dispatch_helpers.py`, `gateway/platforms/webhook_ingress.py`, `gateway/run_agent_cache.py`, `gateway/run_config_loaders.py`, `gateway/run_inbound.py`, `gateway/run_inbound_hooks.py`, `gateway/run_turn_runner.py`, `gateway/session.py`, `gateway/session_policy.py`, `gateway/session_runtime_switch.py`, `gateway/slash_commands_model.py`, `gateway/slash_commands_session.py`, `hermes_cli/observability/schemas/hermes.shared_metrics.v4.schema.json`, `hermes_cli/plugins.py`, `hermes_cli/tools_config.py`, `model_tools.py`, `tools/runtime_control_tool.py`, `toolsets.py`, `tests/agent/test_pre_tool_session_id.py`, `tests/agent/test_run_agent.py`, `tests/agent/test_runtime_control.py`, `tests/agent/test_runtime_control_dispatch.py`, `tests/agent/test_runtime_control_routes.py`, `tests/gateway/test_pre_gateway_dispatch.py`, `tests/gateway/test_runtime_switch_local_session.py`, `tests/gateway/test_session.py`, `tests/gateway/test_session_model_override_routing.py`, `tests/gateway/test_session_policy_coding_posture.py`, `tests/gateway/test_status_command.py`, `tests/gateway/test_switch_session_keeps_runtime_route.py`, `tests/hermes_cli/test_plugins.py`, `tests/hermes_cli/test_runtime_provider_resolution.py`, `tests/hermes_cli/test_tools_config.py`, `tests/tools/test_runtime_control_tool_schema.py`, `tests/tui_gateway/test_profiles_toolset_pin.py`, `tests/tui_gateway/test_tui_gateway_server.py`
+  - `8d161190d4` feat(runtime): inject runtime route awareness prompt [#8]
+  - `7b2f4fa517` test(routing): expect the Runtime/Route block in post-compression system prompts [#8]
+  - `ef7baec345` fix(gateway): turn wiring tolerates bare runner doubles for fork hooks [#8]
+  - `b34cc3f3b6` test(routing): re-anchor runtime-route-awareness tests to the v0.22.5 upstream seams [#8]
+  - `ddcab09185` fix(routing): pin the turn-wiring consume of the staged route state (2026-10-30 sync review) [#8]
+  - `00e2c920e2` test(routing): re-anchor runtime-route-awareness tests to the v0.23.4 upstream seams [#8]
+  - `712b71a184` test(routing): a refreshed session persists its prompt without the API-time Runtime/Route block (2026-11-25 sync regression) [#8]
+  - `3f21d574f5` fix(gateway): re-resolve persisted runtime override bundle [#14]
+  - `4fff840016` fix(gateway): a /model clear also drops the older persisted runtime route (2026-10-30 sync review) [#14]
+  - `14afe25743` test(gateway): re-anchor runtime-override-rehydrate-credentials tests to the v0.23.4 upstream seams [#14]
+  - `fe7d69116d` fix(gateway): a rehydrated runtime route on a managed OAuth host follows the auth store (v0.23.4 port) [#14]
+  - `487f873455` feat(cache): prompt-tail freeze — byte-stable gateway system prompts (patch #18) [#18]
+  - `31e8826749` feat(prompt): Runtime/Route identity speaks route + model (ADR-003 Phase 3c) [#18]
+  - `88a0387a4c` fix(prompt): pin the turn-wiring routing directive and reasoning-source clear (2026-10-30 sync review) [#18]
+  - `450c649c64` test(prompt): re-anchor prompt-tail-freeze tests to the v0.23.4 upstream seams [#18]
+  - `135ff431ad` fix: keep runtime state scoped across compression splits [#7]
+  - `5d36dc7d53` fix(gateway): drop pre_gateway_dispatch prepends on slash commands [#28]
+  - `bfae4b28b6` test(runtime): re-anchor pre-tool block tests to _dispatch_pre_tool_call_hooks seam (2026-08-19 sync) [#77]
+- **touches:** `agent/agent_init.py`, `agent/agent_runtime_helpers.py`, `agent/chat_completion_helpers.py`, `agent/conversation_compression.py`, `agent/conversation_compression_runtime_state.py`, `agent/conversation_loop.py`, `agent/inline_tool_executors.py`, `agent/runtime_control.py`, `agent/system_prompt.py`, `agent/tool_dispatch_helpers.py`, `agent/turn_context.py`, `gateway/platforms/webhook_ingress.py`, `gateway/run.py`, `gateway/run_agent_cache.py`, `gateway/run_config_loaders.py`, `gateway/run_inbound.py`, `gateway/run_inbound_hooks.py`, `gateway/run_turn_prepare.py`, `gateway/run_turn_runner.py`, `gateway/session.py`, `gateway/session_policy.py`, `gateway/session_runtime_switch.py`, `gateway/slash_commands_model.py`, `gateway/slash_commands_session.py`, `hermes_cli/observability/schemas/hermes.shared_metrics.v4.schema.json`, `hermes_cli/plugins.py`, `hermes_cli/tools_config.py`, `model_tools.py`, `tools/runtime_control_tool.py`, `toolsets.py`, `website/docs/developer-guide/runtime-route-awareness.md`, `tests/agent/test_413_compression.py`, `tests/agent/test_pre_tool_session_id.py`, `tests/agent/test_replay_cleanup.py`, `tests/agent/test_run_agent.py`, `tests/agent/test_runtime_control.py`, `tests/agent/test_runtime_control_dispatch.py`, `tests/agent/test_runtime_control_routes.py`, `tests/agent/test_runtime_route_prompt.py`, `tests/agent/test_runtime_state_session_split.py`, `tests/agent/test_session_prompt_refresh.py`, `tests/agent/test_session_prompt_refresh_storage_handle.py`, `tests/gateway/test_pre_gateway_dispatch.py`, `tests/gateway/test_prompt_tail_freeze.py`, `tests/gateway/test_runtime_override_global_model_switch.py`, `tests/gateway/test_runtime_override_restart_rehydration.py`, `tests/gateway/test_runtime_override_state_db_restart.py`, `tests/gateway/test_runtime_override_store_precedence.py`, `tests/gateway/test_runtime_route_turn_wiring.py`, `tests/gateway/test_runtime_switch_local_session.py`, `tests/gateway/test_session.py`, `tests/gateway/test_session_model_override_routing.py`, `tests/gateway/test_session_policy_coding_posture.py`, `tests/gateway/test_status_command.py`, `tests/gateway/test_switch_session_keeps_runtime_route.py`, `tests/hermes_cli/test_plugins.py`, `tests/hermes_cli/test_runtime_provider_resolution.py`, `tests/hermes_cli/test_tools_config.py`, `tests/tools/test_runtime_control_tool_schema.py`, `tests/tui_gateway/test_profiles_toolset_pin.py`, `tests/tui_gateway/test_tui_gateway_server.py`
+- **member port reports (v0.23.4-sync):** `reports/runtime-route-awareness.md`, `reports/runtime-override-rehydrate-credentials.md`, `reports/prompt-tail-freeze.md`, `reports/runtime-state-session-split.md`, `reports/hook-prepend-command-safety.md`, `reports/sync-20260819-test-seams.md` under `~/work/hermes/upstream-sync-20261125/`.
 - **v2026.8.3-sync:** rehydration moved to the modular gateway startup path; explicit reasoning still wins over upstream's per-model reasoning re-resolution on switch.
 - **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/runtime-control.md` for relocations/seams.
 - **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/runtime-control.md` for relocations/seams.
@@ -126,43 +152,6 @@ Bump `base_commit` only through the DECISIONS.md ADR-004 procedure (own-commit c
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/background-review-guardrails.md` for relocations/seams.
 
 
-### 7. runtime-state-session-split
-- **branch:** `soju/patches/runtime-state-session-split`
-- **origin:** `local-author`
-- **upstream_pr:** _(none — dogfood runtime gate correctness)_
-- **state:** `local-only`
-- **rationale:** Runtime hard gates must see the active session's actual model/provider after context compression rotates the session id. Compression split republishes runtime state for the new session while retaining the old session as task/parent scope, preventing fallback to stale cross-session runtime state.
-- **commits:**
-  - `48ea4a06ca` fix: keep runtime state scoped across compression splits
-- **touches:** `agent/conversation_compression.py`, `agent/conversation_compression_runtime_state.py`, `tests/agent/test_runtime_state_session_split.py`
-- **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/runtime-state-session-split.md` for relocations/seams.
-- **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/runtime-state-session-split.md` for relocations/seams.
-- **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/runtime-state-session-split.md` for relocations/seams.
-
-
-### 8. runtime-route-awareness
-- **branch:** `soju/patches/runtime-route-awareness`
-- **stacked-on:** `soju/patches/runtime-control`
-- **origin:** `local-author`
-- **upstream_pr:** _(none — dogfood runtime routing correctness)_
-- **state:** `local-only`
-- **rationale:** Inject an API-call-time Runtime/Route State block so the agent sees live CurrentRuntime plus current-turn DesiredRoute without calling `model_status`. Trusted pre-dispatch `runtime_override` metadata is normalized into one-shot route state for the routed gateway turn, preserving stale-route protection while leaving post-tool rerouting and NEED_CONTEXT scout mode for later phases.
-- **commits:**
-  - `8d161190d4` feat(runtime): inject runtime route awareness prompt
-  - `7b2f4fa517` test(routing): expect the Runtime/Route block in post-compression system prompts
-  - `ef7baec345` fix(gateway): turn wiring tolerates bare runner doubles for fork hooks
-  - `b34cc3f3b6` test(routing): re-anchor runtime-route-awareness tests to the v0.22.5 upstream seams
-  - `ddcab09185` fix(routing): pin the turn-wiring consume of the staged route state (2026-10-30 sync review)
-  - `00e2c920e2` test(routing): re-anchor runtime-route-awareness tests to the v0.23.4 upstream seams
-  - `712b71a184` test(routing): a refreshed session persists its prompt without the API-time Runtime/Route block (2026-11-25 sync regression)
-- **touches:** `agent/chat_completion_helpers.py`, `agent/conversation_loop.py`, `agent/system_prompt.py`, `agent/turn_context.py`, `gateway/run.py`, `gateway/run_agent_cache.py`, `gateway/run_turn_runner.py`, `website/docs/developer-guide/runtime-route-awareness.md`, `tests/agent/test_413_compression.py`, `tests/agent/test_replay_cleanup.py`, `tests/agent/test_run_agent.py`, `tests/agent/test_runtime_route_prompt.py`, `tests/agent/test_session_prompt_refresh.py`, `tests/agent/test_session_prompt_refresh_storage_handle.py`, `tests/gateway/test_pre_gateway_dispatch.py`, `tests/gateway/test_runtime_route_turn_wiring.py`
-- **v2026.7.20-sync:** `_pending_runtime_route_states` registered in upstream `_CONVERSATION_SCOPED_STATE` funnel; failover system message now composed via `compose_effective_system_prompt` so the Runtime/Route block refreshes on provider failover.
-- **note (07-22):** pins fork semantics onto upstream `test_413_compression` exact-equality assertion (Runtime/Route block present in post-compression system prompts; was red on the old stack too).
-- **v2026.9.11-sync:** DONE — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/runtime-route-awareness.md` for relocations/seams.
-- **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/runtime-route-awareness.md` for relocations/seams.
-- **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/runtime-route-awareness.md` for relocations/seams.
-
-
 ### 12. strict-chat-reasoning-details
 - **branch:** `soju/patches/strict-chat-reasoning-details`
 - **origin:** `local-author`
@@ -196,24 +185,6 @@ Bump `base_commit` only through the DECISIONS.md ADR-004 procedure (own-commit c
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/discord-home-autothread-fix.md` for relocations/seams.
 
 
-### 14. runtime-override-rehydrate-credentials
-- **branch:** `soju/patches/runtime-override-rehydrate-credentials`
-- **stacked-on:** `soju/patches/runtime-route-awareness`
-- **origin:** `local-author`
-- **upstream_pr:** _(none — dogfood runtime-control follow-up fix)_
-- **state:** `local-only`
-- **rationale:** Upstream owns live `switch_model` endpoint rollback and provider-header reapplication; this patch is limited to gateway restart/persistence. A persisted runtime route is eligible only when both `runtime_model` and `runtime_provider` labels exist, then resolves once with `target_model` into one authoritative provider bundle (normalized provider, endpoint, API mode, keyed or keyless credential, command/args, and credential pool). Incomplete or unresolved labels stay durable but dormant while the turn falls back wholly to coherent defaults. Persisted reasoning rehydrates independently, and the latest `/model` or runtime-route writer clears the other durable model-route store without clearing reasoning. State DB coverage verifies DB-only restart and that no secret bundle fields are persisted.
-- **commits:**
-  - `3f21d574f5` fix(gateway): re-resolve persisted runtime override bundle
-  - `4fff840016` fix(gateway): a /model clear also drops the older persisted runtime route (2026-10-30 sync review)
-  - `14afe25743` test(gateway): re-anchor runtime-override-rehydrate-credentials tests to the v0.23.4 upstream seams
-  - `fe7d69116d` fix(gateway): a rehydrated runtime route on a managed OAuth host follows the auth store (v0.23.4 port)
-- **touches:** `gateway/run_agent_cache.py`, `gateway/run_config_loaders.py`, `gateway/run_turn_prepare.py`, `gateway/session.py`, `tests/gateway/test_runtime_override_global_model_switch.py`, `tests/gateway/test_runtime_override_restart_rehydration.py`, `tests/gateway/test_runtime_override_state_db_restart.py`, `tests/gateway/test_runtime_override_store_precedence.py`, `tests/gateway/test_session_model_override_routing.py`, `tests/gateway/test_switch_session_keeps_runtime_route.py`
-- **v2026.9.11-sync:** DONE — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/runtime-override-rehydrate-credentials.md` for relocations/seams.
-- **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/runtime-override-rehydrate-credentials.md` for relocations/seams.
-- **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/runtime-override-rehydrate-credentials.md` for relocations/seams.
-
-
 ### 15. turn-waterfall-tracing
 - **branch:** `soju/patches/turn-waterfall-tracing`
 - **origin:** `local-author`
@@ -239,40 +210,22 @@ Bump `base_commit` only through the DECISIONS.md ADR-004 procedure (own-commit c
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/turn-waterfall-tracing.md` for relocations/seams.
 
 
-### 18. prompt-tail-freeze
-- **branch:** `soju/patches/prompt-tail-freeze`
-- **stacked-on:** `soju/patches/runtime-route-awareness`
-- **origin:** `local-author`
-- **upstream_pr:** _(~70% merged upstream as `c0c76a471` byte-stable session context prompts, 2026-07-14)_
-- **state:** `local-only`
-- **rationale:** Fork-only residue after the upstream merge of the original patch: (1) `agent/system_prompt.py` byte-stability for the Runtime/Route block — key-tuple cache, permanently static DesiredRoute line, always-emitted `reasoning_source=`, `format_routing_directive` one-shot delivery riding upstream's turn-sidecar channel; (2) `gateway/run.py` same-route re-selection eviction guard + `include_reasoning` persistence for runtime overrides; (3) fork-only test deltas rebased onto upstream's `test_prompt_tail_freeze.py`/`test_runtime_route_prompt.py`. The pinned session-context prompt, sidecar note staging/consume, VC note, multimodal fallback and sorted connected platforms are upstream now and are NOT re-added. Expiry-path inline sidecar-note pop dropped in favor of upstream's `_clear_conversation_scope` funnel.
-- **commits:**
-  - `e99229770b` feat(cache): prompt-tail freeze — byte-stable gateway system prompts (patch #18)
-  - `76df1f7ed6` feat(prompt): Runtime/Route identity speaks route + model (ADR-003 Phase 3c)
-  - `f7a11a33c0` fix(prompt): pin the turn-wiring routing directive and reasoning-source clear (2026-10-30 sync review)
-  - `04ebbbbb33` test(prompt): re-anchor prompt-tail-freeze tests to the v0.23.4 upstream seams
-- **touches:** `agent/system_prompt.py`, `gateway/run_agent_cache.py`, `gateway/run_turn_runner.py`, `tests/agent/test_runtime_route_prompt.py`, `tests/gateway/test_prompt_tail_freeze.py`
-- **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/prompt-tail-freeze.md` for relocations/seams.
-- **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/prompt-tail-freeze.md` for relocations/seams.
-- **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/prompt-tail-freeze.md` for relocations/seams.
-
-
 ### 23. conn-error-fail-fast
 - **branch:** `soju/patches/conn-error-fail-fast`
-- **stacked-on:** assembled parallel lane (`sync1125/assembly` = v0.23.4 + independent topics, adeca72a8c) — 2026-11-25 chronological tip stack starts here
+- **stacked-on:** assembled parallel lane (`cleanup1126/assembly` = v0.23.4 + the independent topics, octopus) — the chronological tip stack starts here (re-stacked 2026-11-26; was `sync1125/assembly`)
 - **origin:** `local-author`
 - **upstream_pr:** _(none yet — upstream candidate after burn-in)_
 - **state:** `local-only`
 - **rationale:** Consecutive sub-2s transport failures (connection refused/reset before any bytes) mean the endpoint is down, not congested; with no fallback available the retry loop burned a dozen attempts with growing backoff (observed 13 attempts / 170-250s of user-visible silence per turn against a briefly-down codex-lb). Track the instant-failure streak on TurnRetryState and end the turn with an actionable error after `HERMES_FAST_CONN_FAIL_LIMIT` (default 3, 0 disables) once the fallback chain has had its chance; slow timeouts keep the full retry budget.
 - **commits:**
-  - `c085536521` fix(agent): fail fast on instant transport-failure streaks
-  - `bab7cc221d` fix(telemetry): tag instant transport fail-fast exits
-  - `abef70c2ba` test(agent): fail-fast tests patch the backoff where upstream now computes it (2026-09-14 sync)
-  - `7a398a400f` test(agent): fail-fast tests build the agent on upstream's patch targets (2026-10-30 sync)
-  - `7f6728516b` fix(agent): fail-fast measures instant failure per physical connect (2026-10-30 sync review)
-  - `a08293709b` fix(agent): fail-fast result carries failure_retryable and a diagnostic status (2026-10-30 sync review)
-  - `3378c92167` fix(agent): fail-fast settles the transcript like retry exhaustion (2026-10-30 sync review)
-  - `13ec499b1f` test(agent): fail-fast transcript test reads the tail through the storage interface (2026-11-25 sync)
+  - `369cb7c454` fix(agent): fail fast on instant transport-failure streaks
+  - `5465f22a39` fix(telemetry): tag instant transport fail-fast exits
+  - `0d487bb31d` test(agent): fail-fast tests patch the backoff where upstream now computes it (2026-09-14 sync)
+  - `ba32c6e800` test(agent): fail-fast tests build the agent on upstream's patch targets (2026-10-30 sync)
+  - `dd4dcb3e5f` fix(agent): fail-fast measures instant failure per physical connect (2026-10-30 sync review)
+  - `7e5165a64b` fix(agent): fail-fast result carries failure_retryable and a diagnostic status (2026-10-30 sync review)
+  - `8d1bdec3e6` fix(agent): fail-fast settles the transcript like retry exhaustion (2026-10-30 sync review)
+  - `750a87224d` test(agent): fail-fast transcript test reads the tail through the storage interface (2026-11-25 sync)
 - **touches:** `agent/conversation_loop.py`, `agent/turn_api_error.py`, `agent/turn_recovery_fail_fast.py`, `agent/turn_retry_state.py`, `tests/agent/test_fast_transport_fail_fast.py`
 - **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/conn-error-fail-fast.md` for relocations/seams.
 - **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/conn-error-fail-fast.md` for relocations/seams.
@@ -321,37 +274,20 @@ Bump `base_commit` only through the DECISIONS.md ADR-004 procedure (own-commit c
 - **state:** `local-only`
 - **rationale:** Restart recovery was a paper-over: an interrupted turn was abandoned and a synthetic empty user turn told the model to "skip any unfinished work" — the banner's "I'll try to resume where you left off" was implemented by nothing (live incident 2026-07-15, discord thread 1526457680527622247 reduced to "응 오빠, 여기 있어"). Durable turns make the in-flight turn a first-class durable record (`SessionEntry.active_turn`: turn_id/status/boot_id/resume_count) and re-enter the SAME turn on its persisted transcript after a restart: `run_conversation(resume_turn=True)` appends no user row, drops synthetic "Operation interrupted…" closers, completes unanswered tool_calls via existing orphan recovery (side effects = UNKNOWN, never re-executed), and delivers an already-composed final without another model call. Poison cap `HERMES_TURN_RESUME_MAX`/`agent.turn_resume_max` (default 2) abandons repeat offenders with an honest notice. Kill switch `HERMES_GATEWAY_TURN_RESUME`/`agent.gateway_turn_resume` restores legacy behavior. Banner reworded to match reality. See `DECISIONS.md` ADR-002.
 - **commits:**
-  - `aea56c9c7b` feat(gateway): durable turns — same-turn resume across gateway restarts
-  - `4ff41a9027` fix(agent): same-turn resume re-enters past a failed-turn boundary (2026-10-30 sync review)
-  - `295c5f2e0e` fix(gateway): canonically admitted turns write no durable turn record (2026-10-30 sync review)
-  - `abe6c06f87` fix(gateway): retire an answered turn's durable record on the inline claim half (2026-10-30 sync review)
-  - `df5d0c7884` fix(tests): cover the durable-turn gateway wiring the port rebuilt (2026-10-30 sync review)
-  - `86b23fb6af` fix(agent): finalize_turn no longer stamps an unproven turn_id (2026-10-30 sync review)
-  - `70fe778e94` fix(gateway): durable turns on the v0.23.4 test seams (2026-11-25 sync)
-  - `8edbdf29ad` docs(gateway): resume scheduler docstring and event comment describe same-turn resume (2026-11-25 sync review)
+  - `367313b1ed` feat(gateway): durable turns — same-turn resume across gateway restarts
+  - `d194dee602` fix(agent): same-turn resume re-enters past a failed-turn boundary (2026-10-30 sync review)
+  - `246a9567ec` fix(gateway): canonically admitted turns write no durable turn record (2026-10-30 sync review)
+  - `80d7c8dbf5` fix(gateway): retire an answered turn's durable record on the inline claim half (2026-10-30 sync review)
+  - `042066254f` fix(tests): cover the durable-turn gateway wiring the port rebuilt (2026-10-30 sync review)
+  - `5f3e3d9783` fix(agent): finalize_turn no longer stamps an unproven turn_id (2026-10-30 sync review)
+  - `c415f23da5` fix(gateway): durable turns on the v0.23.4 test seams (2026-11-25 sync)
+  - `451005c49b` docs(gateway): resume scheduler docstring and event comment describe same-turn resume (2026-11-25 sync review)
 - **touches:** `agent/conversation_loop.py`, `agent/turn_context.py`, `agent/turn_facade.py`, `agent/turn_resume.py`, `gateway/run_restored_delivery.py`, `gateway/run_runtime_init.py`, `gateway/run_shutdown.py`, `gateway/run_startup.py`, `gateway/run_turn.py`, `gateway/run_turn_persistence.py`, `gateway/run_turn_resume.py`, `gateway/run_turn_runner.py`, `gateway/session.py`, `gateway/session_lifecycle.py`, `gateway/turn_context.py`, `hermes_cli/config_defaults.py`, `tests/agent/test_resume_turn_loop.py`, `tests/agent/test_turn_resume.py`, `tests/gateway/restart_test_helpers.py`, `tests/gateway/test_durable_turn_records.py`, `tests/gateway/test_durable_turn_wiring.py`
 - **v2026.7.20-sync:** reconciled with upstream delivery-obligation ledger (`5854aad8b`): `_redeliver_pending_obligations` force-finishes `active_turn` records for claimed obligations, narrowing `_resume_composed_final` to the ledger-uncovered window; recovery-note bypass rewoven around module-scope `build_resume_recovery_note`.
 - **2026-08-26-sync:** replayed the durable feature delta onto the assembled dependency tip and resolved the four overlapping seams semantically. This preserves the worker-pool helper/call, turn-trace setup, fail-fast retry path, route/runtime rehydration, and current gateway flow while adding only durable-turn behavior; it also removes the duplicate tracing wrapper introduced by the stale resolution. Refreshed the manifest to amended tip `018bd2284`, which preserves upstream's claim-time `resume_pending` clear without redundantly clearing it again after redelivery.
 - **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/durable-turns.md` for relocations/seams.
 - **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/durable-turns.md` for relocations/seams.
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/durable-turns.md` for relocations/seams.
-
-
-### 28. hook-prepend-command-safety
-- **branch:** `soju/patches/hook-prepend-command-safety`
-- **stacked-on:** `soju/patches/durable-turns` (2026-11-25 chronological tip stack)
-- **origin:** `local-author`
-- **upstream_pr:** _(none — hardens the fork-only pre_gateway_dispatch prepend action from runtime-control)_
-- **state:** `local-only`
-- **rationale:** A `pre_gateway_dispatch` `{"action": "prepend"}` rewrote `event.text` before slash dispatch, and `is_command()`/`get_command()` key off `text.startswith("/")` — so any plugin prepend on a command message demoted it into plain chat that fell through to the agent. Live incident 2026-07-15: the inbox-matter-coordinator advisory rewrite (plugin 9ed17c4) prepends an `[INBOX_MATTER ...]` marker on matter-linked threads; `/model` there was answered by the agent's `model_status` tool instead of the interactive picker, and every slash command in those threads broke the same way. Fix: drop prepends (debug log) when the event is a slash command — advisory context is agent-facing and command handlers can't consume it. Plain-chat prepend behavior unchanged.
-- **commits:**
-  - `637b33832a` fix(gateway): drop pre_gateway_dispatch prepends on slash commands
-- **touches:** `gateway/run_inbound_hooks.py`, `tests/gateway/test_pre_gateway_dispatch.py`
-- **v2026.7.20-sync:** restacked — the guarded prepend action is fork-only (runtime-control), so the branch now merges runtime-control before the pick.
-- **2026-08-26-sync:** replayed the hook change onto corrected durable tip `c82e26d88`, preserving the slash-command guard and restoring the declared current dependency edge.
-- **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/hook-prepend-command-safety.md` for relocations/seams.
-- **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/hook-prepend-command-safety.md` for relocations/seams.
-- **v0.23.4-sync:** DONE — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/hook-prepend-command-safety.md` for relocations/seams.
 
 
 ### 29. slow-tool-perf-advisor
@@ -372,34 +308,50 @@ Bump `base_commit` only through the DECISIONS.md ADR-004 procedure (own-commit c
 
 ### 34. model-routing
 - **branch:** `soju/patches/model-routing`
-- **stacked-on:** `soju/patches/hook-prepend-command-safety` (2026-11-25 chronological tip stack)
+- **stacked-on:** `soju/patches/durable-turns` (2026-11-25 chronological tip stack; was #28, which folded into #1 on 2026-11-26)
 - **upstream_pr:** _(none — ADR-003 Phase 1; enum'd delegation aligns with upstream `delegation-model-routing` policy, natural round-2 candidate once Phases 2–3 prove it)_
 - **origin:** `local-author`
 - **state:** `local-only`
 - **rationale:** ADR-003 Phases 1+2 — model routing SoT as a core subsystem. Phase 1: config-declared `model_routes:` catalog (per route: description, provider, model, reasoning_effort, accepted membership, ordered fallbacks), loader with startup cross-validation against `providers:`, and a health-aware resolver (`resolve_route`) that walks default→fallbacks with TTL-cached fail-open provider probes ported from skill-gate's runtime_catalog (401/403 healthy, credit-sniffed 400, 402/429/5xx unhealthy; config-first kill switch `model_routes.health.enabled` + `HERMES_MODEL_ROUTES_HEALTH` bridge). Phase 2: gateway dynamic router (`gateway/model_router.py` + `_model_router_stage`) — classifier core byte-identical to the skill-gate bench winner (parity-test-pinned; changing it requires the 230+120 bench rerun), `model_routes.router` config (mode off|shadow|enforce + `HERMES_MODEL_ROUTER_MODE` bridge, label_routes, chat_route, streak), static condition rules (short-circuit by design — the plugin's live last-wins is a bug not ported), decision log `~/.hermes/logs/model_router_decisions.jsonl` for shadow-soak comparison, enforce apply with /model parity (#48031 auto-reset survival, pending note, session-DB persist). Dormant with empty config. Phase 3 (`model_switch`/`delegate_task` route enums) builds on this; supersedes patch #5 when Phase 3 lands.
+- **absorbed (2026-11-26 cleanup):** the routing core and its two hardening topics are ported and reviewed as one unit. members in commit order: #34 model-routing, #46 route-repromote-hysteresis, #47 passive-provider-health. Old member tips: `backup/cleanup-1126/soju/patches/<name>` and the bundle.
+  - #46 route-repromote-hysteresis: Route `accepted` membership was absorbing: once a session landed on a non-primary accepted member (DOCUMENT_WORK on claude-opus-5, SYSTEM_DEV on gpt-5.6-sol after a health failover), every turn returned `noop_satisfied` and the route primary (claude-fable-5) was never re-promoted. Adds `repromote_after_turns` (router default 3, per-route override, ≤0 disables): after N trusted noop turns on a non-primary member, the router resolves the route and emits `repromote_to_primary` — only onto the healthy true primary (`source=="default"`), `repromote_held` otherwise with the streak clamped for fast recovery. Classifier path trust-gated to `source=="llm"` (regex-fallback labels are inert), static path always trusted; CHAT gets the same mechanism at `noop_already_chat`; `normal_streak` untouched.
+  - #47 passive-provider-health: The model-routes health probe was an active 1-token completion with a 2.5s default timeout; claude-lb's end-to-end completion floor is ~3s, so probes deterministically timed out, the primary was misjudged unhealthy, and SYSTEM_DEV sessions silently failed over to gpt-5.6-sol (2026-07-27/28 incident; 19 of 21 switches landed on the fallback). Health is now passive-first: real completion traffic files the verdicts (`record_provider_outcome` — unhealthy from `try_activate_fallback` on outage-shaped `FailoverReason`s with probe-parity classification, healthy-clear on live completion success gated to one `os.stat` via `has_unhealthy_verdicts`), `provider_key_for_runtime` maps the live agent identity (config key / display name / `custom:` slug / base_url) to the `providers:` config key with no-match→no-record, and `provider_health()` only probes as a *recovery check* on a stale unhealthy verdict — no verdict or a stale healthy one is assumed healthy with zero I/O, so steady state never probes and never burns completion tokens.
 - **known limitation:** model-routed `delegate_task` children carry `request=None` and are refused on continue after a gateway restart (`tools/delegate_tool_continue.py:108-114`, fails closed); in-process continues work. A real fix needs `request={"route": name}` on claimed TaskRoutes and a continue path through `resolve_routed_tasks` (`~/work/hermes/upstream-sync-20261125/reports/model-routing.md:83-95`).
 - **decision (2026-11-26, O-A7):** accepted as a known limitation; about one delegation a week, and the path fails closed. Revisit only if delegation use grows.
-- **commits:**
-  - `78c07d3f97` feat(routing): model_routes catalog + health-aware route resolver (ADR-003 Phase 1)
-  - `b854ecdcdc` feat(routing): core dynamic model router with shadow mode (ADR-003 Phase 2)
-  - `26c183df43` feat(routing): route-enum delegation on delegate_task (ADR-003 Phase 3a)
-  - `d035f69a83` fix(routing): classify the pre-hook message text in the router stage
-  - `6d29c919ad` fixup(model-routing): adapt to v2026.7.20 upstream
-  - `6d2202fd63` test(routing): pin HERMES_MODEL_ROUTER_MODE=off in the hermetic fixture
-  - `a83fdb097a` fix(routing): adapt state and config validation seams
-  - `405a9a1ea9` test(routing): delegate route tests follow upstream schema/batch seams (2026-09-14 sync)
-  - `16190f57fb` fix(gateway): model_router .env read passes encoding=utf-8
-  - `8d9acce57b` test(routing): re-anchor route tests to the v0.22.5 seams (2026-10-30 sync)
-  - `c114c7c4bf` fix(gateway): router classifies the pre-hook text of durably admitted messages (2026-10-30 sync review)
-  - `9a32428541` fix(gateway): model router never routes LOCAL policy-bound sessions (2026-10-30 sync review)
-  - `86d790f605` fix(gateway): router enforce apply commits like a typed /model switch (2026-10-30 sync review)
-  - `8efcb798cf` fix(gateway): router runtime snapshot resolves reasoning for the effective model (2026-10-30 sync review)
-  - `7b2e342dc8` fix(delegation): default_route yields to a chosen delegation backend (2026-10-30 sync review)
-  - `f41bda5d7f` test(routing): pin the classifier core to a vendored bench snapshot (2026-10-30 sync review)
-  - `daf5551995` fix(gateway): model router env reads honour the profile secret scope (2026-10-30 sync review)
-  - `464238e3b4` fix(routing): re-anchor model routing to the v0.23.4 seams (2026-11-25 sync)
-  - `7b2b97c803` fix(routing): keep gateway/run.py under its line ratchet and import ConfigIssue from its owner (2026-11-25 sync review)
-- **touches:** `cli-config.yaml.example`, `gateway/model_router.py`, `gateway/platforms/webhook_ingress.py`, `gateway/run.py`, `gateway/run_inbound.py`, `gateway/run_inbound_model_router.py`, `gateway/run_turn_prepare.py`, `gateway/session_authority.py`, `gateway/session_envelope.py`, `hermes_cli/config.py`, `hermes_cli/config_defaults.py`, `hermes_cli/model_routes.py`, `run_agent.py`, `tools/delegate_tool.py`, `tools/delegate_tool_model_routes.py`, `tests/_fixtures/env_filter.py`, `tests/conftest.py`, `tests/fixtures/skill_gate_classifier_core.json`, `tests/gateway/test_model_router.py`, `tests/gateway/test_model_router_admission.py`, `tests/hermes_cli/test_model_routes.py`, `tests/tools/test_delegate.py`, `tests/tools/test_delegate_tool_model_routes.py`
+- **commits:** (own commits in order; `[#N]` names the absorbed topic each came from)
+  - `87f1f963b9` feat(routing): model_routes catalog + health-aware route resolver (ADR-003 Phase 1)
+  - `778cdaece1` feat(routing): core dynamic model router with shadow mode (ADR-003 Phase 2)
+  - `15be51ed1e` feat(routing): route-enum delegation on delegate_task (ADR-003 Phase 3a)
+  - `b4834ddfa7` fix(routing): classify the pre-hook message text in the router stage
+  - `da8d55df49` fixup(model-routing): adapt to v2026.7.20 upstream
+  - `41ca433ed7` test(routing): pin HERMES_MODEL_ROUTER_MODE=off in the hermetic fixture
+  - `30fbe21d22` fix(routing): adapt state and config validation seams
+  - `c7f209fce0` test(routing): delegate route tests follow upstream schema/batch seams (2026-09-14 sync)
+  - `729ad025c5` fix(gateway): model_router .env read passes encoding=utf-8
+  - `f0a3f81611` test(routing): re-anchor route tests to the v0.22.5 seams (2026-10-30 sync)
+  - `42ac675fc1` fix(gateway): router classifies the pre-hook text of durably admitted messages (2026-10-30 sync review)
+  - `433a72c5c4` fix(gateway): model router never routes LOCAL policy-bound sessions (2026-10-30 sync review)
+  - `4fc9084b20` fix(gateway): router enforce apply commits like a typed /model switch (2026-10-30 sync review)
+  - `c2a5a5bd0a` fix(gateway): router runtime snapshot resolves reasoning for the effective model (2026-10-30 sync review)
+  - `3a32614425` fix(delegation): default_route yields to a chosen delegation backend (2026-10-30 sync review)
+  - `f2997d013b` test(routing): pin the classifier core to a vendored bench snapshot (2026-10-30 sync review)
+  - `1eb3d69eda` fix(gateway): model router env reads honour the profile secret scope (2026-10-30 sync review)
+  - `8d5623466d` fix(routing): re-anchor model routing to the v0.23.4 seams (2026-11-25 sync)
+  - `ebc45ff9de` fix(routing): keep gateway/run.py under its line ratchet and import ConfigIssue from its owner (2026-11-25 sync review)
+  - `fa3179b117` feat(model-routes): add repromote_after_turns knob (router default + per-route override) [#46]
+  - `675cdc2e8b` feat(gateway): re-promote sessions from accepted members to the route primary [#46]
+  - `560c379cbc` test(gateway): cover route re-promotion hysteresis [#46]
+  - `3969b0a5f4` feat(routing): passive-first provider health — verdicts from real traffic [#47]
+  - `0a88fccd95` fix(fallback): file the passive verdict when a reset-deferred switch ends the turn (2026-10-30 sync review) [#47]
+  - `9dda7af696` fix(routing): decide passive health for every FailoverReason (2026-10-30 sync review) [#47]
+  - `547d441692` fix(agent): pin the five passive-health success hooks (2026-10-30 sync review) [#47]
+  - `c46cab130c` fix(routing): scope the passive burst guard to the health cache (2026-10-30 sync review) [#47]
+  - `2f950303d5` fix(routing): keep the per-completion passive-health gate cheap and logged (2026-10-30 sync review) [#47]
+  - `4b3ec3fedd` fix(routing): see same-tick health-cache rewrites in the passive gate memo (2026-10-30 sync review) [#47]
+  - `2b03d7b68f` fix(docs): describe passive-first model_routes health in cli-config.yaml.example (2026-10-30 sync review) [#47]
+  - `ca6e9e5a13` fix(routing): classify v0.23.4's guardrail_blocked for passive health (2026-11-25 sync) [#47]
+- **touches:** `agent/chat_completion_helpers.py`, `agent/chat_completion_nonstream.py`, `agent/passive_provider_health.py`, `agent/turn_recovery.py`, `cli-config.yaml.example`, `gateway/model_router.py`, `gateway/platforms/webhook_ingress.py`, `gateway/run.py`, `gateway/run_inbound.py`, `gateway/run_inbound_model_router.py`, `gateway/run_turn_prepare.py`, `gateway/session_authority.py`, `gateway/session_envelope.py`, `hermes_cli/config.py`, `hermes_cli/config_defaults.py`, `hermes_cli/model_routes.py`, `run_agent.py`, `tools/delegate_tool.py`, `tools/delegate_tool_model_routes.py`, `tests/_fixtures/env_filter.py`, `tests/agent/test_passive_provider_health.py`, `tests/conftest.py`, `tests/fixtures/skill_gate_classifier_core.json`, `tests/gateway/test_model_router.py`, `tests/gateway/test_model_router_admission.py`, `tests/hermes_cli/test_model_routes.py`, `tests/tools/test_delegate.py`, `tests/tools/test_delegate_tool_model_routes.py`
+- **member port reports (v0.23.4-sync):** `reports/route-repromote-hysteresis.md`, `reports/passive-provider-health.md` under `~/work/hermes/upstream-sync-20261125/`.
 - **v2026.8.3-sync:** route state followed the refactored gateway session helpers; config validation moved to `hermes_cli/config_validation.py`; Phase 3a delegation was re-expressed on the current `delegate_task` transport.
 - **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/model-routing.md` for relocations/seams.
 - **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/model-routing.md` for relocations/seams.
@@ -413,107 +365,73 @@ Bump `base_commit` only through the DECISIONS.md ADR-004 procedure (own-commit c
 - **upstream_pr:** _(none — generic and config-off-by-default, upstream candidate once soaked)_
 - **state:** `local-only`
 - **rationale:** Audience-mode persona injection: when `HERMES_HOME/personas/modes.yaml` exists, a mode is selected per session as a pure deterministic function of session-constant inputs (platform/chat_type/chat_id/chat_name/user_id) — first-match rules (string-or-list exact match, chat_name case-insensitive, missing key = wildcard, AND), non-owner guard applied after rules (non-empty `user_id` not in `owners[platform]` forces `guards.non_owner_mode`; missing owners entry fails safe; empty user_id skips), `default_mode` fallback — and the mode's persona markdown is injected as stable-tier slot #2 right after the SOUL.md/DEFAULT_AGENT_IDENTITY identity block, through the same threat scan + truncation cap as SOUL.md. With no modes.yaml the build is byte-identical (strict no-op); all failure paths degrade to the no-op at DEBUG. Cache correctness: an `AudienceMode: <mode>` line joins the volatile tail only while active, and `_stored_prompt_matches_runtime` recomputes the expected mode via a cheap mode-only resolver (both-absent passes → pre-deploy stored prompts stay valid; mismatch/one-sided rebuilds exactly once per session). SOUL.md plumbing parity: `personas/` in profile clone + default-export include set, `hermes_config_mod` threat pattern extended to `.hermes/personas/` paths. The `artifact_register` section of modes.yaml is a tone-gate plugin contract, deliberately not consumed by core.
-- **commits:**
-  - `ae429a0d79` feat(prompt): audience-mode persona injection from personas/modes.yaml
-  - `45352e9e94` fix(prompt): audience persona honours the hosted-scope and safe-worker gate of SOUL.md (2026-11-25 sync review)
+- **absorbed (2026-11-26 cleanup):** members in commit order: #35 audience-personas, #78 base-persona. Old member tips: `backup/cleanup-1126/soju/patches/<name>` and the bundle.
+  - #78 base-persona: modes.yaml gains an optional top-level `base_persona: <file>` key: a personas-dir-relative markdown file prepended (`base + "\n\n" + mode`) to every selected mode persona inside `load_audience_persona`, so shared style/identity rules live in ONE file instead of being duplicated per mode (immediate consumer: fluent-korean Korean-output guideline shared across modes). Injection gating is untouched — the base never changes WHETHER injection happens, only content, so `resolve_audience_mode`/`_persona_stat_ok` (per-turn staleness resolver) stay byte-identical and loader/resolver agreement is preserved. Base file resolves through the same personas-dir containment as mode personas (factored into `_contained_persona_path`) and passes the same `_scan_context_content` + `_truncate_content` pipeline with its own label/read_path. Fail-open: missing/empty/escaping/unreadable base → DEBUG log, mode persona alone; base path == mode path → no self-duplication; key absent → byte-identical to pre-patch behavior.
+- **commits:** (own commits in order; `[#N]` names the absorbed topic each came from)
+  - `955890ab1e` feat(prompt): audience-mode persona injection from personas/modes.yaml
+  - `139585f34d` fix(prompt): audience persona honours the hosted-scope and safe-worker gate of SOUL.md (2026-11-25 sync review)
+  - `8c4bddee96` feat(prompt): optional shared base persona prefix for audience modes [#78]
 - **touches:** `agent/audience_persona.py`, `agent/conversation_loop.py`, `agent/system_prompt.py`, `hermes_cli/profiles.py`, `tools/threat_patterns.py`, `tests/agent/test_audience_persona.py`, `tests/agent/test_system_prompt_switch_invalidation.py`
+- **member port reports (v0.23.4-sync):** `reports/base-persona.md` under `~/work/hermes/upstream-sync-20261125/`.
 - **2026-08-26-sync:** refreshed the declared model-routing ancestry to current tip `99aebe694`; the dependency correction restores the per-call delegation credential seam while leaving audience selection behavior unchanged.
 - **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/audience-personas.md` for relocations/seams.
 - **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/audience-personas.md` for relocations/seams.
 - **v0.23.4-sync:** DONE — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/audience-personas.md` for relocations/seams.
 
 
-### 37. memory-phase0
-- **branch:** `soju/patches/memory-phase0`
+### 37. memory-redesign
+- **branch:** `soju/patches/memory-redesign`
 - **stacked-on:** `soju/patches/audience-personas` (2026-11-25 chronological tip stack)
 - **origin:** `local-author`
 - **upstream_pr:** _(none — ADR-004 dogfood; revisit after shadow soak)_
 - **state:** `local-only`
 - **rationale:** ADR-004 Phase 0 memory-redesign plumbing: `pending/` WAL (durable per-turn buffer for external memory sync), L0-mirror local evidence journal for outgoing memory payloads, `_memory_ingest_disabled` per-agent flag (read-only memory forks), MEMORY.md/USER.md char-cap defaults unified on the config SoT. Journal review fixes: atomic appends, marker-only boundary mirroring, per-directory startup scan, directories pinned at construction.
-- **commits:**
-  - `c6194fed2b` feat(memory): _memory_ingest_disabled per-agent flag — read-only memory forks (ADR-004 Phase 0)
-  - `fc232c6f48` feat(memory): pending/ WAL — durable per-turn buffer for external memory sync (ADR-004 Phase 0)
-  - `c4597801a3` feat(memory): L0-mirror — local evidence journal for outgoing memory payloads (ADR-004 Phase 0)
-  - `0ac453015e` fix(memory): unify MEMORY.md/USER.md char-cap defaults on config SoT (ADR-004 Phase 0)
-  - `693f78ae72` fix(memory): pin journal directories at construction, not at write time
-  - `cbb4054cd3` test(memory): exercise prefetch with a substantive query
-  - `6294c2ef4c` test(memory): pin the Phase-0 gates against upstream's new teardown and stuck-call seams (2026-10-30 sync)
-  - `a4ba97de6a` test(gateway): keep lazy-import allocations out of the spool recovery memory bound (2026-11-25 sync regression)
-- **touches:** `agent/agent_init.py`, `agent/background_review.py`, `agent/conversation_compression.py`, `agent/inline_tool_executors.py`, `agent/memory_journal.py`, `agent/memory_manager.py`, `agent/turn_context.py`, `cli-config.yaml.example`, `optional-skills/research/research-paper-writing/SKILL.md`, `run_agent.py`, `tools/delegate_tool_results.py`, `tools/memory_tool.py`, `tools/memory_tool_store.py`, `website/docs/guides/tips.md`, `website/docs/user-guide/configuration.md`, `website/docs/user-guide/features/memory.md`, `website/docs/user-guide/skills/optional/research/research-research-paper-writing.md`, `website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/guides/tips.md`, `website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/configuration.md`, `website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/features/memory.md`, `tests/agent/test_memory_ingest_disabled.py`, `tests/agent/test_memory_l0_mirror.py`, `tests/agent/test_memory_pending_wal.py`, `tests/gateway/test_shutdown_spool_limits.py`, `tests/tools/test_write_approval.py`
+- **absorbed (2026-11-26 cleanup):** the memory-redesign ADR's phases 0 to 2 and the notes grounding as one topic ("ADR-004" inside these commits means the memory-redesign ADR, not DECISIONS.md ADR-004). members in commit order: #37 memory-phase0, #38 memory-phase1, #39 memory-phase2-taint, #40 memory-phase2-curator, #53 notes-recognition-grounding. Old member tips: `backup/cleanup-1126/soju/patches/<name>` and the bundle.
+  - #38 memory-phase1: ADR-004 Phase 1 notes tier: `NotesStore` declarative notes under the citation contract, `notes_write`/`notes_read`/`memory_propose` tool family, two-step token contract with grounded admission and gated backfill seam. Review fixes close secret-scrub bypasses, add real quote grounding, non-destructive supersede, write-gate parity.
+  - #39 memory-phase2-taint: ADR-004 §① Phase 2 origin-taint machinery: injected-span registry, WAL/mirror span tagging, quote-taint enforcement; spans registered at the prefetch and memory-tool result sites. Review fixes: registry singleton hygiene, WAL/mirror tag coverage, floor-not-round registration timestamps.
+  - #40 memory-phase2-curator: ADR-004 Phase 2 ingest curator: fork recipe, verdict schema, shadow ledger, watermark; curator triggers + `curator_verdict` dispatch wiring. Review fixes: seam scrub+grounding, provenance validation, cross-lane taint interface. Runs shadow-only until the cutover gate.
+  - #53 notes-recognition-grounding: Preview grounding evidence when proposing notes and allow admission to ground against the current user turn only at write time, while preserving mechanical taint rejection and the existing citation contract.
+- **commits:** (own commits in order; `[#N]` names the absorbed topic each came from)
+  - `c29a0a50ae` feat(memory): _memory_ingest_disabled per-agent flag — read-only memory forks (ADR-004 Phase 0) [#37]
+  - `0da81de44f` feat(memory): pending/ WAL — durable per-turn buffer for external memory sync (ADR-004 Phase 0) [#37]
+  - `75499d6132` feat(memory): L0-mirror — local evidence journal for outgoing memory payloads (ADR-004 Phase 0) [#37]
+  - `b2e8d6ecf3` fix(memory): unify MEMORY.md/USER.md char-cap defaults on config SoT (ADR-004 Phase 0) [#37]
+  - `de32b1b886` fix(memory): pin journal directories at construction, not at write time [#37]
+  - `8944649584` test(memory): exercise prefetch with a substantive query [#37]
+  - `764c1cd477` test(memory): pin the Phase-0 gates against upstream's new teardown and stuck-call seams (2026-10-30 sync) [#37]
+  - `bfa12485f6` test(gateway): keep lazy-import allocations out of the spool recovery memory bound (2026-11-25 sync regression) [#37]
+  - `9433d54825` fix(memory): journal review fixes — atomic appends, marker-only boundary mirroring, per-directory startup scan [#38]
+  - `4b7a61896e` feat(memory): NotesStore — declarative notes tier under the citation contract (ADR-004 Phase 1) [#38]
+  - `443d483d71` feat(memory): notes write pipeline — two-step token contract, grounded admission, gated backfill seam (ADR-004 §③) [#38]
+  - `7d235444b1` feat(memory): notes tool family — notes_write/notes_read/memory_propose wiring + prompt guidance (ADR-004 Phase 1) [#38]
+  - `c4e967e916` fix(memory): notes review fixes — close the secret-scrub bypasses, real quote grounding, non-destructive supersede, write gate parity (ADR-004 Phase 1) [#38]
+  - `383205cd0f` test(run_agent): list the notes tools in the post-hook ownership cases (2026-09-14 sync) [#38]
+  - `efe173440c` fix(memory): port the notes tier onto v0.22.5 seams (2026-10-30 sync) [#38]
+  - `a58c46d20b` fix(memory): fit the notes tool first sentences to the tool_search catalog line (2026-11-25 sync) [#38]
+  - `31fe4611b5` fix(shared-metrics): list the notes tools in the v4 tool_unavailable enum (2026-11-25 sync regression) [#38]
+  - `d0834da166` feat(memory): origin-taint machinery — injected-span registry, WAL/mirror span tagging, quote-taint enforcement (ADR-004 §① Phase 2) [#39]
+  - `21d7ba5ffc` feat(memory): register injected memory spans at the prefetch and memory-tool result sites (ADR-004 §① Phase 2) [#39]
+  - `3e197e9be0` fix(memory): origin-taint review fixes — registry singleton hygiene, WAL/mirror tag coverage, floor-not-round registration ts (ADR-004 Phase 2) [#39]
+  - `320be69fcb` fix(memory): keep one taint registry per profile home (2026-11-25 sync review) [#39]
+  - `8b5ace5345` feat(memory): ingest curator core — fork recipe, verdict schema, shadow ledger, watermark (ADR-004 Phase 2) [#40]
+  - `9788d05410` feat(memory): ingest curator triggers + curator_verdict dispatch wiring (ADR-004 Phase 2) [#40]
+  - `c835fee0b5` test(memory): ingest curator Phase-2 suite — shadow invariant, fork isolation, triggers, caps (ADR-004) [#40]
+  - `844f0f991f` fix(memory): ingest curator review fixes — seam scrub+grounding, provenance validation, cross-lane taint interface (ADR-004 Phase 2) [#40]
+  - `737296d254` test(run_agent): list curator_verdict in the post-hook ownership cases (2026-09-14 sync) [#40]
+  - `969fe33f39` fix(memory): port the ingest curator onto v0.22.5 seams (2026-10-30 sync) [#40]
+  - `2f396c4e6b` fix(docs): document the memory ingest curator config keys (2026-10-30 sync regression) [#40]
+  - `555c0f789c` fix(memory): give the ingest curator fork upstream's fork identity and hosted gate (2026-11-25 sync) [#40]
+  - `0fb53d637a` fix(memory): bind the curator idle trigger to its profile and keep the parent's provider pins on the fork (2026-11-25 sync review) [#40]
+  - `66d0527427` feat(memory): add recognition grounding preview [#53]
+  - `0ad3ba0f0a` feat(memory): defer current-turn quote grounding [#53]
+  - `1a1533a33f` docs(memory): document grounding assist contract [#53]
+- **touches:** `IMPLEMENTATION-NOTES.md`, `agent/agent_init.py`, `agent/agent_runtime_helpers.py`, `agent/background_review.py`, `agent/codex_runtime.py`, `agent/conversation_compression.py`, `agent/ingest_curator.py`, `agent/inline_tool_executors.py`, `agent/memory_journal.py`, `agent/memory_manager.py`, `agent/memory_pipeline.py`, `agent/memory_taint.py`, `agent/notes_store.py`, `agent/prompt_builder.py`, `agent/system_prompt.py`, `agent/tool_executor.py`, `agent/turn_context.py`, `agent/turn_finalizer.py`, `cli-config.yaml.example`, `hermes_cli/config_defaults.py`, `hermes_cli/observability/schemas/hermes.shared_metrics.v4.schema.json`, `optional-skills/research/research-paper-writing/SKILL.md`, `run_agent.py`, `tools/delegate_tool_results.py`, `tools/delegate_tool_toolsets.py`, `tools/memory_tool.py`, `tools/memory_tool_store.py`, `tools/notes_tool.py`, `toolsets.py`, `website/docs/guides/tips.md`, `website/docs/user-guide/configuration.md`, `website/docs/user-guide/features/memory.md`, `website/docs/user-guide/skills/optional/research/research-research-paper-writing.md`, `website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/guides/tips.md`, `website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/configuration.md`, `website/i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/features/memory.md`, `tests/agent/test_ingest_curator.py`, `tests/agent/test_memory_ingest_disabled.py`, `tests/agent/test_memory_l0_mirror.py`, `tests/agent/test_memory_pending_wal.py`, `tests/agent/test_memory_pipeline.py`, `tests/agent/test_memory_provider_caller_profile.py`, `tests/agent/test_memory_sync_redaction.py`, `tests/agent/test_memory_taint.py`, `tests/agent/test_notes_store.py`, `tests/agent/test_run_agent.py`, `tests/gateway/test_shutdown_spool_limits.py`, `tests/tools/test_notes_tool.py`, `tests/tools/test_write_approval.py`
+- **member port reports (v0.23.4-sync):** `reports/memory-phase1.md`, `reports/memory-phase2-taint.md`, `reports/memory-phase2-curator.md`, `reports/notes-recognition-grounding.md` under `~/work/hermes/upstream-sync-20261125/`.
 - **v2026.7.20-sync:** re-stacked on memory-write-reason-gate; turn_context gates re-expressed on upstream turn_context.py (7b3dcee92); conversation_compression gate adapted to upstream memory_context capture.
 - **2026-08-26-sync:** replayed the phase-0 commits onto corrected durable-turns so the shared turn-context seam preserves both resume and memory-prefetch invariants.
 - **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/memory-phase0.md` for relocations/seams.
 - **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/memory-phase0.md` for relocations/seams.
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/memory-phase0.md` for relocations/seams.
-
-
-### 38. memory-phase1
-- **branch:** `soju/patches/memory-phase1`
-- **stacked-on:** `soju/patches/memory-phase0` (2026-11-25 chronological tip stack)
-- **origin:** `local-author`
-- **upstream_pr:** _(none — ADR-004 dogfood)_
-- **state:** `local-only`
-- **rationale:** ADR-004 Phase 1 notes tier: `NotesStore` declarative notes under the citation contract, `notes_write`/`notes_read`/`memory_propose` tool family, two-step token contract with grounded admission and gated backfill seam. Review fixes close secret-scrub bypasses, add real quote grounding, non-destructive supersede, write-gate parity.
-- **commits:**
-  - `b78b91434c` fix(memory): journal review fixes — atomic appends, marker-only boundary mirroring, per-directory startup scan
-  - `dc4f5541e3` feat(memory): NotesStore — declarative notes tier under the citation contract (ADR-004 Phase 1)
-  - `3c39521850` feat(memory): notes write pipeline — two-step token contract, grounded admission, gated backfill seam (ADR-004 §③)
-  - `57cfa8c5f0` feat(memory): notes tool family — notes_write/notes_read/memory_propose wiring + prompt guidance (ADR-004 Phase 1)
-  - `ed677f84af` fix(memory): notes review fixes — close the secret-scrub bypasses, real quote grounding, non-destructive supersede, write gate parity (ADR-004 Phase 1)
-  - `217a25bf72` test(run_agent): list the notes tools in the post-hook ownership cases (2026-09-14 sync)
-  - `ecbb20fbb1` fix(memory): port the notes tier onto v0.22.5 seams (2026-10-30 sync)
-  - `3ab9dc4a47` fix(memory): fit the notes tool first sentences to the tool_search catalog line (2026-11-25 sync)
-  - `965bb5ed20` fix(shared-metrics): list the notes tools in the v4 tool_unavailable enum (2026-11-25 sync regression)
-- **touches:** `agent/agent_runtime_helpers.py`, `agent/inline_tool_executors.py`, `agent/memory_journal.py`, `agent/memory_manager.py`, `agent/memory_pipeline.py`, `agent/notes_store.py`, `agent/prompt_builder.py`, `agent/system_prompt.py`, `hermes_cli/observability/schemas/hermes.shared_metrics.v4.schema.json`, `tools/delegate_tool_toolsets.py`, `tools/memory_tool.py`, `tools/notes_tool.py`, `toolsets.py`, `tests/agent/test_memory_l0_mirror.py`, `tests/agent/test_memory_pending_wal.py`, `tests/agent/test_memory_pipeline.py`, `tests/agent/test_memory_provider_caller_profile.py`, `tests/agent/test_memory_sync_redaction.py`, `tests/agent/test_notes_store.py`, `tests/agent/test_run_agent.py`, `tests/tools/test_notes_tool.py`
-- **v2026.7.20-sync:** tool-name unions re-resolved against v2 parent chain (runtime-control tools union at assembly); _dispatch_notes_tool re-anchored above upstream's finalize= signature (271a9d8ec).
-- **2026-08-26-sync:** replayed phase 1 onto the corrected phase-0/durable chain; no phase-1 behavior changed.
-- **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/memory-phase1.md` for relocations/seams.
-- **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/memory-phase1.md` for relocations/seams.
-- **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/memory-phase1.md` for relocations/seams.
-
-
-### 39. memory-phase2-taint
-- **branch:** `soju/patches/memory-phase2-taint`
-- **stacked-on:** `soju/patches/memory-phase1` (2026-11-25 chronological tip stack)
-- **origin:** `local-author`
-- **upstream_pr:** _(none — ADR-004 dogfood)_
-- **state:** `local-only`
-- **rationale:** ADR-004 §① Phase 2 origin-taint machinery: injected-span registry, WAL/mirror span tagging, quote-taint enforcement; spans registered at the prefetch and memory-tool result sites. Review fixes: registry singleton hygiene, WAL/mirror tag coverage, floor-not-round registration timestamps.
-- **commits:**
-  - `894f93ec3c` feat(memory): origin-taint machinery — injected-span registry, WAL/mirror span tagging, quote-taint enforcement (ADR-004 §① Phase 2)
-  - `8644215932` feat(memory): register injected memory spans at the prefetch and memory-tool result sites (ADR-004 §① Phase 2)
-  - `63969bed17` fix(memory): origin-taint review fixes — registry singleton hygiene, WAL/mirror tag coverage, floor-not-round registration ts (ADR-004 Phase 2)
-  - `19f93b7e2b` fix(memory): keep one taint registry per profile home (2026-11-25 sync review)
-- **touches:** `agent/inline_tool_executors.py`, `agent/memory_journal.py`, `agent/memory_manager.py`, `agent/memory_pipeline.py`, `agent/memory_taint.py`, `agent/tool_executor.py`, `agent/turn_context.py`, `run_agent.py`, `tests/agent/test_memory_ingest_disabled.py`, `tests/agent/test_memory_pending_wal.py`, `tests/agent/test_memory_taint.py`
-- **v2026.7.20-sync:** prefetch taint registration combined at assembly with durable-turns' resume guard and waterfall span (see Assembly Integration Fixes).
-- **2026-08-26-sync:** replayed phase-2 taint onto corrected phase 1 so the declared ancestry and combined prefetch seam remain current.
-- **v2026.9.11-sync:** DONE — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/memory-phase2-taint.md` for relocations/seams.
-- **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/memory-phase2-taint.md` for relocations/seams.
-- **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/memory-phase2-taint.md` for relocations/seams.
-
-
-### 40. memory-phase2-curator
-- **branch:** `soju/patches/memory-phase2-curator`
-- **stacked-on:** `soju/patches/memory-phase2-taint` (2026-11-25 chronological tip stack)
-- **origin:** `local-author`
-- **upstream_pr:** _(none — ADR-004 dogfood; shadow-mode observation ongoing)_
-- **state:** `local-only`
-- **rationale:** ADR-004 Phase 2 ingest curator: fork recipe, verdict schema, shadow ledger, watermark; curator triggers + `curator_verdict` dispatch wiring. Review fixes: seam scrub+grounding, provenance validation, cross-lane taint interface. Runs shadow-only until the cutover gate.
-- **commits:**
-  - `dcb46ba3ec` feat(memory): ingest curator core — fork recipe, verdict schema, shadow ledger, watermark (ADR-004 Phase 2)
-  - `f9575e787e` feat(memory): ingest curator triggers + curator_verdict dispatch wiring (ADR-004 Phase 2)
-  - `1618dc74ad` test(memory): ingest curator Phase-2 suite — shadow invariant, fork isolation, triggers, caps (ADR-004)
-  - `ecb3c026c5` fix(memory): ingest curator review fixes — seam scrub+grounding, provenance validation, cross-lane taint interface (ADR-004 Phase 2)
-  - `84ab4fe864` test(run_agent): list curator_verdict in the post-hook ownership cases (2026-09-14 sync)
-  - `f69da4ce1c` fix(memory): port the ingest curator onto v0.22.5 seams (2026-10-30 sync)
-  - `6f65020759` fix(docs): document the memory ingest curator config keys (2026-10-30 sync regression)
-  - `eb2edcecf6` fix(memory): give the ingest curator fork upstream's fork identity and hosted gate (2026-11-25 sync)
-  - `4636d48d5e` fix(memory): bind the curator idle trigger to its profile and keep the parent's provider pins on the fork (2026-11-25 sync review)
-- **touches:** `agent/agent_runtime_helpers.py`, `agent/background_review.py`, `agent/codex_runtime.py`, `agent/conversation_compression.py`, `agent/ingest_curator.py`, `agent/inline_tool_executors.py`, `agent/memory_journal.py`, `agent/memory_manager.py`, `agent/memory_pipeline.py`, `agent/turn_finalizer.py`, `hermes_cli/config_defaults.py`, `run_agent.py`, `website/docs/user-guide/configuration.md`, `tests/agent/test_ingest_curator.py`, `tests/agent/test_memory_provider_caller_profile.py`, `tests/agent/test_memory_sync_redaction.py`, `tests/agent/test_run_agent.py`
-- **2026-08-26-sync:** replayed phase-2 curator onto corrected phase 1 so the declared ancestry remains current; no curator behavior changed.
-- **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/memory-phase2-curator.md` for relocations/seams.
-- **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/memory-phase2-curator.md` for relocations/seams.
-- **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/memory-phase2-curator.md` for relocations/seams.
 
 
 ### 42. anthropic-picker-suppression
@@ -554,58 +472,16 @@ Bump `base_commit` only through the DECISIONS.md ADR-004 procedure (own-commit c
 - **state:** `local-only`
 - **rationale:** `try_activate_fallback(agent, reason)` received the `FailoverReason` but discarded it, so plugins could not distinguish a safety-refusal fallback (deterministic, content-scoped, restore-next-turn) from rate-limit/5xx failovers. Records `agent._fallback_reason` at the single activation success point, mirrors it at every `_fallback_activated` reset/copy site, exposes `fallback_activated`/`fallback_reason` in `get_runtime_state()`, emits `runtime_state` hook events at activation (`event="fallback"`) and restore (`event="restore"`), and forwards the reason from the exception client-error branch (`classified.reason`) and the Codex soft-failure fallback; the HTTP-200 `content_filter` and mid-stream content-filter sites pass it upstream since 6ee6b7cb77. Enables the skill-gate refusal-fallback exemption so a refusal-driven claude-opus-5 fallback can perform dev edits for exactly that turn.
 - **commits:**
-  - `3346234b0f` feat(fallback): record activation reason and publish runtime_state events
-  - `ea8785ddf1` test(fallback): cover fallback reason lifecycle and runtime_state hook
-  - `99f498355f` test(fallback): behaviorally cover loop call-site reason forwarding and the transport-recovery reset
-  - `0052f4ef46` fix(fallback): honor declared api_mode (chain entry or providers.<name>) over URL heuristics
-  - `66ab0aed1a` test(fallback): re-anchor refusal-fallback-reason tests to the v0.22.5 upstream seams
-  - `c1d1875293` fix(fallback): forward the content-policy reason from the Codex soft-failure fallback (2026-10-30 sync review)
+  - `0fdfa2d0cb` feat(fallback): record activation reason and publish runtime_state events
+  - `26abd5129c` test(fallback): cover fallback reason lifecycle and runtime_state hook
+  - `57be49ce0f` test(fallback): behaviorally cover loop call-site reason forwarding and the transport-recovery reset
+  - `5489434f90` fix(fallback): honor declared api_mode (chain entry or providers.<name>) over URL heuristics
+  - `476b61fe80` test(fallback): re-anchor refusal-fallback-reason tests to the v0.22.5 upstream seams
+  - `c25c164731` fix(fallback): forward the content-policy reason from the Codex soft-failure fallback (2026-10-30 sync review)
 - **touches:** `agent/agent_init_fallback.py`, `agent/agent_runtime_helpers.py`, `agent/chat_completion_helpers.py`, `agent/route_binding.py`, `agent/runtime_control.py`, `agent/turn_api_error.py`, `agent/turn_response_check.py`, `agent/voice_turn_route.py`, `tests/agent/test_provider_fallback.py`, `tests/agent/test_refusal_fallback_reason.py`
 - **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/refusal-fallback-reason.md` for relocations/seams.
 - **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/refusal-fallback-reason.md` for relocations/seams.
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/refusal-fallback-reason.md` for relocations/seams.
-
-
-### 46. route-repromote-hysteresis
-- **branch:** `soju/patches/route-repromote-hysteresis`
-- **stacked-on:** `soju/patches/memory-phase2-curator` (2026-11-25 chronological tip stack)
-- **origin:** `local-author`
-- **upstream_pr:** _(none — depends on fork-only model-routing patch #34)_
-- **state:** `local-only`
-- **rationale:** Route `accepted` membership was absorbing: once a session landed on a non-primary accepted member (DOCUMENT_WORK on claude-opus-5, SYSTEM_DEV on gpt-5.6-sol after a health failover), every turn returned `noop_satisfied` and the route primary (claude-fable-5) was never re-promoted. Adds `repromote_after_turns` (router default 3, per-route override, ≤0 disables): after N trusted noop turns on a non-primary member, the router resolves the route and emits `repromote_to_primary` — only onto the healthy true primary (`source=="default"`), `repromote_held` otherwise with the streak clamped for fast recovery. Classifier path trust-gated to `source=="llm"` (regex-fallback labels are inert), static path always trusted; CHAT gets the same mechanism at `noop_already_chat`; `normal_streak` untouched.
-- **commits:**
-  - `cd4a4bb9a5` feat(model-routes): add repromote_after_turns knob (router default + per-route override)
-  - `6ecab2e125` feat(gateway): re-promote sessions from accepted members to the route primary
-  - `95d216f996` test(gateway): cover route re-promotion hysteresis
-- **touches:** `cli-config.yaml.example`, `gateway/model_router.py`, `gateway/run_inbound_model_router.py`, `hermes_cli/model_routes.py`, `tests/gateway/test_model_router.py`, `tests/hermes_cli/test_model_routes.py`
-- **2026-08-26-sync:** refreshed the declared model-routing ancestry to current tip `99aebe694`; re-promotion behavior is unchanged.
-- **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/route-repromote-hysteresis.md` for relocations/seams.
-- **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/route-repromote-hysteresis.md` for relocations/seams.
-- **v0.23.4-sync:** DONE — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/route-repromote-hysteresis.md` for relocations/seams.
-
-
-### 47. passive-provider-health
-- **branch:** `soju/patches/passive-provider-health`
-- **stacked-on:** `soju/patches/route-repromote-hysteresis` (2026-11-25 chronological tip stack)
-- **origin:** `local-author`
-- **upstream_pr:** _(none — depends on fork-only model-routing patch #34)_
-- **state:** `local-only`
-- **rationale:** The model-routes health probe was an active 1-token completion with a 2.5s default timeout; claude-lb's end-to-end completion floor is ~3s, so probes deterministically timed out, the primary was misjudged unhealthy, and SYSTEM_DEV sessions silently failed over to gpt-5.6-sol (2026-07-27/28 incident; 19 of 21 switches landed on the fallback). Health is now passive-first: real completion traffic files the verdicts (`record_provider_outcome` — unhealthy from `try_activate_fallback` on outage-shaped `FailoverReason`s with probe-parity classification, healthy-clear on live completion success gated to one `os.stat` via `has_unhealthy_verdicts`), `provider_key_for_runtime` maps the live agent identity (config key / display name / `custom:` slug / base_url) to the `providers:` config key with no-match→no-record, and `provider_health()` only probes as a *recovery check* on a stale unhealthy verdict — no verdict or a stale healthy one is assumed healthy with zero I/O, so steady state never probes and never burns completion tokens.
-- **commits:**
-  - `36d6642e02` feat(routing): passive-first provider health — verdicts from real traffic
-  - `2f149270ae` fix(fallback): file the passive verdict when a reset-deferred switch ends the turn (2026-10-30 sync review)
-  - `6476db58fc` fix(routing): decide passive health for every FailoverReason (2026-10-30 sync review)
-  - `a99c7bc302` fix(agent): pin the five passive-health success hooks (2026-10-30 sync review)
-  - `b0b3fc3ba2` fix(routing): scope the passive burst guard to the health cache (2026-10-30 sync review)
-  - `32b006b7ab` fix(routing): keep the per-completion passive-health gate cheap and logged (2026-10-30 sync review)
-  - `eb5723368e` fix(routing): see same-tick health-cache rewrites in the passive gate memo (2026-10-30 sync review)
-  - `f0299f5299` fix(docs): describe passive-first model_routes health in cli-config.yaml.example (2026-10-30 sync review)
-  - `dbf0d0b1f1` fix(routing): classify v0.23.4's guardrail_blocked for passive health (2026-11-25 sync)
-- **touches:** `agent/chat_completion_helpers.py`, `agent/chat_completion_nonstream.py`, `agent/passive_provider_health.py`, `agent/turn_recovery.py`, `cli-config.yaml.example`, `hermes_cli/model_routes.py`, `tests/agent/test_passive_provider_health.py`, `tests/hermes_cli/test_model_routes.py`
-- **2026-08-26-sync:** refreshed the declared model-routing ancestry to current tip `99aebe694`; passive-health behavior is unchanged.
-- **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/passive-provider-health.md` for relocations/seams.
-- **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/passive-provider-health.md` for relocations/seams.
-- **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/passive-provider-health.md` for relocations/seams.
 
 
 ### 48. event-loop-db-isolation
@@ -630,17 +506,17 @@ Bump `base_commit` only through the DECISIONS.md ADR-004 procedure (own-commit c
 
 ### 50. per-tool-disable
 - **branch:** `soju/patches/per-tool-disable`
-- **stacked-on:** `soju/patches/passive-provider-health` (2026-11-25 chronological tip stack)
+- **stacked-on:** _(none — independent topic rooted on base v0.23.4; re-rooted 2026-11-26 from the tip stack, its own diff applies on bare base and 5bdd12e61b already made it work without the memory chain)_
 - **origin:** `local-author`
 - **upstream_pr:** _(none — deployment tool-surface control)_
 - **state:** `local-only`
 - **rationale:** Permit `agent.disabled_toolsets` to subtract individual registered tool names as well as whole toolsets, and propagate the denylist into the Codex hermes-tools MCP sidecar so disabled tools cannot remain visible or callable through that transport.
 - **commits:**
-  - `86afc4ede8` fix(codex): honor disabled_toolsets in the hermes-tools MCP sidecar
-  - `252adebb94` feat(toolsets): let disabled_toolsets subtract individual tool names
-  - `605591850e` fix(toolsets): sidecar reads disabled_toolsets like every surface; test seams for v0.22.5 (2026-10-30 sync)
-  - `5bdd12e61b` fix(toolsets): pin per-tool disable and toolset precedence without the memory chain (2026-10-30 sync review)
-  - `3410f5d01e` fix(toolsets): per-tool disabled_toolsets entries follow the #134593 clear and hint logic (2026-11-25 sync review)
+  - `710f0ef1c4` fix(codex): honor disabled_toolsets in the hermes-tools MCP sidecar
+  - `b7c516cb0f` feat(toolsets): let disabled_toolsets subtract individual tool names
+  - `867e9a138b` fix(toolsets): sidecar reads disabled_toolsets like every surface; test seams for v0.22.5 (2026-10-30 sync)
+  - `89ddbae7f5` fix(toolsets): pin per-tool disable and toolset precedence without the memory chain (2026-10-30 sync review)
+  - `e306bacddf` fix(toolsets): per-tool disabled_toolsets entries follow the #134593 clear and hint logic (2026-11-25 sync review)
 - **touches:** `agent/transports/hermes_tools_mcp_server.py`, `cli-config.yaml.example`, `hermes_cli/tools_config.py`, `model_tools.py`, `tests/agent/transports/test_hermes_tools_mcp_server.py`, `tests/hermes_cli/test_disabled_toolsets_per_tool.py`, `tests/tools/test_model_tools.py`
 - **2026-08-26-sync:** rebuilt the integration merge on corrected durable-turns; its delta remains only the four per-tool-disable files and contains no worker-pool addition or reversion. Re-anchored the availability test from service-gated TTS to always-present core tools so it exercises per-tool subtraction rather than optional service configuration.
 - **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/per-tool-disable.md` for relocations/seams.
@@ -682,34 +558,16 @@ Bump `base_commit` only through the DECISIONS.md ADR-004 procedure (own-commit c
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/anthropic-signature-passthrough.md` for relocations/seams.
 
 
-### 53. notes-recognition-grounding
-- **branch:** `soju/patches/notes-recognition-grounding`
-- **stacked-on:** `soju/patches/per-tool-disable` (2026-11-25 chronological tip stack)
-- **origin:** `local-author`
-- **upstream_pr:** _(none — ADR-004 recognition-assist follow-up)_
-- **state:** `local-only`
-- **rationale:** Preview grounding evidence when proposing notes and allow admission to ground against the current user turn only at write time, while preserving mechanical taint rejection and the existing citation contract.
-- **commits:**
-  - `7a7ad3e0ae` feat(memory): add recognition grounding preview
-  - `92d496ca34` feat(memory): defer current-turn quote grounding
-  - `51a897ef0e` docs(memory): document grounding assist contract
-- **touches:** `IMPLEMENTATION-NOTES.md`, `agent/memory_pipeline.py`, `agent/notes_store.py`, `tools/notes_tool.py`, `tests/agent/test_memory_pipeline.py`, `tests/tools/test_notes_tool.py`
-- **2026-08-26-sync:** replayed recognition grounding onto corrected phase-2 taint to retain the declared edge.
-- **v2026.9.11-sync:** DONE — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/notes-recognition-grounding.md` for relocations/seams.
-- **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/notes-recognition-grounding.md` for relocations/seams.
-- **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/notes-recognition-grounding.md` for relocations/seams.
-
-
 ### 54. worker-cpu-hygiene
 - **branch:** `soju/patches/worker-cpu-hygiene`
 - **origin:** `local-author`
 - **upstream_pr:** _(none — 2026-08-05 loop-stall follow-up)_
 - **state:** `local-only`
-- **rationale:** Stop worker threads from starving the gateway event loop of GIL time. lifecycle_guard tokenized each command three times per nesting level (tokenize once, share the segment list); the checkpoint size walk (`_dir_size_bytes`) and the pre-v2 mtime loop used Path.rglob (rewritten on os.scandir with identical early-stop/symlink semantics). The `_dir_file_count` half is upstream's since af70d77be2.
+- **rationale:** Stop worker threads from starving the gateway event loop of GIL time: the checkpoint size walk (`_dir_size_bytes`) and the pre-v2 mtime loop used Path.rglob (rewritten on os.scandir with identical early-stop/symlink semantics). The `_dir_file_count` half is upstream's since af70d77be2. Since 2026-11-26 the lifecycle_guard tokenize-once hunk of the original 0df0228fb6 lives in #66 lifecycle-guard-hardening (the commit was split by file, content unchanged).
 - **commits:**
-  - `0df0228fb6` perf(cron,tools): stop worker threads from starving the event loop of GIL time
-  - `0d3fdbdfca` fix(tools): walk pre-v2 checkpoint mtimes with os.scandir (2026-10-30 sync review)
-- **touches:** `agent/checkpoints/maintenance.py`, `agent/checkpoints/manager.py`, `cron/lifecycle_guard.py`
+  - `0d4a75d106` perf(tools): walk checkpoint dirs with os.scandir instead of Path.rglob (split from 0df0228fb6)
+  - `12ebb868d2` fix(tools): walk pre-v2 checkpoint mtimes with os.scandir (2026-10-30 sync review)
+- **touches:** `agent/checkpoints/maintenance.py`, `agent/checkpoints/manager.py`
 - **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/worker-cpu-hygiene.md` for relocations/seams.
 - **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/worker-cpu-hygiene.md` for relocations/seams.
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/worker-cpu-hygiene.md` for relocations/seams.
@@ -723,102 +581,67 @@ Bump `base_commit` only through the DECISIONS.md ADR-004 procedure (own-commit c
 - **state:** `local-only`
 - **rationale:** The terminal tool's `read_remote_script` callback re-read paths the local bounded reader had already skipped as binaries, so invoking any binary by path inside a gateway session fed decoded machine code back into the recursion and crashed `os.open` with `ValueError: embedded null byte`, killing the whole terminal call. Skip NUL-bearing callback content like the local binary skip, and tolerate `ValueError` in `_read_referenced_script` to match the existing `resolve()`-level tolerance.
 - **commits:**
-  - `4e1738e240` fix(cron): stop lifecycle guard remote fallback from resurrecting binaries
-  - `1ad77ad110` fix(cron): make the local-binary remote-fallback test discriminating (2026-10-30 sync review)
+  - `4eb32fe0b5` fix(cron): stop lifecycle guard remote fallback from resurrecting binaries
+  - `1eb9521e5c` fix(cron): make the local-binary remote-fallback test discriminating (2026-10-30 sync review)
 - **touches:** `tests/hermes_cli/test_gateway_restart_loop.py`
 - **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/lifecycle-guard-nul-fallback.md` for relocations/seams.
 - **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/lifecycle-guard-nul-fallback.md` for relocations/seams.
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/lifecycle-guard-nul-fallback.md` for relocations/seams.
 
 
-### 56. refusal-risk-routing
-- **branch:** `soju/patches/refusal-risk-routing`
-- **stacked-on:** `soju/patches/notes-recognition-grounding` (2026-11-25 chronological tip stack)
+### 56. refusal-recovery
+- **branch:** `soju/patches/refusal-recovery`
+- **stacked-on:** `soju/patches/memory-redesign` (2026-11-25 chronological tip stack)
 - **origin:** `local-author`
 - **upstream_pr:** _(none — dogfood refusal-risk preemptive routing)_
 - **state:** `local-only`
 - **rationale:** Gateway model router gains an orthogonal `refusal_risk` boolean (plus confidence) so hard frontier-refusal turns are preemptively switched to low-refusal routes before the primary model contaminates context. Label flow S1–S7 stays benched and byte-compatible; S0 only sets the orthogonal flag. Config `model_routes.router.refusal` (default disabled) maps SYSTEM_DEV/FRONTEND_DEV → PERMISSIVE_DEV (kimi-k3) and NORMAL/DOCUMENT_WORK → PERMISSIVE_CHAT (grok-4.5) when confidence ≥ threshold and source is LLM. Enforce-mode applied refusal switches emit an owner-visible platform notice via existing `_deliver_platform_notice` (config-gated). Follow-up tune: S0 explicitly false for draft-edit/tone-down of existing NSFW text and own-infra audits; true only for from-scratch NSFW authoring and third-party attack intents. Bench on 300 gold cases @0.85: precision 0.992 / recall 0.928; grok subset 1.0/1.0.
-- **commits:**
-  - `f22b4b6b55` feat(gateway): refusal-risk preemptive routing with permissive routes
-  - `e31211c67f` tune(gateway): narrow S0 refusal for draft-edit vs authoring
-- **touches:** `gateway/model_router.py`, `gateway/run_inbound_model_router.py`, `hermes_cli/model_routes.py`, `tests/gateway/test_model_router.py`, `tests/hermes_cli/test_model_routes.py`
+- **absorbed (2026-11-26 cleanup):** one refusal topic (the shared test files are resolved once; the #58/#59 shared branch is gone; #76 moved down from after #75, checked to apply). #59's cancelling pair e7b06f608b and its revert f0622e9ba8 (net diff empty) is no longer carried. members in commit order: #56 refusal-risk-routing, #57 refusal-api-fallback, #58 refusal-hop-clean-fork, #59 refusal-soft-turnend, #76 clean-fork-soft-refusal-only. Old member tips: `backup/cleanup-1126/soju/patches/<name>` and the bundle.
+  - #57 refusal-api-fallback: When the primary model returns API-level safety refusal (`content_filter` / `FailoverReason.content_policy_blocked`), walk generic `fallback_providers` (opus) first, then resolved PERMISSIVE routes (dev→chat or chat→dev from primary runtime). Gated by `model_routes.router.refusal.enabled` + new `api_fallback` (default false). Preserves `_fallback_reason=content_policy_blocked` for skill-gate turn exemption. Non-refusal reasons unchanged.
+  - #58 refusal-hop-clean-fork: Hard refusal: upstream retention (v0.23.4) removes the refused turn before the router runs; this topic only stages a one-shot PERMISSIVE hop and the notice, so the user's resend lands on the permissive route. Soft refusal: the classifier's `prior_refusal` masks the newest active assistant row (`active=0`, row preserved, `compacted` untouched) and one-shot routes the next turn to PERMISSIVE. History (pre-v0.23.4): the hard path also masked the refusal row. Replaces the preemptive `rewrite_transcript` that hard-deleted the whole session with no refusal evidence. Mid-turn clean-fork scope cut to the current turn (completed history preserved). `prior_refusal` classifier field costs zero extra API calls (router already receives `recent_turns`). Bench 30/30 at precision 1.0 / recall 1.0 after two prompt narrowings (sub-part inability and domain deferral no longer read as refusals). New `deactivate_messages`/`reactivate_messages` are reversible; no hard deletion anywhere.
+  - #59 refusal-soft-turnend: Two gaps observed live on thread 1536678317166694441. (1) A soft refusal authored inside a turn (finish_reason=stop, no error) left no turn-end signal, so nothing masked it and no permissive hop was staged. Add `_handle_gateway_soft_refusal` probing the just-produced response through the existing `prior_refusal` classifier field, gated by length floor + config, with a `refusal_recovery_count` loop guard (`max_recovery_hops` default 2) that stops laundering repeat refusals through more models. (2) A refusal-recovery agent whose generic opus hop then died of `overloaded` never reached PERMISSIVE because the refusal walk only triggered on `content_policy_blocked`. Extend it so an active refusal recovery falls through to PERMISSIVE on ANY generic-exhaustion reason, and add logging to the previously silent `_build_refusal_fallback_chain`.
+  - #76 clean-fork-soft-refusal-only: clean_fork (context truncation on refusal fallback) was firing on ALL refusal-shaped signals, including Anthropic structured `stop_reason=refusal` — a contaminated signal claude-fable-5 emits during normal work. Mid-task it cut tool progress from the fallback model's context, causing re-scoping + announce-and-stop early turn ends (2026-08-19 03:23 incident, session 20260813_031938_3171f671). Owner design verdict: clean_fork exists for ROUTER-CLASSIFIED soft refusals (natural-language decline text contaminating context) ONLY; API/provider/stream policy signals still fall back but must preserve full conversation and tool progress. Adds `RefusalSource` enum (5 sources) + `should_apply_clean_fork()` gate with per-decision INFO log; removes the dead auth-path content_policy branch (is_auth and content_policy are mutually exclusive in error_classifier). Incident-replay test asserts tool results survive into the fallback model's input.
+- **decision (2026-11-26, O-A9):** accept upstream's v0.23.4 retention contract: a hard refusal removes the turn and the user resends. Keep only the one-shot PERMISSIVE hop and the notice; do not carry the refused request into the forced turn.
+- **commits:** (own commits in order; `[#N]` names the absorbed topic each came from)
+  - `21cf5e7670` feat(gateway): refusal-risk preemptive routing with permissive routes [#56]
+  - `b166b2aab3` tune(gateway): narrow S0 refusal for draft-edit vs authoring [#56]
+  - `4a630a3640` feat(fallback): content_policy_blocked prefers PERMISSIVE routes [#57]
+  - `36b2e4d716` fix(fallback): content_policy walks generic before PERMISSIVE [#57]
+  - `ef298a84b2` feat(refusal): clean-fork history on PERMISSIVE hop [#58]
+  - `dd41c4fec5` feat(refusal): mask refused turn and auto-switch instead of rewriting history [#58]
+  - `bd50d447c8` tune(router): narrow prior_refusal to whole-request refusals [#58]
+  - `a11d560a24` fix(refusal): keep the failed-turn boundary when masking a hard refusal (2026-10-30 sync) [#58]
+  - `2cd452046c` fix(refusal): hard-refusal notice drops the always-zero hidden-message count (2026-11-25 sync review) [#58]
+  - `99baba3e57` feat(refusal): detect soft refusals at turn end with recovery-hop guard [#59]
+  - `3baf9b4354` fix(fallback): log empty/built refusal chain reasons [#59]
+  - `582174959a` fix(refusal): run the soft-refusal probe without the dead hard-mask gate (2026-11-25 sync review) [#59]
+  - `d152192201` fix(refusal): reserve clean fork for router soft refusals [#76]
+- **touches:** `agent/agent_init_fallback.py`, `agent/chat_completion_helpers.py`, `agent/refusal_fallback.py`, `agent/refusal_history.py`, `agent/turn_api_error.py`, `agent/turn_context.py`, `agent/turn_iteration_prep.py`, `agent/turn_response_check.py`, `agent/turn_truncation.py`, `gateway/model_router.py`, `gateway/run_agent_cache.py`, `gateway/run_inbound_model_router.py`, `gateway/run_turn_persistence.py`, `gateway/run_turn_runner.py`, `gateway/session_state.py`, `gateway/session_transcript.py`, `hermes_cli/model_routes.py`, `tests/agent/test_refusal_fallback_reason.py`, `tests/agent/test_refusal_history.py`, `tests/gateway/test_model_router.py`, `tests/gateway/test_model_router_failed_turn_boundary.py`, `tests/gateway/test_session_refusal_mask.py`, `tests/hermes_cli/test_model_routes.py`
+- **member port reports (v0.23.4-sync):** `reports/refusal-api-fallback.md`, `reports/refusal-hop-clean-fork.md`, `reports/refusal-soft-turnend.md`, `reports/clean-fork-soft-refusal-only.md` under `~/work/hermes/upstream-sync-20261125/`.
 - **2026-08-26-sync:** replayed the refusal-risk delta onto the corrected production prefix so it no longer carries stale durable/memory integration state. Refreshed the topic after the durable ledger correction so its assembled prefix no longer restores the redundant post-redelivery `resume_pending` clear.
 - **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/refusal-risk-routing.md` for relocations/seams.
 - **v0.22.5-sync:** DONE — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/refusal-risk-routing.md` for relocations/seams.
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/refusal-risk-routing.md` for relocations/seams.
 
 
-### 57. refusal-api-fallback
-- **branch:** `soju/patches/refusal-api-fallback`
-- **stacked-on:** `soju/patches/refusal-risk-routing` (2026-11-25 chronological tip stack)
-- **origin:** `local-author`
-- **upstream_pr:** _(none — dogfood reactive refusal recovery)_
-- **state:** `local-only`
-- **rationale:** When the primary model returns API-level safety refusal (`content_filter` / `FailoverReason.content_policy_blocked`), walk generic `fallback_providers` (opus) first, then resolved PERMISSIVE routes (dev→chat or chat→dev from primary runtime). Gated by `model_routes.router.refusal.enabled` + new `api_fallback` (default false). Preserves `_fallback_reason=content_policy_blocked` for skill-gate turn exemption. Non-refusal reasons unchanged.
-- **commits:**
-  - `49c8dfc220` feat(fallback): content_policy_blocked prefers PERMISSIVE routes
-  - `c5dc8b8719` fix(fallback): content_policy walks generic before PERMISSIVE
-- **touches:** `agent/chat_completion_helpers.py`, `agent/refusal_fallback.py`, `hermes_cli/model_routes.py`, `tests/agent/test_refusal_fallback_reason.py`, `tests/hermes_cli/test_model_routes.py`
-- **2026-08-26-sync:** replayed the API-refusal fallback delta onto the corrected refusal-risk prefix, removing its stale stack integration. Refreshed the exact dependency edge to amended refusal-risk tip `418d95344`, retaining the single claim-time delivery-ledger clear.
-- **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/refusal-api-fallback.md` for relocations/seams.
-- **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/refusal-api-fallback.md` for relocations/seams.
-- **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/refusal-api-fallback.md` for relocations/seams.
-
-
-### 58. refusal-hop-clean-fork
-- **branch:** `soju/patches/refusal-hop-clean-fork`
-- **stacked-on:** `soju/patches/refusal-api-fallback` (2026-11-25 chronological tip stack)
-- **origin:** `local-author`
-- **upstream_pr:** _(none — dogfood refusal masking + auto-switch)_
-- **state:** `local-only`
-- **rationale:** Hard refusal: upstream retention (v0.23.4) removes the refused turn before the router runs; this topic only stages a one-shot PERMISSIVE hop and the notice, so the user's resend lands on the permissive route. Soft refusal: the classifier's `prior_refusal` masks the newest active assistant row (`active=0`, row preserved, `compacted` untouched) and one-shot routes the next turn to PERMISSIVE. History (pre-v0.23.4): the hard path also masked the refusal row. Replaces the preemptive `rewrite_transcript` that hard-deleted the whole session with no refusal evidence. Mid-turn clean-fork scope cut to the current turn (completed history preserved). `prior_refusal` classifier field costs zero extra API calls (router already receives `recent_turns`). Bench 30/30 at precision 1.0 / recall 1.0 after two prompt narrowings (sub-part inability and domain deferral no longer read as refusals). New `deactivate_messages`/`reactivate_messages` are reversible; no hard deletion anywhere.
-- **decision (2026-11-26, O-A9):** accept upstream's v0.23.4 retention contract: a hard refusal removes the turn and the user resends. Keep only the one-shot PERMISSIVE hop and the notice; do not carry the refused request into the forced turn.
-- **commits:**
-  - `cabf7670f3` feat(refusal): clean-fork history on PERMISSIVE hop
-  - `1bc097087f` feat(refusal): mask refused turn and auto-switch instead of rewriting history
-  - `1cf1b204b7` tune(router): narrow prior_refusal to whole-request refusals
-  - `b089cbf02a` fix(refusal): keep the failed-turn boundary when masking a hard refusal (2026-10-30 sync)
-  - `1735ab9a55` fix(refusal): hard-refusal notice drops the always-zero hidden-message count (2026-11-25 sync review)
-- **touches:** `agent/agent_init_fallback.py`, `agent/refusal_history.py`, `agent/turn_api_error.py`, `agent/turn_context.py`, `agent/turn_iteration_prep.py`, `agent/turn_response_check.py`, `agent/turn_truncation.py`, `gateway/model_router.py`, `gateway/run_agent_cache.py`, `gateway/run_inbound_model_router.py`, `gateway/run_turn_persistence.py`, `gateway/run_turn_runner.py`, `gateway/session_state.py`, `gateway/session_transcript.py`, `hermes_cli/model_routes.py`, `tests/agent/test_refusal_fallback_reason.py`, `tests/agent/test_refusal_history.py`, `tests/gateway/test_model_router.py`, `tests/gateway/test_model_router_failed_turn_boundary.py`, `tests/gateway/test_session_refusal_mask.py`, `tests/hermes_cli/test_model_routes.py`
-- **2026-08-26-sync:** replayed the refusal-hop series onto the corrected refusal-API prefix and preserved the runtime-route/refusal-quarantine turn setup at the shared gateway seam. Refreshed the exact refusal-API dependency edge after its ledger correction.
-- **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/refusal-hop-clean-fork.md` for relocations/seams.
-- **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/refusal-hop-clean-fork.md` for relocations/seams.
-- **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/refusal-hop-clean-fork.md` for relocations/seams.
-
-
-### 59. refusal-soft-turnend
-- **branch:** `soju/patches/refusal-hop-clean-fork`
-- **stacked-on:** `soju/patches/refusal-hop-clean-fork` (same branch; its commits follow #58's — 2026-11-25 chronological tip stack)
-- **origin:** `local-author`
-- **upstream_pr:** _(none — dogfood soft-refusal detection + fallback hardening)_
-- **state:** `local-only`
-- **rationale:** Two gaps observed live on thread 1536678317166694441. (1) A soft refusal authored inside a turn (finish_reason=stop, no error) left no turn-end signal, so nothing masked it and no permissive hop was staged. Add `_handle_gateway_soft_refusal` probing the just-produced response through the existing `prior_refusal` classifier field, gated by length floor + config, with a `refusal_recovery_count` loop guard (`max_recovery_hops` default 2) that stops laundering repeat refusals through more models. (2) A refusal-recovery agent whose generic opus hop then died of `overloaded` never reached PERMISSIVE because the refusal walk only triggered on `content_policy_blocked`. Extend it so an active refusal recovery falls through to PERMISSIVE on ANY generic-exhaustion reason, and add logging to the previously silent `_build_refusal_fallback_chain`.
-- **commits:**
-  - `af9504043d` feat(refusal): detect soft refusals at turn end with recovery-hop guard
-  - `e7b06f608b` fix(fallback): extend refusal PERMISSIVE chain to generic-exhaustion on any reason
-  - `f0622e9ba8` Revert "fix(fallback): extend refusal PERMISSIVE chain to generic-exhaustion on any reason"
-  - `8bf298b425` fix(fallback): log empty/built refusal chain reasons
-  - `6048eb0229` fix(refusal): run the soft-refusal probe without the dead hard-mask gate (2026-11-25 sync review)
-- **touches:** `agent/chat_completion_helpers.py`, `agent/refusal_fallback.py`, `gateway/model_router.py`, `gateway/run_inbound_model_router.py`, `gateway/run_turn_persistence.py`, `hermes_cli/model_routes.py`, `tests/agent/test_refusal_fallback_reason.py`, `tests/gateway/test_model_router.py`, `tests/gateway/test_model_router_failed_turn_boundary.py`, `tests/hermes_cli/test_model_routes.py`
-- **2026-08-26-sync:** replayed the soft-turn-end continuation on the corrected refusal-hop branch; the intentional generic-exhaustion revert and retained diagnostic logging are unchanged.
-- **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/refusal-soft-turnend.md` for relocations/seams.
-- **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/refusal-soft-turnend.md` for relocations/seams.
-- **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/refusal-soft-turnend.md` for relocations/seams.
-
-
-### 61. hygiene-noprogress-cooldown
-- **branch:** `soju/patches/hygiene-noprogress-cooldown`
-- **stacked-on:** _(none — applies directly on base; its old parent #60 anthropic-structured-output was merged upstream)_
+### 61. gateway-hygiene-hardening
+- **branch:** `soju/patches/gateway-hygiene-hardening`
+- **stacked-on:** _(none — independent topic rooted on base v0.23.4)_
 - **origin:** `local-author`
 - **upstream_pr:** _(none yet — upstream candidate)_
 - **state:** `local-only`
 - **rationale:** Gateway session hygiene retried compression EVERY turn on sessions where the protected tail spans the whole transcript (1M-context model → tail_token_budget 190k; `hygiene_hard_message_limit: 400` keeps re-triggering; the compressor aborts in ~60ms with `failure_class=no_progress` and no cooldown was recorded — 106 warnings over 4 log rotations, one session hit 20 consecutive retries). The gateway then mis-attributed every no-op to "#21301 no session_db on the hygiene agent" even though session_db was bound. Fix: (1) record the durable DB-backed compression-failure cooldown row (600s, reason `no_progress: protected tail spans the whole transcript`) in the no_progress branch of `compress_context`, classified as a hygiene-only marker (`_HYGIENE_PREAGENT_ONLY_COOLDOWN_MARKERS`) so it gates only the gateway's pre-agent hygiene — the existing hygiene cooldown check (#74136) then stops the churn — and never the in-agent compressor, whose in-memory backoff upstream lifts once the transcript grows (2026-11-25 regression fix d58c750c9f); manual `/compress` (force=True) is unaffected; (2) split the #21301 warning into no_progress (INFO) / summary-abort (WARNING) / genuinely-missing-session_db (#21301 wording kept) / other (WARNING); (3) hygiene trigger log now attributes `trigger=hard_message_limit (N)` vs `token_threshold`.
-- **commits:**
+- **absorbed (2026-11-26 cleanup):** one independent hygiene topic (both edit `gateway/run_turn_hygiene.py` and its test; nothing stacks on #74). members in commit order: #61 hygiene-noprogress-cooldown, #74 hygiene-diag-and-lock-offload. Old member tips: `backup/cleanup-1126/soju/patches/<name>` and the bundle.
+  - #74 hygiene-diag-and-lock-offload: Three hygiene-block fixes from the 2026-08-13 incident forensics. (1) `Session hygiene auto-compress failed: %s` logged empty for `asyncio.TimeoutError` (empty `str()`), which made the incident's 41 failure lines carry no cause — switch to `%r` + exception class name. (2) The cancelled-compression lock release ends in a synchronous SQLite DELETE that appeared in event-loop stall stack dumps — offload via `asyncio.to_thread` (cancellation path; nothing orders against the release, commit already fenced). (3) Expose the hardcoded 0.85 hygiene trigger as `compression.hygiene_threshold` (config.yaml per repo rubric, range-validated, default preserved) with a deduplicated warning-only layering check: `compression.threshold >= hygiene_threshold` means the safety net fires before the primary compressor — the exact inversion that amplified the 08-13 compress storm.
+- **commits:** (own commits in order; `[#N]` names the absorbed topic each came from)
   - `b1445ed946` fix(compression): record cooldown on no_progress hygiene aborts + accurate trigger/abort diagnostics
   - `3cba075ef1` test(agent): stale-cooldown test allows the fork's durable no-progress cooldown
   - `179d72da98` fix(tests): hygiene restart test asserts the summary-abort diagnosis (2026-10-30 sync review)
   - `d58c750c9f` fix(compression): the no-progress cooldown gates gateway hygiene, not the in-agent compressor (2026-11-25 sync regression)
+  - `50b0aa2af8` fix(gateway): hygiene failure diagnostics + off-loop lock release + hygiene_threshold config [#74]
+  - `0348326a64` fix(gateway): defer hygiene cleanup when cancelled during off-loop lock release (2026-10-30 sync review) [#74]
 - **touches:** `agent/context_compressor.py`, `agent/conversation_compression.py`, `gateway/run_turn_hygiene.py`, `tests/agent/test_compression_abort_state_reset.py`, `tests/gateway/test_session_hygiene.py`
+- **member port reports (v0.23.4-sync):** `reports/hygiene-diag-and-lock-offload.md` under `~/work/hermes/upstream-sync-20261125/`.
 - **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/hygiene-noprogress-cooldown.md` for relocations/seams.
 - **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/hygiene-noprogress-cooldown.md` for relocations/seams.
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/hygiene-noprogress-cooldown.md` for relocations/seams.
@@ -826,17 +649,17 @@ Bump `base_commit` only through the DECISIONS.md ADR-004 procedure (own-commit c
 
 ### 62. durable-bg-processes
 - **branch:** `soju/patches/durable-bg-processes`
-- **stacked-on:** `soju/patches/refusal-hop-clean-fork` (2026-11-25 chronological tip stack)
+- **stacked-on:** `soju/patches/refusal-recovery` (2026-11-25 chronological tip stack)
 - **origin:** `local-author`
 - **upstream_pr:** _(none yet — upstream candidate)_
 - **state:** `local-only`
 - **rationale:** Background tool processes died on every gateway restart via three stacked kill mechanisms: (1) shutdown `process_registry.kill_all()` global sweep in `_stop_impl`, (2) systemd `KillMode=mixed` SIGKILL on the unit cgroup after `TimeoutStopSec`, (3) `ExecStopPost=gateway.cgroup_cleanup` per-PID SIGKILL of every cgroup survivor. Checkpoint recovery (`processes.json`) only ever adopted crash survivors, and adopted them `detached` with no output. Fix (config-gated, `terminal.durable_background: false` default off, config.yaml only — no tool-schema change): durable non-PTY local spawns run inside `systemd-run --user --scope --unit=hermes-bg-<sid>` (sibling cgroup — escapes 2 and 3; readiness marker + graceful fallback to plain spawn when scopes are unavailable), write output to `$HERMES_HOME/bg-logs/<sid>.log` (0600/0700) as source of truth so post-restart `read_log`/`poll`/notification tails work, and are excluded from the shutdown sweep via `kill_all(exclude_durable=True)`. Explicit `process(action=kill)` still terminates them; scope units are `reset-failed` on completion. Review fix vs executor output: cron `#60432` interrupted-marking made unconditional again — the cron agent is a ThreadPoolExecutor thread inside the gateway process and dies with it even when its durable subprocess survives; gating on `_killed>0` would let a truncated run report success (regression test added). E2E-verified on this host: scope cgroup escape, checkpoint re-adoption in a fresh registry, and full output readback after simulated restart.
 - **decision (2026-11-26, O-A10):** the parked item "durable mode only outside per-turn worker processes" is closed as a documented scope limit (this host runs no `hermes-worker-*` units). Profile `mymel` stays without `terminal.durable_background`.
 - **commits:**
-  - `abc80c3200` Add durable local background processes
-  - `3bf0782c5c` fix(process-registry): pass stdin=DEVNULL explicitly in the durable sibling (2026-10-30 sync regression)
-  - `fd5a603d60` fix(process-registry): fit durable background processes to v0.23.4 job ownership, profile scope and forced update sweep (2026-11-25 sync)
-  - `277376133a` fix(process-registry): clean up durable scopes over the launch's user bus and document terminal.durable_background (2026-11-25 sync review)
+  - `ce7d792e5a` Add durable local background processes
+  - `21dbbc2ef9` fix(process-registry): pass stdin=DEVNULL explicitly in the durable sibling (2026-10-30 sync regression)
+  - `9da8a5477f` fix(process-registry): fit durable background processes to v0.23.4 job ownership, profile scope and forced update sweep (2026-11-25 sync)
+  - `3927f18e0a` fix(process-registry): clean up durable scopes over the launch's user bus and document terminal.durable_background (2026-11-25 sync review)
 - **touches:** `gateway/run_shutdown.py`, `hermes_cli/config_defaults.py`, `hermes_cli/update_cmd_force_stop.py`, `tools/process_registry.py`, `tools/process_registry_checkpoint.py`, `tools/process_registry_durable.py`, `website/docs/user-guide/configuration.md`, `tests/gateway/test_cron_active_work_drain.py`, `tests/gateway/test_gateway_shutdown.py`, `tests/hermes_cli/test_update_force_stop.py`, `tests/tools/process_registry/__init__.py`, `tests/tools/process_registry/test_durable_scope_cleanup.py`, `tests/tools/test_process_registry.py`
 - **2026-08-26-sync:** replayed the durable-background delta on the corrected prefix, preserving worker niceness and background-first wait escalation. Corrected the shared `Popen` kwargs so argv is passed exactly once and niceness is applied exactly once.
 - **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/durable-bg-processes.md` for relocations/seams.
@@ -852,8 +675,8 @@ Bump `base_commit` only through the DECISIONS.md ADR-004 procedure (own-commit c
 - **state:** `local-only`
 - **rationale:** Outage-shaped failures (`rate_limit`, `billing`, `upstream_rate_limit`, `overloaded`, `server_error`) walked only the global `fallback_providers:` chain, which has no route context and lands dev-routed sessions on a chat-tier model — silently demoting them and tripping skill-gate dev_edit capability gates until the quota window resets (2026-08-13: claude-lb model-quota-exhausted, 13h window, 90 fable→opus fallbacks in one day). Fix: `try_activate_fallback` resolves the CURRENT route via `runtime_satisfies_route` and walks that route's healthy `fallbacks:` (skipping unhealthy/self/unresolvable entries) BEFORE the global chain. Content-policy refusals unchanged (still generic-then-PERMISSIVE, patch #57). Non-routed runtimes and deployments without model_routes behave exactly as before.
 - **commits:**
-  - `6ccb821a50` feat(fallback): route-aware outage fallback prefers current route fallbacks
-  - `7e30144eea` fix(fallback): resolve the outage route from recorded intent, not model id
+  - `b4304f733e` feat(fallback): route-aware outage fallback prefers current route fallbacks
+  - `dedcf340a4` fix(fallback): resolve the outage route from recorded intent, not model id
 - **touches:** `agent/chat_completion_helpers.py`, `agent/outage_route_fallback.py`, `agent/runtime_control.py`, `tests/agent/test_fallback_helpers.py`, `tests/agent/test_runtime_control.py`
 - **followup (2026-08-13):** the first cut was inert. `_build_outage_route_fallback_chain` identified the current route by scanning for the first route the live model satisfies, but membership is ambiguous — `claude-fable-5` is the DOCUMENT_WORK fallback AND the SYSTEM_DEV/FRONTEND_DEV primary, and DOCUMENT_WORK sorts first. A SYSTEM_DEV session resolved as DOCUMENT_WORK, whose only fallback is claude-fable-5 itself; that entry was skipped as self-targeting, the chain came back empty, and the global chain demoted the session to opus regardless. Fix: record the route the session actually selected (`_active_route_name`, set by `dispatch_model_switch` on the resolved/no-op/effort-only outcomes and carried across gateway pre-dispatch agent rebuilds) and prefer it while the live runtime still satisfies it; stale or absent intent falls back to the old scan. `model_status` shared the same ambiguity (reported DOCUMENT_WORK/CHAT for dev sessions) and now consults the same intent.
 - **2026-08-26-sync:** replayed the route-aware fallback delta onto the corrected durable-background prefix; the corrected earlier topics already preserve pending runtime-route state, so the stale integration-repair commit was no longer needed. Refreshed the exact refusal-API dependency edge after its ledger correction.
@@ -893,19 +716,26 @@ Bump `base_commit` only through the DECISIONS.md ADR-004 procedure (own-commit c
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/read-file-binary-sniff.md` for relocations/seams.
 
 
-### 66. lifecycle-guard-multiline
-- **branch:** `soju/patches/lifecycle-guard-multiline`
-- **stacked-on:** `soju/patches/lifecycle-guard-nul-fallback`
+### 66. lifecycle-guard-hardening
+- **branch:** `soju/patches/lifecycle-guard-hardening`
+- **stacked-on:** _(none — independent topic rooted on base v0.23.4; touches only upstream's `cron/lifecycle_guard.py` and two test files)_
 - **origin:** `local-author`
 - **upstream_pr:** _(none — #77131/#76762 third-generation follow-up; upstream candidate)_
 - **state:** `local-only`
 - **rationale:** The lifecycle guard split commands on newlines and shell-tokenized every line, so multiline `python3 -c "..."` / Python heredoc payloads were parsed as shell: a payload line like `sys.path.insert(0, os.path.expanduser('~/.hermes/hermes-agent'))` tokenized into a `/`-bearing token, got treated as a referenced-script path, resolved to a real directory, and `_read_referenced_script`'s non-regular fail-closed marked it unsafe — blocking benign terminal commands inside gateway sessions (29 blocked instances / 13 unique commands in request dumps; 9 of 13 were this false positive). Fix removes only syntactically proven non-shell regions before matching and tokenization: a complete quoted argument to a Python executable's `-c` (basename `python`/`pythonN`/`pythonN.M`, no `--` before payload), or the body of a complete Python heredoc (quoted/bare delimiter, `<<-` tab-strip honored). Unclosed quotes, missing heredoc terminators, shell `-c` payloads, here-strings, and non-Python interpreters stay visible (fail-closed). Preserved detections verified: `hermes gateway restart|stop`, `systemctl`/`launchctl submit|bootstrap`, `bash -c` payload recursion, nested `.sh` walking, binary/NUL skips, and lifecycle commands before/after sanitized payloads. Tokenize-once-per-level contract (patch #54) kept: sanitize once, share the segment list. Verified via TDD (3 RED → GREEN), 100-test file pass, 490-test cron+restart-loop pass, 12 adversarial cases, and historical replay (9/13 freed, 3 genuine lifecycle still blocked, 1 dump-truncation artifact correctly fail-closed).
-- **commits:**
-  - `a6a013d48c` fix(cron): stop lifecycle guard from shell-parsing python payloads
-  - `af16d702a7` fix(cron): mask python payloads only where a shell lexer proves them (2026-10-30 sync review)
-  - `a1515b7ee5` fix(cron): keep python payloads visible to the direct lifecycle scan (v0.23.4 #127698)
-  - `a6ab89201f` fix(cron): keep python heredoc terminator lines in the walk mask (2026-11-25 sync review)
-- **touches:** `cron/lifecycle_guard.py`, `tests/cron/test_lifecycle_guard_python_payloads.py`
+- **absorbed (2026-11-26 cleanup):** one guard topic instead of a 4-branch stack (#54 guard hunk, #55, #66, #68); its first commit is the cron/lifecycle_guard.py half of #54's 0df0228fb6, split by file with content unchanged. members in commit order: #54 worker-cpu-hygiene (guard hunk only), #66 lifecycle-guard-multiline, #68 lifecycle-guard-stmt-boundary. #55 lifecycle-guard-nul-fallback (test-only) is no longer under it. Old member tips: `backup/cleanup-1126/soju/patches/<name>` and the bundle.
+  - #54 worker-cpu-hygiene (guard hunk): lifecycle_guard tokenized each command three times per nesting level (launchctl scan, sh -c payload scan, referenced-script scan); tokenize once per level and share the segment list (the tokenize-once-per-level contract #66 builds on). The checkpoint half stays in #54.
+  - #68 lifecycle-guard-stmt-boundary: `_GATEWAY_LIFECYCLE_PATTERN` Branch D (`p?kill…hermes…gateway`, both token orders) used `[^\n]*` token gaps, so only newlines bounded a match — `;`, `&&`, `|` passed through and stitched INDEPENDENT statements on one physical line into a single "kill the gateway" match. Live reproduction: `kill -USR1 <pid> && echo …; sleep 20; systemctl --user show hermes-gateway-mymel.service -p …` — the kill is the SANCTIONED SIGUSR1 self-restart path and hermes/gateway tokens come from a read-only `systemctl show` unit name three statements later. Counterfactuals verified: newline-separated same content passed, removing the kill passed, renaming the unit passed. Same design-flaw family as #66 (statement boundaries ignored), opposite direction: #66 over-split (newline = new shell statement inside Python payloads), this one under-split (`;&|` not a boundary at all). Fix narrows both Branch D gaps to `[^\n;&|]*`; `&&`/`||` break on their first char so compound operators are covered. Branches A/B/C untouched (their gaps sit between a verb and its own arguments within one statement). Signal whitelisting (-USR1 exemption) considered and rejected as guard-weakening. Real threats preserved: `pkill -f "hermes.*gateway"`, `kill $(pgrep -f …)`/backtick substitution (no `;&|` inside), line-continuation folding, Branch C after `;` prefix. Verified: TDD RED 4→GREEN, file 113 passed, tests/cron 390 passed, 15 adversarial cases.
+- **commits:** (own commits in order; `[#N]` names the absorbed topic each came from)
+  - `21f6a942f4` perf(cron): tokenize each lifecycle-guard command once per nesting level (split from 0df0228fb6) [#54 (split)]
+  - `d8d9b5edfa` fix(cron): stop lifecycle guard from shell-parsing python payloads
+  - `fcc5adc02c` fix(cron): mask python payloads only where a shell lexer proves them (2026-10-30 sync review)
+  - `d57e9bb5d6` fix(cron): keep python payloads visible to the direct lifecycle scan (v0.23.4 #127698)
+  - `5ed38da56e` fix(cron): keep python heredoc terminator lines in the walk mask (2026-11-25 sync review)
+  - `4d8a9f1c93` fix(cron): stop lifecycle guard Branch D from spanning statement boundaries [#68]
+  - `8a776709c5` fix(cron): keep Branch D matching kills fed by a substitution pipeline (2026-10-30 sync review) [#68]
+- **touches:** `cron/lifecycle_guard.py`, `tests/cron/test_lifecycle_guard_python_payloads.py`, `tests/hermes_cli/test_gateway_restart_loop.py`
+- **member port reports (v0.23.4-sync):** `reports/worker-cpu-hygiene.md`, `reports/lifecycle-guard-stmt-boundary.md` under `~/work/hermes/upstream-sync-20261125/`.
 - **v2026.9.11-sync:** DONE — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/lifecycle-guard-multiline.md` for relocations/seams.
 - **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/lifecycle-guard-multiline.md` for relocations/seams.
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/lifecycle-guard-multiline.md` for relocations/seams.
@@ -913,34 +743,18 @@ Bump `base_commit` only through the DECISIONS.md ADR-004 procedure (own-commit c
 
 ### 67. scoped-exhaustion-upstream-classify
 - **branch:** `soju/patches/scoped-exhaustion-upstream-classify`
-- **stacked-on:** `soju/patches/lifecycle-guard-multiline`
+- **stacked-on:** _(none — independent topic rooted on base v0.23.4; re-rooted 2026-11-26, it touches only `agent/error_classifier.py` and its test, identical at base and at the old #66 tip)_
 - **origin:** `local-author`
 - **upstream_pr:** _(none — depends on claude-lb-specific message contract; fork-only)_
 - **state:** `local-only`
 - **rationale:** claude-lb returns HTTP 503 when ONE model's weekly scoped quota is exhausted across its pool while every other model it serves stays healthy (body carries the spec-locked `model-quota-exhausted` token; message shape pinned by claude-lb OpenSpec `account-load-balancing` since 2026-08-13, PR Soju06/claude-lb#127). The generic 503 branch classified this as `overloaded`, which (a) is in `_PASSIVE_UNHEALTHY_REASONS`, so one dead model marked the whole `claude-lb` provider unhealthy for fail_ttl (120s) in the model-routes passive health cache while claude-opus-5 on the same provider served fine, and (b) is transport-shaped in the retry loop, burning 2 retries against a condition whose only recovery is a scoped window reset days out. Fix classifies the token as `upstream_rate_limit` — the existing "one model at an aggregator, not the provider" reason (OpenRouter upstream-429 precedent): deliberately excluded from passive-unhealthy marking, `is_rate_limited`-eager fallback (no wasted transport retries), rotation forced off, route-aware fallback chain applies, and `error_context.upstream_provider` carries the model so the status line reads "Upstream claude-fable-5 rate-limited". Two return sites: the 503/529 status branch (after overflow guards, before the `overloaded` terminal) and `_classify_by_message` (BEFORE `_OVERLOADED_PATTERNS` and `_RATE_LIMIT_PATTERNS` — ordering pinned by test, else "Rate limit exceeded" text would enable credential rotation). 429 branch untouched (regression-pinned: scoped token on 429 stays `rate_limit`). Verified: 73-test classifier file + 134-test fallback/failover/route sweep pass; bare-503 → `overloaded` regression pin preserved verbatim (a delegate attempt to weaken it to an overload-texted message was caught in diff audit and reverted).
 - **commits:**
-  - `b9237ac69f` fix(fallback): classify scoped model-exhaustion 503s as upstream_rate_limit
-  - `7b7d11cb19` test(fallback): pin scoped exhaustion ahead of long-quota-window wording (2026-11-25 sync review)
+  - `e3fa124353` fix(fallback): classify scoped model-exhaustion 503s as upstream_rate_limit
+  - `f0847fe2be` test(fallback): pin scoped exhaustion ahead of long-quota-window wording (2026-11-25 sync review)
 - **touches:** `agent/error_classifier.py`, `tests/agent/test_error_classifier_scoped_exhaustion.py`
 - **v2026.9.11-sync:** DONE — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/scoped-exhaustion-upstream-classify.md` for relocations/seams.
 - **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/scoped-exhaustion-upstream-classify.md` for relocations/seams.
 - **v0.23.4-sync:** DONE — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/scoped-exhaustion-upstream-classify.md` for relocations/seams.
-
-
-### 68. lifecycle-guard-stmt-boundary
-- **branch:** `soju/patches/lifecycle-guard-stmt-boundary`
-- **stacked-on:** `soju/patches/lifecycle-guard-multiline`
-- **origin:** `local-author`
-- **upstream_pr:** _(none — Branch D statement-boundary false positive; upstream candidate)_
-- **state:** `local-only`
-- **rationale:** `_GATEWAY_LIFECYCLE_PATTERN` Branch D (`p?kill…hermes…gateway`, both token orders) used `[^\n]*` token gaps, so only newlines bounded a match — `;`, `&&`, `|` passed through and stitched INDEPENDENT statements on one physical line into a single "kill the gateway" match. Live reproduction: `kill -USR1 <pid> && echo …; sleep 20; systemctl --user show hermes-gateway-mymel.service -p …` — the kill is the SANCTIONED SIGUSR1 self-restart path and hermes/gateway tokens come from a read-only `systemctl show` unit name three statements later. Counterfactuals verified: newline-separated same content passed, removing the kill passed, renaming the unit passed. Same design-flaw family as #66 (statement boundaries ignored), opposite direction: #66 over-split (newline = new shell statement inside Python payloads), this one under-split (`;&|` not a boundary at all). Fix narrows both Branch D gaps to `[^\n;&|]*`; `&&`/`||` break on their first char so compound operators are covered. Branches A/B/C untouched (their gaps sit between a verb and its own arguments within one statement). Signal whitelisting (-USR1 exemption) considered and rejected as guard-weakening. Real threats preserved: `pkill -f "hermes.*gateway"`, `kill $(pgrep -f …)`/backtick substitution (no `;&|` inside), line-continuation folding, Branch C after `;` prefix. Verified: TDD RED 4→GREEN, file 113 passed, tests/cron 390 passed, 15 adversarial cases.
-- **commits:**
-  - `8f588aaded` fix(cron): stop lifecycle guard Branch D from spanning statement boundaries
-  - `8aafd76596` fix(cron): keep Branch D matching kills fed by a substitution pipeline (2026-10-30 sync review)
-- **touches:** `cron/lifecycle_guard.py`, `tests/hermes_cli/test_gateway_restart_loop.py`
-- **v2026.9.11-sync:** DONE — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/lifecycle-guard-stmt-boundary.md` for relocations/seams.
-- **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/lifecycle-guard-stmt-boundary.md` for relocations/seams.
-- **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/lifecycle-guard-stmt-boundary.md` for relocations/seams.
 
 
 ### 71. delegated-child-marker-latch
@@ -951,29 +765,13 @@ Bump `base_commit` only through the DECISIONS.md ADR-004 procedure (own-commit c
 - **state:** `local-only`
 - **rationale:** A normal gateway session (never called `delegate_task`) got permanently classified as a delegate child — kanban mutations refused, `model_tools` tool-definition cache key poisoned. Primary carrier is the shared bash session snapshot (`/tmp/hermes-snap-<id>.sh`): `_resolve_container_task_id` collapses subagent task ids to `"default"` so parent/child share one snapshot, and `_wrap_command`'s trailing `export -p` write-through persisted the child's `HERMES_DELEGATED_CHILD_CONTEXT=1` into the parent's next turns (D1). Same mechanism defeated `scrub_kanban_env()` on the terminal path: sourcing the snapshot re-exported the dispatcher's `HERMES_KANBAN_*` over the scrubbed Popen env (D2). Secondary: detached daemons (ingest-curator, bg-review, async delegation) copy the delegated-child ContextVar and keep it for the process lifetime (D4); `KANBAN_ENV_KEYS` allowlist drifted to 7 of the dispatcher's 10 injected vars (D6). All four reproduced deterministically without a gateway (`~/work/comm-improve/latch-bug/repro*.py`). Fix: unset both families inside the snapshot dump subshell (same audited mechanism as `HERMES_SESSION_*`; no line-based filtering per #71296); scope-correct ContextVar propagation via keyword-only `inherit_delegated_child=True` with the three detached sites opting out (blanket clear measured to regress: in-turn workers lose the flag and a delegated child can mutate board state — fail-closed default kept); once-per-process latch fingerprint diagnostic; prefix-based kanban env scrub. Snapshot fix covers all environment backends (`_wrap_command` lives on `BaseEnvironment`).
 - **commits:**
-  - `a507ca1ca0` fix(delegation): stop delegated-child marker and kanban identity latching across turns
-  - `191fc9656e` fix(delegation): keep execute_code RPC loops out of the detached-daemon list and opt the curator idle timer out of the marker (2026-11-25 sync review)
+  - `722cd96087` fix(delegation): stop delegated-child marker and kanban identity latching across turns
+  - `b838630fb1` fix(delegation): keep execute_code RPC loops out of the detached-daemon list and opt the curator idle timer out of the marker (2026-11-25 sync review)
 - **touches:** `agent/delegation_context.py`, `agent/ingest_curator.py`, `run_agent.py`, `tools/async_delegation.py`, `tools/environments/base_session_env.py`, `tools/thread_context.py`, `tests/tools/test_delegated_child_marker_latch.py`
 - **2026-08-26-sync:** replayed the latch fix onto corrected phase-2 curator to retain the declared edge and curator opt-out behavior.
 - **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/delegated-child-marker-latch.md` for relocations/seams.
 - **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/delegated-child-marker-latch.md` for relocations/seams.
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/delegated-child-marker-latch.md` for relocations/seams.
-
-
-### 74. hygiene-diag-and-lock-offload
-- **branch:** `soju/patches/hygiene-diag-and-lock-offload`
-- **stacked-on:** `soju/patches/hygiene-noprogress-cooldown`
-- **origin:** `local-author` (implemented by kanban goal worker t_a06bd1a3 per runtime-patches-scope §C)
-- **upstream_pr:** _(none yet)_
-- **state:** `local-only`
-- **rationale:** Three hygiene-block fixes from the 2026-08-13 incident forensics. (1) `Session hygiene auto-compress failed: %s` logged empty for `asyncio.TimeoutError` (empty `str()`), which made the incident's 41 failure lines carry no cause — switch to `%r` + exception class name. (2) The cancelled-compression lock release ends in a synchronous SQLite DELETE that appeared in event-loop stall stack dumps — offload via `asyncio.to_thread` (cancellation path; nothing orders against the release, commit already fenced). (3) Expose the hardcoded 0.85 hygiene trigger as `compression.hygiene_threshold` (config.yaml per repo rubric, range-validated, default preserved) with a deduplicated warning-only layering check: `compression.threshold >= hygiene_threshold` means the safety net fires before the primary compressor — the exact inversion that amplified the 08-13 compress storm.
-- **commits:**
-  - `50b0aa2af8` fix(gateway): hygiene failure diagnostics + off-loop lock release + hygiene_threshold config
-  - `0348326a64` fix(gateway): defer hygiene cleanup when cancelled during off-loop lock release (2026-10-30 sync review)
-- **touches:** `gateway/run_turn_hygiene.py`, `tests/gateway/test_session_hygiene.py`
-- **v2026.9.11-sync:** DONE — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/hygiene-diag-and-lock-offload.md` for relocations/seams.
-- **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/hygiene-diag-and-lock-offload.md` for relocations/seams.
-- **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/hygiene-diag-and-lock-offload.md` for relocations/seams.
 
 
 ### 75. turn-exit-reason-tagging
@@ -984,8 +782,8 @@ Bump `base_commit` only through the DECISIONS.md ADR-004 procedure (own-commit c
 - **state:** `local-only`
 - **rationale:** Early conversation-loop exits (compression lock, 413, stream truncation, rate guard, ~16 paths) returned silently with no log line, making "the agent just stopped" incidents unattributable (comm-improve M5 diagnostics). Tag every early exit via a `_tag_exit()` helper; the pre-existing fallback is renamed `early_return(untagged)` so any future untagged site self-surfaces. Observability-only: no control-flow or return-shape change, tagging failures are swallowed.
 - **commits:**
-  - `49c13c5eb8` feat(telemetry): tag every early conversation-loop exit with its reason
-  - `ff515b0363` fix(telemetry): tag upstream interpreter shutdown exit
+  - `6601a02020` feat(telemetry): tag every early conversation-loop exit with its reason
+  - `661d8e6eea` fix(telemetry): tag upstream interpreter shutdown exit
 - **touches:** `agent/conversation_loop.py`, `agent/turn_api_call.py`, `agent/turn_api_error.py`, `agent/turn_empty_response.py`, `agent/turn_final_response.py`, `agent/turn_overflow.py`, `agent/turn_preflight.py`, `agent/turn_recovery.py`, `agent/turn_recovery_autorecover.py`, `agent/turn_recovery_fail_fast.py`, `agent/turn_response_check.py`, `agent/turn_response_intake.py`, `agent/turn_tool_validation.py`, `agent/turn_trace_loop.py`, `agent/turn_truncation.py`, `tests/agent/test_turn_exit_reason_tagging.py`
 - **2026-08-26-sync:** replayed exit tagging onto the corrected assembled conversation loop and retained the new upstream interpreter-shutdown exit tag.
 - **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/turn-exit-reason-tagging.md` for relocations/seams.
@@ -993,62 +791,15 @@ Bump `base_commit` only through the DECISIONS.md ADR-004 procedure (own-commit c
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/turn-exit-reason-tagging.md` for relocations/seams.
 
 
-### 76. clean-fork-soft-refusal-only
-- **branch:** `soju/patches/clean-fork-soft-refusal-only`
-- **stacked-on:** `soju/patches/turn-exit-reason-tagging` (2026-11-25 chronological tip stack)
-- **origin:** `local-author` (implemented by codex per /tmp/clean-fork-task.md; design verdict by owner 2026-08-19)
-- **upstream_pr:** _(none yet)_
-- **state:** `local-only`
-- **rationale:** clean_fork (context truncation on refusal fallback) was firing on ALL refusal-shaped signals, including Anthropic structured `stop_reason=refusal` — a contaminated signal claude-fable-5 emits during normal work. Mid-task it cut tool progress from the fallback model's context, causing re-scoping + announce-and-stop early turn ends (2026-08-19 03:23 incident, session 20260813_031938_3171f671). Owner design verdict: clean_fork exists for ROUTER-CLASSIFIED soft refusals (natural-language decline text contaminating context) ONLY; API/provider/stream policy signals still fall back but must preserve full conversation and tool progress. Adds `RefusalSource` enum (5 sources) + `should_apply_clean_fork()` gate with per-decision INFO log; removes the dead auth-path content_policy branch (is_auth and content_policy are mutually exclusive in error_classifier). Incident-replay test asserts tool results survive into the fallback model's input.
-- **commits:**
-  - `bb533647d0` fix(refusal): reserve clean fork for router soft refusals
-- **touches:** `agent/refusal_history.py`, `agent/turn_api_error.py`, `agent/turn_truncation.py`, `gateway/model_router.py`, `gateway/run_inbound_model_router.py`, `hermes_cli/model_routes.py`, `tests/agent/test_refusal_fallback_reason.py`, `tests/agent/test_refusal_history.py`, `tests/gateway/test_model_router.py`, `tests/gateway/test_model_router_failed_turn_boundary.py`
-- **2026-08-26-sync:** replayed the clean-fork policy delta onto the corrected exit-tagging prefix, preserving both behaviors at the conversation-loop seam.
-- **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/clean-fork-soft-refusal-only.md` for relocations/seams.
-- **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/clean-fork-soft-refusal-only.md` for relocations/seams.
-- **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/clean-fork-soft-refusal-only.md` for relocations/seams.
-
-
-### 77. sync-20260819-test-seams
-- **branch:** `soju/patches/sync-20260819-test-seams`
-- **stacked-on:** `soju/patches/runtime-control`
-- **origin:** `local-author`
-- **upstream_pr:** _(none — sync-only test maintenance)_
-- **state:** `local-only`
-- **rationale:** The 2026-08-19 upstream seam refactor moved pre-tool plugin blocking from `resolve_pre_tool_block` to `_dispatch_pre_tool_call_hooks`, leaving two runtime-control tests monkeypatching a bypassed seam. Upstream now carries equivalent integration coverage for both agent-level and registry-dispatched blocked tools, so this sync patch deletes the stale duplicates instead of re-anchoring redundant tests.
-- **commits:**
-  - `dc0eae394a` test(runtime): re-anchor pre-tool block tests to _dispatch_pre_tool_call_hooks seam (2026-08-19 sync)
-- **touches:** `tests/agent/test_run_agent.py`
-- **v2026.9.11-sync:** DONE — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/sync-20260819-test-seams.md` for relocations/seams.
-- **v0.22.5-sync:** DONE — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/sync-20260819-test-seams.md` for relocations/seams.
-- **v0.23.4-sync:** DONE — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/sync-20260819-test-seams.md` for relocations/seams.
-
-
-### 78. base-persona
-- **branch:** `soju/patches/base-persona`
-- **stacked-on:** `soju/patches/clean-fork-soft-refusal-only` (2026-11-25 chronological tip stack)
-- **origin:** `local-author` (implemented by codex per /tmp/base-persona-prompt.md)
-- **upstream_pr:** _(none — extends the not-yet-upstreamed #35; travels with it if #35 is ever proposed)_
-- **state:** `local-only`
-- **rationale:** modes.yaml gains an optional top-level `base_persona: <file>` key: a personas-dir-relative markdown file prepended (`base + "\n\n" + mode`) to every selected mode persona inside `load_audience_persona`, so shared style/identity rules live in ONE file instead of being duplicated per mode (immediate consumer: fluent-korean Korean-output guideline shared across modes). Injection gating is untouched — the base never changes WHETHER injection happens, only content, so `resolve_audience_mode`/`_persona_stat_ok` (per-turn staleness resolver) stay byte-identical and loader/resolver agreement is preserved. Base file resolves through the same personas-dir containment as mode personas (factored into `_contained_persona_path`) and passes the same `_scan_context_content` + `_truncate_content` pipeline with its own label/read_path. Fail-open: missing/empty/escaping/unreadable base → DEBUG log, mode persona alone; base path == mode path → no self-duplication; key absent → byte-identical to pre-patch behavior.
-- **commits:**
-  - `28b6c78a0b` feat(prompt): optional shared base persona prefix for audience modes
-- **touches:** `agent/audience_persona.py`, `tests/agent/test_audience_persona.py`
-- **2026-08-26-sync:** refreshed the exact audience-personas dependency edge after its model-routing ancestry correction; base-persona behavior is unchanged.
-- **v2026.9.11-sync:** DONE — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/base-persona.md` for relocations/seams.
-- **v0.22.5-sync:** DONE — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/base-persona.md` for relocations/seams.
-- **v0.23.4-sync:** DONE — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/base-persona.md` for relocations/seams.
-
-
 ### 79. gemini-classifier-thinking-compat
 - **branch:** `soju/patches/gemini-classifier-thinking-compat`
-- **stacked-on:** `soju/patches/base-persona` (2026-11-25 chronological tip stack)
+- **stacked-on:** `soju/patches/turn-exit-reason-tagging` (2026-11-25 chronological tip stack; #76 and #78 folded on 2026-11-26)
 - **origin:** `local-author` (implemented by codex per /tmp/gemini-thinking-gateway-prompt.md)
 - **upstream_pr:** _(none — `gateway/model_router.py` router is fork-only)_
 - **state:** `local-only`
 - **rationale:** `_call_gemini` hardcoded `thinkingConfig: {thinkingBudget: 0}`, which Gemini 3.5+ rejects with HTTP 400 INVALID_ARGUMENT (live smoke 2026-08-20), so any router model upgrade past 3.1 silently drops every turn to the regex fallback. New `_thinking_config(model)` parses the family from the model id: <3.5 keeps `thinkingBudget: 0`, 3.5+ (and unparseable ids) send `thinkingLevel: "low"` (thoughts=0 on 3.5/3.6; 3.7 cannot disable thinking at all and `minimal` is rejected — one reason 3.7 was not adopted). Unblocks the config-side router model change to `gemini-3.5-flash-lite` (gold-set rebench 2026-08-20, 350 cases: acc .983 vs .969, false switches 6→2, p50 -347ms, cost -36%; raw at /mnt/scratch/bench/gemini-router-upgrade/2026-08-20/). Prompts/schemas/regexes untouched — skill-gate byte-identity parity tests unaffected.
 - **commits:**
-  - `0a75919f0b` fix(gateway): model-family-aware thinkingConfig for Gemini classifier
+  - `fd15d44896` fix(gateway): model-family-aware thinkingConfig for Gemini classifier
 - **touches:** `gateway/model_router.py`, `tests/gateway/test_model_router.py`
 - **2026-08-26-sync:** refreshed the exact base-persona dependency edge; classifier behavior is unchanged.
 - **v2026.9.11-sync:** DONE — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/gemini-classifier-thinking-compat.md` for relocations/seams.
@@ -1064,9 +815,9 @@ Bump `base_commit` only through the DECISIONS.md ADR-004 procedure (own-commit c
 - **state:** `local-only`
 - **rationale:** Probe-verified diagnosis (2026-08-20) confirmed the routed reasoning happy path is correct but found three robustness gaps that silently drop routed `reasoning_effort`: (1) router-applied reasoning lived only in in-memory SessionState — a gateway restart rehydrated the routed model but not the effort, and `noop_satisfied` never re-stamps it; now persisted (sanitized, non-secret, nested in the existing session model-override record) and rehydrated unless a live explicit session override exists; (2) `try_activate_fallback()` re-resolved reasoning from global config only, overwriting a non-None session/routed config (None with global unset); now preserves the active value and resolves config only when absent — model-specific downgrade stays in the adapter; (3) cached prior-fallback agents let `restore_primary_runtime()` restore a stale non-None snapshot over the freshly assigned per-turn config; TurnRunner now syncs `_primary_runtime.reasoning_config` at assignment. RED reverse-verified: fixes reverted with tests kept → exactly 5 failures. 81 tests green across 8 suites at commit.
 - **commits:**
-  - `5c3b5fce0f` fix(gateway): persist routed reasoning across restart and fallback
-  - `a25fb5dbef` fix(tests): router /model parity carries the routed reasoning record (2026-10-30 sync regression)
-  - `9255301d88` fix(tests): reasoning-route-wire reads SessionState and takes the turn tier (2026-11-25 sync)
+  - `f03e34790f` fix(gateway): persist routed reasoning across restart and fallback
+  - `c4e164c40d` fix(tests): router /model parity carries the routed reasoning record (2026-10-30 sync regression)
+  - `5ac1aa7f60` fix(tests): reasoning-route-wire reads SessionState and takes the turn tier (2026-11-25 sync)
 - **touches:** `agent/chat_completion_helpers.py`, `gateway/run_agent_cache.py`, `gateway/run_inbound_model_router.py`, `gateway/run_turn_prepare.py`, `gateway/run_turn_runner.py`, `gateway/session.py`, `tests/agent/test_fallback_reasoning_override.py`, `tests/gateway/test_model_router.py`, `tests/gateway/test_reasoning_primary_runtime_sync.py`, `tests/gateway/test_session_model_override_persistence.py`
 - **2026-08-26-sync:** replayed reasoning persistence onto the corrected final prefix and combined it with active-route consumption and auto-reset route-state preservation. Refreshed the exact Gemini-classifier dependency edge after the ancestry repair, and removed the stale redundant post-redelivery `resume_pending` clear absorbed by this final assembled topic.
 - **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/reasoning-route-wire.md` for relocations/seams.
@@ -1082,10 +833,10 @@ Bump `base_commit` only through the DECISIONS.md ADR-004 procedure (own-commit c
 - **state:** `local-only`
 - **rationale:** Same-model (fable-5) sessions lose their todo plan mid-session while Claude Code drives its plan to completion. Root cause measured in CC v2.1.226: (1) a `todo_reminder` attachment re-surfaces the todo list every N turns (`TURNS_SINCE_WRITE: 10, TURNS_BETWEEN_REMINDERS: 10`) — Hermes re-injected todos only at compression boundaries, so plans silently aged out of attention (measured: 64% of recent gateway sessions never tracked todos; 14% of todo sessions ended with unfinished pending/in_progress items); (2) CC's TodoWrite result carries a continuation nudge ("Please proceed with the current tasks if applicable") — Hermes returned bare JSON; (3) CC's system prompt carries end-to-end approval-scope + last-paragraph completion guidance — TASK_COMPLETION_GUIDANCE had neither. Fix: periodic reminder through the cache-safe tool-tail channel (same as /steer + run-budget wrap-up; counters on the agent, zeroed by the todo handler in both dispatch paths), CC's verbatim continuation message in a new `message` field of write results (reads stay message-free; hydration json.loads contract preserved), CC TodoWrite description adapted onto the todo schema (+ optional `active_form`/`activeForm` item label), and CC's scope/completion paragraphs appended to TASK_COMPLETION_GUIDANCE verbatim.
 - **commits:**
-  - `e357eb2a2a` feat(agent): Claude Code todo-continuity parity — periodic reminder, continuation nudge, end-to-end scope guidance
-  - `9f08df776b` fix(agent): todo reminder only acts on integer loop counters
-  - `42e1b5f964` fix(todo): lead the todo_list description with its capability so the catalog line fits (2026-11-25 sync)
-  - `561a481727` refactor(agent): import the todo reminder and its helpers at module top (2026-11-25 sync review)
+  - `92b668dbb9` feat(agent): Claude Code todo-continuity parity — periodic reminder, continuation nudge, end-to-end scope guidance
+  - `11a4cace8f` fix(agent): todo reminder only acts on integer loop counters
+  - `7ada4936b0` fix(todo): lead the todo_list description with its capability so the catalog line fits (2026-11-25 sync)
+  - `296eaefdf7` refactor(agent): import the todo reminder and its helpers at module top (2026-11-25 sync review)
 - **touches:** `agent/agent_init.py`, `agent/inline_tool_executors.py`, `agent/prompt_builder.py`, `agent/tool_executor.py`, `agent/turn_iteration_prep.py`, `agent/turn_todo_reminder.py`, `tools/todo_tool.py`, `tests/agent/test_todo_reminder.py`
 - **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/todo-continuity-parity.md` for relocations/seams.
 - **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/todo-continuity-parity.md` for relocations/seams.
@@ -1094,14 +845,14 @@ Bump `base_commit` only through the DECISIONS.md ADR-004 procedure (own-commit c
 
 ### 85. aux-anthropic-mode-max-tokens
 - **branch:** `soju/patches/aux-anthropic-mode-max-tokens`
-- **stacked-on:** `soju/patches/todo-continuity-parity` (2026-11-25 chronological tip stack)
+- **stacked-on:** _(none — independent topic rooted on base v0.23.4; re-rooted 2026-11-26 from the tip stack, its diff applies on bare base)_
 - **origin:** `local-author`
 - **upstream_pr:** none — upstreamable (generic gate mismatch, no fork-only deps). File after live soak; see rationale for the related open upstream issue and the four rejected blanket-forward PRs that bound how narrow the upstream PR must stay
 - **state:** `local-only`
 - **rationale:** Related upstream context: open issue 60388 (`max_tokens` settings silently dropped); four blanket "forward caps to all providers" PRs (60454/60513/60620/60645) were closed unmerged, so any upstream PR must honor the declared `api_mode` as one more anthropic-compat signal and nothing broader. Defect: `_build_call_kwargs()` forwarded an explicit auxiliary `max_tokens` only when the endpoint was detected as anthropic-compatible by provider name (`minimax*`) or a `/anthropic` URL path. A config-declared provider with `api_mode: anthropic_messages` and a plain-host `base_url` (our `claude-lb` at `http://10.8.0.3:2455`) matched neither, so the cap was dropped and `AnthropicAuxiliaryClient.create()` → `build_anthropic_kwargs()` substituted the model's default output ceiling (`_ANTHROPIC_DEFAULT_OUTPUT_LIMIT = 128_000`). Transport selection (`_maybe_wrap_anthropic`) already honored `api_mode == "anthropic_messages"`; cap forwarding used a narrower gate. Measured live 2026-09-04 via claude-lb `debug_artifacts`: compressor requested `max_tokens=1400` per digest, proxy captured `max_tokens: 128000` on the wire; 77/77 compression calls exceeded the cap (avg 6,844 out, max 22,863) and latency was linear in output tokens (13.17 ms/tok, R²=0.961) — ~80% of compaction wall time. Fix: `_build_call_kwargs(..., api_mode=None)` + `or api_mode == "anthropic_messages"` in the cap gate; all 8 call sites (sync/async primary, same-provider retry, fallback, refreshed fallback) thread the resolved/destination api_mode. `max_tokens=None` behavior unchanged; `_ANTHROPIC_COMPAT_PROVIDERS`/`_is_anthropic_compat_endpoint`/adapter default fallback untouched.
 - **commits:**
-  - `30090d7e53` fix(auxiliary): forward explicit max_tokens when api_mode is anthropic_messages
-  - `61412dfa59` fix(fallback-check): thread the route api_mode into the live probe kwargs (2026-11-25 sync review)
+  - `fe7e4d0857` fix(auxiliary): forward explicit max_tokens when api_mode is anthropic_messages
+  - `c2e6ad4898` fix(fallback-check): thread the route api_mode into the live probe kwargs (2026-11-25 sync review)
 - **touches:** `agent/auxiliary_client.py`, `hermes_cli/fallback_check.py`, `tests/agent/test_auxiliary_anthropic_mode_max_tokens.py`, `tests/hermes_cli/test_fallback_check.py`
 - **v2026.9.11-sync:** DONE — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/aux-anthropic-mode-max-tokens.md` for relocations/seams.
 - **v0.22.5-sync:** DONE — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/aux-anthropic-mode-max-tokens.md` for relocations/seams.
@@ -1110,13 +861,13 @@ Bump `base_commit` only through the DECISIONS.md ADR-004 procedure (own-commit c
 
 ### 86. session-store-lock-offload
 - **branch:** `soju/patches/session-store-lock-offload`
-- **stacked-on:** `soju/patches/aux-anthropic-mode-max-tokens` (2026-11-25 chronological tip stack)
+- **stacked-on:** `soju/patches/todo-continuity-parity` (2026-11-25 chronological tip stack; #85 re-rooted on base 2026-11-26)
 - **origin:** `local-author`
 - **upstream_pr:** none — upstreamable in principle (upstream `gateway/session_persistence.py` still runs the UPSERT under `_lock` when `lock_held=True`; probed 2026-09-14 on upstream main: a 1000 ms persistence write blocked `get_model_override` for 855 ms), but the fork version depends on `begin_active_turn` from #27 durable-turns. File after porting to the mixin split.
 - **state:** `local-only`
 - **rationale:** Same defect class as the 2026-07-28/29 gateway outages (event loop stalled behind SQLite held under a store lock). `SessionStore._save_entry(lock_held=True)` and `_save()` ran the SQLite UPSERT / full `sessions.json` rewrite + fsync while the caller still held the store-wide non-reentrant `_lock`, so every reader on the event loop waited for the write. Fix: capture the serialized entry + revision under `_lock`, persist under `_save_lock` only (`_capture_entry_save_locked` / `_persist_entry_save_locked` / `_persist_routing_data_save_locked`); `mark_turn_active`/`begin_active_turn` take `_save_lock` outermost, release `_lock` around the durable write and repair the row if the live entry was structurally replaced meanwhile; metadata/override/suspend writers use `_save_entry` after releasing the lock; `lock_held=True` on `_save_entry` is now a hard error; `_save(lock_held=True)` survives only for the startup stale-prune path (releases/re-acquires around I/O). Measured on the assembled stack: reader blocked 857 ms → 1 ms during a 1000 ms write. Provenance: written in the live production tree by another session on 2026-08-31 (preserved as `~/work/hermes-cc-parity/live-tree-wip-session-store-20260831.patch`), re-applied after the 2026-09-04 rebuild, running in both gateways since 2026-09-04 10:14 UTC; promoted from uncommitted WIP to this topic on 2026-09-14. `tests/gateway` on the topic tree: only pre-existing `test_health_detailed_returns_ok` (`degraded`, environment) fails; it fails identically on the WIP-free tree.
 - **commits:**
-  - `01d467e4e1` fix(gateway): never hold SessionStore._lock across routing persistence I/O
+  - `b9a9481e0a` fix(gateway): never hold SessionStore._lock across routing persistence I/O
 - **touches:** `gateway/session.py`, `gateway/session_lifecycle.py`, `gateway/session_persistence.py`, `gateway/session_prompt_pin.py`, `gateway/session_transcript.py`, `tests/gateway/test_active_turn_recovery.py`, `tests/gateway/test_delete_secondary_profile_multiplex.py`, `tests/gateway/test_durable_turn_records.py`, `tests/gateway/test_routing_entry_origin_heal.py`, `tests/gateway/test_runtime_override_store_precedence.py`, `tests/gateway/test_secondary_route_fence_scope.py`, `tests/gateway/test_session_db_recovery.py`
 - **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/session-store-lock-offload.md` for relocations/seams.
 - **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/session-store-lock-offload.md` for relocations/seams.
@@ -1125,13 +876,13 @@ Bump `base_commit` only through the DECISIONS.md ADR-004 procedure (own-commit c
 
 ### 90. slack-stale-reconnect-task
 - **branch:** `soju/patches/slack-stale-reconnect-task`
-- **stacked-on:** `soju/patches/session-store-lock-offload` (2026-11-25 chronological tip stack)
+- **stacked-on:** _(none — independent topic rooted on base v0.23.4; re-rooted 2026-11-26 from the tip stack, it touches only Slack plugin files)_
 - **origin:** `local-author`
 - **upstream_pr:** none
 - **state:** `local-only`
 - **rationale:** Slack's roughly 5-hourly `disconnect` frame makes slack_sdk 3.43 reconnect inside an untracked `asyncio.ensure_future(run_message_listeners(...))`. When the adapter watchdog restarted the handler in the middle of that refresh (2026-10-17 21:23), `_stop_socket_mode_handler` cancelled only `_socket_mode_task` and three client attributes, so the orphan survived and then looped on `Connector is closed.` / `Session is closed` every 10 s against the closed aiohttp session. Fix: `_track_socket_reconnects(client)` wraps the client's `connect_to_new_endpoint` and records entering tasks in a WeakSet; teardown marks the client superseded and cancels and awaits those tasks before closing the session. If the SDK renames the method the wrap silently no-ops (old behaviour). Deployed to live 2026-10-19 by cherry-pick (cdca4a874a, from d6e8992133). Details: `~/work/vooy/claw-migration-2026-10-05/observe/2026-10-19-hermes-followups.md` section 1.
 - **commits:**
-  - `e23c8396ad` fix(slack): cancel the untracked disconnect-refresh reconnect on handler teardown
+  - `8ffd024670` fix(slack): cancel the untracked disconnect-refresh reconnect on handler teardown
 - **touches:** `plugins/platforms/slack/adapter.py`, `plugins/platforms/slack/adapter_socket_reconnect.py`, `tests/gateway/test_slack_socket_reconnect_heal.py`
 - **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/slack-stale-reconnect-task.md` for relocations/seams.
 - **v0.23.4-sync:** DONE — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/slack-stale-reconnect-task.md` for relocations/seams.
@@ -1139,13 +890,13 @@ Bump `base_commit` only through the DECISIONS.md ADR-004 procedure (own-commit c
 
 ### 94. summary-empty-finish-reason
 - **branch:** `soju/patches/summary-empty-finish-reason`
-- **stacked-on:** `soju/patches/slack-stale-reconnect-task` (2026-11-25 chronological tip stack; #93 dropped; #97 is stacked on it since 2026-11-26)
+- **stacked-on:** _(none — independent topic rooted on base v0.23.4; re-rooted 2026-11-26 from the tip stack, its diff applies on bare base, also together with #51 and #85)_
 - **origin:** `local-author`
 - **upstream_pr:** none
 - **state:** `local-only`
 - **rationale:** 72 of 127 compression summary attempts between 2026-11-10 and 2026-11-14 failed with "Context compression LLM returned empty content", all on claude-fable-5-2, and nothing in the log told a structured refusal (`stop_reason=refusal`) from a reasoning-only turn. When the summary response is judged empty, `ContextCompressor._call_summary_llm` now logs one content-free WARNING (`finish_reason`, `stop_reason`, `output_tokens`, block-type counts, content/reasoning lengths, tool-call count, resolved aux provider/model) before raising the unchanged RuntimeError; the Anthropic aux shim (`_AnthropicCompletionsAdapter.create`) attaches a content-free `native_shape` (raw `stop_reason`, block-type counts) to the response it returns. The failure text, classifier and user warning are untouched. Deployed to the live v0.21.2 tree 2026-11-16 as 48ab645561 (fork-policy source commit 8b6c867785, branch `soju/hotfix-live/summary-empty-finish-reason`). Fork-only diagnostics, no upstream PR.
 - **commits:**
-  - `3fe74a66e1` fix(agent): log why a compression summary came back empty
+  - `bccac62a7a` fix(agent): log why a compression summary came back empty
 - **touches:** `agent/auxiliary_client.py`, `agent/context_compressor.py`, `tests/agent/test_summary_empty_content_diagnostics.py`
 - **v0.22.5-sync:** DONE — added 2026-11-25 by `cherry-pick -x 8b6c867785` onto `soju/patches/sync-20261030-test-seams` (9676072162); applied clean, both hunks still land in the owning modules at v0.22.5 (`_call_summary_llm` in `agent/context_compressor.py`, `_AnthropicCompletionsAdapter` in `agent/auxiliary_client.py`); no prompt/tool-schema change, so #93's generated fixtures stay valid. Record: `~/work/hermes/update-20261125/PREP-REPORT.md` § 3.
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/summary-empty-finish-reason.md` for relocations/seams.
@@ -1153,13 +904,13 @@ Bump `base_commit` only through the DECISIONS.md ADR-004 procedure (own-commit c
 
 ### 95. sync-20261125-test-seams
 - **branch:** `soju/patches/sync-20261125-test-seams`
-- **stacked-on:** `soju/patches/review-fork-checkpoint-warning` (since 2026-11-26; was `summary-empty-finish-reason`; tip of the whole production stack)
+- **stacked-on:** `soju/patches/review-fork-checkpoint-warning` (2026-11-25 chronological tip stack; tip of the whole production stack)
 - **origin:** `local-author`
 - **upstream_pr:** _(none — generated fixtures and test seams for fork gates)_
 - **state:** `local-only`
 - **rationale:** ADR-004 rule 3: generated test fixtures that fork tool-schema, prompt or classifier changes invalidate are re-rendered once, at the tip of the stack, in a dated tip topic. This topic does that for the v0.23.4 stack and supersedes #93 `sync-20261030-test-seams`. It re-renders the prompt-surface snapshot with `scripts/ci/prompt_surface.py render` (tools and guidance of #1, #2, #38, #44, #83), regenerates the Discord conformance vectors for #4's box tables (other platforms and the oracle stamp stay as committed), renders the #34 classifier-core pin from `gateway/model_router.py` (carrying the S0/S0b refusal fields of #56 and #58), and baselines the three fork DEFAULT_CONFIG keys that upstream's docs-drift ratchet flags and no topic documents (`agent.gateway_turn_resume`, `agent.turn_resume_max` from #27, `delegation.default_route` from #34). No runtime code. Re-render it (and amend) whenever a topic below changes the prompt surface, the Discord renderer or the classifier core.
 - **commits:**
-  - `87e6f9c336` test: re-render generated fixtures and re-seam upstream tests to fork gates (2026-11-25 sync)
+  - `d2f0b30a5e` test: re-render generated fixtures and re-seam upstream tests to fork gates (2026-11-25 sync)
 - **touches:** `scripts/ci/docs_drift_baseline.json`, `tests/conformance/vectors/discord.json`, `tests/fixtures/prompt_surface/surfaces.json`, `tests/fixtures/prompt_surface/prompts/*.txt`, `tests/fixtures/prompt_surface/tools/*.json`, `tests/fixtures/skill_gate_classifier_core.json`
 - **v0.23.4-sync:** DONE-WITH-NOTES — created 2026-11-25; see `~/work/hermes/upstream-sync-20261125/reports/sync-20261125-test-seams.md` (renderer for the classifier pin: `~/work/hermes/upstream-sync-20261125/tools/render_classifier_core.py`).
 - **2026-11-26:** re-stacked onto #97 by `cherry-pick` of a9e3fe8fba (same patch-id, applied clean; backup `backup/topics-1126/soju/patches/sync-20261125-test-seams`). #96 and #97 change no prompt surface, Discord renderer, classifier core or config key, so no fixture was re-rendered (`~/work/hermes/hotfix-topics-20261126/REPORT.md`).
@@ -1180,13 +931,13 @@ Bump `base_commit` only through the DECISIONS.md ADR-004 procedure (own-commit c
 
 ### 97. review-fork-checkpoint-warning
 - **branch:** `soju/patches/review-fork-checkpoint-warning`
-- **stacked-on:** `soju/patches/summary-empty-finish-reason` (2026-11-25 chronological tip stack; touches fork code of #40 `agent/ingest_curator.py` and #6/#37/#40 `agent/background_review.py`; #95 is stacked on it)
+- **stacked-on:** `soju/patches/session-store-lock-offload` (2026-11-25 chronological tip stack; #90 and #94 re-rooted on base 2026-11-26)
 - **origin:** `local-author`
 - **upstream_pr:** none
 - **state:** `local-only`
 - **rationale:** Since v0.22.5 every background-review fork logged "compression.checkpoint_required is enabled but the active memory provider (no active provider) does not implement checkpoint API v2" on construction (24 lines on 2026-11-25). Noise: the compress-time gate already exempts a persistence-detached fork with no memory manager and no session DB, but the fork was detached only after the constructor had warned. One predicate `conversation_compression_checkpoint.owns_no_durable_memory` now decides both the gate and the startup warning; `AIAgent(persist_disabled=...)` detaches a fork before init's startup checks, and the review fork and the ingest curator pass it. Every agent that keeps persistence still warns and still fails closed. Ported from hotfix `soju/hotfix-live/review-fork-checkpoint-warning` (b8cc962a22; `~/work/hermes/postcut-20261125/REPORT.md` § P3).
 - **commits:**
-  - `077cb03e36` fix(agent): detached review/curator forks are persistence-detached at construction, so the checkpoint warning skips them
+  - `cff5447981` fix(agent): detached review/curator forks are persistence-detached at construction, so the checkpoint warning skips them
 - **touches:** `agent/agent_init.py`, `agent/background_review.py`, `agent/conversation_compression.py`, `agent/conversation_compression_checkpoint.py`, `agent/ingest_curator.py`, `run_agent.py`, `tests/agent/test_pre_compress_checkpoint_contract.py`
 - **v0.23.4-sync:** DONE — created 2026-11-26 on the v0.23.4 tip stack (`~/work/hermes/hotfix-topics-20261126/REPORT.md`).
 
@@ -1198,29 +949,48 @@ Old tips: `/mnt/garbage/backups-claw-20261126/hermes-fork-refs.bundle` (branch `
 | # | name | retired | how | evidence |
 |---|---|---|---|---|
 | 5 | delegate-per-task-model | 2026-07-16 | superseded | #34 Phase 3a route-enum delegation `ffee9ea3c` (tip in the bundle) |
+| 7 | runtime-state-session-split | 2026-11-26 | folded | into #1 runtime-control, own commits carried by cherry-pick; old tip `backup/cleanup-1126/soju/patches/runtime-state-session-split` |
+| 8 | runtime-route-awareness | 2026-11-26 | folded | into #1 runtime-control, own commits carried by cherry-pick; old tip `backup/cleanup-1126/soju/patches/runtime-route-awareness` |
 | 9 | lsp-idle-reaper | 2026-08-04 | merged upstream | PR #74058 (tip in the bundle) |
 | 10 | aux-runtime-context | 2026-07-22 | merged upstream | upstream `fdc6c32d7`/`73057ed16`/`c201b72f3` ContextVar `_RUNTIME_MAIN_CONTEXT` with per-turn Token scoping, a superset of the `threading.local` fix (tip in the bundle) |
 | 11 | gateway-max-iterations-config-authority | 2026-08-04 | merged upstream | v2026.8.3 reloads and re-bridges `agent.max_turns` per turn (tip in the bundle) |
+| 14 | runtime-override-rehydrate-credentials | 2026-11-26 | folded | into #1 runtime-control, own commits carried by cherry-pick; old tip `backup/cleanup-1126/soju/patches/runtime-override-rehydrate-credentials` |
 | 16 | tool-delay-removal | 2026-08-04 | merged upstream | `ce9f6712f` via PR #64172 (tip in the bundle) |
 | 17 | prompt-cache-stability | 2026-07-22 | merged upstream | upstreamed by the fork author as `7b3dcee92` (api_content sidecar), follow-ups `39efad89a`/`c7035ef25` (tip in the bundle) |
+| 18 | prompt-tail-freeze | 2026-11-26 | folded | into #1 runtime-control, own commits carried by cherry-pick; old tip `backup/cleanup-1126/soju/patches/prompt-tail-freeze` |
 | 19 | request-client-reuse | 2026-08-04 | merged upstream | `82e2c9ce4` via PR #73375 (tip in the bundle) |
 | 20 | async-token-accounting | 2026-08-04 | merged upstream | PR #73359 (tip in the bundle) |
 | 21 | gateway-persist-trim | 2026-08-04 | merged upstream | salvaged as `54eafee30` via PR #76916 (tip in the bundle) |
 | 22 | gateway-worker-pool | 2026-10-30 | merged upstream | `24758cf4b8` + `fb992c84bc` (unbounded turn-body executor); re-adding a finite cap would weaken upstream's fix (tip in the bundle) |
 | 24 | background-first-waits | 2026-10-30 | merged upstream | `33a25058b2` (background-first process waits, `terminal.process_wait_auto_notify`) (tip in the bundle) |
+| 28 | hook-prepend-command-safety | 2026-11-26 | folded | into #1 runtime-control, own commits carried by cherry-pick; old tip `backup/cleanup-1126/soju/patches/hook-prepend-command-safety` |
 | 30 | session-db-read-path-split | 2026-08-04 | merged upstream | v2026.8.3 provides `_read_ctx()` and per-thread `mode=ro` connections (tip in the bundle) |
 | 31 | fts5-cjk-bigram-index | 2026-08-04 | merged upstream | upstream ships `cjk_unicode61`, `native/fts5_cjk/` and `messages_fts_cjk` (tip in the bundle; the only fork CJK index implementation) |
 | 32 | search-slow-query-log | 2026-08-04 | merged upstream | equivalent routing-path slow-query logging landed upstream as `8364576e33` (tip in the bundle) |
 | 33 | fts-v2-config-authority | 2026-08-04 | superseded | fork `messages_fts_v2` never shipped upstream; v2026.8.3 owns `messages_fts_cjk` config; leftover v2 tables removed by #64 on 2026-08-13 (tip in the bundle) |
 | 36 | model-switch-provider-dedupe | 2026-10-30 | merged upstream | `a02ca4a153` + `01d2e6c3d1` + `f7631c0ee7` (/model collapses compat views by identity); our alias logic fails 4 upstream tests (tip in the bundle) |
+| 38 | memory-phase1 | 2026-11-26 | folded | into #37 memory-redesign, own commits carried by cherry-pick; old tip `backup/cleanup-1126/soju/patches/memory-phase1` |
+| 39 | memory-phase2-taint | 2026-11-26 | folded | into #37 memory-redesign, own commits carried by cherry-pick; old tip `backup/cleanup-1126/soju/patches/memory-phase2-taint` |
+| 40 | memory-phase2-curator | 2026-11-26 | folded | into #37 memory-redesign, own commits carried by cherry-pick; old tip `backup/cleanup-1126/soju/patches/memory-phase2-curator` |
 | 41 | cron-secret-scope-env-fallback | 2026-08-04 | merged upstream | PR #69057 (tip in the bundle) |
 | 43 | daemon-pool-py314-compat | 2026-10-30 | merged upstream | `c9fa191334` + `b48cc47a4c` (Python 3.14 daemon worker contexts); the cherry-pick came out empty (tip in the bundle) |
+| 46 | route-repromote-hysteresis | 2026-11-26 | folded | into #34 model-routing, own commits carried by cherry-pick; old tip `backup/cleanup-1126/soju/patches/route-repromote-hysteresis` |
+| 47 | passive-provider-health | 2026-11-26 | folded | into #34 model-routing, own commits carried by cherry-pick; old tip `backup/cleanup-1126/soju/patches/passive-provider-health` |
 | 49 | token-accounting-schema-repair | 2026-08-04 | merged upstream | never rebased, registered as a tombstone; v2026.8.3 shape-gates `_heal_session_model_usage_pk()` and rebuilds malformed `session_model_usage` (tip in the bundle) |
+| 53 | notes-recognition-grounding | 2026-11-26 | folded | into #37 memory-redesign, own commits carried by cherry-pick; old tip `backup/cleanup-1126/soju/patches/notes-recognition-grounding` |
+| 57 | refusal-api-fallback | 2026-11-26 | folded | into #56 refusal-recovery, own commits carried by cherry-pick; old tip `backup/cleanup-1126/soju/patches/refusal-api-fallback` |
+| 58 | refusal-hop-clean-fork | 2026-11-26 | folded | into #56 refusal-recovery, own commits carried by cherry-pick; old tip `backup/cleanup-1126/soju/patches/refusal-hop-clean-fork` |
+| 59 | refusal-soft-turnend | 2026-11-26 | folded | into #56 refusal-recovery, own commits carried by cherry-pick (the cancelling pair e7b06f608b/f0622e9ba8 dropped, net diff empty); old tip `backup/cleanup-1126/soju/patches/refusal-hop-clean-fork` |
 | 60 | anthropic-structured-output | 2026-08-19 | merged upstream | same fix landed upstream as `f709bd8445`, in base 5dd15872a6 (2026-08-19 bump); kept as an intentional empty topic until 2026-10-30 (tip in the bundle) |
+| 68 | lifecycle-guard-stmt-boundary | 2026-11-26 | folded | into #66 lifecycle-guard-hardening, own commits carried by cherry-pick; old tip `backup/cleanup-1126/soju/patches/lifecycle-guard-stmt-boundary` |
 | 69 | approval-grep-escaped-quote | 2026-10-30 | merged upstream | `e383c28d2f` + `9efa50071a` (quote-state parsing in `tools/approval_detection.py`) (tip in the bundle) |
 | 70 | elision-marker-imitation | 2026-10-30 | merged upstream | `77b9ea0831` (#121548, non-imitable compression marker) + `262a6436fa`/`a7baa5f5eb` (tip in the bundle) |
 | 72 | kanban-board-env-precedence | 2026-10-30 | merged upstream | `d11edc0fa2` + `53f1b970a5` + `387c78c8f7` (explicit board beats env pin, with upstream's worker-isolation fence) (tip in the bundle) |
 | 73 | kanban-goal-judge-unavailable | 2026-10-30 | merged upstream | `242244bf68` (#91264, goal loop stops on worker/judge failures) + `c15af4055e` tests (tip in the bundle) |
+| 74 | hygiene-diag-and-lock-offload | 2026-11-26 | folded | into #61 gateway-hygiene-hardening, own commits carried by cherry-pick; old tip `backup/cleanup-1126/soju/patches/hygiene-diag-and-lock-offload` |
+| 76 | clean-fork-soft-refusal-only | 2026-11-26 | folded | into #56 refusal-recovery, own commits carried by cherry-pick; old tip `backup/cleanup-1126/soju/patches/clean-fork-soft-refusal-only` |
+| 77 | sync-20260819-test-seams | 2026-11-26 | folded | into #1 runtime-control, own commits carried by cherry-pick; old tip `backup/cleanup-1126/soju/patches/sync-20260819-test-seams` |
+| 78 | base-persona | 2026-11-26 | folded | into #35 audience-personas, own commits carried by cherry-pick; old tip `backup/cleanup-1126/soju/patches/base-persona` |
 | 81 | precompress-checkpoint-signal | 2026-09-14 | merged upstream | upstream PR #97063; `git cherry` against v2026.9.11 shows '-' for `721c2db628` (tip in the bundle) |
 | 82 | conversation-started-date-stable | 2026-10-30 | merged upstream | any base containing `11b98a1429` (#97930, two-line conversation clock) supersedes this patch; do not file a PR (tip in the bundle) |
 | 84 | lean-single-aux-call | 2026-09-14 | merged upstream | cherry-pick of upstream `4f22543509` (PR 98628), an ancestor of v2026.9.11; residue was fork-base-only (tip in the bundle) |
@@ -1261,13 +1031,9 @@ soju/patches/memory-write-reason-gate
 soju/patches/todo-progress-display
 soju/patches/discord-table-codeblocks
 soju/patches/background-review-guardrails
-soju/patches/runtime-state-session-split
-soju/patches/runtime-route-awareness (stacked on runtime-control)
 soju/patches/strict-chat-reasoning-details
 soju/patches/discord-home-autothread-fix
-soju/patches/runtime-override-rehydrate-credentials (stacked on runtime-route-awareness)
 soju/patches/turn-waterfall-tracing
-soju/patches/prompt-tail-freeze (stacked on runtime-route-awareness)
 soju/patches/llm-activity-recap
 soju/patches/config-knob-bridges
 soju/patches/slow-tool-perf-advisor
@@ -1275,54 +1041,38 @@ soju/patches/anthropic-picker-suppression
 soju/patches/skill-manage-reason-schema
 soju/patches/refusal-fallback-reason (stacked on runtime-control)
 soju/patches/event-loop-db-isolation
+soju/patches/per-tool-disable
 soju/patches/compaction-prompt-cc-upgrades
 soju/patches/anthropic-signature-passthrough
 soju/patches/worker-cpu-hygiene
 soju/patches/lifecycle-guard-nul-fallback (stacked on worker-cpu-hygiene)
-soju/patches/hygiene-noprogress-cooldown
+soju/patches/gateway-hygiene-hardening
 soju/patches/fts-v2-orphan-hardening
 soju/patches/read-file-binary-sniff
-soju/patches/lifecycle-guard-multiline (stacked on lifecycle-guard-nul-fallback)
-soju/patches/scoped-exhaustion-upstream-classify (stacked on lifecycle-guard-multiline)
-soju/patches/lifecycle-guard-stmt-boundary (stacked on lifecycle-guard-multiline)
-soju/patches/hygiene-diag-and-lock-offload (stacked on hygiene-noprogress-cooldown)
-soju/patches/sync-20260819-test-seams (stacked on runtime-control)
+soju/patches/lifecycle-guard-hardening
+soju/patches/scoped-exhaustion-upstream-classify
+soju/patches/aux-anthropic-mode-max-tokens
+soju/patches/slack-stale-reconnect-task
+soju/patches/summary-empty-finish-reason
 soju/patches/external-install-service-launcher
-# sequential lane (chronological tip stack on top of the assembled parallel lane, in this order; merge LAST, each contains the previous)
+cleanup1126/assembly                  ← octopus of the parallel lane on base; root of the tip stack
+# sequential lane (chronological tip stack on cleanup1126/assembly, in this order; merge LAST, each contains the previous)
 soju/patches/conn-error-fail-fast
 soju/patches/durable-turns
-soju/patches/hook-prepend-command-safety
 soju/patches/model-routing
 soju/patches/audience-personas
-soju/patches/memory-phase0
-soju/patches/memory-phase1
-soju/patches/memory-phase2-taint
-soju/patches/memory-phase2-curator
-soju/patches/route-repromote-hysteresis
-soju/patches/passive-provider-health
-soju/patches/per-tool-disable
-soju/patches/notes-recognition-grounding
-soju/patches/refusal-risk-routing
-soju/patches/refusal-api-fallback
-soju/patches/refusal-hop-clean-fork
-soju/patches/refusal-hop-clean-fork (same branch, continues: #59)
+soju/patches/memory-redesign
+soju/patches/refusal-recovery
 soju/patches/durable-bg-processes
 soju/patches/route-aware-outage-fallback
 soju/patches/delegated-child-marker-latch
 soju/patches/turn-exit-reason-tagging
-soju/patches/clean-fork-soft-refusal-only
-soju/patches/base-persona
 soju/patches/gemini-classifier-thinking-compat
 soju/patches/reasoning-route-wire
 soju/patches/todo-continuity-parity
-soju/patches/aux-anthropic-mode-max-tokens
 soju/patches/session-store-lock-offload
-soju/patches/slack-stale-reconnect-task
-soju/patches/summary-empty-finish-reason
 soju/patches/review-fork-checkpoint-warning
 soju/patches/sync-20261125-test-seams (tip of the stack)
-# dropped 2026-11-25: sync-20261030-test-seams (superseded by sync-20261125-test-seams)
-# dropped 2026-10-30 (merged upstream / folded / moot): gateway-worker-pool, background-first-waits, model-switch-provider-dedupe, daemon-pool-py314-compat, approval-grep-escaped-quote, elision-marker-imitation, kanban-board-env-precedence, kanban-goal-judge-unavailable, conversation-started-date-stable, sync-20260914-test-seams, sync-20260914-fixups, sync-20260914-kanban-seams, startup-integrity-check-offload, cron-fire-fence-heartbeat
 ```
 
 ## Operating Procedures
@@ -1362,7 +1112,6 @@ commit) or auto-merges WRONG — re-verify these after every rebuild:
 - `agent/turn_context.py::on_turn_start/memory_prefetch` — memory-phase0's `memory_ingest_allowed` gate combines with durable-turns' `not resume_turn` guard AND turn-waterfall-tracing's span; memory-phase2-taint's `record_injected_text` block appends after the span-wrapped prefetch (conflicts, recorded).
 - `agent/agent_runtime_helpers.py`/`toolsets.py` tool-name lists — union of runtime-control's model tools and memory-phase1's notes tools (conflicts, recorded).
 - `gateway/run_turn_hygiene.py` hygiene compression (was `gateway/run.py`) — event-loop-db-isolation's off-loop construction/binding must preserve upstream's compression commit fence and durable-turn recovery context.
-- `agent/memory_pipeline.py` proposal/admission — notes-recognition-grounding must retain memory-phase2-taint's mechanical injected-span rejection while adding preview and deferred current-turn grounding.
 
 ## Sync History
 
