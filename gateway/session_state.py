@@ -76,8 +76,6 @@ class ConversationState:
     ephemeral_pin: Optional[tuple[Any, ...]] = None  # pinned session-context (change_key, text, redact_pii)
     # (channel_prompt, parent_chat_id) of the last non-internal turn; internal events reuse it
     channel_pin: Optional[tuple[Optional[str], Optional[str]]] = None
-    # One-shot recall quarantine armed by a refusal clean-fork. Consumed when the next agent turn is bound.
-    refusal_recall_quarantine: bool = False
     vc_last: Optional[str] = None  # last voice-channel context delivered
 
     def clear(self) -> None:

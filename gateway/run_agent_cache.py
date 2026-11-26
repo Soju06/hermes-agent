@@ -322,20 +322,6 @@ class GatewayAgentCacheMixin:
         state = states.pop(session_key, None)
         return state if isinstance(state, dict) else None
 
-    def _consume_refusal_recall_quarantine(self, session_key: str) -> bool:
-        """Consume the one-turn recall quarantine armed by a clean-fork."""
-        # Session state lives on GatewayRunner; a mixin-only runner double (the route-state
-        # wiring tests) has none, and the turn wiring must not fail on it.
-        peek = getattr(self, "_peek_session_state", None)
-        if not session_key or not callable(peek):
-            return False
-        state = peek(session_key)
-        if state is None:
-            return False
-        active = bool(state.conversation.refusal_recall_quarantine)
-        state.conversation.refusal_recall_quarantine = False
-        return active
-
     def _apply_gateway_runtime_override(self, directive: dict, source: SessionSource) -> bool:
         """Apply one trusted ``pre_gateway_dispatch`` ``runtime_override`` directive to the session
         route (model/provider via ``hermes_cli.model_switch.switch_model``, reasoning via the session

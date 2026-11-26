@@ -31,8 +31,6 @@ def _init_fallback_chain(agent, fallback_model):
     agent._fallback_activated = getattr(agent, "_fallback_activated", False)
     agent._fallback_reason = getattr(agent, "_fallback_reason", None)
     agent._refusal_clean_fork_active = False
-    agent._refusal_recall_quarantine = False
-    agent._refusal_recall_quarantine_pending = False
     # Legacy attribute kept for backward compat (tests, external callers)
     agent._fallback_model = agent._fallback_chain[0] if agent._fallback_chain else None
     chain = agent._fallback_chain

@@ -522,8 +522,7 @@ class GatewayInboundModelRouterMixin:
 
         if bool(getattr(refusal, "notify", True)):
             try:
-                label = str(entry.get("last_label") or "NORMAL")
-                route_name = _model_router.refusal_route_for_label(refusal, label)
+                route_name = _model_router.refusal_route_for_label(refusal, "NORMAL")
                 directive = await asyncio.to_thread(
                     _model_router._resolve_route_directive,
                     route_name,

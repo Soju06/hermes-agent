@@ -51,13 +51,8 @@ def should_apply_clean_fork(
 
 def begin_refusal_turn(agent: Any) -> None:
     """Per-turn reset: the gateway caches agents across turns, so a clean-fork marker
-    never outlives its turn; a recall quarantine staged by the gateway for THIS turn
-    (``_refusal_recall_quarantine_pending``) becomes active once, then is consumed."""
+    never outlives its turn."""
     agent._refusal_clean_fork_active = False
-    agent._refusal_recall_quarantine = bool(
-        getattr(agent, "_refusal_recall_quarantine_pending", False)
-    )
-    agent._refusal_recall_quarantine_pending = False
 
 
 def current_user_ordinal_from_tail(

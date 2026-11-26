@@ -779,7 +779,6 @@ class TestLoopCallSitesForwardReason:
             for message in result["messages"]
         )
         assert agent._refusal_clean_fork_active is False
-        assert agent._refusal_recall_quarantine is False
         assert "source=provider_output_filter" in caplog.text
         assert "apply=False" in caplog.text
 
