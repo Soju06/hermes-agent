@@ -8,7 +8,7 @@
         "type": "string"
       },
       "evidence": {
-        "description": "Evidence references (>=1 for writes). Each item: {type:'episode', uuid} for a graph episode UUID, or {type:'wal', session_id, entry_id, quote} / {type:'l0', month:'YYYY-MM', quote, wal_entry_id?, session_id?} for a local journal record — the quote must be a VERBATIM substring of that record, substantive (a phrase, not a 2-word fragment), and must never contain secret material. Set tainted:true on any span that came from injected memory context (it will be refused — memory citing itself is not evidence).",
+        "description": "Evidence references (>=1 for writes). Each item: {type:'episode', uuid} for a graph episode UUID, or {type:'wal', session_id, entry_id, quote} / {type:'l0', month:'YYYY-MM', quote, wal_entry_id?} for a local journal record — the quote must be a VERBATIM substring of that record, substantive (a phrase, not a 2-word fragment), and must never contain secret material. Set tainted:true on any span that came from injected memory context (it will be refused — memory citing itself is not evidence).",
         "items": {
           "properties": {},
           "required": [],
