@@ -45,7 +45,7 @@ class TestSchemas:
         desc = NOTES_WRITE_SCHEMA["description"]
         assert "propose" in desc and "confirm" in desc
         assert "NOOP" in desc
-        assert "skills" in desc  # procedural routing is stated
+        assert "procedures or workflows" in desc  # procedural routing is stated, without naming another toolset
         assert "grounding_preview" in desc
         assert "evidence_overrides" in desc
         override = NOTES_WRITE_SCHEMA["parameters"]["properties"][
@@ -327,3 +327,15 @@ class TestMemoryProposeTool:
     def test_empty_content_is_rejected(self):
         res = json.loads(memory_propose_tool(content="", session_id=SESSION))
         assert res["success"] is False
+
+
+def test_notes_write_description_names_no_tool_of_another_toolset():
+    """tools/AGENTS.md: a tool description may only name tools of its own toolset. notes_write
+    shares the memory toolset with memory, so it may point at the memory tool but not at skills,
+    skill_manage or session_search, which a session can have disabled."""
+    from tools.notes_tool import NOTES_WRITE_SCHEMA
+
+    desc = NOTES_WRITE_SCHEMA["description"]
+    for foreign in ("skills", "skill_manage", "session_search"):
+        assert foreign not in desc, foreign
+    assert "memory tool" in desc
