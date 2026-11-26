@@ -19,7 +19,7 @@ base_describe: 8fc037444731
 pinned_at:    2026-11-25
 ```
 
-Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must rebase all `soju/patches/*` topics on top of the new base and verify the production stack rebuilds clean.
+Bump `base_commit` only through the DECISIONS.md ADR-004 procedure (own-commit cherry-picks; see Operating Procedures). Each bump must rebuild all `soju/patches/*` topics on top of the new base and verify the production stack rebuilds clean.
 
 ## Patches (apply order = list order)
 
@@ -60,7 +60,6 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/runtime-control.md` for relocations/seams.
 
 
-
 ### 2. memory-write-reason-gate
 - **branch:** `soju/patches/memory-write-reason-gate`
 - **origin:** `local-author`
@@ -79,7 +78,6 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/memory-write-reason-gate.md` for relocations/seams.
 
 
-
 ### 3. todo-progress-display
 - **branch:** `soju/patches/todo-progress-display`
 - **origin:** `local-author`
@@ -93,7 +91,6 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/todo-progress-display.md` for relocations/seams.
 - **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/todo-progress-display.md` for relocations/seams.
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/todo-progress-display.md` for relocations/seams.
-
 
 
 ### 4. discord-table-codeblocks
@@ -113,14 +110,6 @@ Bump `base_commit` only via `bin/hermes-patches sync <new-ref>`. Each bump must 
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/discord-table-codeblocks.md` for relocations/seams.
 
 
-
-### 5. delegate-per-task-model — SUPERSEDED (2026-07-16)
-Superseded by patch #34 Phase 3a (route-enum delegation, `ffee9ea3c`): raw
-per-task model/provider overrides are replaced by config-declared route enums,
-matching upstream's `delegation-model-routing` policy while keeping per-task
-routing. Branch `soju/patches/delegate-per-task-model` retained for history;
-no longer part of the production stack.
-
 ### 6. background-review-guardrails
 - **branch:** `soju/patches/background-review-guardrails`
 - **origin:** `local-author`
@@ -137,7 +126,6 @@ no longer part of the production stack.
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/background-review-guardrails.md` for relocations/seams.
 
 
-
 ### 7. runtime-state-session-split
 - **branch:** `soju/patches/runtime-state-session-split`
 - **origin:** `local-author`
@@ -150,7 +138,6 @@ no longer part of the production stack.
 - **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/runtime-state-session-split.md` for relocations/seams.
 - **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/runtime-state-session-split.md` for relocations/seams.
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/runtime-state-session-split.md` for relocations/seams.
-
 
 
 ### 8. runtime-route-awareness
@@ -176,19 +163,6 @@ no longer part of the production stack.
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/runtime-route-awareness.md` for relocations/seams.
 
 
-
-### 9. lsp-idle-reaper — MERGED UPSTREAM (2026-08-04)
-Landed via PR #74058; old tip archived at `archive/pre-v20260804/lsp-idle-reaper`.
-
-### 10. aux-runtime-context — MERGED UPSTREAM (2026-07-22)
-Upstream `fdc6c32d7`/`73057ed16`/`c201b72f3` replaced process-global runtime-main state with a
-`contextvars.ContextVar` (`_RUNTIME_MAIN_CONTEXT`) plus per-turn Token scoping — a strict superset of
-this patch's `threading.local` isolation (also covers asyncio tasks). Dropped at the v2026.7.20 base
-bump; old tip archived at `archive/pre-v20260722/aux-runtime-context`.
-
-### 11. gateway-max-iterations-config-authority — MERGED UPSTREAM (2026-08-04)
-v2026.8.3 reloads and re-bridges `agent.max_turns` per turn; old tip archived at `archive/pre-v20260804/gateway-max-iterations-config-authority`.
-
 ### 12. strict-chat-reasoning-details
 - **branch:** `soju/patches/strict-chat-reasoning-details`
 - **origin:** `local-author`
@@ -203,7 +177,6 @@ v2026.8.3 reloads and re-bridges `agent.max_turns` per turn; old tip archived at
 - **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/strict-chat-reasoning-details.md` for relocations/seams.
 - **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/strict-chat-reasoning-details.md` for relocations/seams.
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/strict-chat-reasoning-details.md` for relocations/seams.
-
 
 
 ### 13. discord-home-autothread-fix
@@ -223,7 +196,6 @@ v2026.8.3 reloads and re-bridges `agent.max_turns` per turn; old tip archived at
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/discord-home-autothread-fix.md` for relocations/seams.
 
 
-
 ### 14. runtime-override-rehydrate-credentials
 - **branch:** `soju/patches/runtime-override-rehydrate-credentials`
 - **stacked-on:** `soju/patches/runtime-route-awareness`
@@ -240,7 +212,6 @@ v2026.8.3 reloads and re-bridges `agent.max_turns` per turn; old tip archived at
 - **v2026.9.11-sync:** DONE — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/runtime-override-rehydrate-credentials.md` for relocations/seams.
 - **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/runtime-override-rehydrate-credentials.md` for relocations/seams.
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/runtime-override-rehydrate-credentials.md` for relocations/seams.
-
 
 
 ### 15. turn-waterfall-tracing
@@ -268,15 +239,6 @@ v2026.8.3 reloads and re-bridges `agent.max_turns` per turn; old tip archived at
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/turn-waterfall-tracing.md` for relocations/seams.
 
 
-
-### 16. tool-delay-removal — MERGED UPSTREAM (2026-08-04)
-Landed as `ce9f6712f` via PR #64172; old tip archived at `archive/pre-v20260804/tool-delay-removal`.
-
-### 17. prompt-cache-stability — MERGED UPSTREAM (2026-07-22)
-Upstreamed by the fork author as `7b3dcee92` (*api_content sidecar*, follow-ups `39efad89a`/`c7035ef25`)
-— landed as `agent/turn_context.py` + hooks; changed-line hashes identical for 11/13 files. Dropped at
-the v2026.7.20 base bump; old tip archived at `archive/pre-v20260722/prompt-cache-stability`.
-
 ### 18. prompt-tail-freeze
 - **branch:** `soju/patches/prompt-tail-freeze`
 - **stacked-on:** `soju/patches/runtime-route-awareness`
@@ -293,31 +255,6 @@ the v2026.7.20 base bump; old tip archived at `archive/pre-v20260722/prompt-cach
 - **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/prompt-tail-freeze.md` for relocations/seams.
 - **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/prompt-tail-freeze.md` for relocations/seams.
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/prompt-tail-freeze.md` for relocations/seams.
-
-
-
-### 19. request-client-reuse — MERGED UPSTREAM (2026-08-04)
-Landed as `82e2c9ce4` via PR #73375; old tip archived at `archive/pre-v20260804/request-client-reuse`.
-
-### 20. async-token-accounting — MERGED UPSTREAM (2026-08-04)
-Landed via PR #73359; old tip archived at `archive/pre-v20260804/async-token-accounting`.
-
-### 21. gateway-persist-trim — MERGED UPSTREAM (2026-08-04)
-Salvaged as `54eafee30` via PR #76916; old tip archived at `archive/pre-v20260804/gateway-persist-trim`.
-
-### 22. gateway-worker-pool
-- **branch:** `soju/patches/gateway-worker-pool`
-- **origin:** `local-author`
-- **upstream_pr:** _(none yet — upstream candidate after burn-in)_
-- **state:** `merged-upstream`
-- **rationale:** The gateway's shared agent-turn ThreadPoolExecutor was hardcoded to 10 workers; every agent turn holds one worker for its full duration, so a kanban batch of 8+ concurrent multi-hour marathon turns (300-iteration workers, blocking process waits) starved every other session for hours — observed 9.1h between a finished turn's finalize and its delivery, and users reporting sessions "quietly frozen". Default raised to 24 and exposed as config.yaml `gateway.max_workers` with `HERMES_GATEWAY_MAX_WORKERS` env fallback (clamped ≥ 2); workers are network-I/O-bound so the larger pool is cheap.
-- **commits:**
-  - `4ecc31d405` perf(gateway): size the agent-turn pool from config, default 24
-- **touches:** `gateway/run.py`, `tests/gateway/test_gateway_max_workers.py` _(new)_
-- **v2026.7.20-sync:** coexists with upstream per-session turn lease (`19527db73`): the lease serializes per-session, the pool sizes total concurrency.
-- **v2026.9.11-sync:** DONE — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/gateway-worker-pool.md` for relocations/seams.
-- **v0.22.5-sync:** MERGED UPSTREAM (2026-10-30) — superseded upstream by 24758cf4b8 "fix(gateway): stop capping the turn-body executor at 10 threads" + fb992c84bc (gateway/turn_executor.py _UnboundedThreadExecutor); re-adding a finite cap would weaken upstream's fix — see reports/gateway-worker-pool.md; branch left at its pre-sync tip (`backup/sync-1030/patches/gateway-worker-pool`), not part of the production stack.
-- **v0.22.5-sync:** MERGED UPSTREAM (2026-10-30) — superseded upstream by 24758cf4b8 "fix(gateway): stop capping the turn-body executor at 10 threads" + fb992c84bc (gateway/turn_executor.py _UnboundedThreadExecutor); re-adding a finite cap would weaken upstream's fix — see reports/gateway-worker-pool.md; branch left at its pre-sync tip (`backup/sync-1030/patches/gateway-worker-pool`), not part of the production stack.
 
 
 ### 23. conn-error-fail-fast
@@ -342,21 +279,6 @@ Salvaged as `54eafee30` via PR #76916; old tip archived at `archive/pre-v2026080
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/conn-error-fail-fast.md` for relocations/seams.
 
 
-
-### 24. background-first-waits
-- **branch:** `soju/patches/background-first-waits`
-- **origin:** `local-author`
-- **upstream_pr:** _(none yet — upstream candidate after burn-in)_
-- **state:** `merged-upstream`
-- **rationale:** Models foreground-polled long jobs with chained `process wait` calls (observed 4-5 consecutive 180s waits per turn — total user-facing silence while holding a gateway worker). Background-first: the first full block-wait stays a normal flow (180s window unchanged per user request), but from the SECOND consecutive timed-out wait on the same still-running process, `notify_on_complete` is auto-armed and the tool result instructs the model to end its turn with a summary — the completion re-enters the session as an event and the model explains the result there (the natural LLM recap). `HERMES_PROCESS_WAIT_CAP` tunes the quiet-wait allowance (default 1, 0 disables for completion-bound sessions like kanban workers). The process tool schema and terminal guidance now state the one-wait-per-process contract (one-time tools-hash cache bust on deploy, legitimate).
-- **commits:**
-  - `07b54b39f8` feat(tools): background-first process waits — escalate chained blocking waits
-- **touches:** `tools/process_registry.py`, `tools/terminal_tool.py`, `tests/tools/test_background_first_waits.py` _(new)_
-- **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/background-first-waits.md` for relocations/seams.
-- **v0.22.5-sync:** MERGED UPSTREAM (2026-10-30) — merged upstream: 33a25058b2 (background-first process waits / terminal.process_wait_auto_notify) — see reports/background-first-waits.md; branch left at its pre-sync tip (`backup/sync-1030/patches/background-first-waits`), not part of the production stack.
-- **v0.22.5-sync:** MERGED UPSTREAM (2026-10-30) — merged upstream: 33a25058b2 (background-first process waits / terminal.process_wait_auto_notify) — see reports/background-first-waits.md; branch left at its pre-sync tip (`backup/sync-1030/patches/background-first-waits`), not part of the production stack.
-
-
 ### 25. llm-activity-recap
 - **branch:** `soju/patches/llm-activity-recap`
 - **origin:** `local-author`
@@ -375,7 +297,6 @@ Salvaged as `54eafee30` via PR #76916; old tip archived at `archive/pre-v2026080
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/llm-activity-recap.md` for relocations/seams.
 
 
-
 ### 26. config-knob-bridges
 - **branch:** `soju/patches/config-knob-bridges`
 - **origin:** `local-author`
@@ -390,7 +311,6 @@ Salvaged as `54eafee30` via PR #76916; old tip archived at `archive/pre-v2026080
 - **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/config-knob-bridges.md` for relocations/seams.
 - **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/config-knob-bridges.md` for relocations/seams.
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/config-knob-bridges.md` for relocations/seams.
-
 
 
 ### 27. durable-turns
@@ -417,7 +337,6 @@ Salvaged as `54eafee30` via PR #76916; old tip archived at `archive/pre-v2026080
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/durable-turns.md` for relocations/seams.
 
 
-
 ### 28. hook-prepend-command-safety
 - **branch:** `soju/patches/hook-prepend-command-safety`
 - **stacked-on:** `soju/patches/durable-turns` (2026-11-25 chronological tip stack)
@@ -433,7 +352,6 @@ Salvaged as `54eafee30` via PR #76916; old tip archived at `archive/pre-v2026080
 - **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/hook-prepend-command-safety.md` for relocations/seams.
 - **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/hook-prepend-command-safety.md` for relocations/seams.
 - **v0.23.4-sync:** DONE — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/hook-prepend-command-safety.md` for relocations/seams.
-
 
 
 ### 29. slow-tool-perf-advisor
@@ -452,19 +370,6 @@ Salvaged as `54eafee30` via PR #76916; old tip archived at `archive/pre-v2026080
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/slow-tool-perf-advisor.md` for relocations/seams.
 
 
-
-### 30. session-db-read-path-split — MERGED UPSTREAM (2026-08-04)
-v2026.8.3 provides `_read_ctx()` and per-thread `mode=ro` connections; old tip archived at `archive/pre-v20260804/session-db-read-path-split`.
-
-### 31. fts5-cjk-bigram-index — MERGED UPSTREAM (2026-08-04)
-Upstream ships `cjk_unicode61`, `native/fts5_cjk/`, and `messages_fts_cjk`; old tip archived at `archive/pre-v20260804/fts5-cjk-bigram-index`.
-
-### 32. search-slow-query-log — MERGED UPSTREAM (2026-08-04)
-Equivalent routing-path slow-query logging landed upstream as `8364576e33`; old tip archived at `archive/pre-v20260804/search-slow-query-log`.
-
-### 33. fts-v2-config-authority — MERGED UPSTREAM (2026-08-04)
-Fork `messages_fts_v2` never shipped upstream; v2026.8.3 owns `messages_fts_cjk` configuration. Old tip archived at `archive/pre-v20260804/fts-v2-config-authority`; deployed fork-v2 tables require operator cleanup post-deploy.
-
 ### 34. model-routing
 - **branch:** `soju/patches/model-routing`
 - **stacked-on:** `soju/patches/hook-prepend-command-safety` (2026-11-25 chronological tip stack)
@@ -472,6 +377,8 @@ Fork `messages_fts_v2` never shipped upstream; v2026.8.3 owns `messages_fts_cjk`
 - **origin:** `local-author`
 - **state:** `local-only`
 - **rationale:** ADR-003 Phases 1+2 — model routing SoT as a core subsystem. Phase 1: config-declared `model_routes:` catalog (per route: description, provider, model, reasoning_effort, accepted membership, ordered fallbacks), loader with startup cross-validation against `providers:`, and a health-aware resolver (`resolve_route`) that walks default→fallbacks with TTL-cached fail-open provider probes ported from skill-gate's runtime_catalog (401/403 healthy, credit-sniffed 400, 402/429/5xx unhealthy; config-first kill switch `model_routes.health.enabled` + `HERMES_MODEL_ROUTES_HEALTH` bridge). Phase 2: gateway dynamic router (`gateway/model_router.py` + `_model_router_stage`) — classifier core byte-identical to the skill-gate bench winner (parity-test-pinned; changing it requires the 230+120 bench rerun), `model_routes.router` config (mode off|shadow|enforce + `HERMES_MODEL_ROUTER_MODE` bridge, label_routes, chat_route, streak), static condition rules (short-circuit by design — the plugin's live last-wins is a bug not ported), decision log `~/.hermes/logs/model_router_decisions.jsonl` for shadow-soak comparison, enforce apply with /model parity (#48031 auto-reset survival, pending note, session-DB persist). Dormant with empty config. Phase 3 (`model_switch`/`delegate_task` route enums) builds on this; supersedes patch #5 when Phase 3 lands.
+- **known limitation:** model-routed `delegate_task` children carry `request=None` and are refused on continue after a gateway restart (`tools/delegate_tool_continue.py:108-114`, fails closed); in-process continues work. A real fix needs `request={"route": name}` on claimed TaskRoutes and a continue path through `resolve_routed_tasks` (`~/work/hermes/upstream-sync-20261125/reports/model-routing.md:83-95`).
+- **decision (2026-11-26, O-A7):** accepted as a known limitation; about one delegation a week, and the path fails closed. Revisit only if delegation use grows.
 - **commits:**
   - `78c07d3f97` feat(routing): model_routes catalog + health-aware route resolver (ADR-003 Phase 1)
   - `b854ecdcdc` feat(routing): core dynamic model router with shadow mode (ADR-003 Phase 2)
@@ -499,7 +406,6 @@ Fork `messages_fts_v2` never shipped upstream; v2026.8.3 owns `messages_fts_cjk`
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/model-routing.md` for relocations/seams.
 
 
-
 ### 35. audience-personas
 - **branch:** `soju/patches/audience-personas`
 - **stacked-on:** `soju/patches/model-routing` (2026-11-25 chronological tip stack)
@@ -515,21 +421,6 @@ Fork `messages_fts_v2` never shipped upstream; v2026.8.3 owns `messages_fts_cjk`
 - **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/audience-personas.md` for relocations/seams.
 - **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/audience-personas.md` for relocations/seams.
 - **v0.23.4-sync:** DONE — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/audience-personas.md` for relocations/seams.
-
-
-
-### 36. model-switch-provider-dedupe
-- **branch:** `soju/patches/model-switch-provider-dedupe`
-- **origin:** `local-author`
-- **upstream_pr:** [#66128](https://github.com/NousResearch/hermes-agent/pull/66128)
-- **state:** `merged-upstream`
-- **rationale:** `/model <bare-model>` hard-fails with "declared by multiple configured providers (<slug>, custom:<display name>)" when the model is declared by exactly ONE `providers.<slug>` entry, because `_configured_provider_matches` counts the entry and its `get_compatible_custom_providers` legacy view separately. Fix canonicalizes match collection: a custom row is attributed to its originating providers slug via the `provider_key` stamp (or name+base_url identity). Genuine ambiguity — two different endpoints, including display-name collisions — still errors (regression-pinned). Found by the ADR-003 E2E harness (D1).
-- **commits:**
-  - `f491809bb2` fix(model_switch): dedupe self-duplicate provider views in typed-model routing
-- **touches:** `hermes_cli/model_switch.py`, `tests/hermes_cli/test_model_switch_configured_provider_routing.py`
-- **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/model-switch-provider-dedupe.md` for relocations/seams.
-- **v0.22.5-sync:** MERGED UPSTREAM (2026-10-30) — merged upstream: a02ca4a153 + 01d2e6c3d1 "fix: /model collapses compat views of one configured provider by identity" + f7631c0ee7 (hermes_cli/model_switch.py _duplicates_configured_row); our alias logic fails 4 upstream identity tests — see reports/model-switch-provider-dedupe.md; branch left at its pre-sync tip (`backup/sync-1030/patches/model-switch-provider-dedupe`), not part of the production stack.
-- **v0.22.5-sync:** MERGED UPSTREAM (2026-10-30) — merged upstream: a02ca4a153 + 01d2e6c3d1 "fix: /model collapses compat views of one configured provider by identity" + f7631c0ee7 (hermes_cli/model_switch.py _duplicates_configured_row); our alias logic fails 4 upstream identity tests — see reports/model-switch-provider-dedupe.md; branch left at its pre-sync tip (`backup/sync-1030/patches/model-switch-provider-dedupe`), not part of the production stack.
 
 
 ### 37. memory-phase0
@@ -554,7 +445,6 @@ Fork `messages_fts_v2` never shipped upstream; v2026.8.3 owns `messages_fts_cjk`
 - **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/memory-phase0.md` for relocations/seams.
 - **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/memory-phase0.md` for relocations/seams.
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/memory-phase0.md` for relocations/seams.
-
 
 
 ### 38. memory-phase1
@@ -582,7 +472,6 @@ Fork `messages_fts_v2` never shipped upstream; v2026.8.3 owns `messages_fts_cjk`
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/memory-phase1.md` for relocations/seams.
 
 
-
 ### 39. memory-phase2-taint
 - **branch:** `soju/patches/memory-phase2-taint`
 - **stacked-on:** `soju/patches/memory-phase1` (2026-11-25 chronological tip stack)
@@ -601,7 +490,6 @@ Fork `messages_fts_v2` never shipped upstream; v2026.8.3 owns `messages_fts_cjk`
 - **v2026.9.11-sync:** DONE — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/memory-phase2-taint.md` for relocations/seams.
 - **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/memory-phase2-taint.md` for relocations/seams.
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/memory-phase2-taint.md` for relocations/seams.
-
 
 
 ### 40. memory-phase2-curator
@@ -628,11 +516,6 @@ Fork `messages_fts_v2` never shipped upstream; v2026.8.3 owns `messages_fts_cjk`
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/memory-phase2-curator.md` for relocations/seams.
 
 
-
-### 41. cron-secret-scope-env-fallback — MERGED UPSTREAM (2026-08-04)
-Landed via PR #69057; old tip archived at `archive/pre-v20260804/cron-secret-scope-env-fallback`.
-
-
 ### 42. anthropic-picker-suppression
 - **branch:** `soju/patches/anthropic-picker-suppression`
 - **origin:** `local-author`
@@ -645,21 +528,6 @@ Landed via PR #69057; old tip archived at `archive/pre-v20260804/cron-secret-sco
 - **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/anthropic-picker-suppression.md` for relocations/seams.
 - **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/anthropic-picker-suppression.md` for relocations/seams.
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/anthropic-picker-suppression.md` for relocations/seams.
-
-
-
-### 43. daemon-pool-py314-compat
-- **branch:** `soju/patches/daemon-pool-py314-compat`
-- **origin:** `local-author`
-- **upstream_pr:** [#69209](https://github.com/NousResearch/hermes-agent/pull/69209)
-- **state:** `merged-upstream`
-- **rationale:** `DaemonThreadPoolExecutor` mirrors CPython 3.8–3.13 `ThreadPoolExecutor._adjust_thread_count` internals; CPython 3.14 moved per-worker state into `prepare_context()`/`WorkerContext` and changed `_worker`'s signature, so every `submit()` dies with `AttributeError: '_initializer'` (all concurrent tool batches + background memory sync). Branch on `hasattr(ThreadPoolExecutor, "prepare_context")` and pass matching worker args on both interpreter families. Hoisted from a memory-phase0 rebase collateral to a stack-root patch (2026-07-22).
-- **commits:**
-  - `f5438a68c2` fix(compat): support CPython 3.14 ThreadPoolExecutor internals in DaemonThreadPoolExecutor
-- **touches:** `tools/daemon_pool.py`
-- **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/daemon-pool-py314-compat.md` for relocations/seams.
-- **v0.22.5-sync:** MERGED UPSTREAM (2026-10-30) — merged upstream: c9fa191334 "fix(tools): support daemon pool workers on Python 3.14" + b48cc47a4c "fix(tools): use Python 3.14 daemon worker contexts" (ancestors of TARGET; cherry-pick came out empty) — see reports/daemon-pool-py314-compat.md; branch left at its pre-sync tip (`backup/sync-1030/patches/daemon-pool-py314-compat`), not part of the production stack.
-- **v0.22.5-sync:** MERGED UPSTREAM (2026-10-30) — merged upstream: c9fa191334 "fix(tools): support daemon pool workers on Python 3.14" + b48cc47a4c "fix(tools): use Python 3.14 daemon worker contexts" (ancestors of TARGET; cherry-pick came out empty) — see reports/daemon-pool-py314-compat.md; branch left at its pre-sync tip (`backup/sync-1030/patches/daemon-pool-py314-compat`), not part of the production stack.
 
 
 ### 44. skill-manage-reason-schema
@@ -678,14 +546,13 @@ Landed via PR #69057; old tip archived at `archive/pre-v20260804/cron-secret-sco
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/skill-manage-reason-schema.md` for relocations/seams.
 
 
-
 ### 45. refusal-fallback-reason
 - **branch:** `soju/patches/refusal-fallback-reason`
 - **stacked-on:** `soju/patches/runtime-control`
 - **origin:** `local-author`
 - **upstream_pr:** _(none yet — pairs with the local skill-gate plugin's refusal exemption; upstreamable on its own)_
 - **state:** `local-only`
-- **rationale:** `try_activate_fallback(agent, reason)` received the `FailoverReason` but discarded it, so plugins could not distinguish a safety-refusal fallback (deterministic, content-scoped, restore-next-turn) from rate-limit/5xx failovers. Records `agent._fallback_reason` at the single activation success point, mirrors it at every `_fallback_activated` reset/copy site, exposes `fallback_activated`/`fallback_reason` in `get_runtime_state()`, emits `runtime_state` hook events at activation (`event="fallback"`) and restore (`event="restore"`), and passes the reason at the three conversation-loop refusal call sites (HTTP-200 `content_filter` branch, mid-stream content-filter stub, exception client-error branch → `classified.reason`). Enables the skill-gate refusal-fallback exemption so a refusal-driven claude-opus-5 fallback can perform dev edits for exactly that turn.
+- **rationale:** `try_activate_fallback(agent, reason)` received the `FailoverReason` but discarded it, so plugins could not distinguish a safety-refusal fallback (deterministic, content-scoped, restore-next-turn) from rate-limit/5xx failovers. Records `agent._fallback_reason` at the single activation success point, mirrors it at every `_fallback_activated` reset/copy site, exposes `fallback_activated`/`fallback_reason` in `get_runtime_state()`, emits `runtime_state` hook events at activation (`event="fallback"`) and restore (`event="restore"`), and forwards the reason from the exception client-error branch (`classified.reason`) and the Codex soft-failure fallback; the HTTP-200 `content_filter` and mid-stream content-filter sites pass it upstream since 6ee6b7cb77. Enables the skill-gate refusal-fallback exemption so a refusal-driven claude-opus-5 fallback can perform dev edits for exactly that turn.
 - **commits:**
   - `3346234b0f` feat(fallback): record activation reason and publish runtime_state events
   - `ea8785ddf1` test(fallback): cover fallback reason lifecycle and runtime_state hook
@@ -697,7 +564,6 @@ Landed via PR #69057; old tip archived at `archive/pre-v20260804/cron-secret-sco
 - **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/refusal-fallback-reason.md` for relocations/seams.
 - **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/refusal-fallback-reason.md` for relocations/seams.
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/refusal-fallback-reason.md` for relocations/seams.
-
 
 
 ### 46. route-repromote-hysteresis
@@ -716,7 +582,6 @@ Landed via PR #69057; old tip archived at `archive/pre-v20260804/cron-secret-sco
 - **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/route-repromote-hysteresis.md` for relocations/seams.
 - **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/route-repromote-hysteresis.md` for relocations/seams.
 - **v0.23.4-sync:** DONE — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/route-repromote-hysteresis.md` for relocations/seams.
-
 
 
 ### 47. passive-provider-health
@@ -743,7 +608,6 @@ Landed via PR #69057; old tip archived at `archive/pre-v20260804/cron-secret-sco
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/passive-provider-health.md` for relocations/seams.
 
 
-
 ### 48. event-loop-db-isolation
 - **branch:** `soju/patches/event-loop-db-isolation`
 - **origin:** `local-author`
@@ -763,10 +627,6 @@ Landed via PR #69057; old tip archived at `archive/pre-v20260804/cron-secret-sco
 - **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/event-loop-db-isolation.md` for relocations/seams.
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/event-loop-db-isolation.md` for relocations/seams.
 
-
-
-### 49. token-accounting-schema-repair — MERGED UPSTREAM (2026-08-04)
-v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key layout and rebuilds malformed `session_model_usage`; old tip archived at `archive/pre-v20260804/token-accounting-schema-repair`.
 
 ### 50. per-tool-disable
 - **branch:** `soju/patches/per-tool-disable`
@@ -788,7 +648,6 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/per-tool-disable.md` for relocations/seams.
 
 
-
 ### 51. compaction-prompt-cc-upgrades
 - **branch:** `soju/patches/compaction-prompt-cc-upgrades`
 - **origin:** `local-author`
@@ -803,7 +662,6 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 - **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/compaction-prompt-cc-upgrades.md` for relocations/seams.
 - **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/compaction-prompt-cc-upgrades.md` for relocations/seams.
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/compaction-prompt-cc-upgrades.md` for relocations/seams.
-
 
 
 ### 52. anthropic-signature-passthrough
@@ -824,7 +682,6 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/anthropic-signature-passthrough.md` for relocations/seams.
 
 
-
 ### 53. notes-recognition-grounding
 - **branch:** `soju/patches/notes-recognition-grounding`
 - **stacked-on:** `soju/patches/per-tool-disable` (2026-11-25 chronological tip stack)
@@ -843,13 +700,12 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/notes-recognition-grounding.md` for relocations/seams.
 
 
-
 ### 54. worker-cpu-hygiene
 - **branch:** `soju/patches/worker-cpu-hygiene`
 - **origin:** `local-author`
 - **upstream_pr:** _(none — 2026-08-05 loop-stall follow-up)_
 - **state:** `local-only`
-- **rationale:** Stop worker threads from starving the gateway event loop of GIL time. lifecycle_guard tokenized each command three times per nesting level (tokenize once, share the segment list); checkpoint_manager's dir walks used Path.rglob (rewritten on os.scandir with identical early-stop/symlink semantics).
+- **rationale:** Stop worker threads from starving the gateway event loop of GIL time. lifecycle_guard tokenized each command three times per nesting level (tokenize once, share the segment list); the checkpoint size walk (`_dir_size_bytes`) and the pre-v2 mtime loop used Path.rglob (rewritten on os.scandir with identical early-stop/symlink semantics). The `_dir_file_count` half is upstream's since af70d77be2.
 - **commits:**
   - `0df0228fb6` perf(cron,tools): stop worker threads from starving the event loop of GIL time
   - `0d3fdbdfca` fix(tools): walk pre-v2 checkpoint mtimes with os.scandir (2026-10-30 sync review)
@@ -857,7 +713,6 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 - **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/worker-cpu-hygiene.md` for relocations/seams.
 - **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/worker-cpu-hygiene.md` for relocations/seams.
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/worker-cpu-hygiene.md` for relocations/seams.
-
 
 
 ### 55. lifecycle-guard-nul-fallback
@@ -874,7 +729,6 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 - **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/lifecycle-guard-nul-fallback.md` for relocations/seams.
 - **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/lifecycle-guard-nul-fallback.md` for relocations/seams.
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/lifecycle-guard-nul-fallback.md` for relocations/seams.
-
 
 
 ### 56. refusal-risk-routing
@@ -894,7 +748,6 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/refusal-risk-routing.md` for relocations/seams.
 
 
-
 ### 57. refusal-api-fallback
 - **branch:** `soju/patches/refusal-api-fallback`
 - **stacked-on:** `soju/patches/refusal-risk-routing` (2026-11-25 chronological tip stack)
@@ -912,14 +765,14 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/refusal-api-fallback.md` for relocations/seams.
 
 
-
 ### 58. refusal-hop-clean-fork
 - **branch:** `soju/patches/refusal-hop-clean-fork`
 - **stacked-on:** `soju/patches/refusal-api-fallback` (2026-11-25 chronological tip stack)
 - **origin:** `local-author`
 - **upstream_pr:** _(none — dogfood refusal masking + auto-switch)_
 - **state:** `local-only`
-- **rationale:** When a refusal is detected (hard: `content_policy_blocked` at turn end; soft: classifier `prior_refusal` on the previous assistant turn), mask ONLY the refusal message row (`active=0`, row preserved, `compacted` untouched) and one-shot route the next turn to PERMISSIVE. Replaces the preemptive `rewrite_transcript` that hard-deleted the whole session with no refusal evidence. Mid-turn clean-fork scope cut to the current turn (completed history preserved). `prior_refusal` classifier field costs zero extra API calls (router already receives `recent_turns`). Bench 30/30 at precision 1.0 / recall 1.0 after two prompt narrowings (sub-part inability and domain deferral no longer read as refusals). New `deactivate_messages`/`reactivate_messages` are reversible; no hard deletion anywhere.
+- **rationale:** Hard refusal: upstream retention (v0.23.4) removes the refused turn before the router runs; this topic only stages a one-shot PERMISSIVE hop and the notice, so the user's resend lands on the permissive route. Soft refusal: the classifier's `prior_refusal` masks the newest active assistant row (`active=0`, row preserved, `compacted` untouched) and one-shot routes the next turn to PERMISSIVE. History (pre-v0.23.4): the hard path also masked the refusal row. Replaces the preemptive `rewrite_transcript` that hard-deleted the whole session with no refusal evidence. Mid-turn clean-fork scope cut to the current turn (completed history preserved). `prior_refusal` classifier field costs zero extra API calls (router already receives `recent_turns`). Bench 30/30 at precision 1.0 / recall 1.0 after two prompt narrowings (sub-part inability and domain deferral no longer read as refusals). New `deactivate_messages`/`reactivate_messages` are reversible; no hard deletion anywhere.
+- **decision (2026-11-26, O-A9):** accept upstream's v0.23.4 retention contract: a hard refusal removes the turn and the user resends. Keep only the one-shot PERMISSIVE hop and the notice; do not carry the refused request into the forced turn.
 - **commits:**
   - `cabf7670f3` feat(refusal): clean-fork history on PERMISSIVE hop
   - `1bc097087f` feat(refusal): mask refused turn and auto-switch instead of rewriting history
@@ -931,7 +784,6 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 - **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/refusal-hop-clean-fork.md` for relocations/seams.
 - **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/refusal-hop-clean-fork.md` for relocations/seams.
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/refusal-hop-clean-fork.md` for relocations/seams.
-
 
 
 ### 59. refusal-soft-turnend
@@ -954,18 +806,6 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/refusal-soft-turnend.md` for relocations/seams.
 
 
-
-### 60. anthropic-structured-output
-- **branch:** `soju/patches/anthropic-structured-output`
-- **stacked-on:** _(none — merged upstream)_
-- **origin:** `local-author`
-- **upstream_pr:** _(none yet — upstream candidate)_
-- **state:** `merged-upstream`
-- **rationale:** Plugin structured completions (`plugin_llm.complete_structured`) build an OpenAI Chat Completions `response_format` payload in extra_body; the anthropic_messages transport forwarded it verbatim and strict Anthropic gateways (claude-lb) reject it with HTTP 400 ("use output_config.format"). Observed live: every discord-thread-autotitle rename failed for 2+ days (1,600+ errors) once the main provider became claude-lb. Fix: `_translate_anthropic_response_format` converts `json_schema`→`output_config.format={"type":"json_schema","schema":S}` and `json_object`→permissive object schema (SDK 0.87.0 has no schema-less JSON mode), merging into any existing `output_config` (adaptive-thinking `effort` coexists) and excluding `response_format` from the raw extra_body passthrough alongside `reasoning`. Async path delegates to the sync adapter via `asyncio.to_thread`, covered by test. Non-Anthropic transports unchanged.
-- **commits:**
-  - `c67b6662b fix(aux): translate response_format to output_config.format for anthropic transport`
-- **touches:** `agent/auxiliary_client.py`, `tests/agent/test_anthropic_structured_output.py`
-
 ### 61. hygiene-noprogress-cooldown
 - **branch:** `soju/patches/hygiene-noprogress-cooldown`
 - **stacked-on:** _(none — applies directly on base; its old parent #60 anthropic-structured-output was merged upstream)_
@@ -984,7 +824,6 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/hygiene-noprogress-cooldown.md` for relocations/seams.
 
 
-
 ### 62. durable-bg-processes
 - **branch:** `soju/patches/durable-bg-processes`
 - **stacked-on:** `soju/patches/refusal-hop-clean-fork` (2026-11-25 chronological tip stack)
@@ -992,6 +831,7 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 - **upstream_pr:** _(none yet — upstream candidate)_
 - **state:** `local-only`
 - **rationale:** Background tool processes died on every gateway restart via three stacked kill mechanisms: (1) shutdown `process_registry.kill_all()` global sweep in `_stop_impl`, (2) systemd `KillMode=mixed` SIGKILL on the unit cgroup after `TimeoutStopSec`, (3) `ExecStopPost=gateway.cgroup_cleanup` per-PID SIGKILL of every cgroup survivor. Checkpoint recovery (`processes.json`) only ever adopted crash survivors, and adopted them `detached` with no output. Fix (config-gated, `terminal.durable_background: false` default off, config.yaml only — no tool-schema change): durable non-PTY local spawns run inside `systemd-run --user --scope --unit=hermes-bg-<sid>` (sibling cgroup — escapes 2 and 3; readiness marker + graceful fallback to plain spawn when scopes are unavailable), write output to `$HERMES_HOME/bg-logs/<sid>.log` (0600/0700) as source of truth so post-restart `read_log`/`poll`/notification tails work, and are excluded from the shutdown sweep via `kill_all(exclude_durable=True)`. Explicit `process(action=kill)` still terminates them; scope units are `reset-failed` on completion. Review fix vs executor output: cron `#60432` interrupted-marking made unconditional again — the cron agent is a ThreadPoolExecutor thread inside the gateway process and dies with it even when its durable subprocess survives; gating on `_killed>0` would let a truncated run report success (regression test added). E2E-verified on this host: scope cgroup escape, checkpoint re-adoption in a fresh registry, and full output readback after simulated restart.
+- **decision (2026-11-26, O-A10):** the parked item "durable mode only outside per-turn worker processes" is closed as a documented scope limit (this host runs no `hermes-worker-*` units). Profile `mymel` stays without `terminal.durable_background`.
 - **commits:**
   - `abc80c3200` Add durable local background processes
   - `3bf0782c5c` fix(process-registry): pass stdin=DEVNULL explicitly in the durable sibling (2026-10-30 sync regression)
@@ -1002,7 +842,6 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 - **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/durable-bg-processes.md` for relocations/seams.
 - **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/durable-bg-processes.md` for relocations/seams.
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/durable-bg-processes.md` for relocations/seams.
-
 
 
 ### 63. route-aware-outage-fallback
@@ -1023,7 +862,6 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 - **v0.23.4-sync:** DONE — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/route-aware-outage-fallback.md` for relocations/seams.
 
 
-
 ### 64. fts-v2-orphan-hardening
 - **branch:** `soju/patches/fts-v2-orphan-hardening`
 - **stacked-on:** _(none — applies directly on base)_
@@ -1040,13 +878,12 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/fts-v2-orphan-hardening.md` for relocations/seams.
 
 
-
 ### 65. read-file-binary-sniff
 - **branch:** `soju/patches/read-file-binary-sniff`
 - **stacked-on:** _(none — applies directly on base)_
 - **origin:** `local-author`
 - **upstream_pr:** _(none yet — upstream candidate; the sniff path is stock upstream code)_
-- **state:** `pending-upstream`
+- **state:** `local-only`
 - **rationale:** `read_file` refused valid UTF-8 Korean text with "Binary file - cannot display as text" — intermittently, and with no relation to file content type. Root cause is a two-stage mismatch in `tools/file_operations.py`: the binary sniff samples the first 1000 **bytes** (`head -c 1000`, ~L1182) while the terminal backend decodes stdout with `errors="replace"`, so a 3-byte Hangul or 4-byte emoji straddling byte 1000 leaves 1-3 trailing U+FFFD; `_is_likely_binary` (~L901) treats any U+FFFD in the sample as binary. That FFFD check is a deliberate fail-safe (it stops a read→edit→write roundtrip from overwriting undecodable bytes with mojibake) and is preserved — only the truncation artifact is excluded. Whether a given file trips this is pure byte-boundary luck, which is why it looked unreproducible: `personas/private.md` (2686 B) hits FFFD at cuts 1000/1024/2048, while `work.md` happens to land on a character boundary and reads fine; editing a file shifts the boundary and the symptom appears or vanishes. Fix: pass `sample_truncated=(file_size > 1000)` from the read path and, only in that case, strip a trailing run of at most 3 U+FFFD before the check. Untruncated samples keep byte-identical behavior, mid-sample FFFD still flags binary (genuine mojibake is not tail-only), and a trailing run of 4+ is not a boundary artifact so it still flags. Verified RED/GREEN by reverting `tools/file_operations.py` alone against the new tests (4 fail → 70 pass), then live: the reference doc describing this very bug was itself unreadable via `read_file` before the fix.
 - **commits:**
   - `72c6bad6a6` fix(tools): don't flag UTF-8 text as binary when head -c splits a multibyte char
@@ -1054,7 +891,6 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 - **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/read-file-binary-sniff.md` for relocations/seams.
 - **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/read-file-binary-sniff.md` for relocations/seams.
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/read-file-binary-sniff.md` for relocations/seams.
-
 
 
 ### 66. lifecycle-guard-multiline
@@ -1075,7 +911,6 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/lifecycle-guard-multiline.md` for relocations/seams.
 
 
-
 ### 67. scoped-exhaustion-upstream-classify
 - **branch:** `soju/patches/scoped-exhaustion-upstream-classify`
 - **stacked-on:** `soju/patches/lifecycle-guard-multiline`
@@ -1092,7 +927,6 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 - **v0.23.4-sync:** DONE — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/scoped-exhaustion-upstream-classify.md` for relocations/seams.
 
 
-
 ### 68. lifecycle-guard-stmt-boundary
 - **branch:** `soju/patches/lifecycle-guard-stmt-boundary`
 - **stacked-on:** `soju/patches/lifecycle-guard-multiline`
@@ -1107,39 +941,6 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 - **v2026.9.11-sync:** DONE — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/lifecycle-guard-stmt-boundary.md` for relocations/seams.
 - **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/lifecycle-guard-stmt-boundary.md` for relocations/seams.
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/lifecycle-guard-stmt-boundary.md` for relocations/seams.
-
-
-
-### 69. approval-grep-escaped-quote
-- **branch:** `soju/patches/approval-grep-escaped-quote`
-- **stacked-on:** _(none — applies directly on base)_
-- **origin:** `local-author`
-- **upstream_pr:** `85922`
-- **state:** `merged-upstream`
-- **rationale:** Started as a false positive — `grep -n "^from\|^__all__\|^    \"" file.py` was rejected as `hardline: command parser limit or malformed executable payload`, blocking a read-only grep in gateway sessions. Root cause: `detect_hardline_command` fed `_normalize_command_for_detection(command)` to the grep parser, but normalization strips backslash-escapes (`\"` → `"`), so the parser saw an odd number of quotes and reported the parse malformed, which fails closed. Investigating that exposed a far more serious defect in the same quote-state confusion: the hardline floor could be BYPASSED entirely. `_CMDPOS`-anchored hardline patterns do not match `; reboot` directly — they fire only after `_mark_command_starts` inserts a newline at each quote-aware command start. When an escaped quote is present, normalization leaves the quote open (`echo "a"b"; reboot`), the tokenizer sees one unterminated segment, no marker is inserted, and the floor never fires. Verified live on stock base and on the deployed tree: `cat "f\"n.txt"; rm -rf --no-preserve-root /` returned `approved=True` from `check_dangerous_command` — i.e. the yolo-proof floor, which is documented as unbypassable, was bypassable with one escaped quote in front of any command. Fix is three commits, additive only (variant generation is any-match, so adding variants can only tighten the floor): (1) validate grep syntax against faithful shell quote state, using `_mask_quoted_newlines(command)` rather than normalized text; (2) emit an ADDITIONAL detection variant whose command starts are marked BEFORE normalization, using a `" \n"` marker so a preceding backslash cannot swallow the inserted newline as a line continuation; (3) `_mark_command_starts` must not treat an offset inside a `${...}` parameter expansion as a command start — marking inside `${IFS}` produced `${ \nIFS}`, which defeated the IFS-collapse regex in normalization and left `echo "a\"b"; rm${IFS}-rf${IFS}--no-preserve-root${IFS}/` executable and unblocked (confirmed with the safe analogue `echo "a\"b"; echo${IFS}BYPASS_EXECUTED`, rc=0, second statement executed). A single-quote variant (`echo 'a\'b'; reboot`) was investigated and is NOT a bypass — bash rejects it with rc=2 (unterminated quote), so it cannot execute. Verified RED/GREEN per commit (1 → 5 → 4 failing tests), 266 passed across the four affected test files, mutation-killed both new code paths (reverting the param-expansion skip → 4 failures; reverting the faithful-marking variant → 88 failures), and 33 adversarial cases hand-checked against BASE to confirm zero regressions: every remaining difference from base is either fail-safe over-blocking that predates this patch or a non-executable string.
-- **commits:**
-  - `ceb813e1ac` fix(approval): parse raw grep quote state before hardline checks
-  - `5a1c0aa77e` fix(approval): mark command starts from faithful quote state
-  - `bdd6590fd9` fix(approval): don't mark command starts inside parameter expansions
-- **touches:** `tools/approval.py`, `tests/tools/test_execution_flag_detection.py`
-- **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/approval-grep-escaped-quote.md` for relocations/seams.
-- **v0.22.5-sync:** MERGED UPSTREAM (2026-10-30) — merged upstream: e383c28d2f + 9efa50071a (tools/approval_detection.py quote-state parsing) — see reports/approval-grep-escaped-quote.md; branch left at its pre-sync tip (`backup/sync-1030/patches/approval-grep-escaped-quote`), not part of the production stack.
-- **v0.22.5-sync:** MERGED UPSTREAM (2026-10-30) — merged upstream: e383c28d2f + 9efa50071a (tools/approval_detection.py quote-state parsing) — see reports/approval-grep-escaped-quote.md; branch left at its pre-sync tip (`backup/sync-1030/patches/approval-grep-escaped-quote`), not part of the production stack.
-
-
-### 70. elision-marker-imitation
-- **branch:** `soju/patches/elision-marker-imitation`
-- **stacked-on:** `soju/patches/route-aware-outage-fallback` (2026-09-14 chronological tip stack)
-- **origin:** `local-author`
-- **upstream_pr:** _(none — pending dogfood soak before proposing)_
-- **state:** `merged-upstream`
-- **rationale:** The compressor rewrote old tool_call arguments and oversized message bodies using the static literal `...[truncated]`. Because that literal is identical at every emission site and always terminates the truncated string, a long session's context accumulates dozens of `string value → marker → close JSON` examples and the model pattern-completes the same shape onto NEW tool calls — `write_file`, `patch`, `terminal`, `execute_code` payloads shipped silently cut off mid-word, producing broken files and unterminated here-docs. The failure is self-propagating: measured on live `state.db` (2026-07-01..08-14), 1,507 fresh imitated calls across 151 sessions (terminal 881, write_file 291, execute_code 217, patch 207, skill_manage 48), and **84% were preceded by the model's own earlier imitation** rather than a fresh compressor rewrite. Disproved the competing hypothesis that payloads are truncated at the tool boundary: 3,019 fresh `write_file` calls parsed with **0** malformed arguments and a 105,084-char `content` was delivered intact, so pre-truncating a payload is never correct. Root cause is shape, not policy — the marker is a constant a model can reproduce. Fix replaces it with `_elision_marker(n)` embedding the exact omitted-character count, which a model composing a fresh payload cannot know, making the marker unreproducible by pattern completion and self-identifying as a compression artifact. Converted every emission site reaching main-model context: `context_compressor` (pass-3 tool_call args shrink, summarizer serialization for tool/assistant/user bodies, deterministic fallback turn, active-task line), `skill_preprocessing` inline-shell output, `trajectory_compressor` summary input, `delegate_tool` goal preview. `hermes_cli/auth.py` deliberately untouched — it renders CLI error text for a human terminal, not model context. JSON-validity contract from upstream `3128d9fcd2` (`_truncate_tool_call_args_json`, shrink inside the parsed structure so strict providers do not 400) is preserved and re-asserted by tests. Verified: 12 new tests + 141 passed across the three affected suites, plus a loop simulation confirming markers differ by payload size.
-- **commits:**
-  - `213c1f93b6` fix(compression): make elision markers non-imitable by the model
-- **touches:** `agent/context_compressor.py`, `agent/skill_preprocessing.py`, `trajectory_compressor.py`, `tools/delegate_tool.py`, `tests/agent/test_elision_marker_guard.py` (new), `tests/agent/test_context_compressor.py`, `tests/test_trajectory_compressor.py`
-- **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/elision-marker-imitation.md` for relocations/seams.
-- **v0.22.5-sync:** MERGED UPSTREAM (2026-10-30) — merged upstream: 77b9ea0831 "fix(agent): route every model-visible elision through the non-imitable compression marker (#121548)" + 262a6436fa/a7baa5f5eb (agent/compression_marker.py elide/elide_middle) — see reports/elision-marker-imitation.md; branch left at its pre-sync tip (`backup/sync-1030/patches/elision-marker-imitation`), not part of the production stack.
-- **v0.22.5-sync:** MERGED UPSTREAM (2026-10-30) — merged upstream: 77b9ea0831 "fix(agent): route every model-visible elision through the non-imitable compression marker (#121548)" + 262a6436fa/a7baa5f5eb (agent/compression_marker.py elide/elide_middle) — see reports/elision-marker-imitation.md; branch left at its pre-sync tip (`backup/sync-1030/patches/elision-marker-imitation`), not part of the production stack.
 
 
 ### 71. delegated-child-marker-latch
@@ -1159,37 +960,6 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/delegated-child-marker-latch.md` for relocations/seams.
 
 
-
-### 72. kanban-board-env-precedence
-- **branch:** `soju/patches/kanban-board-env-precedence`
-- **stacked-on:** _(none — applies directly on base; verified `git diff --stat base..production -- hermes_cli/kanban_db.py` empty before this patch)_
-- **origin:** `local-author` (implementation delegated to codex; design proposal by kanban goal worker t_231c8f71)
-- **upstream_pr:** _(none yet — upstream-eligible: file untouched by other fork patches)_
-- **state:** `merged-upstream`
-- **rationale:** `HERMES_KANBAN_DB` env pin outranked an explicit `board=` argument / `--board` flag in `hermes_cli/kanban_db.py` path resolution, so any process inheriting a worker's env silently wrote to the wrong board's DB while the CLI printed success. Observed live 2026-08-16: `notify-subscribe --board comm-improve` stored its subscription in the default board DB → task-completion notifications never delivered → owner fell back to manual polling (the exact scheduling-crank pattern the comm-improve track exists to remove). Same defect class hit `create`. Diagnostic key: sibling env `HERMES_KANBAN_BOARD` was correctly overridden by `--board`; only `HERMES_KANBAN_DB` had inverted precedence. Fix reorders resolution to explicit-arg → env pin → current-board pointer, preserving the dispatcher→worker handoff contract (argument-less calls still follow the env pin, so workers keep their own board). Verified: isolated repro matrix FAIL→PASS on the patch and FAIL re-confirmed on base; 3 worker-selfboard contracts PASS; kanban suites green with pre-existing failures reproduced on base.
-- **commits:**
-  - `6699af13a6` fix(kanban): honor explicit board over env pins
-- **touches:** `hermes_cli/kanban_db.py`, `tests/gateway/test_kanban_notifier.py`, `tests/gateway/test_kanban_notifier_apiserver_wake.py`, `tests/hermes_cli/test_kanban_boards.py`
-- **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/kanban-board-env-precedence.md` for relocations/seams.
-- **v0.22.5-sync:** MERGED UPSTREAM (2026-10-30) — merged upstream: d11edc0fa2 "fix(kanban): explicit board param trumps env pin (HERMES_KANBAN_DB)" + 53f1b970a5 + 387c78c8f7 (hermes_cli/kanban_db.py _explicit_board_slug / _explicit_board_intent_pinned fence); porting our unconditional precedence would drop upstream's worker-isolation fence — see reports/kanban-board-env-precedence.md. The #89 fold-in 455cb2715d (kanban test isolation) is moot with it.; branch left at its pre-sync tip (`backup/sync-1030/patches/kanban-board-env-precedence`), not part of the production stack.
-- **v0.22.5-sync:** MERGED UPSTREAM (2026-10-30) — merged upstream: d11edc0fa2 "fix(kanban): explicit board param trumps env pin (HERMES_KANBAN_DB)" + 53f1b970a5 + 387c78c8f7 (hermes_cli/kanban_db.py _explicit_board_slug / _explicit_board_intent_pinned fence); porting our unconditional precedence would drop upstream's worker-isolation fence — see reports/kanban-board-env-precedence.md. The #89 fold-in 455cb2715d (kanban test isolation) is moot with it.; branch left at its pre-sync tip (`backup/sync-1030/patches/kanban-board-env-precedence`), not part of the production stack.
-
-
-### 73. kanban-goal-judge-unavailable
-- **branch:** `soju/patches/kanban-goal-judge-unavailable`
-- **stacked-on:** _(none — applies directly on base; `hermes_cli/goals.py` untouched by other fork patches, merge-base verified `3c27eb6234`)_
-- **origin:** `local-author` (implemented by kanban goal worker t_126b9f1e per runtime-patches-scope §D)
-- **upstream_pr:** _(none yet — upstream-eligible)_
-- **state:** `merged-upstream`
-- **rationale:** `run_kanban_goal_loop` discarded the judge's `transport_failed` signal: with an unreachable/misconfigured judge the loop fed "continue" every turn until the goal-turn budget exhausted, then auto-blocked with a generic budget message. Observed live twice on 2026-08-17/18 (board comm-improve): 15/15 turns burned in 8 seconds, worker never ran a single tool call, block reason said "budget exhausted" instead of the actual cause (judge 401). The CLI `/goal` path already auto-pauses on judge transport failure — this patch brings the kanban goal path to parity: N consecutive judge transport failures (default 3, config `kanban.judge_failure_limit`) → `kanban_block` with typed reason `judge_unavailable`, preserving worker session state for resume instead of burning budget.
-- **commits:**
-  - `e390216241` fix(goals): block kanban goal-mode cards early when the judge is unreachable
-- **touches:** `hermes_cli/goals.py`, `tests/hermes_cli/test_kanban_goal_mode.py` (new)
-- **v2026.9.11-sync:** DONE — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/kanban-goal-judge-unavailable.md` for relocations/seams.
-- **v0.22.5-sync:** MERGED UPSTREAM (2026-10-30) — merged upstream: 242244bf68 "fix(kanban): stop goal loop on worker/judge failures (#91264)" + c15af4055e tests (hermes_cli/goals.py returns stopped/judge transport failure on the first judge transport failure) — see reports/kanban-goal-judge-unavailable.md; branch left at its pre-sync tip (`backup/sync-1030/patches/kanban-goal-judge-unavailable`), not part of the production stack.
-- **v0.22.5-sync:** MERGED UPSTREAM (2026-10-30) — merged upstream: 242244bf68 "fix(kanban): stop goal loop on worker/judge failures (#91264)" + c15af4055e tests (hermes_cli/goals.py returns stopped/judge transport failure on the first judge transport failure) — see reports/kanban-goal-judge-unavailable.md; branch left at its pre-sync tip (`backup/sync-1030/patches/kanban-goal-judge-unavailable`), not part of the production stack.
-
-
 ### 74. hygiene-diag-and-lock-offload
 - **branch:** `soju/patches/hygiene-diag-and-lock-offload`
 - **stacked-on:** `soju/patches/hygiene-noprogress-cooldown`
@@ -1204,7 +974,6 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 - **v2026.9.11-sync:** DONE — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/hygiene-diag-and-lock-offload.md` for relocations/seams.
 - **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/hygiene-diag-and-lock-offload.md` for relocations/seams.
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/hygiene-diag-and-lock-offload.md` for relocations/seams.
-
 
 
 ### 75. turn-exit-reason-tagging
@@ -1224,7 +993,6 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/turn-exit-reason-tagging.md` for relocations/seams.
 
 
-
 ### 76. clean-fork-soft-refusal-only
 - **branch:** `soju/patches/clean-fork-soft-refusal-only`
 - **stacked-on:** `soju/patches/turn-exit-reason-tagging` (2026-11-25 chronological tip stack)
@@ -1241,7 +1009,6 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/clean-fork-soft-refusal-only.md` for relocations/seams.
 
 
-
 ### 77. sync-20260819-test-seams
 - **branch:** `soju/patches/sync-20260819-test-seams`
 - **stacked-on:** `soju/patches/runtime-control`
@@ -1255,7 +1022,6 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 - **v2026.9.11-sync:** DONE — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/sync-20260819-test-seams.md` for relocations/seams.
 - **v0.22.5-sync:** DONE — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/sync-20260819-test-seams.md` for relocations/seams.
 - **v0.23.4-sync:** DONE — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/sync-20260819-test-seams.md` for relocations/seams.
-
 
 
 ### 78. base-persona
@@ -1274,7 +1040,6 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 - **v0.23.4-sync:** DONE — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/base-persona.md` for relocations/seams.
 
 
-
 ### 79. gemini-classifier-thinking-compat
 - **branch:** `soju/patches/gemini-classifier-thinking-compat`
 - **stacked-on:** `soju/patches/base-persona` (2026-11-25 chronological tip stack)
@@ -1289,7 +1054,6 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 - **v2026.9.11-sync:** DONE — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/gemini-classifier-thinking-compat.md` for relocations/seams.
 - **v0.22.5-sync:** DONE — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/gemini-classifier-thinking-compat.md` for relocations/seams.
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/gemini-classifier-thinking-compat.md` for relocations/seams.
-
 
 
 ### 80. reasoning-route-wire
@@ -1310,40 +1074,12 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/reasoning-route-wire.md` for relocations/seams.
 
 
-
-### 81. precompress-checkpoint-signal
-- **branch:** `soju/patches/precompress-checkpoint-signal`
-- **stacked-on:** _(none — applies directly on base `b742be711a15aad543a871d2d3022277b70dc551`; fork changes in `MemoryManager.on_pre_compress` only add `_mirror_boundary(...)` 19 lines above the provider call, while the v2 detection, message selection, call, and exception policy retain upstream provenance)_
-- **origin:** `local-author`
-- **upstream_pr:** [NousResearch/hermes-agent#97063](https://github.com/NousResearch/hermes-agent/pull/97063)
-- **state:** `merged-upstream`
-- **rationale:** `MemoryManager.on_pre_compress()` detected checkpoint API v2 providers and selected normalized evidence correctly, but called them without `require_checkpoint`; providers therefore stayed in their default best-effort mode, swallowed durable-write failures, and let required compression proceed as a false success. Forward the flag only to providers advertising the requested checkpoint API version, preserving the strict one-argument `on_pre_compress(self, messages)` contract for bundled and third-party v1 providers. Regression probes cover required/best-effort v2 signaling, legacy signature compatibility, and required-mode failure propagation.
-- **commits:**
-  - `721c2db6286f7a6c9f0398bea34fd829f49498ff` fix(memory): forward checkpoint requirement to v2 providers`
-- **touches:** `agent/memory_manager.py`, `tests/agent/test_pre_compress_checkpoint_contract.py`
-- **v2026.9.11-sync:** DROPPED — merged upstream: git cherry TARGET shows '-' for 721c2db628; branch left at its pre-sync tip (`backup/sync-0914/patches/precompress-checkpoint-signal`), not part of the production stack.
-
-
-### 82. conversation-started-date-stable
-- **branch:** `soju/patches/conversation-started-date-stable`
-- **stacked-on:** _(none — applies directly on base `b742be711a15aad543a871d2d3022277b70dc551`; `agent/system_prompt.py` is also touched by sibling patches (runtime-route prefix, base-persona) but in disjoint regions — new helpers land after `_append_tui_embedded_clarifier`, the render-site edit replaces only the `timestamp_line` f-string, and `invalidate_system_prompt` gains a capture block above its existing body)_
-- **origin:** `local-author`
-- **upstream_pr:** none — **do not file.** Upstream independently fixed this on 2026-08-29, one day before this patch: `11b98a1429` (#97930, two-line conversation clock salvaging #96224) derives the date deterministically from the session id's embedded `YYYYMMDD_HHMMSS` stamp via `_session_start_like`, walking to the lineage root (`get_conversation_root`) so compaction rotation keeps the original birth date; `514707ff3e` (#98426) pairs it with always-rebuild-at-commit-boundary. A PR would be closed `implemented_on_main`. (Discovered at PR-prep time, 2026-08-30 — grep upstream/main before filing, per hermes-fork-new-patch.md.)
-- **state:** `merged-upstream` — **drop at next base bump**: any base containing `11b98a1429` supersedes this patch (identical symptom, upstream's session-id-derived approach preferred over this patch's memo+stored-prompt recovery). Expect the rebase to surface a conflict in `agent/system_prompt.py`'s timestamp block; resolve by taking upstream wholesale and deleting this patch's helpers + test file.
-- **rationale:** `build_system_prompt` re-rendered `Conversation started:` from `now()` on every rebuild (compaction boundary, restore without a stored prompt), so a long-lived session's prompt claimed it began today — live `state.db` showed a session started Aug 26 carrying `Conversation started: Sunday, August 30` after its Aug 30 compaction. Factually wrong for the model and a pure prefix-cache loss. Freeze the rendered value per session: session-scoped `(session_id, value)` memo on the agent, seeded by `invalidate_system_prompt` from the prompt it discards (compaction path) or recovered from stored prompt bytes on restore (last matching line, shape-validated so quoted lookalikes in project context/memory are never adopted); only a genuinely new session renders `now()`. No DB read on the build path (`test_fresh_build_when_no_history` pins that contract). Unit + full-build integration tests (real `AIAgent`, patched `hermes_time.now`).
-- **commits:**
-  - `aa826025cb87e4838bcb9de4c706398853d5f28b` fix(prompt): freeze Conversation started date to the session's first build
-- **touches:** `agent/system_prompt.py`, `tests/agent/test_conversation_started_freeze.py` (new)
-- **v0.22.5-sync:** MERGED UPSTREAM (2026-10-30) — superseded upstream by 11b98a1429 (two-line conversation clock), ancestor of TARGET — manifest-annotated drop; branch left at its pre-sync tip (`backup/sync-1030/patches/conversation-started-date-stable`), not part of the production stack.
-- **v0.22.5-sync:** MERGED UPSTREAM (2026-10-30) — superseded upstream by 11b98a1429 (two-line conversation clock), ancestor of TARGET — manifest-annotated drop; branch left at its pre-sync tip (`backup/sync-1030/patches/conversation-started-date-stable`), not part of the production stack.
-
-
 ### 83. todo-continuity-parity
 - **branch:** `soju/patches/todo-continuity-parity`
 - **stacked-on:** `soju/patches/reasoning-route-wire` (2026-11-25 chronological tip stack)
 - **origin:** `local-author`
 - **upstream_pr:** none — upstreamable (generic harness gap, no fork-only deps); file after live-session soak
-- **state:** `pending-upstream`
+- **state:** `local-only`
 - **rationale:** Same-model (fable-5) sessions lose their todo plan mid-session while Claude Code drives its plan to completion. Root cause measured in CC v2.1.226: (1) a `todo_reminder` attachment re-surfaces the todo list every N turns (`TURNS_SINCE_WRITE: 10, TURNS_BETWEEN_REMINDERS: 10`) — Hermes re-injected todos only at compression boundaries, so plans silently aged out of attention (measured: 64% of recent gateway sessions never tracked todos; 14% of todo sessions ended with unfinished pending/in_progress items); (2) CC's TodoWrite result carries a continuation nudge ("Please proceed with the current tasks if applicable") — Hermes returned bare JSON; (3) CC's system prompt carries end-to-end approval-scope + last-paragraph completion guidance — TASK_COMPLETION_GUIDANCE had neither. Fix: periodic reminder through the cache-safe tool-tail channel (same as /steer + run-budget wrap-up; counters on the agent, zeroed by the todo handler in both dispatch paths), CC's verbatim continuation message in a new `message` field of write results (reads stay message-free; hydration json.loads contract preserved), CC TodoWrite description adapted onto the todo schema (+ optional `active_form`/`activeForm` item label), and CC's scope/completion paragraphs appended to TASK_COMPLETION_GUIDANCE verbatim.
 - **commits:**
   - `e357eb2a2a` feat(agent): Claude Code todo-continuity parity — periodic reminder, continuation nudge, end-to-end scope guidance
@@ -1356,26 +1092,12 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/todo-continuity-parity.md` for relocations/seams.
 
 
-
-### 84. lean-single-aux-call
-- **branch:** `soju/patches/lean-single-aux-call`
-- **stacked-on:** `soju/patches/todo-continuity-parity` (chronological tip stack; file overlap with #51/#60/#70 in `agent/context_compressor.py` — verified their load-bearing symbols survive: `_LEAN_USER_MESSAGES_HEADING`, `_truncate_tool_call_args_json`)
-- **origin:** `cherry-pick:4f22543509d1b91dc45bcb369447126c5eb14fb7`
-- **upstream_pr:** 98628 (merged upstream 2026-09, ahead of our base) — **do not file.** Auto-drops at the next base bump: any base containing `4f22543509` supersedes this patch
-- **state:** `merged-upstream`
-- **rationale:** Lean-mode compaction's `_build_chunk_digests()` issued up to `_LEAN_DIGEST_MAX_CHUNKS=28` strictly sequential auxiliary LLM calls per compaction attempt (one per 72K-char chunk). Measured live 2026-09-04: 800k-token sessions took 956-1440s to compact and were fence-cancelled at the 600s ceiling (`commit_fence_cancelled`), then re-attempted every turn. Upstream hit the same symptom (#96603 "Summarizing Thread extremely slow", 7-11 min stalls) and fixed it by deleting the digest loop: the detailed identifier-preserving session log is folded into the ONE main summary request, oversized regions are evenly sampled with an exact-count elision marker. Cherry-pick resolution: kept the fork-base compressor around upstream-only summary-route pinning (not imported); docs retain this fork's `tail_mode: legacy` default while describing the single-call lean path; `tests/agent/test_compression_attempt_ownership.py` (upstream attempt-ownership subsystem absent at our base) replaced with a symbol-removal guard. `ed3562bbbc` (moot digest tests) not taken — its only path was fork-base-missing. Verified no regression: broad `-k "compress or compaction or lean"` selector fails the same 81 tests on base and on this tip (all `tools/daemon_pool.py` Python 3.14 `ThreadPoolExecutor._initializer` pre-existing + 1 LSP kill-guard), 0 new failures.
-- **commits:**
-  - `f5c64fefab` fix(compression): lean compaction makes exactly one auxiliary request per attempt
-- **touches:** `agent/context_compressor.py`, `tests/agent/test_compression_attempt_ownership.py`, `tests/agent/test_lean_single_aux_call.py` (new), `evals/compaction/runner.py`, `evals/compaction/results/SCORECARD-2026-08-15.md`, `website/docs/developer-guide/context-compression-and-caching.md`, `website/docs/user-guide/configuration.md`
-- **v2026.9.11-sync:** DROPPED — merged upstream: 4f22543509 (Upstream-PR 98628) is an ancestor of v2026.9.11; residue was fork-base-only (S3 report); branch left at its pre-sync tip (`backup/sync-0914/patches/lean-single-aux-call`), not part of the production stack.
-
-
 ### 85. aux-anthropic-mode-max-tokens
 - **branch:** `soju/patches/aux-anthropic-mode-max-tokens`
 - **stacked-on:** `soju/patches/todo-continuity-parity` (2026-11-25 chronological tip stack)
 - **origin:** `local-author`
 - **upstream_pr:** none — upstreamable (generic gate mismatch, no fork-only deps). File after live soak; see rationale for the related open upstream issue and the four rejected blanket-forward PRs that bound how narrow the upstream PR must stay
-- **state:** `pending-upstream`
+- **state:** `local-only`
 - **rationale:** Related upstream context: open issue 60388 (`max_tokens` settings silently dropped); four blanket "forward caps to all providers" PRs (60454/60513/60620/60645) were closed unmerged, so any upstream PR must honor the declared `api_mode` as one more anthropic-compat signal and nothing broader. Defect: `_build_call_kwargs()` forwarded an explicit auxiliary `max_tokens` only when the endpoint was detected as anthropic-compatible by provider name (`minimax*`) or a `/anthropic` URL path. A config-declared provider with `api_mode: anthropic_messages` and a plain-host `base_url` (our `claude-lb` at `http://10.8.0.3:2455`) matched neither, so the cap was dropped and `AnthropicAuxiliaryClient.create()` → `build_anthropic_kwargs()` substituted the model's default output ceiling (`_ANTHROPIC_DEFAULT_OUTPUT_LIMIT = 128_000`). Transport selection (`_maybe_wrap_anthropic`) already honored `api_mode == "anthropic_messages"`; cap forwarding used a narrower gate. Measured live 2026-09-04 via claude-lb `debug_artifacts`: compressor requested `max_tokens=1400` per digest, proxy captured `max_tokens: 128000` on the wire; 77/77 compression calls exceeded the cap (avg 6,844 out, max 22,863) and latency was linear in output tokens (13.17 ms/tok, R²=0.961) — ~80% of compaction wall time. Fix: `_build_call_kwargs(..., api_mode=None)` + `or api_mode == "anthropic_messages"` in the cap gate; all 8 call sites (sync/async primary, same-provider retry, fallback, refreshed fallback) thread the resolved/destination api_mode. `max_tokens=None` behavior unchanged; `_ANTHROPIC_COMPAT_PROVIDERS`/`_is_anthropic_compat_endpoint`/adapter default fallback untouched.
 - **commits:**
   - `30090d7e53` fix(auxiliary): forward explicit max_tokens when api_mode is anthropic_messages
@@ -1386,12 +1108,11 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/aux-anthropic-mode-max-tokens.md` for relocations/seams.
 
 
-
 ### 86. session-store-lock-offload
 - **branch:** `soju/patches/session-store-lock-offload`
 - **stacked-on:** `soju/patches/aux-anthropic-mode-max-tokens` (2026-11-25 chronological tip stack)
 - **origin:** `local-author`
-- **upstream_pr:** none — upstreamable in principle (upstream `gateway/session_persistence.py` still runs the UPSERT under `_lock` when `lock_held=True`; probed 2026-09-14 on upstream main: a 1000 ms persistence write blocked `get_model_override` for 855 ms), but the fork version depends on `begin_active_turn` from #21. File after porting to the mixin split.
+- **upstream_pr:** none — upstreamable in principle (upstream `gateway/session_persistence.py` still runs the UPSERT under `_lock` when `lock_held=True`; probed 2026-09-14 on upstream main: a 1000 ms persistence write blocked `get_model_override` for 855 ms), but the fork version depends on `begin_active_turn` from #27 durable-turns. File after porting to the mixin split.
 - **state:** `local-only`
 - **rationale:** Same defect class as the 2026-07-28/29 gateway outages (event loop stalled behind SQLite held under a store lock). `SessionStore._save_entry(lock_held=True)` and `_save()` ran the SQLite UPSERT / full `sessions.json` rewrite + fsync while the caller still held the store-wide non-reentrant `_lock`, so every reader on the event loop waited for the write. Fix: capture the serialized entry + revision under `_lock`, persist under `_save_lock` only (`_capture_entry_save_locked` / `_persist_entry_save_locked` / `_persist_routing_data_save_locked`); `mark_turn_active`/`begin_active_turn` take `_save_lock` outermost, release `_lock` around the durable write and repair the row if the live entry was structurally replaced meanwhile; metadata/override/suspend writers use `_save_entry` after releasing the lock; `lock_held=True` on `_save_entry` is now a hard error; `_save(lock_held=True)` survives only for the startup stale-prune path (releases/re-acquires around I/O). Measured on the assembled stack: reader blocked 857 ms → 1 ms during a 1000 ms write. Provenance: written in the live production tree by another session on 2026-08-31 (preserved as `~/work/hermes-cc-parity/live-tree-wip-session-store-20260831.patch`), re-applied after the 2026-09-04 rebuild, running in both gateways since 2026-09-04 10:14 UTC; promoted from uncommitted WIP to this topic on 2026-09-14. `tests/gateway` on the topic tree: only pre-existing `test_health_detailed_returns_ok` (`degraded`, environment) fails; it fails identically on the WIP-free tree.
 - **commits:**
@@ -1400,58 +1121,6 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 - **v2026.9.11-sync:** DONE-WITH-NOTES — rebuilt 2026-09-14 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20260914/reports/session-store-lock-offload.md` for relocations/seams.
 - **v0.22.5-sync:** DONE-WITH-NOTES — rebuilt 2026-10-30 by cherry-pick onto the new base; see `~/work/hermes/upstream-sync-20261030/reports/session-store-lock-offload.md` for relocations/seams.
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/session-store-lock-offload.md` for relocations/seams.
-
-
-
-### 87. sync-20260914-test-seams
-- **branch:** `soju/patches/sync-20260914-test-seams`
-- **stacked-on:** `soju/patches/session-store-lock-offload` (2026-09-14 chronological tip stack — this is the tip of the whole production stack)
-- **origin:** `local-author`
-- **upstream_pr:** none — test-only re-seaming of upstream tests to fork gates; nothing to upstream
-- **state:** `merged-upstream`
-- **rationale:** Upstream v2026.9.11 tests that collide with fork behaviour on the assembled stack, adjusted without touching code under test: five upstream tests call `memory add/replace` without the fork's mandatory `reason` (#2 memory-write-reason-gate) — `test_background_review_memory_scope`, `test_builtin_memory_disabled_surface`, `test_skip_memory_store_65429`; `TestSystemdCgroupIsolation` in `test_process_registry.py` pins the exact spawn argv while stubbing `shutil.which` for every name, so the fork's nice(1) prefix (#48 event-loop-db-isolation) leaked into the expected argv — autouse fixture makes `_nice_argv` the identity inside that class. Companion to #77 (2026-08-19 seams) which gained the prompt-cache static-prefix re-seam in this sync.
-- **commits:**
-  - `80bcb3a05d7d` test: re-seam upstream tests to fork gates (2026-09-14 sync)
-- **touches:** `tests/agent/test_background_review_memory_scope.py`, `tests/agent/test_builtin_memory_disabled_surface.py`, `tests/agent/test_skip_memory_store_65429.py`, `tests/tools/test_process_registry.py`
-- **v2026.9.11-sync:** NEW — created 2026-09-14.
-- **v0.22.5-sync:** DROPPED (2026-10-30) — DROPPED (duplicate): its single seam commit 80bcb3a05d is already carried by #2 (8db5914255) and #48 (b5279de582) ports — see reports/sync-20260914-test-seams.md; branch left at its pre-sync tip (`backup/sync-1030/patches/sync-20260914-test-seams`), not part of the production stack.
-- **v0.22.5-sync:** DROPPED (2026-10-30) — DROPPED (duplicate): its single seam commit 80bcb3a05d is already carried by #2 (8db5914255) and #48 (b5279de582) ports — see reports/sync-20260914-test-seams.md; branch left at its pre-sync tip (`backup/sync-1030/patches/sync-20260914-test-seams`), not part of the production stack.
-
-
-### 88. sync-20260914-fixups
-- **branch:** `soju/patches/sync-20260914-fixups`
-- **stacked-on:** `soju/patches/sync-20260914-test-seams` (2026-09-14 chronological tip stack)
-- **origin:** `local-author`
-- **upstream_pr:** none
-- **state:** `merged-upstream`
-- **rationale:** Post-sync regression fixups found by the full-suite comparison against pristine v2026.9.11 (66 tests failing only on the stack). Code fixes, each annotated with its OWNER TOPIC to be folded in at the next base bump: `_maybe_inject_todo_reminder` only acts on real int counters (#83); `gateway/model_router.py` read_text encoding (#34); display-wiring hooks `_consume_pending_runtime_route_state` / `_consume_refusal_recall_quarantine` read via getattr and `_make_runtime_update_callback` made a staticmethod so upstream's SimpleNamespace runner doubles work (#1/#8/#58); `turn_trace_obj` read via getattr in the queued follow-up path (#15); named `providers.<name>` entries restored to upstream's `provider="custom"` + `requested_provider=<slug>` identity contract — `hermes_cli/runtime_provider_custom.py` is byte-identical to upstream again (#1, drop the 7d690a provider_label hunk at the next bump). Test seams (fork behaviour intentional): auxiliary wire strips `reasoning` (#12); durable `no_progress` cooldown accepted by the rotation-state test (#61); shutdown-drain spy accepts `kill_all(exclude_durable=True)` (#62). Details: `~/work/hermes/upstream-sync-20260914/reports/sync-20260914-fixups.md`.
-- **commits:**
-  - `c18916d4cc` fix(agent): todo reminder only acts on integer loop counters
-  - `bd24a67465` fix(gateway): model_router .env read passes encoding=utf-8
-  - `6df65201c6` fix(gateway): turn wiring tolerates bare runner doubles for fork hooks
-  - `20af1512b1` fix(gateway): queued follow-up reads turn_trace_obj via getattr
-  - `69481b4788` test(agent): re-seam auxiliary wire test to the fork's reasoning strip
-  - `22edad0a3f` test(agent): stale-cooldown test allows the fork's durable no-progress cooldown
-  - `f5766a017b` test(gateway): settle-window kill_all spy accepts exclude_durable kwarg
-  - `1963690e9f` fix(runtime): named custom providers resolve with provider='custom' again
-- **v2026.9.11-sync:** NEW — created 2026-09-14.
-- **v0.22.5-sync:** DROPPED (2026-10-30) — DROPPED (folded): all 8 fixups folded into their owner topics (#1, #8, #12 moot, #15, #34, #61, #62 moot, #83) — matrix in notes/fold-in-status.md and reports/sync-20260914-fixups.md; branch left at its pre-sync tip (`backup/sync-1030/patches/sync-20260914-fixups`), not part of the production stack.
-- **v0.22.5-sync:** DROPPED (2026-10-30) — DROPPED (folded): all 8 fixups folded into their owner topics (#1, #8, #12 moot, #15, #34, #61, #62 moot, #83) — matrix in notes/fold-in-status.md and reports/sync-20260914-fixups.md; branch left at its pre-sync tip (`backup/sync-1030/patches/sync-20260914-fixups`), not part of the production stack.
-
-
-### 89. sync-20260914-kanban-seams
-- **branch:** `soju/patches/sync-20260914-kanban-seams`
-- **stacked-on:** `soju/patches/sync-20260914-fixups` (2026-09-14 chronological tip stack — tip of the whole production stack)
-- **origin:** `local-author`
-- **upstream_pr:** none — test-only
-- **state:** `merged-upstream`
-- **rationale:** (1) 15 upstream kanban notifier/wake tests isolated their DB purely via the `HERMES_KANBAN_DB` pin; with #72 (explicit board beats the pin) and upstream's notifier now opening boards explicitly they read the real default board. Shared helper `tests/gateway/_kanban_isolation.py::init_isolated_kanban` (same pattern as #72's own seam) applied to 16 pin sites in 5 files; no assertion weakened. Production sets no `HERMES_KANBAN_DB`. (2) ~35 `tests/hermes_cli/test_update_*` tests failed only under xdist on the stack: five upstream tests force fresh imports via `del sys.modules[...]` without restoring, so later tests patched stale module objects and `hermes update` ran un-mocked — **which is what fast-forwarded `main` to upstream and ran real `git checkout main` / `pull --ff-only upstream main` inside a scratch worktree on 2026-09-14 12:43 UTC**. Fixed with `tests/hermes_cli/conftest.py::evict_modules` (restores both the `sys.modules` entry and the parent-package attribute). Details: `~/work/hermes/upstream-sync-20260914/reports/sync-20260914-kanban-seams.md`.
-- **commits:**
-  - `455cb2715d` test(kanban): isolate notifier tests via HERMES_KANBAN_HOME, not the DB pin
-  - `21729888fb` test(hermes_cli): restore evicted modules after fresh-import fixtures
-- **v2026.9.11-sync:** NEW — created 2026-09-14.
-- **v0.22.5-sync:** DROPPED (2026-10-30) — DROPPED (moot): 455cb2715d moot after #72 was dropped; 21729888fb moot under upstream's per-file subprocess runner (polluters deleted/rewritten) — reports/sync-20260914-kanban-seams.md; branch left at its pre-sync tip (`backup/sync-1030/patches/sync-20260914-kanban-seams`), not part of the production stack.
-- **v0.22.5-sync:** DROPPED (2026-10-30) — DROPPED (moot): 455cb2715d moot after #72 was dropped; 21729888fb moot under upstream's per-file subprocess runner (polluters deleted/rewritten) — reports/sync-20260914-kanban-seams.md; branch left at its pre-sync tip (`backup/sync-1030/patches/sync-20260914-kanban-seams`), not part of the production stack.
 
 
 ### 90. slack-stale-reconnect-task
@@ -1468,50 +1137,6 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 - **v0.23.4-sync:** DONE — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/slack-stale-reconnect-task.md` for relocations/seams.
 
 
-
-### 91. startup-integrity-check-offload
-- **branch:** `soju/patches/startup-integrity-check-offload`
-- **stacked-on:** `soju/patches/slack-stale-reconnect-task` (chronological tip stack)
-- **origin:** `local-author`
-- **upstream_pr:** none
-- **state:** `merged-upstream`
-- **rationale:** After an unclean exit, `record_startup()` reached `_report_unclean_exit` and `check_state_db_integrity()`, which ran `PRAGMA quick_check(1)` synchronously on the event-loop thread against the 11 GB `state.db` (537 s loop stall on 2026-10-19 01:00, 429.6 s on 09-29). The gateway start path now calls `record_startup(background_integrity_check=True)`: exit-diag records `state_db_integrity: "pending"` and a daemon thread runs the check, then writes a separate `gateway.previous_unclean_exit.state_db_integrity` record (verdict, elapsed_s) and the same ERROR on corruption. Direct callers keep the synchronous default. The source branch was named fix/startup-migration-check; the cause is the integrity check, not `state_db_data_migrations`. Deployed to live 2026-10-19 by cherry-pick (65c63b0e1d, from 2df3fdc3b4). Details: `~/work/vooy/claw-migration-2026-10-05/observe/2026-10-19-hermes-followups.md` section 2.
-- **commits:**
-  - `d703b507f3` fix(gateway): run the post-unclean-exit state.db quick_check off the startup path
-- **touches:** `gateway/lifecycle_ledger.py`, `gateway/run.py`, `tests/gateway/test_lifecycle_state_db_check.py`
-- **v0.22.5-sync:** MERGED UPSTREAM (2026-10-30) — merged upstream: ac90478e08 "fix(gateway): defer the unclean-exit state.db integrity scan off the startup path" + 2fe81e7879 + 8f0367c8ec — reports/startup-integrity-check-offload.md; branch left at its pre-sync tip (`backup/sync-1030/patches/startup-integrity-check-offload`), not part of the production stack.
-- **v0.22.5-sync:** MERGED UPSTREAM (2026-10-30) — merged upstream: ac90478e08 "fix(gateway): defer the unclean-exit state.db integrity scan off the startup path" + 2fe81e7879 + 8f0367c8ec — reports/startup-integrity-check-offload.md; branch left at its pre-sync tip (`backup/sync-1030/patches/startup-integrity-check-offload`), not part of the production stack.
-
-
-### 92. cron-fire-fence-heartbeat
-- **branch:** `soju/patches/cron-fire-fence-heartbeat`
-- **stacked-on:** `soju/patches/startup-integrity-check-offload` (chronological tip stack; tip of the whole production stack)
-- **origin:** `local-author`
-- **upstream_pr:** none
-- **state:** `merged-upstream`
-- **rationale:** The restart-safe cron worker holds the job's fire fence (in-process RLock plus flock) through result delivery by design. The worker's 60 s claim-heartbeat thread waited up to 30 s (`_JOBS_LOCK_TIMEOUT_SECONDS`) on that fence, got the fail-closed False and read it as ownership loss, so runs whose delivery took longer than about 30 s were recorded `error: "Interrupted by shutdown before terminal completion."` although they were delivered (storage-janitor 2026-10-18, clb-renewal-watch 2026-10-19). Fix: `heartbeat_fire_claim(..., raise_if_fence_unavailable=False)`; only the heartbeat loop opts in and treats `FireFenceUnavailable` as an unverified tick inside the 180 s grace. A real takeover (fence acquired, different owner) is still immediate loss, and other callers keep the fail-closed False. Deployed to live 2026-10-19 by cherry-pick (b9de701076, from 51f589b2c3). Details: `~/work/vooy/claw-migration-2026-10-05/observe/2026-10-19-hermes-followups.md` section 3.
-- **commits:**
-  - `d8d3910461` fix(cron): a fire-fence timeout in the claim heartbeat is "unverified", not ownership loss
-- **touches:** `cron/jobs.py`, `cron/scheduler.py`, `tests/cron/test_script_claim_heartbeat.py`
-- **v0.22.5-sync:** MERGED UPSTREAM (2026-10-30) — merged upstream: 87b013b21e "fix(cron): do not hold fire fence during heartbeat save_jobs" + 9a60a7f316 + eafed27cf0 — reports/cron-fire-fence-heartbeat.md; branch left at its pre-sync tip (`backup/sync-1030/patches/cron-fire-fence-heartbeat`), not part of the production stack.
-- **v0.22.5-sync:** MERGED UPSTREAM (2026-10-30) — merged upstream: 87b013b21e "fix(cron): do not hold fire fence during heartbeat save_jobs" + 9a60a7f316 + eafed27cf0 — reports/cron-fire-fence-heartbeat.md; branch left at its pre-sync tip (`backup/sync-1030/patches/cron-fire-fence-heartbeat`), not part of the production stack.
-
-
-### 93. sync-20261030-test-seams — DROPPED (2026-11-25)
-- **branch:** `soju/patches/sync-20261030-test-seams`
-- **stacked-on:** `soju/patches/slack-stale-reconnect-task` (2026-10-30 chronological tip stack; #94 is stacked on it since 2026-11-25)
-- **origin:** `local-author`
-- **upstream_pr:** _(none — generated fixtures and test seams for fork gates)_
-- **state:** `merged-upstream`
-- **rationale:** Stack-level re-render of upstream's generated test fixtures that any fork tool-schema or prompt change invalidates (ADR-004 rule 3: test-only re-seaming lives in a dated tip topic): the prompt-surface snapshot (`tests/fixtures/prompt_surface/**`, now carrying `model_status`/`model_switch` (#1), memory `reason` (#2), `notes_*` and `memory_propose` (#38), skill_manage `reason` (#44), todo guidance (#83)), the Discord conformance vectors (`tests/conformance/vectors/discord.json`, fenced box tables from #4), the skill-gate classifier-core pin (`tests/fixtures/skill_gate_classifier_core.json`, #34's parity snapshot regenerated at the tip because #46/#56/#58/#59/#76 edit the classifier core), and `scripts/ci/docs_drift_baseline.json` entries for the deliberately undocumented fork keys `agent.gateway_turn_resume`, `agent.turn_resume_max` (#27) and `delegation.default_route` (#34). Regenerate at the stack tip and amend whenever a topic below changes a tool schema or prompt text.
-- **commits:**
-  - `9676072162` test: re-render generated fixtures and re-seam upstream tests to fork gates (2026-10-30 sync)
-- **touches:** `scripts/ci/docs_drift_baseline.json`, `tests/conformance/vectors/discord.json`, `tests/fixtures/prompt_surface/surfaces.json`, `tests/fixtures/prompt_surface/tools/*.json`, `tests/fixtures/skill_gate_classifier_core.json`
-- **v0.22.5-sync:** DONE-WITH-NOTES — created 2026-10-30; see `~/work/hermes/upstream-sync-20261030/reports/sync-20261030-test-seams.md`.
-- **v0.23.4-sync:** DROPPED (2026-11-25) — superseded by #95 `sync-20261125-test-seams`: its single commit 9676072162 only re-rendered generated fixtures (prompt surface, Discord conformance vectors, skill-gate classifier-core pin) and added docs-drift baseline entries for fork keys; #95 re-renders the same artifacts over the v0.23.4 stack and carries the three docs-drift keys forward (`~/work/hermes/upstream-sync-20261125/reports/sync-20261030-test-seams.md`); branch left at its pre-sync tip (`backup/sync-1125/patches/sync-20261030-test-seams`), not part of the production stack.
-
-
-
 ### 94. summary-empty-finish-reason
 - **branch:** `soju/patches/summary-empty-finish-reason`
 - **stacked-on:** `soju/patches/slack-stale-reconnect-task` (2026-11-25 chronological tip stack; #93 dropped; #97 is stacked on it since 2026-11-26)
@@ -1524,7 +1149,6 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 - **touches:** `agent/auxiliary_client.py`, `agent/context_compressor.py`, `tests/agent/test_summary_empty_content_diagnostics.py`
 - **v0.22.5-sync:** DONE — added 2026-11-25 by `cherry-pick -x 8b6c867785` onto `soju/patches/sync-20261030-test-seams` (9676072162); applied clean, both hunks still land in the owning modules at v0.22.5 (`_call_summary_llm` in `agent/context_compressor.py`, `_AnthropicCompletionsAdapter` in `agent/auxiliary_client.py`); no prompt/tool-schema change, so #93's generated fixtures stay valid. Record: `~/work/hermes/update-20261125/PREP-REPORT.md` § 3.
 - **v0.23.4-sync:** DONE-WITH-NOTES — rebuilt 2026-11-25 by cherry-pick onto v0.23.4; see `~/work/hermes/upstream-sync-20261125/reports/summary-empty-finish-reason.md` for relocations/seams.
-
 
 
 ### 95. sync-20261125-test-seams
@@ -1541,7 +1165,6 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 - **2026-11-26:** re-stacked onto #97 by `cherry-pick` of a9e3fe8fba (same patch-id, applied clean; backup `backup/topics-1126/soju/patches/sync-20261125-test-seams`). #96 and #97 change no prompt surface, Discord renderer, classifier core or config key, so no fixture was re-rendered (`~/work/hermes/hotfix-topics-20261126/REPORT.md`).
 
 
-
 ### 96. external-install-service-launcher
 - **branch:** `soju/patches/external-install-service-launcher`
 - **stacked-on:** _(none — independent topic rooted on base v0.23.4; touches no fork code)_
@@ -1553,7 +1176,6 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
   - `e79156cc34` fix(launchers): an external tree's services and detached children run its own venv, never PM's store Python
 - **touches:** `hermes_cli/_launchers.py`, `hermes_cli/gateway.py`, `tests/hermes_cli/test_external_service_unit.py`, `tests/hermes_cli/test_source_launcher_publication.py`
 - **v0.23.4-sync:** DONE — created 2026-11-26 on v0.23.4 (`~/work/hermes/hotfix-topics-20261126/REPORT.md`).
-
 
 
 ### 97. review-fork-checkpoint-warning
@@ -1568,6 +1190,46 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 - **touches:** `agent/agent_init.py`, `agent/background_review.py`, `agent/conversation_compression.py`, `agent/conversation_compression_checkpoint.py`, `agent/ingest_curator.py`, `run_agent.py`, `tests/agent/test_pre_compress_checkpoint_contract.py`
 - **v0.23.4-sync:** DONE — created 2026-11-26 on the v0.23.4 tip stack (`~/work/hermes/hotfix-topics-20261126/REPORT.md`).
 
+
+## Retired entries (numbers are never reused)
+
+Old tips: `/mnt/garbage/backups-claw-20261126/hermes-fork-refs.bundle` (branch `soju/patches/<name>`, or tag `archive/...` / `backup/sync-*/patches/<name>` as named). Full former sections: `git show backup/sync-1125/fork-policy:PATCHES.md`.
+
+| # | name | retired | how | evidence |
+|---|---|---|---|---|
+| 5 | delegate-per-task-model | 2026-07-16 | superseded | #34 Phase 3a route-enum delegation `ffee9ea3c` (tip in the bundle) |
+| 9 | lsp-idle-reaper | 2026-08-04 | merged upstream | PR #74058 (tip in the bundle) |
+| 10 | aux-runtime-context | 2026-07-22 | merged upstream | upstream `fdc6c32d7`/`73057ed16`/`c201b72f3` ContextVar `_RUNTIME_MAIN_CONTEXT` with per-turn Token scoping, a superset of the `threading.local` fix (tip in the bundle) |
+| 11 | gateway-max-iterations-config-authority | 2026-08-04 | merged upstream | v2026.8.3 reloads and re-bridges `agent.max_turns` per turn (tip in the bundle) |
+| 16 | tool-delay-removal | 2026-08-04 | merged upstream | `ce9f6712f` via PR #64172 (tip in the bundle) |
+| 17 | prompt-cache-stability | 2026-07-22 | merged upstream | upstreamed by the fork author as `7b3dcee92` (api_content sidecar), follow-ups `39efad89a`/`c7035ef25` (tip in the bundle) |
+| 19 | request-client-reuse | 2026-08-04 | merged upstream | `82e2c9ce4` via PR #73375 (tip in the bundle) |
+| 20 | async-token-accounting | 2026-08-04 | merged upstream | PR #73359 (tip in the bundle) |
+| 21 | gateway-persist-trim | 2026-08-04 | merged upstream | salvaged as `54eafee30` via PR #76916 (tip in the bundle) |
+| 22 | gateway-worker-pool | 2026-10-30 | merged upstream | `24758cf4b8` + `fb992c84bc` (unbounded turn-body executor); re-adding a finite cap would weaken upstream's fix (tip in the bundle) |
+| 24 | background-first-waits | 2026-10-30 | merged upstream | `33a25058b2` (background-first process waits, `terminal.process_wait_auto_notify`) (tip in the bundle) |
+| 30 | session-db-read-path-split | 2026-08-04 | merged upstream | v2026.8.3 provides `_read_ctx()` and per-thread `mode=ro` connections (tip in the bundle) |
+| 31 | fts5-cjk-bigram-index | 2026-08-04 | merged upstream | upstream ships `cjk_unicode61`, `native/fts5_cjk/` and `messages_fts_cjk` (tip in the bundle; the only fork CJK index implementation) |
+| 32 | search-slow-query-log | 2026-08-04 | merged upstream | equivalent routing-path slow-query logging landed upstream as `8364576e33` (tip in the bundle) |
+| 33 | fts-v2-config-authority | 2026-08-04 | superseded | fork `messages_fts_v2` never shipped upstream; v2026.8.3 owns `messages_fts_cjk` config; leftover v2 tables removed by #64 on 2026-08-13 (tip in the bundle) |
+| 36 | model-switch-provider-dedupe | 2026-10-30 | merged upstream | `a02ca4a153` + `01d2e6c3d1` + `f7631c0ee7` (/model collapses compat views by identity); our alias logic fails 4 upstream tests (tip in the bundle) |
+| 41 | cron-secret-scope-env-fallback | 2026-08-04 | merged upstream | PR #69057 (tip in the bundle) |
+| 43 | daemon-pool-py314-compat | 2026-10-30 | merged upstream | `c9fa191334` + `b48cc47a4c` (Python 3.14 daemon worker contexts); the cherry-pick came out empty (tip in the bundle) |
+| 49 | token-accounting-schema-repair | 2026-08-04 | merged upstream | never rebased, registered as a tombstone; v2026.8.3 shape-gates `_heal_session_model_usage_pk()` and rebuilds malformed `session_model_usage` (tip in the bundle) |
+| 60 | anthropic-structured-output | 2026-08-19 | merged upstream | same fix landed upstream as `f709bd8445`, in base 5dd15872a6 (2026-08-19 bump); kept as an intentional empty topic until 2026-10-30 (tip in the bundle) |
+| 69 | approval-grep-escaped-quote | 2026-10-30 | merged upstream | `e383c28d2f` + `9efa50071a` (quote-state parsing in `tools/approval_detection.py`) (tip in the bundle) |
+| 70 | elision-marker-imitation | 2026-10-30 | merged upstream | `77b9ea0831` (#121548, non-imitable compression marker) + `262a6436fa`/`a7baa5f5eb` (tip in the bundle) |
+| 72 | kanban-board-env-precedence | 2026-10-30 | merged upstream | `d11edc0fa2` + `53f1b970a5` + `387c78c8f7` (explicit board beats env pin, with upstream's worker-isolation fence) (tip in the bundle) |
+| 73 | kanban-goal-judge-unavailable | 2026-10-30 | merged upstream | `242244bf68` (#91264, goal loop stops on worker/judge failures) + `c15af4055e` tests (tip in the bundle) |
+| 81 | precompress-checkpoint-signal | 2026-09-14 | merged upstream | upstream PR #97063; `git cherry` against v2026.9.11 shows '-' for `721c2db628` (tip in the bundle) |
+| 82 | conversation-started-date-stable | 2026-10-30 | merged upstream | any base containing `11b98a1429` (#97930, two-line conversation clock) supersedes this patch; do not file a PR (tip in the bundle) |
+| 84 | lean-single-aux-call | 2026-09-14 | merged upstream | cherry-pick of upstream `4f22543509` (PR 98628), an ancestor of v2026.9.11; residue was fork-base-only (tip in the bundle) |
+| 87 | sync-20260914-test-seams | 2026-10-30 | folded | duplicate: seam commit `80bcb3a05d` already carried by the #2 (`8db5914255`) and #48 (`b5279de582`) ports (tip in the bundle) |
+| 88 | sync-20260914-fixups | 2026-10-30 | folded | all 8 fixups folded into owner topics #1, #8, #15, #34, #61, #83; the #12 and #62 fold-ins moot (tip in the bundle) |
+| 89 | sync-20260914-kanban-seams | 2026-10-30 | moot | `455cb2715d` moot after #72's drop; `21729888fb` moot under upstream's per-file subprocess runner (tip in the bundle) |
+| 91 | startup-integrity-check-offload | 2026-10-30 | merged upstream | `ac90478e08` (unclean-exit state.db integrity scan deferred off the startup path) + `2fe81e7879` + `8f0367c8ec` (tip in the bundle) |
+| 92 | cron-fire-fence-heartbeat | 2026-10-30 | merged upstream | `87b013b21e` (no fire fence held during heartbeat save_jobs) + `9a60a7f316` + `eafed27cf0` (tip in the bundle) |
+| 93 | sync-20261030-test-seams | 2026-11-25 | superseded | re-rendered by #95 sync-20261125-test-seams, which also carries the three docs-drift keys (tip in the bundle) |
 
 ## State Vocabulary
 
@@ -1671,17 +1333,19 @@ See `DECISIONS.md` ADR-001 for the full policy. Short forms:
 # Add a new patch
 bin/hermes-patches add <name> [--origin local-author|cherry-pick:SHA|upstream-pr:N]
 
-# Rebuild production from base + patches
+# Rebuild production from base + patches. `rebuild` runs `git checkout` in its own checkout,
+# so run it from a dedicated worktree (git worktree add --detach .worktree/<x> soju/fork-policy), never in REPO's main worktree.
 bin/hermes-patches rebuild
 
-# Pull latest upstream and rebase all patches on new base
-bin/hermes-patches sync upstream/main
+# Base bump: plain `git rebase` (bin/hermes-patches sync) is NOT sufficient for tip-stack topics.
+# Follow DECISIONS.md ADR-004 and its consequence notes; reuse ~/work/hermes/upstream-sync-20261125/tools/
+# (build-venv.sh, run-suite-chunked.py, final_restack.py).
 
 # Show patch states (open PR? merged? conflicts on rebase?)
 bin/hermes-patches status
 
-# Roll the live host venv back to pure upstream (rollback)
-git -C ~/.hermes/hermes-agent checkout main && bin/hermes-venv-rebuild
+# Roll the live host back: follow the newest Sync History entry's rollback tags and the procedure in
+# ~/work/hermes/upstream-sync-20261125/SYNC-REPORT.md § Rollback refs (external install stamp, venv swap).
 ```
 
 ## Assembly Integration Fixes (re-apply when reassembling production)
@@ -1690,14 +1354,14 @@ Sibling patches that only interact at production-assembly time. The rebuild's
 sequential merge either conflicts here (resolution recorded in the merge
 commit) or auto-merges WRONG — re-verify these after every rebuild:
 
-- `run_agent.py::_create_request_openai_client` — upstream's reusable-client body must remain INSIDE turn-waterfall-tracing's `llm.client_create` span.
+- `agent/client_lifecycle.py::_create_request_openai_client` (was `run_agent.py`) — upstream's reusable-client body must remain INSIDE turn-waterfall-tracing's `llm.client_create` span.
 - `agent/conversation_loop.py` — durable-turns' `resume_turn`/`turn_id` params must be threaded through turn-waterfall-tracing's `run_conversation` → `_run_conversation_impl` split, incl. both wrapper call sites (SILENT auto-merge drop; fixed by `3e84fb9f5`).
 - `agent/turn_context.py::memory_prefetch` — durable-turns' `not resume_turn` guard combines with the tracing span wrapper (conflict, recorded).
 - `gateway/session.py::from_dict` — runtime-control's three `runtime_*` kwargs must appear exactly once (positional-shuffle conflict, recorded).
 
 - `agent/turn_context.py::on_turn_start/memory_prefetch` — memory-phase0's `memory_ingest_allowed` gate combines with durable-turns' `not resume_turn` guard AND turn-waterfall-tracing's span; memory-phase2-taint's `record_injected_text` block appends after the span-wrapped prefetch (conflicts, recorded).
 - `agent/agent_runtime_helpers.py`/`toolsets.py` tool-name lists — union of runtime-control's model tools and memory-phase1's notes tools (conflicts, recorded).
-- `gateway/run.py` hygiene compression — event-loop-db-isolation's off-loop construction/binding must preserve upstream's compression commit fence and durable-turn recovery context.
+- `gateway/run_turn_hygiene.py` hygiene compression (was `gateway/run.py`) — event-loop-db-isolation's off-loop construction/binding must preserve upstream's compression commit fence and durable-turn recovery context.
 - `agent/memory_pipeline.py` proposal/admission — notes-recognition-grounding must retain memory-phase2-taint's mechanical injected-span rejection while adding preview and deferred current-turn grounding.
 
 ## Sync History
@@ -1721,7 +1385,7 @@ commit) or auto-merges WRONG — re-verify these after every rebuild:
 - **Dropped — folded/moot:** #87 sync-20260914-test-seams (duplicate of the #2/#48 ports), #88 sync-20260914-fixups (all 8 folded into #1, #8, #15, #34, #61, #83; #12 and #62 fold-ins moot), #89 sync-20260914-kanban-seams (moot after #72's drop and upstream's per-file test runner).
 - **New:** #93 sync-20261030-test-seams (generated fixtures re-rendered at the tip).
 - **Environment:** TARGET requires Python 3.14 for every runtime dependency; `dev`/`test` are dependency-groups; `pyyaml` left core; `FTS_STORAGE_VERSION` 2 → 3 realigns `messages_fts` on first writable open; `_config_version` 42 → 51. Full facts: `~/work/hermes/upstream-sync-20261030/SYNC-REPORT.md`.
-- **Rollback:** tags `backup/sync-1030/production` (547716fcc4), `backup/sync-1030/live-production` (b9de701076), `backup/sync-1030/fork-policy` (ac958cf362), `backup/sync-1030/patches/*`.
+- **Rollback:** tags `backup/sync-1030/production` (547716fcc4), `backup/sync-1030/live-production` (b9de701076), `backup/sync-1030/fork-policy` (ac958cf362), `backup/sync-1030/patches/*`. (tag deleted 2026-11-26, in `hermes-fork-refs.bundle`)
 
 
 ### 2026-07-22 — base bump 4281151ae → 3ef6bbd20 (v2026.7.20, 1,358 commits)
@@ -1729,7 +1393,7 @@ Full stack rebuild (35 → 33 active patches), multi-agent triage + per-patch re
 - **Dropped (merged upstream):** prompt-cache-stability (`7b3dcee92`), aux-runtime-context (`fdc6c32d7`+`73057ed16`+`c201b72f3`).
 - **Reduced:** prompt-tail-freeze → fork-only residue (~30%) on runtime-route-awareness (upstream `c0c76a471`).
 - **Reworked for upstream landings:** turn-waterfall-tracing (segmented dispatch), request-client-reuse (request-local anthropic clients #67142 + single-writer fence #65991), durable-turns (delivery ledger `5854aad8b` + recovery-note refactor `9fc0074ba`), model-routing (conversation-scope funnel `19527db73`).
-- **Retired branches deleted (tips tagged `archive/pre-v20260722/*`):** gateway-executor-capacity, process-wait-visibility (aliases of old prompt-tail-freeze tip), long-wait-heartbeat, slash-command-mixin-shadow, tool-delay-env-default, delegate-per-task-model.
+- **Retired branches deleted (tips tagged `archive/pre-v20260722/*`):** gateway-executor-capacity, process-wait-visibility (aliases of old prompt-tail-freeze tip), long-wait-heartbeat, slash-command-mixin-shadow, tool-delay-env-default, delegate-per-task-model. (tag deleted 2026-11-26, in `hermes-fork-refs.bundle`)
 - **Manifest fixes:** duplicate §19–21 removed; `stacked-on` field introduced.
 - **Known environment issue (pre-existing at TARGET, not fork-caused):** upstream `tools/daemon_pool.py` mirrors CPython ≤3.13 ThreadPoolExecutor internals; under Python 3.14 (`.venv` = 3.14.6) every concurrent tool-batch test fails with `AttributeError: _initializer`. Verify the deployment venv Python before rollout; upstream-report candidate.
 
@@ -1751,7 +1415,7 @@ re-merged (`merge: apply patch runtime-route-awareness (413-compression expectat
 
 ### 2026-08-04 — base bump 3ef6bbd20 → 3c27eb623 (v2026.8.3)
 Full stack rebase and drop pass across the upstream July/August refactors.
-- **Dropped with archived tips:** tool-delay-removal (`ce9f6712f`, PR #64172), request-client-reuse (`82e2c9ce4`, PR #73375), async-token-accounting (PR #73359), gateway-persist-trim (`54eafee30`, PR #76916), lsp-idle-reaper (PR #74058), cron-secret-scope-env-fallback (PR #69057), session-db-read-path-split (upstream `_read_ctx()`/per-thread `mode=ro`), fts5-cjk-bigram-index (upstream `cjk_unicode61` + `messages_fts_cjk`), search-slow-query-log (upstream equivalent `8364576e33`), fts-v2-config-authority (superseded by upstream's CJK layout), gateway-max-iterations-config-authority (equivalent per-turn config bridge), and the formerly unmanifested token-accounting-schema-repair (upstream shape-gated `_heal_session_model_usage_pk()`). Every old tip is tagged under `archive/pre-v20260804/`.
+- **Dropped with archived tips:** tool-delay-removal (`ce9f6712f`, PR #64172), request-client-reuse (`82e2c9ce4`, PR #73375), async-token-accounting (PR #73359), gateway-persist-trim (`54eafee30`, PR #76916), lsp-idle-reaper (PR #74058), cron-secret-scope-env-fallback (PR #69057), session-db-read-path-split (upstream `_read_ctx()`/per-thread `mode=ro`), fts5-cjk-bigram-index (upstream `cjk_unicode61` + `messages_fts_cjk`), search-slow-query-log (upstream equivalent `8364576e33`), fts-v2-config-authority (superseded by upstream's CJK layout), gateway-max-iterations-config-authority (equivalent per-turn config bridge), and the formerly unmanifested token-accounting-schema-repair (upstream shape-gated `_heal_session_model_usage_pk()`). Every old tip is tagged under `archive/pre-v20260804/`. (tag deleted 2026-11-26, in `hermes-fork-refs.bundle`)
 - **Reworked:** runtime-control/gateway state rehydration followed the modular gateway helpers; model-routing followed the new session/config-validation seams; durable-turns was expressed through `TurnContext`/`TurnRunner`; event-loop-db-isolation preserved the upstream compression commit fence and current FTS layout; compaction guidance was adapted without restoring the upstream-removed Historical In-Progress section; notes recognition grounding was stacked on memory-phase2-taint to preserve mechanical rejection.
 - **Registered from live production:** event-loop-db-isolation, per-tool-disable, compaction-prompt-cc-upgrades, anthropic-signature-passthrough, and notes-recognition-grounding. token-accounting-schema-repair was registered as a merged-upstream tombstone instead of rebased.
 - **Operator follow-up:** remove legacy fork `messages_fts_v2` tables/triggers from the deployed `state.db` after rollout; this repository change deliberately does not mutate live state. — **DONE 2026-08-13** via patch #64 `fts-v2-orphan-hardening` (fixed in code, not by hand: the orphan was blocking `optimize-storage` outright). Live DB 20041.3 MB → 8164.3 MB.
