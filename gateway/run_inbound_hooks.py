@@ -76,9 +76,14 @@ class GatewayInboundHooksMixin:
     ) -> Optional[MessageEvent]:
         """Run the ``pre_gateway_dispatch`` plugin hook; None = drop, else the (maybe rewritten) event.
         Results: ``{"action": "skip"}`` → drop; ``{"action": "rewrite", "text"}`` → replace ``event.text``;
-        ``allow``/None → normal dispatch. On the messaging path it runs BEFORE auth so plugins can handle
-        unauthorized senders; on the producer path (webhook/relay, ``admit_producer``) it runs AFTER the
-        delivery's authorization, which preparing its payload performs, so it never sees a refused sender.
+        ``{"action": "prepend", "text"}`` → prepend text (accumulates; dropped when the event is a slash
+        command); ``{"action": "runtime_override", ...}``
+        → staged on the event and applied by ``_hm_apply_runtime_override_directives`` only after auth and
+        the emergency-stop gate (``_hm_apply_producer_runtime_overrides`` before a producer commit);
+        ``allow``/None → normal dispatch. On the messaging path it runs BEFORE
+        auth so plugins can handle unauthorized senders; on the producer path (webhook/relay,
+        ``admit_producer``) it runs AFTER the delivery's authorization, which preparing its payload
+        performs, so it never sees a refused sender.
 
         Once per inbound message, at ingress (here, or ``admit_producer`` for webhook/relay), never
         while an admitted row EXECUTES: a messaging turn already passed it before its commit, and a
@@ -97,6 +102,8 @@ class GatewayInboundHooksMixin:
             logger.warning("pre_gateway_dispatch invocation failed: %s", _hook_exc)
             _hook_results = []
 
+        _runtime_override_directives: list[dict] = []
+        _hook_prepends: list[str] = []
         for _result in _hook_results:
             if not isinstance(_result, dict):
                 continue
@@ -108,6 +115,14 @@ class GatewayInboundHooksMixin:
                     source.chat_id or "unknown",
                 )
                 return None
+            if _action == "runtime_override":
+                _runtime_override_directives.append(_result)
+                continue
+            if _action == "prepend":
+                _prepend_text = _result.get("text")
+                if isinstance(_prepend_text, str) and _prepend_text.strip():
+                    _hook_prepends.append(_prepend_text.strip())
+                continue
             if _action == "rewrite":
                 _new_text = _result.get("text")
                 if isinstance(_new_text, str):
@@ -126,7 +141,73 @@ class GatewayInboundHooksMixin:
                 break
             if _action == "allow":
                 break
+
+        if _hook_prepends and (_command := event.get_command()):
+            # Slash commands must reach the dispatcher unmodified: is_command()/get_command() key off
+            # text.startswith("/"), so a prepended advisory would demote /model, /status, etc. into
+            # plain chat that falls through to the agent. Command handlers can't consume hook context
+            # anyway, so on command messages prepends are dropped (debug log), not deferred. Path-like
+            # text (``/home/...``, no command name) is plain chat and keeps its prepends.
+            logger.debug("pre_gateway_dispatch prepend dropped for slash command /%s", _command)
+            _hook_prepends = []
+        if _hook_prepends:
+            _combined = "\n\n".join(_hook_prepends)
+            _original = event.text or ""
+            _prepended_text = f"{_combined}\n\n{_original}" if _original else _combined
+            # The same event handling as ``rewrite`` above. A prepend adds agent context and leaves the
+            # user's own words as they were, so a typed answer to a voice note stays the typed text.
+            if getattr(event, '_busy_observed', False):
+                event.text = _prepended_text
+            else:
+                from gateway.session_ingress_context import carry_callback
+                prepended = dataclasses.replace(event, text=_prepended_text)
+                carry_callback(event, prepended)
+                prepended._rewritten_from = event  # accept_interrupt reaches the adapter's event
+                _carry_replied_voice_answer(event, prepended, event.text)
+                event = prepended
+        if _runtime_override_directives:
+            # Trusted plugins may pick a session route before the first LLM call; the directives ride
+            # the event (same pattern as ``_bot_loop_admitted``) so they can only be applied after auth.
+            event._hermes_runtime_override_directives = _runtime_override_directives
         return event
+
+    async def _hm_apply_producer_runtime_overrides(self, event: MessageEvent) -> None:
+        """Producer ingress (webhook/relay ``admit_producer``): apply the staged ``runtime_override``
+        directives before the commit, in ``_handle_message``'s order. The committed admission payload
+        does not carry them and the hook never runs again when the row executes, so this is their one
+        chance. Authorization already ran (preparing the payload); the emergency-stop gate decides as
+        on the messaging path, and a paused delivery applies nothing."""
+        if not getattr(event, "_hermes_runtime_override_directives", None):
+            return
+        if self._hm_estop_gate(event, event.source, False) is not None:
+            return
+        await self._hm_apply_runtime_override_directives(event, event.source)
+
+    async def _hm_apply_runtime_override_directives(self, event: MessageEvent, source: SessionSource) -> None:
+        """Apply ``runtime_override`` directives staged by ``_hm_pre_gateway_dispatch_hook``. Called only
+        after auth and after the emergency-stop gate decided this event may proceed.
+
+        Off the owner loop like ``/model``: ``switch_model`` can hit a synchronous models.dev fetch on a
+        cold cache and the durable runtime_* write is a routing-index save (``to_thread`` carries the
+        profile ContextVars). The code-skew guard ``/model`` runs first refuses the model half of a
+        directive on a stale process; its reasoning half still applies."""
+        directives = getattr(event, "_hermes_runtime_override_directives", None)
+        if not directives:
+            return
+        from gateway.slash_commands_model import _model_switch_skew_guard
+        _model_keys = ("model", "raw_input", "provider", "explicit_provider")
+        with contextlib.suppress(Exception):
+            # Created here, on the loop: the worker below only sets this session's fields.
+            self._session_state(self._session_key_for_source(source))
+        _skew = None
+        for _directive in directives:
+            if isinstance(_directive, dict) and any(str(_directive.get(k) or "").strip() for k in _model_keys):
+                if _skew is None:
+                    _skew = _model_switch_skew_guard() or ""
+                if _skew:
+                    logger.warning("pre_gateway_dispatch runtime_override model switch refused: %s", _skew)
+                    _directive = {k: v for k, v in _directive.items() if k not in _model_keys}
+            await asyncio.to_thread(self._apply_gateway_runtime_override, _directive, source)
 
     def _hm_quick_commands(self) -> dict:
         """User-defined ``quick_commands`` mapping from config (empty dict when unset/malformed)."""

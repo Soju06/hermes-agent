@@ -67,6 +67,9 @@ class TurnContext:
     # "internal_notification" for async-delegation/background notifications (#82888).
     persist_user_display_kind: Optional[str] = None
     persist_user_display_metadata: Optional[dict] = None
+    # Per-turn waterfall trace begun by the runner at message ingress (agent/turn_trace.py); None
+    # when HERMES_TURN_TRACE is unset.
+    turn_trace_obj: Any = None
     user_config: Any = None
     mute_notification_reply: bool = False
     voice_turn: bool = False  # a voice-note turn: runs on auxiliary.voice_chat

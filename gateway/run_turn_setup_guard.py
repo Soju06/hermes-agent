@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import traceback
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
+from agent import turn_trace
 from agent.i18n import t
 
 logger = logging.getLogger("gateway.run")
@@ -123,10 +125,15 @@ async def run_preagent_setup(runner, event, source, quick_key: str, run_generati
     a person's message is never dropped silently; a /stop or /new answers for itself."""
     try:
         async with preagent_setup_guard(runner, quick_key):
+            _trace = turn_trace.get_bound(event)  # begun in _handle_message_with_agent (None when off)
+            _t_span = time.time() if _trace is not None else 0.0
             resolved = await runner._hmwa_resolve_session(event, source)
             if resolved is None:
                 return None, None
             source, session_entry, session_key = resolved
+            if _trace is not None:
+                _trace.add_span("gateway.session_resolve", _t_span, time.time())
+                _trace.tag(session_key=session_key)
             prepared, env_tokens = await runner._hmwa_prepare_turn(
                 event, source, session_entry, session_key, quick_key, run_generation,
             )

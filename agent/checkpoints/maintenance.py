@@ -12,7 +12,7 @@ from agent.checkpoints.manager import (
     _GIT_TIMEOUT, _LEGACY_PREFIX, _PRUNE_MARKER_NAME, _REFS_PREFIX, _STORE_DIRNAME,
     _dir_size_bytes, _index_path, _list_projects, _pre_v2_shadow_repos,
     _project_meta_path, _ref_name, _resolve_checkpoint_base, _run_git, _store_has_head,
-    _store_path,
+    _store_path, _walk_entries,
 )
 
 # Pinned name: these lines stay under `hermes logs --component tools`.
@@ -256,16 +256,15 @@ def _prune_checkpoints(
         ):
             reason = "orphan"
         if reason is None and retention_days > 0:
+            # os.scandir walk, not Path.rglob: this runs on the gateway housekeeping
+            # thread, and rglob's per-entry Path objects cost GIL time the event loop
+            # needs (2026-08-05 loop-stall incident).  Unreadable dirs are skipped.
             newest = 0.0
-            try:
-                for p in child.rglob("*"):
-                    try:
-                        mt = p.stat().st_mtime
-                        newest = max(newest, mt)
-                    except OSError:
-                        continue
-            except OSError:
-                pass
+            for entry in _walk_entries(str(child)):
+                try:
+                    newest = max(newest, entry.stat().st_mtime)
+                except OSError:
+                    continue
             if newest > 0 and newest < cutoff:
                 reason = "stale"
         if reason is None:

@@ -16,6 +16,7 @@ from hermes_cli.plugins import (
     PluginContext,
     PluginManager,
     PluginManifest,
+    VALID_HOOKS,
     _dispatch_pre_tool_call_hooks,
     get_pre_tool_call_block_message,
     get_pre_verify_continue_message,
@@ -894,6 +895,32 @@ class TestPluginLoading:
 class TestPluginHooks:
     """Tests for lifecycle hook registration and invocation."""
 
+
+    def test_valid_hooks_include_runtime_state(self):
+        assert "runtime_state" in VALID_HOOKS
+
+    def test_runtime_state_hook_can_be_registered_and_invoked(self, tmp_path, monkeypatch):
+        plugins_dir = tmp_path / "hermes_test" / "plugins"
+        _make_plugin_dir(
+            plugins_dir, "runtime_state_plugin",
+            register_body=(
+                'ctx.register_hook("runtime_state", '
+                'lambda **kw: {"event": kw.get("event"), "model": kw.get("state", {}).get("model")})'
+            ),
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        results = mgr.invoke_hook(
+            "runtime_state",
+            event="switch",
+            state={"model": "gpt-5.5"},
+            session_id="s1",
+            platform="discord",
+        )
+        assert results == [{"event": "switch", "model": "gpt-5.5"}]
 
     def test_pre_gateway_dispatch_collects_action_dicts(self, tmp_path, monkeypatch):
         """pre_gateway_dispatch callbacks return action dicts (skip/rewrite/allow)."""

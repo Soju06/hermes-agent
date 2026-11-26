@@ -149,6 +149,7 @@ def _memory(agent, args: dict, ctx: InlineToolContext) -> Any:
         (
             ("action", "action"), ("target", "target"), ("content", "content"),
             ("old_text", "old_text"), ("new_text", "new_text"), ("operations", "operations"),
+            ("reason", "reason", ""),
         ),
         store=agent._memory_store,
     )
@@ -297,8 +298,26 @@ def _setup_mcp_shim(agent, args: dict, ctx: InlineToolContext) -> Any:
     }, ctx)
 
 
+def _model_status(agent, args: dict, ctx: InlineToolContext) -> Any:
+    from agent.runtime_control import model_status
+
+    return model_status(agent)
+
+
+def _model_switch(agent, args: dict, ctx: InlineToolContext) -> Any:
+    # Single tool-dispatch entry point (ADR-003 Phase 3c): forwarding of the LLM-facing
+    # ``route``/``reason`` surface is defined once in agent/runtime_control.py so the
+    # sequential and concurrent executors cannot drift.
+    from agent.runtime_control import dispatch_model_switch
+
+    return dispatch_model_switch(agent, args)
+
+
 # Order is the historical if/elif order of ``execute_tool_calls_sequential``.
 _RAW_INLINE_TOOL_EXECUTORS: dict[str, InlineToolExecutor] = {
+    # Core-owned runtime introspection/switching (agent/runtime_control.py): needs live agent state.
+    "model_status": _model_status,
+    "model_switch": _model_switch,
     "todo_list": _tool(
         "tools.todo_tool", "todo_tool", ("todos", "todos"), ("merge", "merge", False),
         store=lambda agent, ctx: agent._todo_store,

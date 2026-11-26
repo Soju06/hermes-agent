@@ -29,7 +29,9 @@ class TestSkillManageSchemaDiet(unittest.TestCase):
         handler-only compat. Every per-action branch is a flat op object
         (memory-tool pattern), not a nested sub-object."""
         props = SKILL_MANAGE_SCHEMA["parameters"]["properties"]
-        self.assertEqual(sorted(props), ["operations"])
+        # Local patch (skill-manage-reason-schema): the optional per-call `reason` rationale
+        # object rides alongside operations[] for the skills admission gate.
+        self.assertEqual(sorted(props), ["operations", "reason"])
         self.assertEqual(SKILL_MANAGE_SCHEMA["parameters"]["required"], ["operations"])
         for branch in self._branches():
             self.assertEqual(branch["required"][:2], ["name", "action"])

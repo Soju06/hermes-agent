@@ -441,6 +441,11 @@ class ClientLifecycleMixin:
             logger.debug("%s client abort failed (%s, shared=False) %s error=%s", label, reason, context, exc)
 
     def _create_request_openai_client(self, *, reason: str, api_kwargs: Optional[dict] = None) -> Any:
+        from agent import turn_trace
+        with turn_trace.span("llm.client_create", obj=self):
+            return self._create_request_openai_client_impl(reason=reason, api_kwargs=api_kwargs)
+
+    def _create_request_openai_client_impl(self, *, reason: str, api_kwargs: Optional[dict] = None) -> Any:
         from unittest.mock import Mock
         primary_client = self._ensure_primary_openai_client(reason=reason)
         if self.provider == "moa" or isinstance(primary_client, Mock):

@@ -7,15 +7,22 @@ the live gateway writer and corrupt B-tree pages (#45383).
 """
 
 import logging
+import os
 import sqlite3
-from unittest.mock import MagicMock
+import threading
+import time
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from persistence.sqlite import _registry
+from persistence.sqlite import _maintenance_thread, _registry, _schema
 from persistence.sqlite._holder import StoreHolder
 from persistence.sqlite.admin import SQLiteStoreAdmin
 from persistence.sqlite.admin._maintenance import _FtsStorageOptimizer
+from persistence.sqlite.conversation._store.messages import append_message
+from persistence.sqlite.conversation._store.sessions import create_session
+from tests.persistence_sqlite.core._wal_generation_harness import pin_wal
 
 
 class TrackingConnection:
@@ -202,10 +209,18 @@ class TestVacuumUsesPassive:
 
 
 class TestCheckpointFrequency:
-    """Checkpoint triggers every N writes."""
+    """Checkpoint runs from the maintenance thread, never the write hot path.
 
-    def test_checkpoint_triggers_at_interval(self, db):
-        """_try_wal_checkpoint is called every _CHECKPOINT_EVERY_N_WRITES writes."""
+    Inline per-Nth-write checkpointing made whichever caller crossed the
+    threshold pay for a multi-GB WAL flush while every other writer queued
+    behind self._lock (2026-07-28 event-loop stall ingredient). The write
+    path now only counts; the session-db-maintenance thread checkpoints
+    once the counter advances past _CHECKPOINT_EVERY_N_WRITES.
+    """
+
+    def test_write_path_never_checkpoints_inline(self, db):
+        # The background thread would race these counts on a slow runner; only explicit ticks here.
+        _maintenance_thread.stop_maintenance_thread(db)
         call_count = [0]
         original = db._try_wal_checkpoint
 
@@ -215,7 +230,30 @@ class TestCheckpointFrequency:
 
         db._try_wal_checkpoint = counting_checkpoint
 
-        # Write exactly _CHECKPOINT_EVERY_N_WRITES sessions to trigger one checkpoint
+        n = db._CHECKPOINT_EVERY_N_WRITES
+        import time as _time
+        for i in range(n * 2):
+            db._execute_write(lambda conn, _i=i: conn.execute(
+                "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
+                (f"sess_{_i}", "test", _time.time()),
+            ))
+
+        assert call_count[0] == 0, (
+            f"write path must not checkpoint inline, got {call_count[0]} calls"
+        )
+
+    def test_maintenance_tick_checkpoints_after_threshold(self, db):
+        # The background thread would race these counts on a slow runner; only explicit ticks here.
+        _maintenance_thread.stop_maintenance_thread(db)
+        call_count = [0]
+        original = db._try_wal_checkpoint
+
+        def counting_checkpoint():
+            call_count[0] += 1
+            original()
+
+        db._try_wal_checkpoint = counting_checkpoint
+
         n = db._CHECKPOINT_EVERY_N_WRITES
         import time as _time
         for i in range(n):
@@ -224,6 +262,187 @@ class TestCheckpointFrequency:
                 (f"sess_{_i}", "test", _time.time()),
             ))
 
+        _maintenance_thread.maintenance_tick(db)
         assert call_count[0] == 1, (
-            f"Expected 1 checkpoint after {n} writes, got {call_count[0]}"
+            f"Expected 1 checkpoint from the maintenance tick, got {call_count[0]}"
         )
+        # Below-threshold delta: the next tick is a no-op.
+        _maintenance_thread.maintenance_tick(db)
+        assert call_count[0] == 1
+
+    def test_maintenance_thread_lifecycle(self, tmp_path):
+        db = StoreHolder(tmp_path / "maint.db")
+        assert db._maint_thread is None, "opening the store must not spawn the maintenance thread"
+        create_session(db, "s", "cli")  # the first committed write starts it
+        thread = db._maint_thread
+        assert thread is not None and thread.is_alive()
+        db.close()
+        thread.join(timeout=3.0)
+        assert not thread.is_alive()
+
+    def test_maintenance_thread_does_not_pin_unclosed_db(self, tmp_path):
+        """The maintenance thread must hold only a weakref to the holder.
+
+        Tests and short-lived callers create a store holder without close();
+        a bound-method thread target pinned every such instance and its
+        sqlite caches for the process lifetime — a full-suite run was
+        OOM-killed at 37GB RSS. Unclosed instances must stay collectable.
+        """
+        import gc
+        import weakref
+
+        db = StoreHolder(tmp_path / "leak.db")
+        create_session(db, "s", "cli")  # the first committed write starts the thread
+        thread = db._maint_thread
+        assert thread is not None and thread.is_alive()
+        ref = weakref.ref(db)
+        del db  # no close() on purpose
+        gc.collect()
+        assert ref() is None, "an unclosed store holder must be garbage-collectable"
+        # The orphaned thread notices the dead ref on its next wake and
+        # exits on its own (daemon either way; this just proves the exit
+        # path). Waking it early via the stop event would defeat the
+        # point, so poke the weakref path directly with a short interval.
+        assert thread.daemon
+
+
+class TestMaintenanceTickGenerationProbe:
+    """The background tick re-probes for a replaced file or lost WAL generation before maintaining.
+
+    Inline, the checkpoint and FTS merge ran right after the triggering write's in-lock probe; on the
+    maintenance thread up to one interval passes without one, and a checkpoint on a lost generation
+    writes stale frames into the main DB (#105670).
+    """
+
+    @pytest.mark.platforms("linux")  # deleted-WAL detection uses Linux unlink semantics
+    def test_tick_after_deleted_wal_generation_quarantines_instead_of_maintaining(self, tmp_path, monkeypatch):
+        # Pin WAL so this host's SQLite matches the production topology (as in the #105670 guard tests).
+        pin_wal(monkeypatch)
+        path = tmp_path / "state.db"
+        db = StoreHolder(db_path=path)
+        try:
+            # Only the explicit tick below may run maintenance.
+            _maintenance_thread.stop_maintenance_thread(db)
+            create_session(db, "s", "cli")
+            append_message(db, "s", role="user", content="before")
+            if not db._wal_active or not Path(str(path) + "-wal").exists():
+                pytest.skip("WAL not active on this filesystem")
+            db._CHECKPOINT_EVERY_N_WRITES = 1
+            db._FTS_MERGE_EVERY_N_WRITES = 1
+            merges = []
+            monkeypatch.setattr(_schema, "_merge_fts_incrementally", lambda holder, **kw: merges.append(kw) or 0)
+            for suffix in ("-wal", "-shm"):
+                sidecar = Path(str(path) + suffix)
+                if sidecar.exists():
+                    os.unlink(sidecar)
+
+            with patch.object(db._conn, "execute", wraps=db._conn.execute) as mock_execute:
+                _maintenance_thread.maintenance_tick(db)
+            checkpoint_calls = [c for c in mock_execute.call_args_list if "wal_checkpoint" in str(c).lower()]
+
+            assert db._db_wal_generation_lost is True, "the tick did not probe the WAL generation"
+            assert not checkpoint_calls, f"the tick checkpointed a lost WAL generation: {checkpoint_calls}"
+            assert merges == [], "the tick ran an FTS merge on a lost WAL generation"
+        finally:
+            db.close()
+
+
+class TestMaintenanceThreadStartFailure:
+    """A maintenance thread that cannot start must not fail, block or replay the write that starts it.
+
+    The thread is best-effort, like the checkpoint and FTS merge it runs, and neither opening the store nor a
+    write ever depended on it while that work ran inline. A start failure (thread or pid limit, or a
+    process-wide ``threading.Thread`` stand-in that runs targets inline) used to abort the open, so every
+    caller reported storage as unavailable. That handle now keeps the inline per-Nth-write cadence.
+    """
+
+    @staticmethod
+    def _refuse_maintenance_thread(monkeypatch):
+        real_thread = threading.Thread
+
+        class _NoMaintenanceThread(real_thread):
+            def start(self):
+                if self.name == "session-db-maintenance":
+                    raise RuntimeError("can't start new thread")
+                super().start()
+
+        monkeypatch.setattr(_maintenance_thread.threading, "Thread", _NoMaintenanceThread)
+
+    @staticmethod
+    def _insert_session(db, session_id):
+        db._execute_write(lambda conn: conn.execute(
+            "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
+            (session_id, "test", time.time()),
+        ))
+
+    def test_writes_survive_thread_start_failure_and_maintain_inline(self, tmp_path, monkeypatch, caplog):
+        self._refuse_maintenance_thread(monkeypatch)
+        db = StoreHolder(db_path=tmp_path / "state.db")
+        try:
+            calls = []
+            monkeypatch.setattr(db, "_try_wal_checkpoint", lambda: calls.append("checkpoint"))
+            monkeypatch.setattr(_maintenance_thread, "_try_incremental_merge_fts", lambda holder: calls.append("merge"))
+            db._CHECKPOINT_EVERY_N_WRITES = 2
+            db._FTS_MERGE_EVERY_N_WRITES = 4
+            with caplog.at_level(logging.WARNING, logger="hermes_state"):
+                self._insert_session(db, "sess_0")  # the first committed write tries to start the thread
+            assert db._maint_thread is None
+            assert db._maint_inline is True
+            assert any("maintenance thread" in r.getMessage() for r in caplog.records), (
+                "a handle without its maintenance thread must leave a WARNING")
+            for i in range(1, 4):
+                self._insert_session(db, f"sess_{i}")
+            assert calls == ["checkpoint", "checkpoint", "merge"]
+            assert db._conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 4
+        finally:
+            db.close()
+
+    def test_inline_running_thread_stand_in_never_blocks_the_write(self, tmp_path, monkeypatch):
+        """The TUI gateway tests swap ``server.threading.Thread`` (the process-wide class) for stand-ins
+        that run the target inline with its args. The maintenance loop then ran on the thread that
+        started it and never returned."""
+        real_thread = threading.Thread
+
+        class _InlineMaintenanceThread(real_thread):
+            def start(self):
+                if self.name == "session-db-maintenance":
+                    self.run()  # target(*args, **kwargs) on the caller, as the inline stand-ins do
+                    return
+                super().start()
+
+        opened = {}
+
+        def _open_and_write():
+            db = opened.setdefault("db", StoreHolder(db_path=tmp_path / "state.db"))
+            self._insert_session(db, "first")
+
+        writer = real_thread(target=_open_and_write, daemon=True)
+        monkeypatch.setattr(_maintenance_thread.threading, "Thread", _InlineMaintenanceThread)
+        writer.start()
+        writer.join(timeout=30)
+        assert not writer.is_alive(), "the first write blocked inside the inline-run maintenance loop"
+        db = opened["db"]
+        try:
+            assert db._maint_thread is None
+            assert db._maint_inline is True
+        finally:
+            db.close()
+
+    def test_inline_maintenance_failure_never_fails_or_replays_the_write(self, tmp_path, monkeypatch):
+        """The inline tick runs after the commit: an error reaching _execute_write's lock-retry
+        handlers would replay a write that already landed."""
+        self._refuse_maintenance_thread(monkeypatch)
+        db = StoreHolder(db_path=tmp_path / "state.db")
+        try:
+            ticks = []
+
+            def _failing_tick(holder):
+                ticks.append(1)
+                raise sqlite3.OperationalError("database is locked")
+
+            monkeypatch.setattr(_maintenance_thread, "maintenance_tick", _failing_tick)
+            self._insert_session(db, "only")
+            assert ticks == [1]
+            assert db._conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 1
+        finally:
+            db.close()

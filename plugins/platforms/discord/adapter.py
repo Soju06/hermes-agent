@@ -302,7 +302,7 @@ from gateway.config import Platform, PlatformConfig, discord_channel_id_from_lin
 from gateway.approval_actor import clarify_refusal, refusal_text, slash_confirm_refusal
 
 from gateway.platforms.helpers import (
-    MessageDeduplicator, ThreadParticipationTracker, convert_table_to_bullets, is_discord_channel_obfuscated,
+    MessageDeduplicator, ThreadParticipationTracker, is_discord_channel_obfuscated,
     numbered_clarify_choices, tag_safe_display_name,
 )
 from gateway.platforms.helpers import cancel_task, inline_document_text
@@ -1176,6 +1176,7 @@ from plugins.platforms.discord.adapter_authorization import DiscordAuthorization
 from plugins.platforms.discord.adapter_slash_auth import DiscordSlashAuthMixin
 from plugins.platforms.discord.adapter_live_gates import DiscordLiveGatesMixin
 from plugins.platforms.discord.adapter_command_sync import DiscordCommandSyncMixin, app_command_scopes
+from plugins.platforms.discord.adapter_tables import _wrap_markdown_tables_for_discord
 from plugins.platforms.discord.adapter_thread_titles import DiscordThreadTitlesMixin, SemanticThreadRenames
 from plugins.platforms.discord.adapter_voice_info import DiscordVoiceInfoMixin
 from plugins.platforms.discord.adapter_reactions import DiscordReactionsMixin
@@ -4235,10 +4236,10 @@ class DiscordAdapter(DiscordLiveGatesMixin, DiscordCommandSyncMixin, DiscordAuth
             print(f"[{self.name}] Updated DISCORD_ALLOWED_USERS with {len(self._username_resolved_ids)} resolved ID(s)")
 
     def format_message(self, content: str) -> str:
-        """Format for Discord: GFM tables become bullet lists (Discord doesn't render pipe tables)."""
+        """Format for Discord: GFM tables become fenced box-drawing tables (Discord doesn't render pipe tables)."""
         if not content:
             return content
-        return convert_table_to_bullets(content)
+        return _wrap_markdown_tables_for_discord(content)
 
     async def _defer_unless_expired(self, interaction: discord.Interaction, warn_fmt: str, *warn_args) -> bool:
         """Ephemeral defer(); False (after a warning) when the interaction token already expired

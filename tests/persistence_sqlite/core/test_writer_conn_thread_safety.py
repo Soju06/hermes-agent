@@ -27,7 +27,7 @@ import time
 
 import pytest
 
-from persistence.sqlite import _schema
+from persistence.sqlite import _maintenance_thread, _schema
 from persistence.sqlite._holder import StoreHolder
 from persistence.sqlite.conversation._store.messages import append_message, append_messages_batch, get_messages
 from persistence.sqlite.conversation._store.sessions import (
@@ -148,6 +148,9 @@ class TestSystemErrorTransactionBoundary:
     def test_post_commit_maintenance_error_does_not_replay_message(
         self, db, monkeypatch
     ):
+        # Maintenance runs on the session-db-maintenance thread, never inside the write; drive
+        # its tick explicitly so the maintenance failure is observed deterministically.
+        _maintenance_thread.stop_maintenance_thread(db)
         create_session(db, "s1", "cli")
         before = db._write_count
         maintenance_calls = {"n": 0}
@@ -165,6 +168,8 @@ class TestSystemErrorTransactionBoundary:
         monkeypatch.setattr(_schema, "_merge_fts_incrementally", fail_once)
 
         message_id = append_message(db, "s1", "user", "exactly-once")
+        assert maintenance_calls["n"] == 0  # the write path only advances the counter
+        _maintenance_thread.maintenance_tick(db)  # the failing merge is logged, never raised
         matching = [
             row for row in get_messages(db, "s1")
             if row["content"] == "exactly-once"

@@ -14,7 +14,9 @@ def _pin_and_resolve(cfg: dict, names: list[str]) -> tuple[set[str], set[str] | 
     from hermes_cli.tools_config import _get_platform_tools
 
     _save_toolset_pin(cfg, names, save_config=lambda _c: None)
-    resolved = set(_get_platform_tools(cfg, "cli", include_default_mcp_servers=False))
+    # Fork (runtime-control): the non-configurable ``runtime`` toolset (model_status/model_switch) rides
+    # every non-empty selection; the pin invariant is about the toolsets the user picked.
+    resolved = set(_get_platform_tools(cfg, "cli", include_default_mcp_servers=False)) - {"runtime"}
     _toolsets, pinned = _describe_toolsets(cfg)
     return resolved, pinned
 

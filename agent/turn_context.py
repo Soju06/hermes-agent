@@ -39,6 +39,7 @@ from agent.model_metadata import (
 from agent.image_token_cost import bind_image_token_cost
 from agent.usage_anchor import anchored_context_tokens, restore_usage_anchor
 from agent.turn_author import parse_turn_author
+from agent import turn_trace
 
 logger = logging.getLogger(__name__)
 
@@ -1221,6 +1222,10 @@ def build_turn_context(
     compression."""
     from agent.turn_context_compaction import CompactionOutcome, run_turn_start_compaction
 
+    # Per-turn trace (None when tracing is disabled).
+    _tt = turn_trace.get_bound(agent)
+    _prologue_started = time.time() if _tt is not None else None
+
     # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
     install_safe_stdio()
 
@@ -1326,9 +1331,12 @@ def build_turn_context(
 
     # System prompt is cached per session for prefix caching. A warm agent (kept across turns)
     # first adopts any `hermes sessions refresh-prompts` request recorded since it set its prompt.
-    refresh_warm_prompt(agent, system_message, conversation_history)
-    if agent._cached_system_prompt is None:
-        restore_or_build_system_prompt(agent, system_message, conversation_history)
+    with turn_trace.span("prologue.system_prompt", trace=_tt) as _sp_span:
+        refresh_warm_prompt(agent, system_message, conversation_history)
+        _sp_rebuilt = agent._cached_system_prompt is None
+        _sp_span.tag(rebuilt=_sp_rebuilt)
+        if _sp_rebuilt:
+            restore_or_build_system_prompt(agent, system_message, conversation_history)
     active_system_prompt = agent._cached_system_prompt
     # `/delegation <backend> --now`: after the pin restore, so a fresh agent rebuilds too.
     from agent.delegation_backends import apply_requested_tool_rebuild
@@ -1343,7 +1351,8 @@ def build_turn_context(
     except Exception:
         logger.debug("message_agent injection skipped", exc_info=True)
 
-    _ensure_session_row(agent, pending_cli_message)
+    with turn_trace.span("prologue.persist_early", trace=_tt):
+        _ensure_session_row(agent, pending_cli_message)
 
     # A turn interrupted before admission could not write its accepted input because
     # it did not own the session lease. Persist that carried-forward row now, before
@@ -1359,12 +1368,14 @@ def build_turn_context(
     # Before turn-start compaction: its summary request quotes recent user turns, this one included,
     # so a vetoed prompt skips it (the turn makes no model call at all).
     _blocks: list[str] = []
-    plugin_user_context = _collect_pre_llm_call_context(
-        agent, effective_task_id=effective_task_id, turn_id=turn_id,
-        original_user_message=original_user_message, messages=messages,
-        conversation_history=conversation_history, blocks=_blocks,
-    )
+    with turn_trace.span("prologue.pre_llm_hook", trace=_tt):
+        plugin_user_context = _collect_pre_llm_call_context(
+            agent, effective_task_id=effective_task_id, turn_id=turn_id,
+            original_user_message=original_user_message, messages=messages,
+            conversation_history=conversation_history, blocks=_blocks,
+        )
     plugin_block_message = _blocks[0] if _blocks else ""  # first veto wins
+    _cpf_started = time.time() if _tt is not None else None
     compaction = CompactionOutcome(
         messages=messages, active_system_prompt=active_system_prompt,
         conversation_history=conversation_history, current_turn_user_idx=current_turn_user_idx,
@@ -1374,6 +1385,11 @@ def build_turn_context(
         current_turn_user_idx=current_turn_user_idx, user_message=user_message,
         effective_task_id=effective_task_id,
     )
+    if _cpf_started is not None:
+        _tt.add_span(
+            "prologue.compression_preflight", _cpf_started, time.time(),
+            compressed=compaction.compressed,
+        )
     messages = compaction.messages
     active_system_prompt = compaction.active_system_prompt
     conversation_history = compaction.conversation_history
@@ -1387,8 +1403,14 @@ def build_turn_context(
 
     _bind_interrupt_scope(agent, ra)
     # A vetoed prompt never leaves the host: no external-memory prefetch, no titling call.
+    _memory_prefetch_started = time.time() if _tt is not None else None
     ext_prefetch_cache = "" if plugin_block_message else _memory_turn_start_and_prefetch(
         agent, original_user_message, turn_author, previous_user_message)
+    if _memory_prefetch_started is not None:
+        _tt.add_span(
+            "prologue.memory_prefetch", _memory_prefetch_started, time.time(),
+            decision="hit" if ext_prefetch_cache else "empty",
+        )
 
     # Title the session now: titling depends only on the user's ask (before any injected
     # context lands on list content), so it runs concurrently with the turn. Daemon thread,
@@ -1411,7 +1433,14 @@ def build_turn_context(
                 plugin_user_context, preflight_compressed=compaction.compressed,
             )
 
-    _persist_turn_start(agent, messages, conversation_history, pending_cli_message)
+    # trace: successor of the pre-restructure crash persist that prologue.persist_early
+    # used to cover (the user-turn row is written once, after prefetch/pre_llm_call, with
+    # its final api_content); measured separately from the early row create.
+    with turn_trace.span("prologue.persist_user_turn", trace=_tt):
+        _persist_turn_start(agent, messages, conversation_history, pending_cli_message)
+
+    if _prologue_started is not None:
+        _tt.add_span("turn.prologue", _prologue_started, time.time())
 
     return TurnContext(
         user_message=user_message, original_user_message=original_user_message, messages=messages,
@@ -1553,9 +1582,9 @@ def build_api_messages(
     # Final system message = cached prompt + ephemeral additions (API-time only).
     # Plugin/recall context goes into the user message, never the system prompt: the
     # prompt is built ONCE per session and replayed verbatim (stable cache prefix).
-    effective_system = active_system_prompt or ""
-    if agent.ephemeral_system_prompt:
-        effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
+    # ``compose_effective_system_prompt`` also appends the live Runtime/Route State block.
+    from agent.system_prompt import compose_effective_system_prompt
+    effective_system = compose_effective_system_prompt(agent, active_system_prompt or "")
     if effective_system:
         api_messages = [{"role": "system", "content": effective_system}] + api_messages
     return api_messages, effective_system

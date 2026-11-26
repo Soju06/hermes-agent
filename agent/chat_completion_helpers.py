@@ -2016,6 +2016,10 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
                 continue
             old_model, old_provider = bound
             fb_model = agent.model  # normalized by the binder
+            # Record WHY the fallback activated so plugins (e.g. capability gates) can distinguish
+            # a refusal-driven temporary swap from any other fallback state. Only set on the
+            # success path — exhaustion and skip paths must not leave a stale reason behind.
+            agent._fallback_reason = reason.value if reason is not None else None
             rewrite_prompt_model_identity(agent, fb_model, fb_provider)
 
             notice = (
@@ -2035,6 +2039,16 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
             # The stale-call streak measured the OLD provider; carrying it over would
             # short-circuit the fresh fallback before its first stream attempt.
             _reset_stale_streak(agent)
+            # Publish the mid-turn swap on the runtime_state hook so guardrail plugins (skill-gate)
+            # see the new model/provider + fallback_reason immediately. Best-effort: activation must
+            # never fail because a plugin hook failed. Local import — runtime_control is core-owned
+            # and pulling it at module scope risks an import cycle.
+            try:
+                from agent.runtime_control import _emit_runtime_state_event, get_runtime_state
+
+                _emit_runtime_state_event(agent, event="fallback", state=get_runtime_state(agent))
+            except Exception as _hook_err:
+                logger.debug("runtime_state fallback event failed: %s", _hook_err)
             from agent.native_compaction import resolve_native_compaction_capabilities
             agent.runtime_capabilities = resolve_native_compaction_capabilities(
                 model=agent.model, base_url=agent.base_url, provider=fb_provider, is_codex_backend=fb_provider == "openai-codex")
@@ -2092,9 +2106,9 @@ def _iteration_summary_api_messages(agent, messages: list) -> list:
             agent._sanitize_tool_calls_for_strict_api(api_msg, model=sanitize_model)
         api_messages.append(api_msg)
 
-    effective_system = agent._cached_system_prompt or ""
-    if agent.ephemeral_system_prompt:
-        effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
+    from agent.system_prompt import compose_effective_system_prompt
+
+    effective_system = compose_effective_system_prompt(agent, agent._cached_system_prompt or "")
     if effective_system:
         api_messages = [{"role": "system", "content": effective_system}] + api_messages
     for idx, pfm in enumerate(agent.prefill_messages or ()):
@@ -2784,6 +2798,9 @@ class _StreamingCall(StreamingWaitMonitor):
     def _new_diag(self) -> dict:
         diag = self.agent._stream_diag_init()
         self.clients.diag = diag
+        # Turn trace: the loop reads first_chunk_at/started_at off this dict for the
+        # in-flight llm.call span's TTFT tag (agent/turn_trace.py).
+        self.agent._last_stream_diag = diag
         return diag
 
     def _count_chunk(self, diag, chunk) -> None:

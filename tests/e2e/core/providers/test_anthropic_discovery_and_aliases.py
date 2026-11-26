@@ -26,6 +26,10 @@ from tests.fakes.providers.anthropic_messages import AnthropicMessagesServer, Re
 pytestmark = [pytest.mark.skipif(not sys.platform.startswith("linux"), reason="process-tree cleanup uses /proc"),
               pytest.mark.live_system_guard_bypass]
 
+# Write reason accepted by the add/patch reason gate (fork patch: memory-write-reason-gate).
+WRITE_REASON = "This is a durable environment fact that should persist across sessions."
+
+
 class DiscoveryIgnoredEndpoint(AssertionError):
     """#120844's signature: raised ONLY when the configured endpoint's catalog is not what the picker
     serves; the type ``known_gate`` accepts for the discovery cells."""
@@ -132,7 +136,8 @@ def test_oauth_wire_names_map_back_to_real_tools(rig) -> None:
     target.write_text("WIRE-FILE-CONTENT-93", encoding="utf-8")
     r.srv.push(
         Reply([ToolUse("mcp__read_file", {"path": str(target)}),
-               ToolUse("mcp__context_notes", {"action": "add", "target": "memory", "content": note})]),
+               ToolUse("mcp__context_notes", {"action": "add", "target": "memory", "content": note,
+                                              "reason": WRITE_REASON})]),
         Reply([Text("ALIASES-DONE")]),
     )
     proc = r.run("-z", "Read wire.txt and remember the note.")

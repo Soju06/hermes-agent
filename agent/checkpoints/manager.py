@@ -61,7 +61,7 @@ import time
 from pathlib import Path, PurePosixPath
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import selected_git_env, windows_hide_flags
-from typing import Optional
+from typing import Iterator, Optional
 
 from utils import env_int
 
@@ -862,18 +862,40 @@ def _too_broad(abs_dir: str) -> bool:
     return Path(abs_dir) in {Path("/"), home, *home.parents}
 
 
+def _walk_entries(path: str) -> Iterator[os.DirEntry]:
+    """Every entry under ``path`` via os.scandir (symlinked dirs are not descended, like rglob);
+    unreadable directories are skipped.
+
+    os.scandir instead of Path.rglob: this runs on worker threads inside the
+    gateway process, and rglob's per-entry Path materialization over a large
+    tree (node_modules and friends) burns GIL time the event loop needs
+    (2026-08-05 loop-stall incident, 2 threads mid-walk).
+    """
+    stack = [path]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    yield entry
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+
+
 def _dir_size_bytes(path: Path) -> int:
     """Best-effort recursive size in bytes.  Returns 0 on error."""
     total = 0
-    try:
-        for p in path.rglob("*"):
-            try:
-                if p.is_file():
-                    total += p.stat().st_size
-            except OSError:
-                continue
-    except OSError:
-        pass
+    for entry in _walk_entries(str(path)):
+        try:
+            if entry.is_file():
+                total += entry.stat().st_size
+        except OSError:
+            continue
     return total
 
 

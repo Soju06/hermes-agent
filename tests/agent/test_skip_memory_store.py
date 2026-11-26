@@ -78,6 +78,8 @@ def test_skip_memory_memory_tool_handler_works_and_provider_skipped(
         action="add",
         target="memory",
         content="User prefers concise answers.",
+        # add/patch must carry a write reason (fork patch: memory-write-reason-gate).
+        reason="Communication-style preference that applies to every future session.",
         store=agent._memory_store,
     )
     result = json.loads(raw)

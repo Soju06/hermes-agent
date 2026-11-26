@@ -1574,3 +1574,53 @@ def test_index_desc_limit_sets_the_skill_manage_description_budget(tmp_path, mon
     created = json.loads(skill_manage(action="create", name="market-data", content=content))
     assert created["success"] is True, created
     assert "max 160 chars" in schema_desc()
+
+
+# ---------------------------------------------------------------------------
+# Schema: structured write rationale (`reason`)
+# ---------------------------------------------------------------------------
+
+
+def test_skill_manage_schema_declares_structured_reason():
+    """The tool schema must advertise the `reason` rationale contract.
+
+    The skills admission gate (ADR-004 §② — deployed as an external plugin)
+    hard-requires a structured JSON rationale on create/edit/patch. Without
+    this property, schema-following models cannot discover the contract and
+    only learn it through blocked-call retry loops. The field list here is
+    pinned so plugin-side contract drift is at least caught as a failing
+    docs expectation on the core side.
+    """
+    from tools.skill_manager_tool import SKILL_MANAGE_SCHEMA
+
+    props = SKILL_MANAGE_SCHEMA["parameters"]["properties"]
+    assert "reason" in props
+    reason = props["reason"]
+    # Typed object, not a "JSON object string": constrained decoding then
+    # enforces the field types at generation time — a string where the
+    # neighbor array belongs (the #1 gate false-rejection) becomes
+    # unrepresentable instead of a misleading runtime block.
+    assert reason["type"] == "object"
+    rprops = reason["properties"]
+    assert rprops["claim_kind"]["enum"] == ["procedural"]
+    assert rprops["execution_evidence"]["enum"] == ["tier-A", "tier-B", "tier-C"]
+    assert rprops["evidence"]["type"] == "string"
+    assert rprops["target"]["enum"] == ["patch-existing", "new-skill"]
+    assert rprops["neighbor_skills_checked"]["type"] == "array"
+    assert rprops["neighbor_skills_checked"]["items"] == {"type": "string"}
+    assert rprops["neighbor_skills_checked"]["minItems"] == 1
+    assert rprops["verified_by"]["enum"] == ["llm-judgment"]
+    assert set(reason["required"]) == {
+        "claim_kind",
+        "execution_evidence",
+        "evidence",
+        "target",
+        "neighbor_skills_checked",
+    }
+    # `reason` itself must stay OPTIONAL at the schema level: only
+    # create/edit/patch are gated, and enforcement belongs to the gate
+    # (fail-closed plugin), not to top-level JSON-Schema `required`.
+    # Upstream's advertised call shape is the `operations` array (the flat
+    # action/name shape is accepted, not advertised).
+    assert SKILL_MANAGE_SCHEMA["parameters"]["required"] == ["operations"]
+    assert "reason" not in SKILL_MANAGE_SCHEMA["parameters"]["required"]

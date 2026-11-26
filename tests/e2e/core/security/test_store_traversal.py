@@ -73,6 +73,8 @@ KNOWN: dict[str, tuple[str, str]] = {
 }
 
 _STORE_CONFIG = "memory:\n  memory_enabled: true\n  write_approval: true\nskills:\n  write_approval: true\n"
+# Write reason accepted by the add/patch reason gate (fork patch: memory-write-reason-gate).
+WRITE_REASON = "This is a durable environment fact that should persist across sessions."
 _SKILL = "---\nname: {name}\ndescription: {desc}\n---\n\n# {name}\n\n{body}\n"
 
 
@@ -122,7 +124,8 @@ def store(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Store]:
     key = H.canary("sk-store")
     memory_texts = [H.canary(f"staged-memory-{i}") for i in range(3)]
     skill_texts = [H.canary(f"staged-skill-{i}") for i in range(2)]
-    script: list[Any] = [ToolCall("memory", {"action": "add", "target": "memory", "content": t}) for t in memory_texts]
+    script: list[Any] = [ToolCall("memory", {"action": "add", "target": "memory", "content": t, "reason": WRITE_REASON})
+                         for t in memory_texts]
     script += [ToolCall("skill_manage", {"action": "create", "name": f"staged-skill-{i}",
                                          "content": _skill_md(f"staged-skill-{i}", t)})
                for i, t in enumerate(skill_texts)]

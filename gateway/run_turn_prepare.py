@@ -11,6 +11,7 @@ import os
 import queue
 import threading
 import time
+from agent import turn_trace
 from agent.i18n import t
 from agent.session_activity import format_iteration_progress
 from contextlib import nullcontext, suppress
@@ -69,6 +70,20 @@ def _resolve_policy_agent_runtime(runner, policy, *, fallback=True, record_notic
             runner._pre_agent_fallback_notice = notice
         return fallback_entry['model'], _runtime_agent_kwargs(runtime)
     return model, _runtime_agent_kwargs(runtime)
+
+
+def _persisted_runtime_bundle(override: dict) -> dict:
+    """Runtime kwargs of a rehydrated runtime route (``_rehydrate_persisted_runtime_route``): exactly
+    what its one provider resolution produced, so nothing is layered from the configured default."""
+    bundle_runtime = {
+        k: override.get(k) for k in ("api_key", "base_url", "provider", "api_mode", "credential_pool")
+    }
+    bundle_runtime["command"] = override.get("command")
+    bundle_runtime["args"] = list(override.get("args") or [])
+    for k in ("requested_provider", "max_tokens", "request_overrides", "capabilities"):
+        if override.get(k) is not None and override.get(k) != {}:
+            bundle_runtime[k] = override.get(k)
+    return bundle_runtime
 
 
 def _recover_or_remember_model(runner, skey, model):
@@ -225,6 +240,17 @@ class GatewayTurnPrepareMixin:
         if override:
             override_model = override.get("model", model)
             override_runtime = _session_override_snapshot(override)
+            if override.get("_runtime_bundle_complete") is True and not managed_oauth:
+                # Rehydrated runtime route: one atomic provider-resolution bundle (endpoint, mode,
+                # credentials, command, args, pool) — never mixed with the configured default.
+                # A managed OAuth bundle's key is a snapshot like any other: it takes the
+                # per-turn auth-store resolution below, still on its own provider.
+                bundle_runtime = _persisted_runtime_bundle(override)
+                logger.debug(
+                    "Persisted runtime bundle (fast): session=%s config_model=%s -> override_model=%s provider=%s",
+                    skey or "", model, override_model, bundle_runtime.get("provider"),
+                )
+                return override_model, bundle_runtime
             if override_runtime.get("api_key") and not managed_oauth:
                 if override_runtime.get("credential_pool") is None:
                     override_runtime["credential_pool"] = _credential_pool_for_provider(override.get("provider"))
@@ -833,11 +859,18 @@ class GatewayTurnPrepareMixin:
 
         # An unreadable store is not an empty conversation: stop before the agent invents continuity
         # from []. Restore task-local context here (before the broad cleanup finally).
+        _trace = turn_trace.get_bound(event)  # turn trace begun in _handle_message_with_agent
         try:
+            _t_span = time.time() if _trace is not None else 0.0
             history = await self.async_session_store.load_transcript(session_entry.session_id)
+            if _trace is not None:
+                _trace.add_span("gateway.transcript_load", _t_span, time.time())
+                _t_span = time.time()
             history = await self._hmwa_run_session_hygiene(
                 event, source, session_entry, session_key, history, _quick_key, run_generation,
             )
+            if _trace is not None:
+                _trace.add_span("gateway.hygiene", _t_span, time.time())
         except TranscriptReadError:
             self._clear_session_env(_session_env_tokens)
             from gateway.session_results import record_unexecuted_failure

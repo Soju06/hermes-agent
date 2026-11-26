@@ -32,6 +32,7 @@ from agent.context_compressor_summary import accepts_keyword_argument
 from agent.context_engine import CompactionProgressText, automatic_compaction_status_message, sanitize_memory_context
 from agent.conversation_compression_codex import _compress_context_via_codex_app_server
 from agent.conversation_compression_deadline import resolve_context_compression_timeouts
+from agent.conversation_compression_runtime_state import publish_runtime_state_after_split
 from agent.conversation_compression_scaffolding import _SYNTHETIC_USER_FLAGS, _message_text, is_user_role_scaffolding
 from agent.conversation_compression_telemetry import (
     _emit_aborted_attempt_telemetry, _emit_blocked_attempt_telemetry, _emit_bypassed_attempt_telemetry,
@@ -3341,6 +3342,9 @@ def _finish_compaction_boundary(
             elif callable(_clear_labels := getattr(type(_labels_db), "clear_session_activity_labels", None)):
                 _clear_labels(_labels_db, _old_sid)
 
+    # Republish runtime state for the rotated session before later gates observe the new id.
+    publish_runtime_state_after_split(agent, _old_sid)
+
     # Plugin engines use boundary_reason="compression" to keep lineage/checkpoint
     # state. Fires in BOTH modes: in-place passes the same id, the boundary is real.
     if session_commit_succeeded and (bool(_old_sid) or compacted_in_place):
@@ -3447,6 +3451,16 @@ def _candidate_rejected(
     if compressed == messages_before_compression or (
         _strip_marker_for_comparison(compressed) == _strip_marker_for_comparison(messages_before_compression)
     ):
+        agent._last_compression_no_progress = True
+        # Gateway hygiene rebuilds the agent every attempt, so the in-memory backoff below never reaches it: persist
+        # the durable row its pre-agent check honours, or hygiene re-runs this no-op every turn. Only the row, with a
+        # hygiene-only error: this compressor keeps the backoff a grown transcript lifts (force=/compress overrides).
+        with _swallow('no-progress compression cooldown persist failed', exc_info=True):
+            from agent.context_compressor import _NO_PROGRESS_COOLDOWN_ERROR, _SUMMARY_FAILURE_COOLDOWN_SECONDS
+
+            if callable(_persist := getattr(agent.context_compressor, "_durable_write", None)):
+                _persist("record_compression_failure_cooldown", "no-progress compression cooldown",
+                         time.time() + _SUMMARY_FAILURE_COOLDOWN_SECONDS, _NO_PROGRESS_COOLDOWN_ERROR)
         logger.info(
             "Compression made no progress (session=%s) — skipping boundary rewrite.", agent.session_id or "none"
         )
@@ -3871,6 +3885,7 @@ def _begin_compression_attempt(
         raise RuntimeError("a compression notification is already pending")
     agent._last_compression_attempt_recorded = True
     agent._last_compression_attempt_in_place = None
+    agent._last_compression_no_progress = False
     agent._compression_skipped_due_to_lock = None
     # Clear the lock-skip signal at the VERY TOP, before the codex route and the breaker gates below can
     # early-return (per-attempt state rule, #58630/#69853). A stale ``True``/holder value from a prior

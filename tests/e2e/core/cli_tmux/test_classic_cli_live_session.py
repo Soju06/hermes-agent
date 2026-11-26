@@ -45,6 +45,9 @@ delegation:
   max_iterations: 5
 """
 
+# Write reason accepted by the add/patch reason gate (fork patch: memory-write-reason-gate).
+WRITE_REASON = "This is a durable environment fact that should persist across sessions."
+
 
 def _marker(user: str) -> str:
     import re
@@ -69,7 +72,8 @@ def _main(record: dict[str, Any]):
         "LIVE03": lambda: ToolCall("read_file", {"path": "notes.txt"}),
         "LIVE04": lambda: ToolCall("write_file", {"path": "made_by_agent.txt", "content": "written through the gateway\n"}),
         "LIVE05": lambda: ToolCall("search_files", {"pattern": "fixture", "path": "."}),
-        "LIVE07": lambda: ToolCall("memory", {"action": "add", "target": "memory", "content": "LIVE07 fact: likes tea"}),
+        "LIVE07": lambda: ToolCall("memory", {"action": "add", "target": "memory", "content": "LIVE07 fact: likes tea",
+                                              "reason": WRITE_REASON}),
         "LIVE08": lambda: ToolCall("clarify", {"questions": [
             {"question": "LIVE08 which colour?", "choices": ["red", "blue"]},
             {"question": "LIVE08 which size?", "choices": ["small", "large"]}]}),

@@ -26,6 +26,8 @@ from session_keys import profile_from_session_key_namespace
 
 logger = logging.getLogger(__name__)
 
+_RUNTIME_UNSET = object()
+
 
 # -- PII redaction helpers --------------------------------------------------------------------
 
@@ -556,6 +558,13 @@ class SessionEntry:
     # None means nobody toggled it (new, branched, reset, migrated, cron entries, and every conversation
     # boundary, ``_clear_session_boundary_security_state``), so the session's launch policy applies.
     yolo: Optional[bool] = None
+    # Session-scoped runtime overrides (agent model_switch / pre-dispatch runtime_override). Durable
+    # session metadata, unlike per-process GatewayRunner caches. Only stable identifiers are stored;
+    # resolved credentials/endpoints are re-derived after restart. Appended after ``yolo`` so
+    # positional construction of the upstream fields keeps its meaning.
+    runtime_model: Optional[str] = None
+    runtime_provider: Optional[str] = None
+    runtime_reasoning_effort: Optional[str] = None
 
     # Fields (de)serialized verbatim, in wire order (``from_dict`` reads them with
     # ``data.get(name, <dataclass default>)``), split around the three ISO-datetime/token keys.
@@ -568,6 +577,7 @@ class SessionEntry:
         "is_fresh_reset", "was_auto_reset", "auto_reset_reason", "reset_had_activity",
         "prev_session_id",
     )
+    _RUNTIME_FIELDS = ("runtime_model", "runtime_provider", "runtime_reasoning_effort")
 
     def to_dict(self) -> dict[str, Any]:
         result = {
@@ -584,6 +594,7 @@ class SessionEntry:
         result["active_turn_token"] = self.active_turn_token
         result["active_turn_started_at"] = _iso(self.active_turn_started_at)
         result.update((name, getattr(self, name)) for name in self._RESET_FIELDS)
+        result.update((name, getattr(self, name)) for name in self._RUNTIME_FIELDS)
         if self.model_override:
             # Defence-in-depth against an unsanitized dict stored directly.
             result["model_override"] = sanitize_model_override(self.model_override)
@@ -621,7 +632,10 @@ class SessionEntry:
             raise ValueError("Invalid session_key: potential directory traversal detected")
 
         defaults = {f.name: f.default for f in fields(cls)}
-        plain = {n: data.get(n, defaults[n]) for n in cls._PLAIN_FIELDS + cls._RESET_FIELDS}
+        plain = {
+            n: data.get(n, defaults[n])
+            for n in cls._PLAIN_FIELDS + cls._RESET_FIELDS + cls._RUNTIME_FIELDS
+        }
         plain["expiry_finalized"] = data.get("expiry_finalized", data.get("memory_flushed", False))
         # Rows written before the tri-state stored a bare ``yolo`` bool where False also meant "never
         # toggled": only their ON is a real toggle; False follows the launch policy, as it did then.
@@ -1179,15 +1193,25 @@ class SessionStore(
 
         with self._lock:
             entry = self._entry_locked(session_key)
-            if entry is None or entry.model_override == cleaned:
+            if entry is None:
+                return
+            # A /model write, a clear included (``--global``, ``/resume``), is the newer model-route
+            # writer: it supersedes a persisted runtime route (runtime_model/runtime_provider) but
+            # leaves runtime_reasoning_effort alone.
+            has_runtime_route = bool(entry.runtime_model or entry.runtime_provider)
+            if entry.model_override == cleaned and not has_runtime_route:
                 return
             # Publish only after persistence so a failed clear remains retryable.
             data, generation = self._snapshot_routing_locked()
             # Snapshot reconciliation may replace the entry after database recovery.
             entry = self._entries[session_key]
-            data[session_key] = replace(entry, model_override=cleaned).to_dict()
+            data[session_key] = replace(
+                entry, model_override=cleaned, runtime_model=None, runtime_provider=None,
+            ).to_dict()
             self._persist_routing_data(data, generation)
             entry.model_override = cleaned
+            entry.runtime_model = None
+            entry.runtime_provider = None
 
     def set_session_yolo(self, session_key: str, enabled: Optional[bool]) -> bool:
         """Persist the lane's ``/yolo`` bypass (None: back to the launch policy); False when the key has no
@@ -1203,6 +1227,70 @@ class SessionStore(
         with self._lock:
             entry = self._entry_locked(session_key)
             return dict(entry.model_override) if entry and entry.model_override else None
+
+    def get_entry(self, session_key: str) -> Optional[SessionEntry]:
+        """Return a loaded SessionEntry by key without creating a new session."""
+        with self._lock:
+            return self._entry_locked(session_key)
+
+    def update_runtime_override(
+        self,
+        session_key: str,
+        *,
+        model: Any = _RUNTIME_UNSET,
+        provider: Any = _RUNTIME_UNSET,
+        reasoning_effort: Any = _RUNTIME_UNSET,
+    ) -> bool:
+        """Persist session-scoped runtime override metadata.
+
+        ``_RUNTIME_UNSET`` means leave unchanged while ``None``/empty string
+        clears a field. Credentials and resolved endpoint details are never
+        stored.
+        """
+        if not session_key:
+            return False
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            if entry is None:
+                return False
+            if model is not _RUNTIME_UNSET or provider is not _RUNTIME_UNSET:
+                # The runtime route is the newer model-route writer: it supersedes a persisted
+                # /model override (reasoning is independent and left untouched).
+                entry.model_override = None
+            if model is not _RUNTIME_UNSET:
+                entry.runtime_model = str(model).strip() if model else None
+            if provider is not _RUNTIME_UNSET:
+                entry.runtime_provider = str(provider).strip() if provider else None
+            if reasoning_effort is not _RUNTIME_UNSET:
+                entry.runtime_reasoning_effort = (
+                    str(reasoning_effort).strip().lower() if reasoning_effort else None
+                )
+            entry.updated_at = _now()
+            self._save()
+            return True
+
+    def clear_runtime_overrides(
+        self,
+        session_key: str,
+        *,
+        model: bool = True,
+        reasoning: bool = True,
+    ) -> bool:
+        """Clear persisted runtime overrides at conversation/session boundaries."""
+        if not session_key:
+            return False
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            if entry is None:
+                return False
+            if model:
+                entry.runtime_model = None
+                entry.runtime_provider = None
+            if reasoning:
+                entry.runtime_reasoning_effort = None
+            entry.updated_at = _now()
+            self._save()
+            return True
 
     def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:
         """Force reset a session, creating a new session ID."""
@@ -1393,6 +1481,10 @@ class SessionStore(
                         {"terminal_cwd": old_entry.metadata["terminal_cwd"]}
                         if preserve_prompt_pin and "terminal_cwd" in old_entry.metadata else {}
                     ),
+                    # The durable runtime route (agent model_switch / runtime_override) is the /model
+                    # pin's twin: it rides a non-boundary re-pin too; /resume clears both after this.
+                    runtime_model=old_entry.runtime_model, runtime_provider=old_entry.runtime_provider,
+                    runtime_reasoning_effort=old_entry.runtime_reasoning_effort,
                 )
         if refused:
             return None

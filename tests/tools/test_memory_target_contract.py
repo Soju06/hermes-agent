@@ -13,16 +13,20 @@ from tools.registry import registry
 from tools.skill_provenance import reset_current_write_origin, set_current_write_origin
 from tools import write_approval as wa
 
+# Write reason accepted by the add/patch reason gate (fork patch: memory-write-reason-gate).
+WRITE_REASON = "This is a durable environment fact that should persist across sessions."
+
 
 def _call(route, store, args):
     if route == "store":
         return store.apply_batch(args.get("target"), args["operations"])
     if route == "replay":
         return apply_memory_pending({"action": "batch", **args}, store)
+    tool_args = {**args, "reason": WRITE_REASON}
     if route == "inline":
         agent = SimpleNamespace(_memory_store=store, _memory_manager=None)
-        return json.loads(INLINE_TOOL_EXECUTORS["memory"](agent, args, None))
-    return json.loads(registry.dispatch("memory", args, store=store))
+        return json.loads(INLINE_TOOL_EXECUTORS["memory"](agent, tool_args, None))
+    return json.loads(registry.dispatch("memory", tool_args, store=store))
 
 
 @pytest.mark.parametrize("route", ["registry", "inline", "store", "replay"])

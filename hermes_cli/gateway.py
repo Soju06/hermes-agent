@@ -2844,9 +2844,9 @@ def legacy_launchd_labels_for_install(exclude=()) -> list[str]:
 
 
 def get_python_path() -> str:
-    from hermes_cli._launchers import resolve_store_python
+    from hermes_cli._launchers import service_python
 
-    return str(resolve_store_python(PROJECT_ROOT) or sys.executable)
+    return str(service_python(PROJECT_ROOT))
 
 
 # =============================================================================
@@ -2962,8 +2962,8 @@ def _build_service_path_dirs(project_root: Path | None = None) -> list[str]:
         except OSError:
             return False
 
-    candidates = []
-    # Python and dependency executable paths are selected at boot, not persisted.
+    from hermes_cli._launchers import service_venv  # an external tree's own venv; PM selects at boot
+    candidates = [str(venv / "bin") for venv in (service_venv(project_root),) if venv is not None]
 
     hermes_home = get_hermes_home()
     extras = (project_root / "node_modules" / ".bin", hermes_home / "node" / "bin", hermes_home / "node_modules" / ".bin")
@@ -3078,7 +3078,7 @@ def _prepare_service_launcher(*, system: bool = False, run_as_user: str | None =
         # Publication gate: ask what stage_launcher will bind, so an inherited
         # HERMES_RUNTIME_DIR cannot stand in for this install's store (#131745).
         if not publishes_service_launcher(root):
-            return  # Externally owned Nix/developer runtime, or a macOS app's own signed launcher.
+            return  # Externally owned Nix/developer/fork runtime, or a macOS app's own signed launcher.
         local = root / ".hermes" / "bin"
         paths = ensure_install_launchers(root, local)
         if len(paths) != len(ENTRY_POINTS):
@@ -3094,9 +3094,8 @@ def _prepare_service_launcher(*, system: bool = False, run_as_user: str | None =
 
 
 def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) -> str:
-    from hermes_cli._launchers import installation_command
-
-    python_path = get_python_path()
+    from hermes_cli._launchers import installation_command, service_venv
+    python_path, venv = get_python_path(), service_venv(PROJECT_ROOT)
     working_dir = _stable_service_working_dir()
     project_root = PROJECT_ROOT
 
@@ -3120,6 +3119,7 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
             profile_arg = _profile_arg(hermes_home)
         # Remap paths under the calling user's home (/root/) to the target user's so the service can read them.
         python_path = _remap_path_for_user(python_path, home_dir)
+        venv = venv and _remap_path_for_user(str(venv), home_dir)
         working_dir = str(hermes_home) if hermes_home else _remap_path_for_user(working_dir, home_dir)
         project_root = Path(_remap_path_for_user(str(project_root), home_dir))
         path_entries = [_remap_path_for_user(p, home_dir) for p in path_entries]
@@ -3174,7 +3174,7 @@ Type={systemd_type}
 {systemd_watchdog_directives}{identity_lines}ExecStart={_systemd_command(start)}
 WorkingDirectory={working_dir}
 {env_lines}Environment="PATH={sane_path}"
-
+{f'Environment="VIRTUAL_ENV={venv}"' if venv else ""}
 Environment="HERMES_HOME={hermes_home}"
 Environment="HERMES_SUPERVISED_CHILD=1"
 {bundled_env_block}Restart=always

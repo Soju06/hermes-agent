@@ -16,6 +16,7 @@ import os
 import queue
 import threading
 import time
+from agent import turn_trace
 from agent.i18n import t
 from agent.session_activity import format_iteration_progress
 from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND, FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE
@@ -167,9 +168,13 @@ from gateway.run_turn_prepare import GatewayTurnPrepareMixin
 from gateway.run_background import GatewayBackgroundMixin
 from gateway.run_turn_hygiene import GatewayTurnHygieneMixin
 from gateway.run_turn_persistence import GatewayTurnPersistenceMixin
+from gateway.run_turn_activity_recap import GatewayTurnActivityRecapMixin
 
 
-class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, GatewayTurnPersistenceMixin):
+class GatewayTurnMixin(
+    GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, GatewayTurnPersistenceMixin,
+    GatewayTurnActivityRecapMixin,
+):
     """Agent-turn execution for GatewayRunner (see module docstring)."""
 
 
@@ -195,6 +200,35 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             _platform_name, hash_for_log(source.user_id), hash_for_log(source.chat_id),
             len(event.text or ""), getattr(event, "reply_to_message_id", None),
         )
+
+        # Turn trace: gateway owns begin(); finish() happens in the adapter's
+        # _process_message_background after delivery (bound to the event so it
+        # is reachable there).  None when HERMES_TURN_TRACE is unset — every
+        # use below is guarded.  Carried in locals/bound objects, never via
+        # thread-local: this coroutine shares the event loop thread with
+        # concurrent sessions.  The pre-agent setup guard times
+        # gateway.session_resolve off the event's binding.
+        _trace = turn_trace.begin(
+            key=_quick_key, started_at=_msg_start_time, platform=_platform_name,
+        )
+        if _trace is not None:
+            turn_trace.bind(event, _trace)
+            # The pre-dispatch hook loop may swap `event` for a copy
+            # (dataclasses.replace on prepend/rewrite directives), but the
+            # adapter's finish site still holds the ORIGINAL event.  The
+            # SessionSource object survives the replace, so bind it as the
+            # durable carrier; adapters resolve event-then-source and clear
+            # both after finish.
+            turn_trace.bind(source, _trace)
+            try:
+                _dbnc_ts = getattr(event, "_hermes_debounce_enqueue_ts", None)
+                if _dbnc_ts:
+                    _trace.mark("transport.inbound_debounce", at=float(_dbnc_ts))
+                    _trace.tag(debounce_ms=round(
+                        (_msg_start_time - float(_dbnc_ts)) * 1000.0, 1,
+                    ))
+            except Exception:
+                pass
 
         from gateway.run_turn_setup_guard import run_preagent_setup
         setup, reply = await run_preagent_setup(self, event, source, _quick_key, run_generation)
@@ -231,7 +265,9 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                     **reply_expected_metadata(event.reply_expected), **diagnostic_metadata(event)},
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
+                turn_trace_obj=_trace,
             )
+            _t_persist = time.time() if _trace is not None else 0.0
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
             # A queued (/queue) chain answered the LAST message of the chain, so the outer final
@@ -286,12 +322,16 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             await self._record_room_silence_decision(
                 session_key, agent_result, _intentional_silence,
                 display_kind=prepared.persist_user_display_kind, reply_expected=event.reply_expected)
+            if _trace is not None:
+                _trace.add_span("gateway.persist", _t_persist, time.time())
             return await self._deliver_turn_response_then_limit_offer(
                 event, source, session_entry, session_key, run_generation,
                 agent_result, agent_messages, response, _footer_line, _intentional_silence,
             )
 
         except Exception as e:
+            if _trace is not None:
+                _trace.tag(gateway_error=type(e).__name__)
             return await self._hmwa_agent_error_reply(e, event, source, session_entry, session_key, prepared)
         finally:
             # Restore session context variables to their pre-handler state
@@ -854,6 +894,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         def _display_surface_mode(
             setting: str, *, default: bool = False,
             require_platform_override_for: set[Any] | None = None, allow_generic: bool = False,
+            allow_recap: bool = False,
         ) -> str:
             """Return off|raw|generic for a gateway visibility surface."""
             if require_platform_override_for:
@@ -867,6 +908,11 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             value = resolve_display_setting(user_config, platform_key, setting, default)
             if isinstance(value, str) and value.strip().lower() == "generic":
                 return "generic" if allow_generic else "off"
+            if isinstance(value, str) and value.strip().lower() == "recap":
+                # LLM-generated one-line activity recap (long-running
+                # notifications only). Surfaces that don't support it treat
+                # the setting as plain "on".
+                return "recap" if allow_recap else "raw"
             return "raw" if bool(value) else "off"
 
         def _generic_status_phrase(kind: str, *, tool_name: str | None = None, preview: str | None = None, args: Any = None) -> str:
@@ -1774,6 +1820,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                     reply_expected=next_reply_expected, persist_user_display_metadata={
                         **display_metadata_for_event(pending_event),
                         **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event)} or None,
+                    turn_trace_obj=getattr(turn_ctx, "turn_trace_obj", None),
                 )
         except asyncio.CancelledError:
             await _run_followup_processing_hook(
@@ -1977,7 +2024,9 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         from gateway.run import _float_env, _interim_metadata, _non_conversational_metadata
         _notify_start = time.time()
         _NOTIFY_INTERVAL = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 180)
-        _long_running_mode = disp._display_surface_mode("long_running_notifications", default=True, allow_generic=True)
+        _long_running_mode = disp._display_surface_mode(
+            "long_running_notifications", default=True, allow_generic=True, allow_recap=True,
+        )
         if _NOTIFY_INTERVAL <= 0 or _long_running_mode == "off":
             return
         source, session_key, agent_holder = turn_ctx.source, turn_ctx.session_key, turn_ctx.agent_holder
@@ -2009,13 +2058,30 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                         _parts.append(str(_action))
                     if _parts:
                         _status_detail = " — " + ", ".join(_parts)
-            _heartbeat_text = (
-                disp._generic_status_phrase("status")
-                if _long_running_mode == "generic"
-                else t("gateway.progress.working_heartbeat", minutes=_elapsed_mins, detail=_status_detail)
-            )
+            _recap_line = None
+            if _long_running_mode == "recap" and agent_holder[0] is not None:
+                _recap_line = await self._llm_activity_recap(agent_holder[0], session_key)
+            if _long_running_mode == "generic":
+                _heartbeat_text = disp._generic_status_phrase("status")
+            elif _recap_line:
+                _heartbeat_text = f"⏳ {_elapsed_mins} min — {_recap_line}"
+            else:
+                _heartbeat_text = t("gateway.progress.working_heartbeat", minutes=_elapsed_mins, detail=_status_detail)
             try:
                 _notify_res = None
+                # Recap mode keeps the bubble at the thread bottom: an
+                # edited message buried by hours of tool traffic is
+                # invisible, so delete-and-resend instead of edit when the
+                # adapter supports deletion.
+                if (
+                    _heartbeat_msg_id
+                    and _long_running_mode == "recap"
+                    and getattr(type(_notify_adapter), "delete_message", None)
+                    not in (None, BasePlatformAdapter.delete_message)
+                ):
+                    with suppress(Exception):
+                        await _notify_adapter.delete_message(source.chat_id, _heartbeat_msg_id)
+                    _heartbeat_msg_id = None
                 if _heartbeat_msg_id:
                     try:
                         _notify_res = await _notify_adapter.edit_message(source.chat_id, _heartbeat_msg_id, _heartbeat_text)
@@ -2052,11 +2118,18 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         reply_expected: Optional[bool] = None,
         scheduled_heartbeat: bool = False,
         title_user_message: Optional[str] = None,
+        turn_trace_obj: Optional[Any] = None,
     ) -> dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
         Keys: "final_response", "messages", "api_calls", "completed"."""
         if self._get_proxy_url():
+            if turn_trace_obj is not None:
+                turn_trace_obj.add_span(
+                    "gateway.ingest", turn_trace_obj.started_at, time.time(),
+                    platform=source.platform.value if source.platform else "",
+                    session_key=session_key,
+                )
             result = await self._run_agent_via_proxy(
                 message=message, context_prompt=context_prompt, history=history, source=source,
                 session_id=session_id, session_key=session_key, run_generation=run_generation,
@@ -2095,6 +2168,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             reply_expected=reply_expected,
             persist_user_display_metadata=persist_user_display_metadata, scheduled_heartbeat=scheduled_heartbeat,
             voice_turn=str(getattr(message_type, "value", message_type) or "").lower() == "voice",
+            turn_trace_obj=turn_trace_obj,
         )
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,
@@ -2122,6 +2196,12 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         )
 
         try:
+            if turn_trace_obj is not None:
+                turn_trace_obj.add_span(
+                    "gateway.ingest", turn_trace_obj.started_at, time.time(),
+                    platform=source.platform.value if source.platform else "",
+                    session_key=session_key,
+                )
             # run_sync is TurnRunner.run_sync (bound method; executor call unchanged).
             worker = self._run_agent_start_turn_worker(turn_ctx, turn_runner.run_sync)
             _executor_task_holder[0] = worker.executor_task  # read late by _notify_long_running

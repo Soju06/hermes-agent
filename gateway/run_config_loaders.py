@@ -331,7 +331,8 @@ class GatewayConfigLoadersMixin:
         self, *, source: Optional[SessionSource] = None, session_key: Optional[str] = None,
         model: str = "",
     ) -> dict | None:
-        """Session ``/reasoning --session`` > per-model ``agent.reasoning_overrides`` > global.
+        """Session ``/reasoning --session`` > persisted ``SessionEntry.runtime_reasoning_effort``
+        (rehydrated after a gateway restart) > per-model ``agent.reasoning_overrides`` > global.
 
         ``model`` must be the session's *effective* model (session ``/model`` override included);
         empty uses ``model.default``.
@@ -341,6 +342,17 @@ class GatewayConfigLoadersMixin:
             _r_state = self._peek_session_state(resolved_session_key)
             if _r_state is not None and _r_state.conversation.reasoning_override is not None:
                 return _r_state.conversation.reasoning_override
+            # Durable session-scoped reasoning override (agent model_switch / runtime_override)
+            # persisted on the SessionEntry: rehydrate into the in-memory override after a restart.
+            entry = self._get_session_entry(resolved_session_key)
+            persisted_effort = getattr(entry, "runtime_reasoning_effort", None)
+            if persisted_effort:
+                from hermes_constants import parse_reasoning_effort
+
+                persisted = parse_reasoning_effort(persisted_effort)
+                if persisted is not None:
+                    self._session_state(resolved_session_key).conversation.reasoning_override = dict(persisted)
+                    return persisted
         from gateway.session_setting_commands import local_policy
         if (policy := local_policy(self, source)) is not None:
             # A local session runs its frozen (or followed) level, not the profile's.

@@ -618,6 +618,8 @@ DEFAULT_CONFIG = {
         "micro_compact_defrag_threshold_tokens": 2000,
         # Gateway session-hygiene force-compress threshold, by message count.
         "hygiene_hard_message_limit": 5000,
+        # Gateway pre-agent hygiene trigger ratio, (0, 1]; keep it above compression.threshold.
+        "hygiene_threshold": 0.85,
         # Max seconds the gateway waits for pre-agent hygiene compression WITHOUT forward progress.
         # Inactivity budget: a slow model still streaming tokens extends the wait.
         "hygiene_timeout_seconds": 30,

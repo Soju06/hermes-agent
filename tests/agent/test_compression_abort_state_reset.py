@@ -18,8 +18,9 @@ empty-transcript returns — so every abort path leaves the attempt outcome
 
 import os
 import tempfile
+import time
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 
 def _make_agent(session_db):
@@ -132,4 +133,82 @@ class TestAbortPathsResetPerAttemptState:
             assert new_history is history
             db.close()
 
+    def test_no_progress_records_durable_cooldown_but_force_still_runs(self):
+        """A protected-tail no-op writes the durable row the gateway hygiene pass honours. This compressor keeps
+        only the structural backoff: the same transcript waits, /compress runs, and a grown transcript compacts
+        again while the row is still live (2026-11-25 sync regression)."""
+        from agent.conversation_compression import compress_context
+        from persistence_assembly import open_persistence, profile_scope
+        from tests.fixtures.storage_seed import seed_session
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = open_persistence(profile_scope(home=Path(tmpdir)))
+            seed_session(db, "abort-state-session", "test")
+            agent = _make_agent(db)
+            agent._compression_feasibility_checked = True
+            messages = [
+                {"role": "user", "content": "protected request"},
+                {"role": "assistant", "content": "protected response"},
+                {"role": "user", "content": "latest request"},
+                {"role": "assistant", "content": "latest response"},
+            ]
+            compressor_call = MagicMock(
+                side_effect=lambda current, **_kwargs: [dict(m) for m in current]
+            )
+            agent.context_compressor.compress = compressor_call
+
+            returned, _ = compress_context(
+                agent,
+                messages,
+                "system",
+                approx_tokens=100_000,
+            )
+
+            assert returned is messages
+            compressor_call.assert_called_once()
+            assert agent._last_compression_no_progress is True
+            now = time.time()
+            cooldown = db.messages.read_compression_cooldown(
+                "abort-state-session", now
+            )
+            assert cooldown is not None
+            assert cooldown.until - now > 0
+            assert cooldown.error == (
+                "no_progress: protected tail spans the whole transcript"
+            )
+            # The row is hygiene-only: the in-agent cooldown gate does not honour it.
+            compressor = agent.context_compressor
+            assert compressor.get_active_compression_failure_cooldown(refresh=True) is None
+
+            compressor_call.reset_mock()
+            returned, _ = compress_context(
+                agent,
+                messages,
+                "system",
+                approx_tokens=100_000,
+            )
+            assert returned is messages
+            compressor_call.assert_not_called()
+            assert agent._last_compression_no_progress is False
+
+            compress_context(
+                agent,
+                messages,
+                "system",
+                approx_tokens=100_000,
+                force=True,
+            )
+            compressor_call.assert_called_once()
+
+            # The turn preflight lifts the backoff once the transcript grew; the live row must not block it.
+            grown = messages + [
+                {"role": "user", "content": "next request"},
+                {"role": "assistant", "content": "next response"},
+            ]
+            assert db.messages.read_compression_cooldown("abort-state-session", time.time()) is not None
+            compressor.lift_structural_backoff_if_grown(len(grown))
+            compressor_call.reset_mock()
+            compress_context(agent, grown, "system", approx_tokens=100_000)
+            compressor_call.assert_called_once()
+            db.close()
 

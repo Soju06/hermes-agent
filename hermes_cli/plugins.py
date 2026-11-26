@@ -133,7 +133,11 @@ VALID_HOOKS: set[str] = {
     # "should_rotate_credential"/"should_fallback": bool, "message": str, "error_context": dict}.
     # Run-all-then-pick-first (see get_plugin_error_classification). Privacy: error_message/
     # error_body may be unredacted.
-    "transform_api_error_classification", "on_session_start", "on_session_end",
+    "transform_api_error_classification",
+    # runtime_state: fired by agent/runtime_control.py after model_status/model_switch and by other
+    # core runtime seams so plugins observe the effective model/provider/reasoning without relying
+    # on generic post_tool_call paths.
+    "runtime_state", "on_session_start", "on_session_end",
     "on_session_finalize", "on_session_reset", "on_session_delete",
     # on_session_open: local session created/opened, before its first turn. Kwargs: session_id, platform, reason.
     "on_session_open",

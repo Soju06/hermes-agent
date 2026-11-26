@@ -16,7 +16,7 @@ Oracles (all imported, never reimplemented):
   whatsapp  gateway.platforms.whatsapp_common.WhatsAppBehaviorMixin
             .format_message (standard markdown → WhatsApp formatting)
   discord   plugins.platforms.discord.adapter.DiscordAdapter.format_message
-            (GFM tables → bullet groups; otherwise identity)
+            (GFM tables → fenced box-drawing tables; otherwise identity)
 
 Expect semantics (consumed by the gg runner):
   parity    connector render must BYTE-EQUAL native_output
@@ -24,9 +24,10 @@ Expect semantics (consumed by the gg runner):
   semantic  connector renders a DIFFERENT representation on purpose
             (Telegram: connector sends HTML, native sends MarkdownV2);
             the runner asserts plain-text content equivalence instead.
-  divergent documented no-parity (e.g. Discord tables: native converts to
-            bullets, connector passes raw markdown through). The runner
-            asserts the DOCUMENTED connector behavior named in `note`.
+  divergent documented no-parity (e.g. Discord tables: native renders
+            fenced box-drawing tables, connector passes raw markdown
+            through). The runner asserts the DOCUMENTED connector
+            behavior named in `note`.
 
 Run:  python scripts/generate_conformance_vectors.py [--out DIR]
 Determinism is covered by tests/conformance/test_vector_generator.py.
@@ -177,7 +178,7 @@ _EXPECT_OVERRIDES: dict[str, dict[str, tuple]] = {
         "unclosed-fence": ("divergent", "unterminated fence handling differs; both degrade without dropping content"),
     },
     "discord": {
-        "table-simple": ("divergent", "native converts GFM tables to bullet groups; connector passes raw markdown through (port deferred — parity report Phase 4/oracle section)"),
+        "table-simple": ("divergent", "native renders GFM tables as fenced box-drawing tables; connector passes raw markdown through (port deferred — parity report Phase 4/oracle section)"),
         "table-cjk": ("divergent", "same as table-simple"),
     },
 }

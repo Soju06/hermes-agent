@@ -10,7 +10,8 @@ from pathlib import Path
 import pytest
 
 from tests.agent.test_session_prompt_refresh import (
-    _assert_stale, _assert_updated, _refresh_prompts, _system, _update_profile, _user_texts, _write_profile,
+    _assert_persisted_as_sent, _assert_stale, _assert_updated, _refresh_prompts, _system, _update_profile,
+    _user_texts, _write_profile,
 )
 from tests.fakes.fake_llm_provider import FakeLLMServer
 
@@ -67,7 +68,8 @@ def test_the_verb_makes_the_next_turn_adopt_the_updated_sources(profile, monkeyp
     _assert_updated(refreshed)
     assert _user_texts(srv.main_requests()[-1])[:2] == ["hello", "anything new?"]
     prompt, model_config = _stored(home, "chat-a")
-    assert prompt == refreshed and model_config.get("prompt_refresh_epoch") == request["epoch"]
+    _assert_persisted_as_sent(prompt, refreshed)
+    assert model_config.get("prompt_refresh_epoch") == request["epoch"]
 
 
 def test_the_refreshed_prompt_is_restored_without_another_rebuild(profile, monkeypatch):

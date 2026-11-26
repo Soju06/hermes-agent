@@ -184,6 +184,10 @@ async def _admit_once(authority, event, webhook, hooks, live, committed):
             # a provider retry or relay re-send resends that, and resolves to this row.
             from gateway.session_ingress_media import ingress_fingerprint
             admitted._ingress_sha256 = ingress_fingerprint(committed[0], event.raw_message)
+        if getattr(admitted, '_hermes_runtime_override_directives', None):
+            # Staged runtime_override directives ride only this in-memory event, never the
+            # committed payload: they apply now, before the commit (fork runtime-control).
+            await runner._hm_apply_producer_runtime_overrides(admitted)
     if live and await _answers_live_turn(runner, event, admitted):
         await _release_preparation(authority, committed[0])
         return None

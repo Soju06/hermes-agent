@@ -35,7 +35,7 @@ from agent.compression_marker import _COMPRESSION_MARKER_PREFIX
 from agent.interrupt_control import _REASON_USER_INTERRUPT, interrupt_skip_wording
 from session_rules.turns import coalesce_tool_call_id
 from agent.onboarding import observe_tool_result as observe_onboarding_result
-from agent import plugin_live_notes
+from agent import plugin_live_notes, turn_trace_loop
 from agent.lsp import deferred as lsp_deferred
 from agent.prompt_cache_scope import conversation_id
 from agent.inline_tool_executors import (
@@ -56,6 +56,7 @@ from agent.tool_dispatch_helpers import (
 from session_rules.turns import _is_multimodal_tool_result, _multimodal_text_summary
 from tools.terminal_tool_lifecycle import get_active_env
 from tools.thread_context import propagate_context_to_thread
+from tools.perf_advisor import with_perf_advisory
 from tools.tool_result_storage import (
     maybe_persist_tool_result,
     enforce_turn_budget,
@@ -1169,6 +1170,7 @@ def _commit_tool_result(
             _append_subdir_hint_to_multimodal(persisted_result, subdir_hints)
         else:
             persisted_result += subdir_hints
+    persisted_result = with_perf_advisory(persisted_result, function_name, function_args, tool_duration)
 
     # Multimodal dicts become an OpenAI-style content list; text-only servers get a
     # string-safe fallback so a rejected image result never poisons history.
@@ -1403,11 +1405,13 @@ class _ConcurrentBatch:
             result = ref.emit_cancelled(agent, start)
             duration = time.time() - start
             logger.info("tool %s cancelled (%.2fs)", ref.name, duration)
+            turn_trace_loop.trace_tool_call(agent, ref.name, start, duration, error="cancelled")
             return _ToolOutcome(ref, result, duration, True, False)
         except Exception as tool_error:
             result = f"Error executing tool '{ref.name}': {tool_error}"
             logger.error("_invoke_tool raised for %s: %s", ref.name, tool_error, exc_info=True)
         duration = time.time() - start
+        turn_trace_loop.trace_tool_call(agent, ref.name, start, duration)
         if not blocked and not dispatched:
             ref.emit_post(agent, result, duration_ms=int(duration * 1000))
         is_error, _ = _detect_tool_failure(ref.name, result)
@@ -1945,9 +1949,10 @@ def _execute_tool_calls_sequential(agent, assistant_message, messages: list, eff
             display_index=i,
             tool_start_time=tool_start_time,
         )
-        if not _publish_sequential_result(agent, messages, ref, managed, tool_duration=tool_duration, index=i,
-                                          budget=_tool_budget, transform_applied=dispatch.transform_applied):
-            return
+        with turn_trace_loop.tool_publish_span(agent, ref.name, tool_start_time, tool_duration):
+            if not _publish_sequential_result(agent, messages, ref, managed, tool_duration=tool_duration, index=i,
+                                              budget=_tool_budget, transform_applied=dispatch.transform_applied):
+                return
 
         if agent._interrupt_requested and i < len(tool_calls):
             if not _skip_remaining_sequential(

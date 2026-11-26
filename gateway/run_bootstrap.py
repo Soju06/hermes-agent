@@ -494,7 +494,9 @@ async def _start_gateway_shutdown_tail(
     runner, _control_server, cron_stop: threading.Event, cron_provider,
     cron_thread: Any, housekeeping_thread: threading.Thread,
     _planned_stop_watcher_stop: threading.Event, _planned_stop_watcher_thread: threading.Thread,
-    _signal_initiated_shutdown: list) -> bool:
+    _signal_initiated_shutdown: list, *,
+    _loop_stall_watchdog_stop: Optional[threading.Event] = None,
+    _loop_stall_watchdog_thread: Optional[threading.Thread] = None) -> bool:
     """Post-``wait_for_shutdown`` teardown; returns the process exit verdict (True = exit 0)."""
     from gateway.run import (_CRON_SHUTDOWN_DRAIN_TIMEOUT, _HOUSEKEEPING_SHUTDOWN_DRAIN_TIMEOUT, _await_thread_exit, _best_effort, _resolve_gateway_exit_verdict, _shutdown_mcp_servers_nonblocking, _stop_cron_provider)
     # Control socket first: once shutdown begins we are no longer a truthful "serving here" answer and a
@@ -528,6 +530,10 @@ async def _start_gateway_shutdown_tail(
     # Stop the planned-stop watcher (daemon=True so this is belt-and-suspenders).
     _planned_stop_watcher_stop.set()
     _planned_stop_watcher_thread.join(timeout=2)
+    if _loop_stall_watchdog_stop is not None:
+        _loop_stall_watchdog_stop.set()
+    if _loop_stall_watchdog_thread is not None:
+        _loop_stall_watchdog_thread.join(timeout=2)
 
     # Never suppressed: a raise here is a real teardown failure (it once hid a changed signature,
     # leaving every MCP connection and the shared loop up while the gateway reported a clean exit).
@@ -854,6 +860,7 @@ async def _start_gateway_runtime(config: Optional[GatewayConfig] = None, replace
     _control_server = None
     runner = None
     _planned_stop_watcher_stop = None
+    _loop_stall_watchdog_stop = None
     try:
         _start_gateway_configure_logging(verbosity)
 
@@ -913,6 +920,19 @@ async def _start_gateway_runtime(config: Optional[GatewayConfig] = None, replace
             args=(_planned_stop_watcher_stop, runner, loop, shutdown_signal_handler), daemon=True,
             name="planned-stop-watcher")
         _planned_stop_watcher_thread.start()
+
+        # Loop-stall watchdog: platform-independent successor to relying on
+        # discord.py's "heartbeat blocked" warnings for loop-freeze detection
+        # (2026-07-28 outage). ERROR + MainThread stack + PSI on stalls ≥5s.
+        from gateway.loop_stall_watchdog import _run_loop_stall_watchdog
+        _loop_stall_watchdog_stop = threading.Event()
+        _loop_stall_watchdog_thread = threading.Thread(
+            target=_run_loop_stall_watchdog,
+            args=(_loop_stall_watchdog_stop, loop),
+            daemon=True,
+            name="loop-stall-watchdog",
+        )
+        _loop_stall_watchdog_thread.start()
 
         # Right after the PID claim (which makes us authoritative). Fatal: local clients attach only
         # with tickets minted on this listener, so startup aborts without it.
@@ -975,7 +995,9 @@ async def _start_gateway_runtime(config: Optional[GatewayConfig] = None, replace
             finally:
                 verdict = await _start_gateway_shutdown_tail(
                     runner, _control_server, cron_stop, cron_provider, cron_thread, housekeeping_thread,
-                    _planned_stop_watcher_stop, _planned_stop_watcher_thread, _signal_initiated_shutdown)
+                    _planned_stop_watcher_stop, _planned_stop_watcher_thread, _signal_initiated_shutdown,
+                    _loop_stall_watchdog_stop=_loop_stall_watchdog_stop,
+                    _loop_stall_watchdog_thread=_loop_stall_watchdog_thread)
         return verdict
 
     finally:
@@ -992,6 +1014,8 @@ async def _start_gateway_runtime(config: Optional[GatewayConfig] = None, replace
         finally:
             if _planned_stop_watcher_stop is not None:
                 _planned_stop_watcher_stop.set()
+            if _loop_stall_watchdog_stop is not None:
+                _loop_stall_watchdog_stop.set()
             if _control_server is not None:
                 await _control_server.stop()
             remove_pid_file()

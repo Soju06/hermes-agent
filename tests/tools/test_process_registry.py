@@ -43,6 +43,13 @@ def _reset_systemd_scope_cache():
     _pr._SYSTEMD_SCOPE_AVAILABLE = original
 
 
+@pytest.fixture(autouse=True)
+def _no_terminal_child_nice(monkeypatch):
+    """Spawn-argv assertions here pin the unprefixed command (systemd scope, compound
+    rewrite); the nice(1) prefix has its own contract in test_terminal_child_nice.py."""
+    monkeypatch.setenv("HERMES_TERMINAL_CHILD_NICE", "0")
+
+
 def _make_session(
     sid="proc_test123",
     command="echo hello",

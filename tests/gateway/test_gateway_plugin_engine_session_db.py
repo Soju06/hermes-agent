@@ -111,7 +111,7 @@ def test_a_cold_compress_binds_a_plugin_engine_to_a_session_db_closed_when_it_en
         assert engine.stores == [store]
 
 
-def test_session_hygiene_rebinds_a_plugin_engine_to_the_agents_session_db(store, closes, engine):
+def test_session_hygiene_rebinds_a_plugin_engine_to_the_agents_session_db(monkeypatch, store, closes, engine):
     with patch("agent.agent_init._select_context_engine", return_value=engine):
         agent = AIAgent(api_key="test-key", base_url="http://127.0.0.1:9/v1", model="test/model", quiet_mode=True,
                         skip_context_files=True, skip_memory=True, skip_background_review=True,
@@ -119,8 +119,18 @@ def test_session_hygiene_rebinds_a_plugin_engine_to_the_agents_session_db(store,
     agent._compress_context = lambda messages, *_a, **_k: (messages, None)
     [(session_db, _row)] = engine.bound
 
-    async def build_agent(*_args):
-        return agent, store
+    # Fork #48 event-loop-db-isolation: the rebind belongs to the hygiene build, which runs AIAgent.__init__ and
+    # bind_session_state off the event loop, so the real build runs here and only its AIAgent construction is stubbed.
+    built = []
+
+    def construct(**kwargs):
+        built.append(kwargs)
+        return agent
+
+    monkeypatch.setattr("run_agent.AIAgent", construct)
+
+    async def build_agent(*args):
+        return await GatewayRunner._hmwa_hygiene_build_agent(gateway, *args)
 
     async def wait_for_summary(attempt, *_args):
         return await attempt.future
@@ -132,6 +142,7 @@ def test_session_hygiene_rebinds_a_plugin_engine_to_the_agents_session_db(store,
         GatewayRunner._cleanup_agent_resources(gateway, hyg_agent)
 
     gateway = SimpleNamespace(
+        persistence=store,
         _hmwa_hygiene_build_agent=build_agent, _hmwa_hygiene_wait_for_summary=wait_for_summary,
         _hmwa_hygiene_apply_result=nothing, _track_deferred_agent_worker=lambda *_a: None,
         _evict_cached_agent=lambda _key: None, _cleanup_agent_resources_off_loop=cleanup,
@@ -142,6 +153,7 @@ def test_session_hygiene_rebinds_a_plugin_engine_to_the_agents_session_db(store,
         gateway, attempt, SimpleNamespace(total_ceiling_seconds=60.0), SimpleNamespace(approx_tokens=100_000),
         history, history, "test/model", {}, None, SimpleNamespace(session_id="s1"), "agent:main:cli", "qk", 0,
     ))
+    assert [(kw["session_id"], kw["persistence"]) for kw in built] == [("s1", store)]
     assert len(engine.bound) == 2
     assert engine.bound[-1][0] is session_db
     assert engine.bound[-1][1] == store.sessions.get("s1").as_session_row()

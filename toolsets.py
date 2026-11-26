@@ -18,7 +18,8 @@ _HERMES_CORE_TOOLS = [
     "browser_cdp", "browser_dialog",
     "browser_vault",  # rides with the browser; deferred by default (tools.tool_search.defer)
     "text_to_speech",
-    "todo_list", "memory",
+    # Planning, memory, and model/runtime introspection
+    "todo_list", "memory", "model_status", "model_switch",
     "session_search",
     "clarify",
     "execute_code", "delegate_task",
@@ -124,6 +125,7 @@ TOOLSETS = {
     "todo": _ts("Task planning and tracking for multi-step work", ["todo_list"]),
     "memory": _ts("Persistent memory across sessions (personal notes + user profile)", ["memory"]),
     "context_engine": _ts("Runtime tools exposed by the active context engine"),
+    "runtime": _ts("Inspect and switch the current model/provider/reasoning for session scope", ["model_status", "model_switch"]),
     "session_search": _ts("Search and recall past conversations with summarization", ["session_search"]),
     "connections": _ts("Remote connector discovery, execution, and account authorization", ["manage_connections"]),
     "project": _ts("Desktop Projects — create/switch named workspaces (GUI sessions only)", ["desktop_project"]),
