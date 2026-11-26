@@ -1718,3 +1718,11 @@ async def test_hygiene_threshold_normal_layering_does_not_warn(
     assert await runner._handle_message(event) == "ok"
     log_text = "\n".join(r.getMessage() for r in caplog.records)
     assert "hygiene safety net will fire before" not in log_text
+
+
+def test_hygiene_threshold_is_a_registered_default_config_key():
+    """compression.hygiene_threshold is registered in DEFAULT_CONFIG with the gateway's historical
+    0.85 trigger, so `hermes config` and the docs-drift ratchet know it (documented, not baselined)."""
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    assert DEFAULT_CONFIG["compression"]["hygiene_threshold"] == 0.85
