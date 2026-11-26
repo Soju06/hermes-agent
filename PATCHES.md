@@ -1514,7 +1514,7 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 
 ### 94. summary-empty-finish-reason
 - **branch:** `soju/patches/summary-empty-finish-reason`
-- **stacked-on:** `soju/patches/slack-stale-reconnect-task` (2026-11-25 chronological tip stack; #93 dropped, #95 is stacked on it)
+- **stacked-on:** `soju/patches/slack-stale-reconnect-task` (2026-11-25 chronological tip stack; #93 dropped; #97 is stacked on it since 2026-11-26)
 - **origin:** `local-author`
 - **upstream_pr:** none
 - **state:** `local-only`
@@ -1529,15 +1529,44 @@ v2026.8.3 shape-gates `_heal_session_model_usage_pk()` on the actual primary-key
 
 ### 95. sync-20261125-test-seams
 - **branch:** `soju/patches/sync-20261125-test-seams`
-- **stacked-on:** `soju/patches/summary-empty-finish-reason` (2026-11-25 chronological tip stack; tip of the whole production stack)
+- **stacked-on:** `soju/patches/review-fork-checkpoint-warning` (since 2026-11-26; was `summary-empty-finish-reason`; tip of the whole production stack)
 - **origin:** `local-author`
 - **upstream_pr:** _(none — generated fixtures and test seams for fork gates)_
 - **state:** `local-only`
 - **rationale:** ADR-004 rule 3: generated test fixtures that fork tool-schema, prompt or classifier changes invalidate are re-rendered once, at the tip of the stack, in a dated tip topic. This topic does that for the v0.23.4 stack and supersedes #93 `sync-20261030-test-seams`. It re-renders the prompt-surface snapshot with `scripts/ci/prompt_surface.py render` (tools and guidance of #1, #2, #38, #44, #83), regenerates the Discord conformance vectors for #4's box tables (other platforms and the oracle stamp stay as committed), renders the #34 classifier-core pin from `gateway/model_router.py` (carrying the S0/S0b refusal fields of #56 and #58), and baselines the three fork DEFAULT_CONFIG keys that upstream's docs-drift ratchet flags and no topic documents (`agent.gateway_turn_resume`, `agent.turn_resume_max` from #27, `delegation.default_route` from #34). No runtime code. Re-render it (and amend) whenever a topic below changes the prompt surface, the Discord renderer or the classifier core.
 - **commits:**
-  - `a9e3fe8fba` test: re-render generated fixtures and re-seam upstream tests to fork gates (2026-11-25 sync)
+  - `87e6f9c336` test: re-render generated fixtures and re-seam upstream tests to fork gates (2026-11-25 sync)
 - **touches:** `scripts/ci/docs_drift_baseline.json`, `tests/conformance/vectors/discord.json`, `tests/fixtures/prompt_surface/surfaces.json`, `tests/fixtures/prompt_surface/prompts/*.txt`, `tests/fixtures/prompt_surface/tools/*.json`, `tests/fixtures/skill_gate_classifier_core.json`
 - **v0.23.4-sync:** DONE-WITH-NOTES — created 2026-11-25; see `~/work/hermes/upstream-sync-20261125/reports/sync-20261125-test-seams.md` (renderer for the classifier pin: `~/work/hermes/upstream-sync-20261125/tools/render_classifier_core.py`).
+- **2026-11-26:** re-stacked onto #97 by `cherry-pick` of a9e3fe8fba (same patch-id, applied clean; backup `backup/topics-1126/soju/patches/sync-20261125-test-seams`). #96 and #97 change no prompt surface, Discord renderer, classifier core or config key, so no fixture was re-rendered (`~/work/hermes/hotfix-topics-20261126/REPORT.md`).
+
+
+
+### 96. external-install-service-launcher
+- **branch:** `soju/patches/external-install-service-launcher`
+- **stacked-on:** _(none — independent topic rooted on base v0.23.4; touches no fork code)_
+- **origin:** `local-author`
+- **upstream_pr:** none
+- **state:** `local-only`
+- **rationale:** A tree stamped `install-stamp.json` `updateMechanism: external` (this host: the fork tree runs its own `venv/` built by `bin/hermes-venv-rebuild`) beside a PM store with no committed generation must never run PM's store Python. Since v0.22.5 every gateway boot (`refresh_systemd_unit_if_needed`) regenerated both user units to exec `<tree>/.hermes/bin/hermes` (a store launcher that exits 1, "no dependency environment is committed") and published that launcher; live was protected only by the `zz-venv-runtime.conf` drop-ins. Since v0.23.4 the boot step `install_default_plugins` (`default_plugins.spawn_install` → `runtime_command`) also started a detached store-Python child that exited 1 on every gateway/CLI start before it could record a backoff. Fix: one predicate `_launchers.external_runtime` plus `service_python` (the running interpreter for an external tree, else the store Python) and `service_venv`; `runtime_command` runs `service_python`, `installation_command` returns `<python> -m <module>` for an external tree beside a store (after upstream's macOS `sealed_service_launcher` and the Nix/developer `runtime_command` branch), `publishes_service_launcher` is False for it, and `generate_systemd_unit` puts the venv's `bin` first on PATH and writes `VIRTUAL_ENV`. Self-managed, Nix and macOS app trees are unchanged. Ported from hotfix `soju/hotfix-live/external-service-unit` (96eadabd76, v0.22.5 base; investigation `~/work/hermes/postcut-20261125/REPORT.md` § P2). After the first boot on this topic both live units are rewritten to the venv form; the drop-ins are then redundant and harmless.
+- **commits:**
+  - `e79156cc34` fix(launchers): an external tree's services and detached children run its own venv, never PM's store Python
+- **touches:** `hermes_cli/_launchers.py`, `hermes_cli/gateway.py`, `tests/hermes_cli/test_external_service_unit.py`, `tests/hermes_cli/test_source_launcher_publication.py`
+- **v0.23.4-sync:** DONE — created 2026-11-26 on v0.23.4 (`~/work/hermes/hotfix-topics-20261126/REPORT.md`).
+
+
+
+### 97. review-fork-checkpoint-warning
+- **branch:** `soju/patches/review-fork-checkpoint-warning`
+- **stacked-on:** `soju/patches/summary-empty-finish-reason` (2026-11-25 chronological tip stack; touches fork code of #40 `agent/ingest_curator.py` and #6/#37/#40 `agent/background_review.py`; #95 is stacked on it)
+- **origin:** `local-author`
+- **upstream_pr:** none
+- **state:** `local-only`
+- **rationale:** Since v0.22.5 every background-review fork logged "compression.checkpoint_required is enabled but the active memory provider (no active provider) does not implement checkpoint API v2" on construction (24 lines on 2026-11-25). Noise: the compress-time gate already exempts a persistence-detached fork with no memory manager and no session DB, but the fork was detached only after the constructor had warned. One predicate `conversation_compression_checkpoint.owns_no_durable_memory` now decides both the gate and the startup warning; `AIAgent(persist_disabled=...)` detaches a fork before init's startup checks, and the review fork and the ingest curator pass it. Every agent that keeps persistence still warns and still fails closed. Ported from hotfix `soju/hotfix-live/review-fork-checkpoint-warning` (b8cc962a22; `~/work/hermes/postcut-20261125/REPORT.md` § P3).
+- **commits:**
+  - `077cb03e36` fix(agent): detached review/curator forks are persistence-detached at construction, so the checkpoint warning skips them
+- **touches:** `agent/agent_init.py`, `agent/background_review.py`, `agent/conversation_compression.py`, `agent/conversation_compression_checkpoint.py`, `agent/ingest_curator.py`, `run_agent.py`, `tests/agent/test_pre_compress_checkpoint_contract.py`
+- **v0.23.4-sync:** DONE — created 2026-11-26 on the v0.23.4 tip stack (`~/work/hermes/hotfix-topics-20261126/REPORT.md`).
 
 
 ## State Vocabulary
@@ -1596,6 +1625,7 @@ soju/patches/scoped-exhaustion-upstream-classify (stacked on lifecycle-guard-mul
 soju/patches/lifecycle-guard-stmt-boundary (stacked on lifecycle-guard-multiline)
 soju/patches/hygiene-diag-and-lock-offload (stacked on hygiene-noprogress-cooldown)
 soju/patches/sync-20260819-test-seams (stacked on runtime-control)
+soju/patches/external-install-service-launcher
 # sequential lane (chronological tip stack on top of the assembled parallel lane, in this order; merge LAST, each contains the previous)
 soju/patches/conn-error-fail-fast
 soju/patches/durable-turns
@@ -1627,6 +1657,7 @@ soju/patches/aux-anthropic-mode-max-tokens
 soju/patches/session-store-lock-offload
 soju/patches/slack-stale-reconnect-task
 soju/patches/summary-empty-finish-reason
+soju/patches/review-fork-checkpoint-warning
 soju/patches/sync-20261125-test-seams (tip of the stack)
 # dropped 2026-11-25: sync-20261030-test-seams (superseded by sync-20261125-test-seams)
 # dropped 2026-10-30 (merged upstream / folded / moot): gateway-worker-pool, background-first-waits, model-switch-provider-dedupe, daemon-pool-py314-compat, approval-grep-escaped-quote, elision-marker-imitation, kanban-board-env-precedence, kanban-goal-judge-unavailable, conversation-started-date-stable, sync-20260914-test-seams, sync-20260914-fixups, sync-20260914-kanban-seams, startup-integrity-check-offload, cron-fire-fence-heartbeat
@@ -1670,6 +1701,11 @@ commit) or auto-merges WRONG — re-verify these after every rebuild:
 - `agent/memory_pipeline.py` proposal/admission — notes-recognition-grounding must retain memory-phase2-taint's mechanical injected-span rejection while adding preview and deferred current-turn grounding.
 
 ## Sync History
+
+### 2026-11-26 — two post-cutover hotfixes carried as topics on the v0.23.4 stack (base unchanged)
+- **New:** #96 external-install-service-launcher (independent, on base), #97 review-fork-checkpoint-warning (tip stack, on #94). #95 re-stacked onto #97 by cherry-pick (same patch-id, no fixture re-render). Production diff against 194763e0de = #96 + #97 only.
+- **Not carried:** hotfix `soju/hotfix-live/watch-route-identity` (c593e93eb1): superseded by upstream 91171b7f0b "fix(gateway): admit automation wakes on route identity, not display fields", an ancestor of base 8fc0374447 (`git merge-base --is-ancestor`); the hotfix was never a manifest entry.
+- **Rollback:** tags `backup/topics-1126/soju/production` (194763e0de), `backup/topics-1126/soju/fork-policy` (c5d460f6e9), `backup/topics-1126/soju/patches/sync-20261125-test-seams` (a9e3fe8fba), `backup/topics-1126/soju/patches/summary-empty-finish-reason` (3fe74a66e1, unchanged). Record: `~/work/hermes/hotfix-topics-20261126/REPORT.md`.
 
 ### 2026-11-25 — base bump bf0203a794 → 8fc0374447 (v0.23.4, 18,455 commits, 14,328 files; old session store removed for the `persistence/` package, folder-facade layout rule)
 - **Method:** ADR-004 with the 2026-11-25 consequence note: preflight (`am --3way`, 50/205 clean on bare TARGET) + relocation map; 12 parallel worktree groups → octopus `sync1125/assembly` (v1 f8cc6fd329; v2 adeca72a8c after the interim-suite regression fixes); the chronological tip stack ported in parallel lanes (validated at the OLD base) and re-stacked linearly once in manifest order (28 of 29 entries clean; one test-file conflict at #76). Every port adversarially reviewed by an independent read-only reviewer; blocker/major findings fixed in the owner topic (#4, #35, #50, #64, #66; plus minors), regression fixes from two full suites in the owner topics (#1, #8, #37, #38, #48 test seams; #61 real fix).
