@@ -12,6 +12,7 @@ import time
 from contextlib import suppress
 from typing import Any, Callable, List, Optional, Tuple
 
+from agent import turn_trace
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.delegation_context import is_dispatcher_owned_worker_context
 from agent.interrupt_control import interrupted_during_api_call_reason
@@ -621,14 +622,25 @@ def public_pre_transform(agent, pre_transform: Optional[Any]) -> Optional[Any]:
 def _mirror_turn_to_memory(
     agent, *, original_user_message, final_response, interrupted, messages, review_memory, review_skills, vetoed,
 ) -> None:
-    """External-memory sync (+ next prefetch), then the background memory/skill review. A prompt a
-    ``pre_llm_call`` hook vetoed never leaves the host, so neither runs for that turn."""
+    """External-memory sync (+ next prefetch), the ingest-curator trigger observation, then the
+    background memory/skill review. A prompt a ``pre_llm_call`` hook vetoed never leaves the host,
+    so none of them runs for that turn."""
     if vetoed:
         return
     agent._sync_external_memory_for_turn(
         original_user_message=original_user_message, final_response=final_response,
         interrupted=interrupted, messages=messages,
     )
+    # Ingest-curator trigger observation (ADR-004 Phase 2, SHADOW). Pure O(turn-slice) arithmetic
+    # inline; any curator run spawns on a daemon thread. No-op unless curator.ingest_enabled;
+    # fail-open.
+    if final_response and not interrupted:
+        try:
+            from agent.ingest_curator import observe_turn_completed
+            observe_turn_completed(agent, messages)
+        except Exception:
+            from agent.conversation_loop import logger
+            logger.debug("ingest-curator turn observation failed (fail-open)", exc_info=True)
     # Background memory/skill review runs AFTER delivery so it never competes with the
     # user's task. Suppressed by skip_background_review (e.g. cron): the fork costs
     # ~30K tokens / event with no human-in-the-loop benefit. Best-effort; the review
@@ -655,6 +667,10 @@ def finalize_turn(
     """Run the post-loop finalization and return the turn ``result`` dict."""
     from agent.conversation_loop import logger
     from agent.turn_context import PRE_LLM_BLOCK_EXIT_REASON
+
+    # Per-turn trace (None when tracing is disabled).
+    _tt = turn_trace.get_bound(agent)
+    _finalize_started = time.time() if _tt is not None else None
 
     vetoed = _turn_exit_reason == PRE_LLM_BLOCK_EXIT_REASON  # a pre_llm_call block: no model call at all
 
@@ -731,15 +747,17 @@ def finalize_turn(
     from agent.turn_context import start_deferred_title_upgrade
     _guarded_cleanup("start_deferred_title_upgrade", lambda: start_deferred_title_upgrade(agent), _cleanup_errors, logger)
     # ``user_message`` may be a multimodal list of parts; the trajectory format wants a string.
-    _guarded_cleanup(
-        "save_trajectory",
-        lambda: agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed),
-        _cleanup_errors, logger,
-    )
-    _guarded_cleanup(
-        "cleanup_task_resources", lambda: agent._cleanup_task_resources(effective_task_id),
-        _cleanup_errors, logger,
-    )
+    with turn_trace.span("finalize.trajectory", trace=_tt):
+        _guarded_cleanup(
+            "save_trajectory",
+            lambda: agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed),
+            _cleanup_errors, logger,
+        )
+    with turn_trace.span("finalize.resource_cleanup", trace=_tt):
+        _guarded_cleanup(
+            "cleanup_task_resources", lambda: agent._cleanup_task_resources(effective_task_id),
+            _cleanup_errors, logger,
+        )
     # Persist only after the transcript tail is shaped and scaffolding removed. Each
     # sub-step runs in the same order as the original inline block, and the
     # stream-recovered ``final_response`` is rebound the moment it is computed — BEFORE
@@ -764,7 +782,8 @@ def finalize_turn(
             _micro_compact_after_turn(agent, messages, final_response, logger, effective_task_id)
         agent._persist_session(messages, conversation_history)
 
-    _guarded_cleanup("persist_session", _persist_step, _cleanup_errors, logger)
+    with turn_trace.span("finalize.persist", trace=_tt):
+        _guarded_cleanup("persist_session", _persist_step, _cleanup_errors, logger)
 
     # Keep the gateway's separate in-memory history snapshot current even on
     # cleanup error, so a later prompt isn't sent with a pre-turn snapshot.
@@ -774,6 +793,7 @@ def finalize_turn(
     _log_turn_exit(agent, messages, final_response, api_call_count, _turn_exit_reason, interrupted, logger)
 
     # Response transforms apply only to real, uninterrupted responses.
+    _hooks_started = time.time() if _tt is not None else None
     if final_response and not interrupted:
         final_response = _append_file_mutation_footer(agent, final_response, logger)
     if not interrupted:
@@ -853,6 +873,8 @@ def finalize_turn(
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
+    if _hooks_started is not None:
+        _tt.add_span("finalize.post_hooks", _hooks_started, time.time())
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Persistence failures already set failed=True; also stamp `error` so the gateway
@@ -897,6 +919,7 @@ def finalize_turn(
     if _should_review_skills:
         agent._iters_since_skill = 0
 
+    _md_started = time.time() if _tt is not None else None
     _mirror_turn_to_memory(
         agent, original_user_message=original_user_message, final_response=final_response,
         interrupted=interrupted, messages=messages, review_memory=_should_review_memory,
@@ -927,4 +950,10 @@ def finalize_turn(
 
     agent._turn_preflight_display_snapshot = None
     agent._turn_received_provider_response = False
+
+    if _md_started is not None:
+        _tt.add_span("finalize.memory_dispatch", _md_started, time.time())
+    if _finalize_started is not None:
+        _tt.add_span("turn.finalize", _finalize_started, time.time())
+
     return result

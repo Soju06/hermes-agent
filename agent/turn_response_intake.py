@@ -18,6 +18,7 @@ from agent.trajectory import has_incomplete_scratchpad
 from agent.turn_truncation import (
     CODEX_FALLBACK_ACTIVATED, continue_codex_incomplete, normalize_response_for_agent, partial_result,
 )
+from agent.turn_trace_loop import tag_exit
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -226,6 +227,7 @@ def normalize_model_response(
         rolled_back_messages = agent._get_messages_up_to_last_assistant(messages)
         agent._cleanup_task_resources(effective_task_id)
         agent._persist_session(messages, conversation_history)
+        tag_exit("incomplete_scratchpad_retries_exhausted")
         return _verdict("return", partial_result(
             rolled_back_messages, api_call_count, "Incomplete REASONING_SCRATCHPAD after 2 retries"
         ))
@@ -244,6 +246,7 @@ def normalize_model_response(
             active_system_prompt = _sync_failover_system_message(agent, api_messages, active_system_prompt)
             return _verdict("continue")
         if _codex_result is not None:
+            tag_exit("codex_incomplete_continuations_exhausted")
             return _verdict("return", _codex_result)
         return _verdict("continue")
     if hasattr(agent, "_codex_incomplete_retries"):

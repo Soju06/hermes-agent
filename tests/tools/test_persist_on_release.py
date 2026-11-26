@@ -136,6 +136,10 @@ def test_spawn_local_stamps_persist_on_release(registry, monkeypatch, tmp_path):
     monkeypatch.setattr(registry, "_track_started", lambda *a, **k: None)
     monkeypatch.setattr(terminal_tool_sudo, "_rewrite_compound_background", lambda c: c)
     monkeypatch.setattr(ProcessRegistry, "_scope_argv", lambda *a, **k: None)
+    # The stubbed argv above goes through the fork's nice(1) prefix before Popen;
+    # pass it through unchanged (the prefix has its own contract in
+    # test_terminal_child_nice.py). Patched where spawn_local reads it.
+    monkeypatch.setattr("tools.process_registry._nice_argv", lambda argv: argv)
     fake_popen = MagicMock()
     fake_popen.pid = 4242
     monkeypatch.setattr("subprocess.Popen", MagicMock(return_value=fake_popen))

@@ -566,12 +566,14 @@ def _build_children(
 
 
 def _routes_for(task_list: list[dict[str, Any]], cfg: dict[str, Any], credentials_cfg: Optional[dict[str, Any]],
-                parent_agent: Any) -> tuple[list[Any], Optional[str]]:
+                parent_agent: Any, route: Optional[str] = None) -> tuple[list[Any], Optional[str]]:
     """Per-task routes: an internal caller's explicit ``credentials_cfg`` (e.g. /review → auxiliary.review) owns
-    every task's route; otherwise the active delegation provider decides each one."""
-    from tools.delegate_tool_routes import resolve_task_routes, route_for_config
+    every task's route; otherwise a declared model route (``route``, ADR-003 Phase 3a) claims its tasks and the
+    active delegation provider decides the rest."""
+    from tools.delegate_tool_routes import route_for_config
     if credentials_cfg is None:
-        return resolve_task_routes(task_list, cfg, parent_agent)
+        from tools.delegate_tool_model_routes import resolve_routed_tasks
+        return resolve_routed_tasks(task_list, cfg, parent_agent, top_route=route)
     try:
         route = route_for_config(credentials_cfg, parent_agent)
     except ValueError as exc:
@@ -614,13 +616,17 @@ def delegate_task(
     goal: Optional[str] = None, context: Optional[str] = None, tasks: Optional[list[dict[str, Any]]] = None,
     max_iterations: Optional[int] = None, role: Optional[str] = None, background: Optional[bool] = None,
     output_schema: Optional[dict[str, Any]] = None, images: Optional[list[str]] = None, action: Optional[str] = None,
-    subagent_id: Optional[str] = None, message: Optional[str] = None, parent_agent=None,
+    subagent_id: Optional[str] = None, message: Optional[str] = None, route: Optional[str] = None, parent_agent=None,
     credentials_cfg: Optional[dict[str, Any]] = None,
 ) -> str:
     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
     list/steer/stop run synchronously and bypass the pause gate, depth limit and async dispatch. ``role`` is legacy
     (per-task beats top-level; capability is depth-derived). Returns JSON with one results entry per task, or a
-    dispatch handle when running in the background."""
+    dispatch handle when running in the background.
+
+    The 'route' parameter (only exposed to the model when model_routes routes are declared, ADR-003 Phase 3a)
+    runs a task's child on that route's health-checked provider/model. Precedence: per-task route > top-level
+    route > delegation.default_route > the active delegation provider (tools/delegate_tool_model_routes.py)."""
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
     from tools.hosted_tool_policy import host_feature_refusal
@@ -677,7 +683,7 @@ def delegate_task(
         # (internal callers only, e.g. /review → auxiliary.review: a per-call routing owner shaped like the
         # delegation section, kept together with its fallback policy through child construction). Explicit-pin
         # preflight failures (e.g. pinned delegation.command missing from PATH) refuse the spawn loudly (#80450).
-        routes, err = _routes_for(task_list, cfg, credentials_cfg, parent_agent)
+        routes, err = _routes_for(task_list, cfg, credentials_cfg, parent_agent, route)
     if err:
         return tool_error(err)
     from tools.delegate_tool_auto_resume import refuse_waiting_duplicates
@@ -841,6 +847,9 @@ def _build_dynamic_schema_overrides() -> dict:
         tasks = overrides_params["properties"]["tasks"]
         tasks["items"] = {**tasks["items"], "properties": {**tasks["items"]["properties"], **extra_params}}
     description = _build_top_level_description(independent_completions=independent_completions)
+    # Route param (ADR-003 Phase 3a): only when model_routes declares routes; otherwise a no-op.
+    from tools.delegate_tool_model_routes import inject_route_param
+    description = inject_route_param(overrides_params, description)
     return {
         "description": f"{description}\n{addendum}" if addendum else description,
         "parameters": overrides_params,
@@ -1005,7 +1014,7 @@ registry.register(
         max_iterations=args.get("max_iterations"), role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")), output_schema=args.get("output_schema"),
         images=args.get("images"), action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
-        parent_agent=kw.get("parent_agent"),
+        route=args.get("route"), parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,
     emoji="🔀",

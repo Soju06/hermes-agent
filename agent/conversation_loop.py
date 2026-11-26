@@ -35,7 +35,9 @@ from agent.runtime_cwd import resolve_agent_cwd
 from agent.surface_switch import (
     identity_line_value, note_inert_pinned_tools, runtime_host_value, stage_surface_switch_note,
 )
+from agent import audience_persona, turn_trace
 from agent.turn_context import PRE_LLM_BLOCK_EXIT_REASON, PreflightCompressionTimedOut, build_turn_context
+from agent.turn_trace_loop import IterationSpans, conversation_trace, tag_exit, trace_llm_call
 from hermes_cli.observability.shared_metrics_efficiency import record_cache_break, record_prompt_rebuild
 from hermes_cli.plugins_dispatch import held_stream_transforms
 from agent.turn_retry_state import TurnRetryState
@@ -1008,6 +1010,9 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     stored_cwd = runtime_host_value(prompt, "Current working directory")
     if stored_cwd and stored_cwd != str(resolve_agent_cwd()):
         return False
+    # AudienceMode tail line: both-absent matches; a mismatch or one-sided presence rebuilds once.
+    if identity_line_value(prompt, "AudienceMode") != audience_persona.expected_audience_mode(agent):
+        return False
     # Platform is deliberately NOT an identity field: a surface switch does not invalidate the
     # stored bytes, it only makes their interface section out of date, and that is corrected by
     # agent.surface_switch.stage_surface_switch_note without touching the cached prefix (#104414).
@@ -1226,7 +1231,8 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     if not isinstance(sp, str) or not sp:
         return active_system_prompt
     if api_messages and api_messages[0].get("role") == "system":
-        effective = (sp + "\n\n" + agent.ephemeral_system_prompt).strip() if agent.ephemeral_system_prompt else sp
+        from agent.system_prompt import compose_effective_system_prompt
+        effective = compose_effective_system_prompt(agent, sp)
         if not _rewrite_system_content_blocks(api_messages[0], effective):
             api_messages[0]["content"] = effective
     return sp
@@ -1552,6 +1558,8 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[dict[str, Any]]:
 
     Returns a turn result dict when a phase ends the turn, else None once the loop is left
     (success, a restart armed on ``s._retry``, interrupt, or retries exhausted)."""
+    _tt = turn_trace.get_bound(agent)
+    _llm_call_started = None  # trace: start of the in-flight llm.call attempt
     while s.retry_count < s.max_retries:
         _ng = _run_phase(nous_rate_limit_guard, agent, s)
         if _ng.action == "return":
@@ -1559,18 +1567,38 @@ def _run_api_retry_loop(agent, s: _LoopState) -> Optional[dict[str, Any]]:
         if _ng.action == "break":
             return None
         try:
+            _req_setup_started = time.time() if _tt is not None else None
             _run_phase(build_api_request, agent, s)
+            if _req_setup_started is not None:
+                _tt.add_span("iteration.request_setup", _req_setup_started, time.time())
+            _llm_call_started = time.time() if _tt is not None else None
+            _pfp_tags = None
+            if _llm_call_started is not None:
+                agent._last_stream_diag = None
+                if turn_trace.prefix_fingerprint_enabled():
+                    _pfp_tags = turn_trace.prefix_fingerprint(s.api_kwargs)
+            # Fail-fast streak timer: a refused/reset-before-bytes death (<2s) vs a slow timeout.
+            if s._retry is not None:
+                s._retry.attempt_started_at = time.time()
             if _run_phase(perform_api_call, agent, s).action == "break":
+                trace_llm_call(_tt, _llm_call_started, agent, s, error="interrupted")
+                _llm_call_started = None
                 return None
+            trace_llm_call(_tt, _llm_call_started, agent, s, pfp_tags=_pfp_tags)
+            _llm_call_started = None
             _rc = _run_phase(check_api_response, agent, s)
             if _rc.action == "return":
                 return _rc.result
             if _rc.action == "break":
                 return None
         except InterruptedError:
+            trace_llm_call(_tt, _llm_call_started, agent, s, error="InterruptedError")
+            _llm_call_started = None
             if _run_phase(handle_api_interrupt, agent, s).action == "break":
                 return None
         except Exception as api_error:
+            trace_llm_call(_tt, _llm_call_started, agent, s, error=type(api_error).__name__)
+            _llm_call_started = None
             _ae = _run_phase(handle_api_error, agent, s, api_error=api_error)
             if _ae.action == "return":
                 return _ae.result
@@ -1594,6 +1622,7 @@ def _turn_without_loop(agent: Any, s: _LoopState, block_message: str) -> Optiona
     (agent/transports/codex_app_server_session.py)."""
     if block_message:
         s.final_response, s._turn_exit_reason = block_message, PRE_LLM_BLOCK_EXIT_REASON
+        tag_exit(PRE_LLM_BLOCK_EXIT_REASON, agent)
         return _finalize_from_state(agent, s)
     return _codex_app_server_turn(agent, s) if agent.api_mode == "codex_app_server" else None
 
@@ -1608,6 +1637,7 @@ def _codex_app_server_turn(agent: Any, s: Any) -> Optional[dict[str, Any]]:
     )
     from agent.turn_recovery import activate_codex_app_server_fallback
     if not activate_codex_app_server_fallback(agent, codex_result):
+        tag_exit("codex_app_server_turn", agent)
         return codex_result
     # Fallback activation rewrote provider/model/api_mode: retry this same user turn on the generic
     # loop below, keeping codex's projected rows and its failed API call in the turn's accounting.
@@ -1689,6 +1719,7 @@ def _run_conversation_turn(
             title_user_message=title_user_message,
         )
     except PreflightCompressionTimedOut as _preflight_timeout_exc:
+        tag_exit("preflight_compression_timeout", agent)
         return _preflight_timeout_result(agent, _preflight_timeout_exc, conversation_history)
     # Voice turns may run on auxiliary.voice_chat: bound after the prompt/row/compaction were settled
     # against the main model, undone in finalize_turn (and run_conversation's finally on early exits).
@@ -1715,6 +1746,9 @@ def _run_conversation_turn(
         max_compression_attempts=getattr(agent, "max_compression_attempts", 3),
         **{f.name: getattr(_ctx, f.name.lstrip("_")) for f in fields(_LoopState) if f.name in _CTX_FIELDS},
     )
+    # Per-turn waterfall trace (None when HERMES_TURN_TRACE is unset).
+    _tt = turn_trace.get_bound(agent)
+    _iters = IterationSpans(_tt)
     if (early_result := _turn_without_loop(agent, s, _ctx.plugin_block_message)) is not None:
         return early_result
 
@@ -1724,11 +1758,15 @@ def _run_conversation_turn(
     while _prelude_action != "break" and (
         (s.api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call
     ):
+        _iters.next()
         if _run_phase(begin_iteration, agent, s).action == "break":
             break
         _run_phase(prepare_iteration, agent, s)
+        _ctx_asm_started = time.time() if _tt is not None else None
         _run_phase(route_change_offload, agent, s)
         _run_phase(assemble_api_request, agent, s)
+        if _ctx_asm_started is not None:
+            _tt.add_span("iteration.context_assemble", _ctx_asm_started, time.time())
         _pg = _run_phase(run_preflight_gate, agent, s)
         if _pg.action == "return":
             return _pg.result
@@ -1771,6 +1809,7 @@ def _run_conversation_turn(
             if _run_phase(handle_outer_loop_error, agent, s, e=e).action == "break":
                 break
 
+    _iters.close(s._turn_exit_reason)
     result = _finalize_from_state(agent, s)
     if s._compression_timeout_exhausted:
         # Reuse the gateway's context-recovery contract: transcript stays intact while
@@ -1811,42 +1850,44 @@ def run_conversation(
 
     # Steer / redirect / interrupt set this mid-turn; the result reports whether the turn ran untouched.
     agent._turn_user_intervened = False
-    # Images attached natively to this user turn stay visible to vision_analyze for the turn, so
-    # it does not embed the same pixels a second time into the same request (#76411).
-    with native_turn_images(user_message):
-        try:
-            result = _run_conversation_turn(
-                agent,
-                user_message,
-                system_message=system_message,
-                conversation_history=conversation_history,
-                task_id=task_id,
-                stream_callback=stream_callback,
-                persist_user_message=persist_user_message,
-                persist_user_timestamp=persist_user_timestamp,
-                persist_user_display_kind=persist_user_display_kind,
-                persist_user_display_metadata=persist_user_display_metadata,
-                persist_user_platform_id=persist_user_platform_id,
-                moa_config=moa_config,
-                turn_author=turn_author,
-                title_user_message=title_user_message,
-                prelude=prelude,
-            )
-        finally:
-            end_voice_turn_route(agent)
-            # Every turn exit (early returns included): a machine session stops warming; a chat a
-            # person types into keeps its budget of keep-alives while idle (prompt_cache_lifecycle).
-            end_turn_prompt_cache_warming(agent)
-    fence_result_reply(result)
-    # Joined before settle_held_final so a held transform sees the lead, unless a collapsed partial already ran it.
-    from agent.primary_auth_fallback import lead_failed_turn_with_primary_auth
-    lead_failed_turn_with_primary_auth(agent, result)
-    settle_held_final(agent, result)
-    result = export_current_turn_boundary(agent, result, user_message)
-    if isinstance(result, dict):
-        result["user_intervened"] = bool(getattr(agent, "_turn_user_intervened", False))
-    _close_durable_failed_turn(agent, result)
-    return result
+    # Waterfall trace ownership + the root ``turn`` span (agent/turn_trace_loop.py).
+    with conversation_trace(agent):
+        # Images attached natively to this user turn stay visible to vision_analyze for the turn, so
+        # it does not embed the same pixels a second time into the same request (#76411).
+        with native_turn_images(user_message):
+            try:
+                result = _run_conversation_turn(
+                    agent,
+                    user_message,
+                    system_message=system_message,
+                    conversation_history=conversation_history,
+                    task_id=task_id,
+                    stream_callback=stream_callback,
+                    persist_user_message=persist_user_message,
+                    persist_user_timestamp=persist_user_timestamp,
+                    persist_user_display_kind=persist_user_display_kind,
+                    persist_user_display_metadata=persist_user_display_metadata,
+                    persist_user_platform_id=persist_user_platform_id,
+                    moa_config=moa_config,
+                    turn_author=turn_author,
+                    title_user_message=title_user_message,
+                    prelude=prelude,
+                )
+            finally:
+                end_voice_turn_route(agent)
+                # Every turn exit (early returns included): a machine session stops warming; a chat a
+                # person types into keeps its budget of keep-alives while idle (prompt_cache_lifecycle).
+                end_turn_prompt_cache_warming(agent)
+        fence_result_reply(result)
+        # Joined before settle_held_final so a held transform sees the lead, unless a collapsed partial already ran it.
+        from agent.primary_auth_fallback import lead_failed_turn_with_primary_auth
+        lead_failed_turn_with_primary_auth(agent, result)
+        settle_held_final(agent, result)
+        result = export_current_turn_boundary(agent, result, user_message)
+        if isinstance(result, dict):
+            result["user_intervened"] = bool(getattr(agent, "_turn_user_intervened", False))
+        _close_durable_failed_turn(agent, result)
+        return result
 
 
 _FAILED_TURN_ERROR_MAX_CHARS = 2000

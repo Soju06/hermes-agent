@@ -2,10 +2,10 @@
   "cli-code.claude": {
     "prompt_tokens": {
       "context": 134,
-      "stable": 1829,
+      "stable": 2387,
       "volatile": 1268
     },
-    "tool_tokens": 9464,
+    "tool_tokens": 11427,
     "tools": [
       "browser_cdp",
       "browser_dialog",
@@ -14,6 +14,11 @@
       "delegate_task",
       "execute_code",
       "memory",
+      "memory_propose",
+      "model_status",
+      "model_switch",
+      "notes_read",
+      "notes_write",
       "patch",
       "read_file",
       "search_files",
@@ -33,10 +38,10 @@
   "cli.claude": {
     "prompt_tokens": {
       "context": 0,
-      "stable": 1225,
+      "stable": 1782,
       "volatile": 1268
     },
-    "tool_tokens": 9464,
+    "tool_tokens": 11427,
     "tools": [
       "browser_cdp",
       "browser_dialog",
@@ -45,6 +50,11 @@
       "delegate_task",
       "execute_code",
       "memory",
+      "memory_propose",
+      "model_status",
+      "model_switch",
+      "notes_read",
+      "notes_write",
       "patch",
       "read_file",
       "search_files",
@@ -64,10 +74,10 @@
   "cli.gemini": {
     "prompt_tokens": {
       "context": 0,
-      "stable": 1646,
+      "stable": 2204,
       "volatile": 1266
     },
-    "tool_tokens": 9464,
+    "tool_tokens": 11427,
     "tools": [
       "browser_cdp",
       "browser_dialog",
@@ -76,6 +86,11 @@
       "delegate_task",
       "execute_code",
       "memory",
+      "memory_propose",
+      "model_status",
+      "model_switch",
+      "notes_read",
+      "notes_write",
       "patch",
       "read_file",
       "search_files",
@@ -95,10 +110,10 @@
   "cli.gpt": {
     "prompt_tokens": {
       "context": 0,
-      "stable": 2420,
+      "stable": 2977,
       "volatile": 1264
     },
-    "tool_tokens": 9620,
+    "tool_tokens": 11583,
     "tools": [
       "browser_cdp",
       "browser_dialog",
@@ -107,6 +122,11 @@
       "delegate_task",
       "execute_code",
       "memory",
+      "memory_propose",
+      "model_status",
+      "model_switch",
+      "notes_read",
+      "notes_write",
       "patch",
       "read_file",
       "search_files",
@@ -126,10 +146,10 @@
   "cli.hermes": {
     "prompt_tokens": {
       "context": 0,
-      "stable": 1225,
+      "stable": 1782,
       "volatile": 1268
     },
-    "tool_tokens": 9464,
+    "tool_tokens": 11427,
     "tools": [
       "browser_cdp",
       "browser_dialog",
@@ -138,6 +158,11 @@
       "delegate_task",
       "execute_code",
       "memory",
+      "memory_propose",
+      "model_status",
+      "model_switch",
+      "notes_read",
+      "notes_write",
       "patch",
       "read_file",
       "search_files",
@@ -157,10 +182,10 @@
   "cron.claude": {
     "prompt_tokens": {
       "context": 0,
-      "stable": 1211,
+      "stable": 1769,
       "volatile": 1268
     },
-    "tool_tokens": 9464,
+    "tool_tokens": 11427,
     "tools": [
       "browser_cdp",
       "browser_dialog",
@@ -169,6 +194,11 @@
       "delegate_task",
       "execute_code",
       "memory",
+      "memory_propose",
+      "model_status",
+      "model_switch",
+      "notes_read",
+      "notes_write",
       "patch",
       "read_file",
       "search_files",
@@ -188,10 +218,10 @@
   "desktop.claude": {
     "prompt_tokens": {
       "context": 0,
-      "stable": 1495,
+      "stable": 2052,
       "volatile": 1269
     },
-    "tool_tokens": 10120,
+    "tool_tokens": 12083,
     "tools": [
       "browser_cdp",
       "browser_dialog",
@@ -200,6 +230,11 @@
       "delegate_task",
       "execute_code",
       "memory",
+      "memory_propose",
+      "model_status",
+      "model_switch",
+      "notes_read",
+      "notes_write",
       "patch",
       "react_to_message",
       "read_file",
@@ -220,10 +255,10 @@
   "discord.claude": {
     "prompt_tokens": {
       "context": 0,
-      "stable": 1244,
+      "stable": 1801,
       "volatile": 1269
     },
-    "tool_tokens": 9464,
+    "tool_tokens": 11427,
     "tools": [
       "browser_cdp",
       "browser_dialog",
@@ -232,6 +267,11 @@
       "delegate_task",
       "execute_code",
       "memory",
+      "memory_propose",
+      "model_status",
+      "model_switch",
+      "notes_read",
+      "notes_write",
       "patch",
       "read_file",
       "search_files",
@@ -251,10 +291,10 @@
   "telegram.claude": {
     "prompt_tokens": {
       "context": 0,
-      "stable": 1330,
+      "stable": 1888,
       "volatile": 1269
     },
-    "tool_tokens": 9464,
+    "tool_tokens": 11427,
     "tools": [
       "browser_cdp",
       "browser_dialog",
@@ -263,6 +303,11 @@
       "delegate_task",
       "execute_code",
       "memory",
+      "memory_propose",
+      "model_status",
+      "model_switch",
+      "notes_read",
+      "notes_write",
       "patch",
       "read_file",
       "search_files",

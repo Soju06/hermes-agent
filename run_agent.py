@@ -90,6 +90,7 @@ def _gateway_origin_json(agent: "AIAgent") -> Optional[str]:
 
 
 from agent.iteration_budget import IterationBudget
+from agent import turn_trace
 from hermes_cli.env_loader import load_hermes_dotenv
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 
@@ -269,7 +270,7 @@ class AIAgent(
         chat_id: str | None = None, chat_name: str | None = None, chat_type: str | None = None, thread_id: str | None = None,
         gateway_session_key: str | None = None,
         skip_context_files: bool = False, load_soul_identity: bool = False,
-        skip_memory: bool = False, skip_background_review: bool = False,
+        skip_memory: bool = False, skip_background_review: bool = False, persist_disabled: bool = False,
         session_db=None, persistence=None, parent_session_id: str | None = None,
         iteration_budget: IterationBudget = None, run_budget_seconds: Optional[float] = None,
         fallback_model: dict[str, Any] | None = None, credential_pool=None,
@@ -856,8 +857,11 @@ class AIAgent(
                     explicit=explicit))
 
             # Carry the active profile into the review thread so MEMORY.md / skill review writes land in the
-            # right profile.
-            threading.Thread(target=propagate_context_to_thread(_target_with_requeue), daemon=True, name="bg-review").start()
+            # right profile. The delegated-child marker is NOT inherited: the review outlives the turn.
+            threading.Thread(
+                target=propagate_context_to_thread(_target_with_requeue, inherit_delegated_child=False),
+                daemon=True, name="bg-review",
+            ).start()
         except Exception:
             finish_background_review_run(self, review_run)
             raise
@@ -888,6 +892,8 @@ class AIAgent(
     _build_memory_write_metadata = _forward("agent.background_review", "build_memory_write_metadata")
     _apply_pending_steer_to_tool_results = _forward("agent.agent_runtime_helpers", "apply_pending_steer_to_tool_results")
 
+    get_activity_recap_context = _forward("agent.activity_recap", "build_activity_recap_context")
+
     def get_activity_summary(self) -> dict:
         """Diagnostic snapshot: ``last_activity_*`` plus the short aliases gateway and delegate readers use."""
         from agent.session_activity import build_activity_snapshot
@@ -910,18 +916,50 @@ class AIAgent(
         if getattr(self, "_memory_provider_shutdown", False):
             return
         self._memory_provider_shutdown = True
-        if self._memory_manager and self._memory_manager.claim_teardown(session_end=True):
+        # Ingest-curator session-end boundary (ADR-004 Phase 2, SHADOW): >=3-turn sessions with a
+        # dirty buffer get a cold curation run on a daemon thread. Observed BEFORE provider
+        # teardown so the fork's memory_search reads still work. No-op unless
+        # curator.ingest_enabled; internally skips ingest-disabled forks; fail-open.
+        try:
+            from agent.ingest_curator import observe_session_end
+            observe_session_end(self, messages)
+        except Exception:
+            logger.debug("ingest-curator session-end observation failed (fail-open)", exc_info=True)
+        from agent.memory_manager import memory_ingest_allowed
+        # ADR-004 Phase 0: an ingest-disabled fork never OWNS its manager — it is rebound from the parent.
+        # on_session_end would run end-of-session extraction (a graph write) on the fork's harness transcript,
+        # and shutdown_all would tear down the parent's live provider mid-session. The gate runs before
+        # claim_teardown so the fork never takes the real owner's teardown claim either.
+        if self._memory_manager and memory_ingest_allowed(self) and self._memory_manager.claim_teardown(session_end=True):
             try:
                 self._memory_manager.on_session_end(messages or [])
             except Exception as e:
                 logger.warning("Memory provider on_session_end failed during shutdown: %s", e, exc_info=True)
             _quietly(lambda: self._memory_manager.shutdown_all())
+            # ADR-004 §① origin-taint (Phase 2): evict this session's in-memory injected-span
+            # registry (the durable sidecar is kept for post-session readers — curator, dream —
+            # and TTLs out via its own GC). Owner-only by construction: this branch is only
+            # reached when memory_ingest_allowed(self), so an ingest-disabled fork sharing the
+            # parent's live session can never evict the parent's registry state mid-conversation.
+            try:
+                from agent import memory_taint
+                memory_taint.end_session(self.session_id or "")
+            except Exception:
+                pass
         _notify_context_engine_session_end(self, messages)
 
     def commit_memory_session(self, messages: list | None = None) -> None:
         """Flush end-of-session extraction on session_id rotation (/new, compression) without tearing providers
         down."""
-        if self._memory_manager:
+        # Ingest-curator session boundary (ADR-004 Phase 2, SHADOW) — same rationale as in
+        # shutdown_memory_provider. Fail-open.
+        try:
+            from agent.ingest_curator import observe_session_end
+            observe_session_end(self, messages)
+        except Exception:
+            logger.debug("ingest-curator session-end observation failed (fail-open)", exc_info=True)
+        from agent.memory_manager import memory_ingest_allowed
+        if self._memory_manager and memory_ingest_allowed(self):
             _quietly(lambda: self._memory_manager.on_session_end(messages or []))
         _notify_context_engine_session_end(self, messages)
 
@@ -939,6 +977,12 @@ class AIAgent(
         fire against stale context. See #15218.
         """
         if interrupted or not (self._memory_manager and final_response and original_user_message):
+            return
+        # ADR-004 Phase 0: ingest-disabled forks (background review, ingest curator) share the
+        # parent's manager for reads only — this is the sync_all/queue_prefetch_all write
+        # chokepoint (turn_finalizer + codex_runtime both land here), so it must gate.
+        from agent.memory_manager import memory_ingest_allowed
+        if not memory_ingest_allowed(self):
             return
         # Flatten multimodal parts to text (newline-joined for memory).
         user_text = _summarize_user_message_for_log(original_user_message, sep="\n")
@@ -972,7 +1016,10 @@ class AIAgent(
         # The Codex app-server child is an LLM client, not session tool state: the evicted instance is popped
         # from the cache and a rebuilt agent spawns its own child, so an unclosed one leaks for the gateway's life.
         _quietly(self._close_codex_session)
-        if getattr(self, "_memory_manager", None) is not None:
+        from agent.memory_manager import memory_ingest_allowed
+        # An ingest-disabled fork's manager is the parent's (ADR-004 Phase 0): soft-releasing it would stop
+        # the parent's provider writers mid-session.
+        if getattr(self, "_memory_manager", None) is not None and memory_ingest_allowed(self):
             _quietly(self._memory_manager.release_soft)
         from agent.prepared_compaction import release_for_agent
         _quietly(release_for_agent, self)
@@ -1367,22 +1414,41 @@ class AIAgent(
         """
         tool_calls = assistant_message.tool_calls
         args = (assistant_message, messages, effective_task_id, api_call_count)
+
+        # Per-turn trace: running tool_calls total lives in the trace tags so
+        # the run_conversation wrapper can copy it onto the root `turn` span.
+        _tt = turn_trace.get_bound(self)
+        if _tt is not None:
+            try:
+                _tt.tag(tool_calls=_tt.tags.get("tool_calls", 0) + len(tool_calls))
+            except Exception:
+                pass
+
         self._executing_tools = True  # allow _vprint during tool execution even with stream consumers
         try:
             with scoped_connection_surface(agent_connection_surface(self)):
                 if len(tool_calls) <= 1:
-                    self._execute_tool_calls_sequential(*args)
+                    with turn_trace.span("tools.batch", trace=_tt, count=len(tool_calls), mode="sequential"):
+                        self._execute_tool_calls_sequential(*args)
                 else:
                     from agent.tool_dispatch_helpers import _plan_tool_batch_segments
                     active_env = get_active_env(effective_task_id)
                     exec_cwd = Path(active_env.cwd) if active_env is not None and active_env.cwd else None
                     segments = _plan_tool_batch_segments(tool_calls, execution_cwd=exec_cwd)
                     if len(segments) == 1:
+                        # mode tag mirrors the actual dispatch path: a homogeneous plan keeps its
+                        # single-path executor.
+                        _mode = "concurrent" if segments[0][0] == "parallel" else "sequential"
                         run = self._execute_tool_calls_concurrent if segments[0][0] == "parallel" else self._execute_tool_calls_sequential
-                        run(*args)
+                        with turn_trace.span("tools.batch", trace=_tt, count=len(tool_calls), mode=_mode):
+                            run(*args)
                     else:
                         from agent.tool_executor import execute_tool_calls_segmented
-                        execute_tool_calls_segmented(self, *args, segments=segments)
+                        # Mixed batch: one tools.batch span covers the whole batch; per-tool tools.call
+                        # spans come from the sequential/concurrent executors reused per segment.
+                        with turn_trace.span("tools.batch", trace=_tt, count=len(tool_calls),
+                                             mode="segmented", segments=len(segments)):
+                            execute_tool_calls_segmented(self, *args, segments=segments)
         finally:
             self._executing_tools = False
         # getattr: test stubs built without _set_defaults drive this method too
@@ -1408,7 +1474,8 @@ class AIAgent(
             max_iterations=function_args.get("max_iterations"), role=function_args.get("role"),
             background=not (getattr(self, "_delegate_depth", 0) > 0), images=function_args.get("images"),
             action=function_args.get("action"),
-            subagent_id=function_args.get("subagent_id"), message=function_args.get("message"), parent_agent=self,
+            subagent_id=function_args.get("subagent_id"), message=function_args.get("message"),
+            route=function_args.get("route"), parent_agent=self,
         )
 
     _invoke_tool = _forward("agent.agent_runtime_helpers", "invoke_tool")

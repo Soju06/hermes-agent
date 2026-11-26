@@ -58,7 +58,415 @@ def _make_runner(platform: Platform):
     runner.pairing_store._is_rate_limited.return_value = False
     runner.session_store = MagicMock()
     runner._running_agents = {}
+    runner._session_model_overrides = {}
+    runner._pending_runtime_route_states = {}
     return runner, adapter
+
+
+def _reasoning_override(runner, session_key):
+    """The session's reasoning override, read from ``SessionState`` (the legacy
+    ``_session_reasoning_overrides`` dict view is gone upstream)."""
+    state = runner._peek_session_state(session_key)
+    return state.conversation.reasoning_override if state is not None else None
+
+
+def _reasoning_overrides(runner):
+    """Every session's reasoning override that is set, keyed by session key."""
+    sessions = runner.__dict__.get("_sessions") or {}
+    return {key: state.conversation.reasoning_override for key, state in sessions.items()
+            if state.conversation.reasoning_override is not None}
+
+
+@pytest.mark.asyncio
+async def test_hook_skip_short_circuits_dispatch(monkeypatch):
+    """A plugin returning {'action': 'skip'} drops the message before auth."""
+    _clear_auth_env(monkeypatch)
+
+    async def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            return [{"action": "skip", "reason": "plugin-handled"}]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.ainvoke_hook", _fake_hook)
+
+    runner, adapter = _make_runner(Platform.WHATSAPP)
+
+    result = await runner._handle_message(_make_event("hi"))
+
+    assert result is None
+    adapter.send.assert_not_awaited()
+    runner.pairing_store.generate_code.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_hook_rewrite_replaces_event_text(monkeypatch):
+    """A plugin returning {'action': 'rewrite', 'text': ...} mutates event.text."""
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+
+    seen_text = {}
+
+    async def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            return [{"action": "rewrite", "text": "REWRITTEN"}]
+        return []
+
+    async def _capture(event, source, _quick_key, _run_generation):
+        seen_text["value"] = event.text
+        return "ok"
+
+    monkeypatch.setattr("hermes_cli.plugins.ainvoke_hook", _fake_hook)
+
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._handle_message_with_agent = _capture  # noqa: SLF001
+
+    await runner._handle_message(_make_event("original"))
+
+    assert seen_text.get("value") == "REWRITTEN"
+
+
+@pytest.mark.asyncio
+async def test_hook_runtime_override_applies_after_auth_before_agent(monkeypatch):
+    """runtime_override switches the session route before the first agent call."""
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+
+    async def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            return [
+                {
+                    "action": "runtime_override",
+                    "model": "gpt-5.5",
+                    "provider": "codex-nekos",
+                    "reasoning_effort": "high",
+                    "reason": "codex-lb PR review",
+                }
+            ]
+        return []
+
+    switch_calls = []
+
+    def _fake_switch_model(**kwargs):
+        switch_calls.append(kwargs)
+        return SimpleNamespace(
+            success=True,
+            new_model="gpt-5.5",
+            target_provider="codex-nekos",
+            api_key="test-key",
+            base_url="https://codex.nekos.me/v1",
+            api_mode="codex_responses",
+            provider_label="codex-nekos",
+            error_message="",
+        )
+
+    captured = {}
+    async def _capture(event, source, _quick_key, _run_generation):
+        session_key = runner._session_key_for_source(source)  # noqa: SLF001
+        captured["model_override"] = runner._session_model_overrides.get(session_key)  # noqa: SLF001
+        captured["reasoning_override"] = _reasoning_override(runner, session_key)
+        captured["route_state"] = runner._pending_runtime_route_states.get(session_key)  # noqa: SLF001
+        return "ok"
+
+    monkeypatch.setattr("hermes_cli.plugins.ainvoke_hook", _fake_hook)
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", _fake_switch_model)
+
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._handle_message_with_agent = _capture  # noqa: SLF001
+
+    await runner._handle_message(_make_event("codex-lb 817 확인해줘"))
+
+    assert switch_calls
+    assert switch_calls[0]["raw_input"] == "gpt-5.5"
+    assert switch_calls[0]["explicit_provider"] == "codex-nekos"
+    assert captured["model_override"] == {
+        "model": "gpt-5.5",
+        "provider": "codex-nekos",
+        "api_key": "test-key",
+        "base_url": "https://codex.nekos.me/v1",
+        "api_mode": "codex_responses",
+    }
+    assert captured["reasoning_override"] == {"enabled": True, "effort": "high"}
+    assert captured["route_state"] == {
+        "label": "RUNTIME_OVERRIDE",
+        "target_provider": "codex-nekos",
+        "target_model": "gpt-5.5",
+        "target_reasoning_effort": "high",
+        "source": "pre_gateway_dispatch",
+        "strictness": "auto_reconsiderable",
+        "confidence": "unknown",
+        "reason": "codex-lb PR review",
+    }
+
+
+def test_pending_runtime_route_state_is_consumed_once():
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    session_key = "whatsapp:chat:user"
+    state = {"label": "SYSTEM_DEV", "target_model": "gpt-5.5"}
+
+    runner._set_pending_runtime_route_state(session_key, state)  # noqa: SLF001
+
+    assert runner._consume_pending_runtime_route_state(session_key) == state  # noqa: SLF001
+    assert runner._consume_pending_runtime_route_state(session_key) is None  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_hook_runtime_override_does_not_apply_before_auth(monkeypatch):
+    """runtime_override from an unauthorized message must not mutate session state."""
+    _clear_auth_env(monkeypatch)
+    monkeypatch.delenv("WHATSAPP_ALLOWED_USERS", raising=False)
+
+    async def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            return [
+                {
+                    "action": "runtime_override",
+                    "model": "gpt-5.5",
+                    "provider": "codex-nekos",
+                    "reasoning_effort": "high",
+                }
+            ]
+        return []
+
+    # Recorded, not raised: _apply_gateway_runtime_override logs and swallows a raising switch, so
+    # an AssertionError here could never fail the test.
+    switch_calls = []
+
+    monkeypatch.setattr("hermes_cli.plugins.ainvoke_hook", _fake_hook)
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model",
+                        lambda **kwargs: switch_calls.append(kwargs) or _fake_switch_result())
+    monkeypatch.setattr("gateway.slash_commands_model._model_switch_skew_guard", lambda: None)
+
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner.pairing_store.generate_code.return_value = "12345"
+
+    result = await runner._handle_message(_make_event("codex-lb 817 확인해줘"))
+
+    assert result is None
+    assert switch_calls == []
+    assert runner._session_model_overrides == {}
+    # The directive's reasoning half is the other state a pre-auth application would write.
+    assert _reasoning_overrides(runner) == {}
+
+
+def _runtime_override_hook(**directive):
+    async def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            return [{"action": "runtime_override", **directive}]
+        return []
+    return _fake_hook
+
+
+def _fake_switch_result(**_kwargs):
+    return SimpleNamespace(
+        success=True, new_model="gpt-5.5", target_provider="codex-nekos", api_key="test-key",
+        base_url="https://codex.nekos.me/v1", api_mode="codex_responses", provider_label="codex-nekos",
+        error_message="",
+    )
+
+
+@pytest.mark.asyncio
+async def test_hook_runtime_override_resolves_and_persists_off_the_owner_loop(monkeypatch):
+    """Bug class of tests/gateway/test_owner_loop_writes_class.py: the directive's ``switch_model``
+    (a cold models.dev fetch) and its durable runtime_* write (a routing-index save) run off the
+    owner loop, as upstream's ``/model`` resolves its switch (2026-10-30 sync review)."""
+    import threading
+
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+    threads = {}
+
+    def _switch(**kwargs):
+        threads["switch_model"] = threading.get_ident()
+        return _fake_switch_result(**kwargs)
+
+    monkeypatch.setattr("hermes_cli.plugins.ainvoke_hook", _runtime_override_hook(
+        model="gpt-5.5", provider="codex-nekos", reasoning_effort="high"))
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", _switch)
+    monkeypatch.setattr("gateway.slash_commands_model._model_switch_skew_guard", lambda: None)
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner.session_store.update_runtime_override.side_effect = (
+        lambda *a, **k: threads.setdefault("persist", threading.get_ident()))
+
+    async def _capture(event, source, _quick_key, _run_generation):
+        threads["loop"] = threading.get_ident()
+        return "ok"
+
+    runner._handle_message_with_agent = _capture  # noqa: SLF001
+    await runner._handle_message(_make_event("route me"))
+
+    assert threads["switch_model"] != threads["loop"]
+    assert threads["persist"] != threads["loop"]
+    session_key = runner._session_key_for_source(_make_event().source)  # noqa: SLF001
+    assert runner._session_model_overrides[session_key]["model"] == "gpt-5.5"  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_hook_runtime_override_model_half_is_refused_under_code_skew(monkeypatch):
+    """The ``/model`` code-skew guard covers the directive's model switch; its reasoning half applies."""
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+    switch_calls = []
+    monkeypatch.setattr("hermes_cli.plugins.ainvoke_hook", _runtime_override_hook(
+        model="gpt-5.5", provider="codex-nekos", reasoning_effort="high"))
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model",
+                        lambda **kwargs: switch_calls.append(kwargs) or _fake_switch_result())
+    monkeypatch.setattr("gateway.slash_commands_model._model_switch_skew_guard", lambda: "stale code")
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    captured = {}
+
+    async def _capture(event, source, _quick_key, _run_generation):
+        session_key = runner._session_key_for_source(source)  # noqa: SLF001
+        captured["model_override"] = runner._session_model_overrides.get(session_key)  # noqa: SLF001
+        captured["reasoning_override"] = _reasoning_override(runner, session_key)
+        return "ok"
+
+    runner._handle_message_with_agent = _capture  # noqa: SLF001
+    await runner._handle_message(_make_event("route me"))
+
+    assert switch_calls == []
+    assert captured["model_override"] is None
+    assert captured["reasoning_override"] == {"enabled": True, "effort": "high"}
+
+
+@pytest.mark.asyncio
+async def test_hook_prepend_applies_to_plain_chat(monkeypatch):
+    """A plugin returning {'action': 'prepend', 'text': ...} prefixes event.text."""
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+
+    seen_text = {}
+
+    async def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            return [{"action": "prepend", "text": "[INBOX_MATTER det_key=x]"}]
+        return []
+
+    async def _capture(event, source, _quick_key, _run_generation):
+        seen_text["value"] = event.text
+        return "ok"
+
+    monkeypatch.setattr("hermes_cli.plugins.ainvoke_hook", _fake_hook)
+
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._handle_message_with_agent = _capture
+
+    await runner._handle_message(_make_event("hello there"))
+
+    assert seen_text.get("value") == "[INBOX_MATTER det_key=x]\n\nhello there"
+
+
+@pytest.mark.asyncio
+async def test_hook_prepend_dropped_for_slash_command(monkeypatch):
+    """Prepends must not mutate slash commands.
+
+    is_command()/get_command() key off text.startswith("/"): a prepended
+    advisory marker would demote a recognized command (/model, /status, ...)
+    into plain chat that falls through to the agent (live incident
+    2026-07-15: /model in an inbox-matter Discord thread answered by the
+    agent's model_status tool instead of the interactive picker).
+    """
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+
+    async def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            return [{"action": "prepend", "text": "[INBOX_MATTER det_key=x]"}]
+        return []
+
+    seen = {}
+
+    async def _capture_model(event):
+        seen["model_event_text"] = event.text
+        return "picker"
+
+    async def _capture_agent(event, source, _quick_key, _run_generation):
+        seen["agent_event_text"] = event.text
+        return "ok"
+
+    monkeypatch.setattr("hermes_cli.plugins.ainvoke_hook", _fake_hook)
+
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._handle_model_command = _capture_model
+    runner._handle_message_with_agent = _capture_agent
+
+    result = await runner._handle_message(_make_event("/model"))
+
+    # The command must reach the /model handler with its text intact —
+    # not fall through to the agent as prepended plain chat.
+    assert seen.get("model_event_text") == "/model"
+    assert "agent_event_text" not in seen
+    assert result == "picker"
+
+
+@pytest.mark.asyncio
+async def test_hook_prepend_kept_for_path_like_plain_chat(monkeypatch):
+    """Text that merely starts with ``/`` but names no command (a pasted path) is plain chat for
+    the agent, so its advisory prepend still applies; only real commands drop it."""
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+
+    async def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            return [{"action": "prepend", "text": "[INBOX_MATTER det_key=x]"}]
+        return []
+
+    seen = {}
+
+    async def _capture_agent(event, source, _quick_key, _run_generation):
+        seen["agent_event_text"] = event.text
+        return "ok"
+
+    monkeypatch.setattr("hermes_cli.plugins.ainvoke_hook", _fake_hook)
+
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._handle_message_with_agent = _capture_agent
+
+    await runner._handle_message(_make_event("/home/me/notes.txt summarize this"))
+
+    assert seen.get("agent_event_text") == "[INBOX_MATTER det_key=x]\n\n/home/me/notes.txt summarize this"
+
+
+@pytest.mark.asyncio
+async def test_hook_allow_falls_through_to_auth(monkeypatch):
+    """A plugin returning {'action': 'allow'} continues to normal dispatch."""
+    _clear_auth_env(monkeypatch)
+    # No allowed users set → auth fails → pairing flow triggers.
+    monkeypatch.delenv("WHATSAPP_ALLOWED_USERS", raising=False)
+
+    async def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            return [{"action": "allow"}]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.ainvoke_hook", _fake_hook)
+
+    runner, adapter = _make_runner(Platform.WHATSAPP)
+    runner.pairing_store.generate_code.return_value = "12345"
+
+    result = await runner._handle_message(_make_event("hi"))
+
+    # auth chain ran → pairing code was generated
+    assert result is None
+    runner.pairing_store.generate_code.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_hook_exception_does_not_break_dispatch(monkeypatch):
+    """A raising plugin hook does not break the gateway."""
+    _clear_auth_env(monkeypatch)
+    monkeypatch.delenv("WHATSAPP_ALLOWED_USERS", raising=False)
+
+    async def _fake_hook(name, **kwargs):
+        raise RuntimeError("plugin blew up")
+
+    monkeypatch.setattr("hermes_cli.plugins.ainvoke_hook", _fake_hook)
+
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner.pairing_store.generate_code.return_value = None
+
+    # Should not raise; falls through to auth chain.
+    result = await runner._handle_message(_make_event("hi"))
+    assert result is None
 
 
 @pytest.mark.asyncio
@@ -780,3 +1188,233 @@ def test_relay_binding_moves_to_a_text_rewrite_but_never_to_a_new_source():
         carry_callback(rewritten, replace(rewritten, source=copy(rewritten.source), text="c"))
         assert _relay_callback.get()[1] is rewritten
     assert _relay_callback.get() is None
+
+
+@pytest.mark.asyncio
+async def test_hook_prepend_prepends_text_to_event(monkeypatch):
+    """A plugin returning {'action': 'prepend', 'text': ...} prepends to event.text."""
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+
+    seen_text = {}
+
+    async def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            return [{"action": "prepend", "text": "[CONTEXT]\nSome context."}]
+        return []
+
+    async def _capture(event, source, _quick_key, _run_generation):
+        seen_text["value"] = event.text
+        return "ok"
+
+    monkeypatch.setattr("hermes_cli.plugins.ainvoke_hook", _fake_hook)
+
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._handle_message_with_agent = _capture
+
+    await runner._handle_message(_make_event("hello world"))
+
+    assert seen_text["value"].startswith("[CONTEXT]")
+    assert "hello world" in seen_text["value"]
+
+
+@pytest.mark.asyncio
+async def test_hook_multiple_prepends_accumulate(monkeypatch):
+    """Multiple prepend directives are combined before the original text."""
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+
+    seen_text = {}
+
+    async def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            return [
+                {"action": "prepend", "text": "First."},
+                {"action": "prepend", "text": "Second."},
+            ]
+        return []
+
+    async def _capture(event, source, _quick_key, _run_generation):
+        seen_text["value"] = event.text
+        return "ok"
+
+    monkeypatch.setattr("hermes_cli.plugins.ainvoke_hook", _fake_hook)
+
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._handle_message_with_agent = _capture
+
+    await runner._handle_message(_make_event("original"))
+
+    val = seen_text["value"]
+    assert val.startswith("First.")
+    assert "Second." in val
+    assert val.endswith("original")
+
+
+@pytest.mark.asyncio
+async def test_hook_prepend_with_runtime_override(monkeypatch):
+    """prepend and runtime_override directives both apply in the same turn."""
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+
+    dispatched = {}
+
+    async def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            return [
+                {
+                    "action": "runtime_override",
+                    "model": "gpt-5.5",
+                    "provider": "codex-nekos",
+                },
+                {"action": "prepend", "text": "[Dev routing applied]"},
+            ]
+        return []
+
+    async def _capture(event, source, _quick_key, _run_generation):
+        dispatched["text"] = event.text
+        return "ok"
+
+    monkeypatch.setattr("hermes_cli.plugins.ainvoke_hook", _fake_hook)
+
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner._handle_message_with_agent = _capture
+    # Stub the override application
+    runner._apply_gateway_runtime_override = lambda d, s: None
+
+    await runner._handle_message(_make_event("build it"))
+
+    assert "[Dev routing applied]" in dispatched["text"]
+    assert "build it" in dispatched["text"]
+
+
+def _runtime_override_plugin(directive):
+    from hermes_cli.plugins import get_plugin_manager
+
+    manager = get_plugin_manager()
+    manager._discovered = True
+    manager._hooks.setdefault("pre_gateway_dispatch", []).append(
+        lambda event, **_kwargs: {"action": "runtime_override", **directive})
+
+
+async def _run_webhook_delivery(client, adapter, text, delivery_id, *, capture=None):
+    from tests.waiting import async_wait_until
+
+    runner = adapter._message_handler.__self__
+    authority = runner.session_authority
+    authority.__dict__.pop("_schedule", None)  # the real drain executes the admitted row
+    runner._handle_message_with_agent = capture or AsyncMock(return_value="agent-ok")
+    assert (await _post_webhook(client, text, delivery_id)).status == 202
+
+    def settled():
+        rows = raw_holder(authority.persistence)._read_all("SELECT status FROM session_admissions")
+        return rows if rows and all(row["status"] == "terminal" for row in rows) else None
+
+    await async_wait_until(settled, what="the admitted delivery executed")
+    return runner
+
+
+@pytest.mark.asyncio
+async def test_webhook_runtime_override_applies_at_producer_ingress_before_commit(monkeypatch):
+    """Receipt-only producer ingress (webhook/relay ``admit_producer``) runs the hook before the
+    commit and never at execution; a ``runtime_override`` staged on the in-memory event used to be
+    dropped at commit. It now applies at ingress (after authorization, which preparing the payload
+    ran), so the executed turn runs the selected route (2026-10-30 sync review)."""
+    from aiohttp.test_utils import TestClient, TestServer
+
+    switch_calls = []
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model",
+                        lambda **kwargs: switch_calls.append(kwargs) or _fake_switch_result())
+    monkeypatch.setattr("gateway.slash_commands_model._model_switch_skew_guard", lambda: None)
+    _runtime_override_plugin({"model": "gpt-5.5", "provider": "codex-nekos", "reasoning_effort": "high"})
+    adapter, app = _webhook_app()
+    seen = {}
+
+    async with TestClient(TestServer(app)) as client:
+        runner = adapter._message_handler.__self__
+
+        async def _capture(event, source, _quick_key, _run_generation):
+            session_key = runner._session_key_for_source(source)  # noqa: SLF001
+            seen["model_override"] = runner._session_model_overrides.get(session_key)  # noqa: SLF001
+            seen["reasoning_override"] = _reasoning_override(runner, session_key)
+            return "agent-ok"
+
+        await _run_webhook_delivery(client, adapter, "route me", "d-route", capture=_capture)
+
+    assert len(switch_calls) == 1 and switch_calls[0]["raw_input"] == "gpt-5.5"
+    assert (seen["model_override"] or {}).get("model") == "gpt-5.5", seen
+    assert seen["reasoning_override"] == {"enabled": True, "effort": "high"}
+
+
+@pytest.mark.asyncio
+async def test_webhook_runtime_override_is_not_applied_under_the_emergency_stop(monkeypatch):
+    """The producer path keeps ``_handle_message``'s order: a delivery the emergency-stop gate pauses
+    applies no route (its execution is answered by the same gate)."""
+    from aiohttp.test_utils import TestClient, TestServer
+
+    switch_calls = []
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model",
+                        lambda **kwargs: switch_calls.append(kwargs) or _fake_switch_result())
+    monkeypatch.setattr("gateway.slash_commands_model._model_switch_skew_guard", lambda: None)
+    monkeypatch.setattr("agent.estop.paused_reply", lambda: "paused")
+    _runtime_override_plugin({"model": "gpt-5.5", "provider": "codex-nekos", "reasoning_effort": "high"})
+    adapter, app = _webhook_app()
+
+    async with TestClient(TestServer(app)) as client:
+        runner = await _run_webhook_delivery(client, adapter, "route me", "d-paused")
+        reasoning_overrides = _reasoning_overrides(runner)
+
+    assert switch_calls == []
+    assert reasoning_overrides == {}
+
+
+@pytest.mark.asyncio
+async def test_hook_prepend_copy_keeps_the_rewrite_chain_and_the_typed_voice_answer(monkeypatch):
+    """A prepend rebuilds the event the way ``rewrite`` does, so it keeps what upstream's rewrite keeps
+    (4a0143fd68, 643d285d2f): ``accept_interrupt`` reaches the event the adapter dispatched, and a typed
+    reply to a voice note still answers with the typed text, since the prepend is agent context."""
+    from gateway.run import GatewayRunner
+
+    async def _fake_hook(name, **kwargs):
+        return [{"action": "prepend", "text": "[CONTEXT]"}] if name == "pre_gateway_dispatch" else []
+
+    monkeypatch.setattr("hermes_cli.plugins.ainvoke_hook", _fake_hook)
+    runner = object.__new__(GatewayRunner)
+    event = _make_event("replied-to speech\n\ntyped answer")
+    event._telegram_replied_voice_typed_text = "typed answer"
+
+    prepended = await runner._hm_pre_gateway_dispatch_hook(event, event.source)
+
+    assert prepended is not event and prepended.text == "[CONTEXT]\n\nreplied-to speech\n\ntyped answer"
+    assert getattr(prepended, "_telegram_replied_voice_typed_text", None) == "typed answer"
+    prepended.accept_interrupt()
+    assert getattr(event, "_interrupt_accepted", False) is True
+
+
+@pytest.mark.asyncio
+async def test_prepended_busy_followup_preserves_processing_hooks(monkeypatch):
+    """A prepend on a busy follow-up keeps its executor-owned lifecycle, as upstream's rewrite does
+    (d8eff5f6aa): the observed event is changed in place, never replaced by a copy."""
+    import asyncio
+
+    from gateway.platforms.event import ProcessingOutcome
+    from tests.gateway.test_busy_followup_processing_hooks import HookAdapter, _busy_hook_owner
+    from tests.gateway.test_shared_busy_receive_loop import _statuses, _wait_for
+
+    async def prepend(name, **kwargs):
+        if name == "pre_gateway_dispatch" and kwargs["event"].text == "two":
+            return [{"action": "prepend", "text": "[ctx]"}]
+        return []
+
+    monkeypatch.setattr("hermes_cli.lifecycle.ainvoke_hook", prepend)
+    adapter = HookAdapter()
+    authority, source, gate = await _busy_hook_owner(monkeypatch, adapter)
+    await adapter.handle_message(MessageEvent(text="one", source=source, message_id="m1"))
+    await _wait_for(lambda: _statuses(authority).get("one") == "started")
+    await asyncio.wait_for(adapter.handle_message(MessageEvent(text="two", source=source, message_id="m2")), 5)
+    await _wait_for(lambda: _statuses(authority).get("[ctx]\n\ntwo") == "queued")
+    assert not any(h[0] == "m2" for h in adapter.hooks)
+    gate.set()
+    await _wait_for(lambda: "reply to [ctx]\n\ntwo" in adapter.sent and not adapter._background_tasks, 15)
+    assert [h for h in adapter.hooks if h[0] == "m2"] == [
+        ("m2", "start"), ("m2", "complete", ProcessingOutcome.SUCCESS)]

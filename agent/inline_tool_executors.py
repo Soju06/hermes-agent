@@ -149,12 +149,16 @@ def _memory(agent, args: dict, ctx: InlineToolContext) -> Any:
         (
             ("action", "action"), ("target", "target"), ("content", "content"),
             ("old_text", "old_text"), ("new_text", "new_text"), ("operations", "operations"),
+            ("reason", "reason", ""),
         ),
         store=agent._memory_store,
     )
     # Mirror built-in memory writes to external providers; gating lives in
-    # MemoryManager.notify_memory_tool_write.
-    if agent._memory_manager:
+    # MemoryManager.notify_memory_tool_write. Skipped for ingest-disabled forks
+    # (ADR-004 Phase 0) — their built-in MEMORY.md writes must not fan out to the
+    # external graph.
+    from agent.memory_manager import memory_ingest_allowed
+    if agent._memory_manager and memory_ingest_allowed(agent):
         agent._memory_manager.notify_memory_tool_write(
             result,
             args,
@@ -164,6 +168,25 @@ def _memory(agent, args: dict, ctx: InlineToolContext) -> Any:
             ),
         )
     return result
+
+
+def _notes_tool(function_name: str) -> InlineToolExecutor:
+    """Notes tier (ADR-004 Phase 1) — dispatched inline (like ``memory``) so the handler gets
+    the session id and, for the flag-gated notes→graph backfill, this agent's MemoryManager
+    (withheld from ingest-disabled forks for the same reason built-in memory writes don't fan
+    out there, Phase 0). Agent-state resolution lives in
+    ``tools.notes_tool.dispatch_notes_tool_for_agent``, shared by both executor paths."""
+    def _exec(agent, args: dict, ctx: InlineToolContext) -> Any:
+        from tools.notes_tool import dispatch_notes_tool_for_agent
+        return dispatch_notes_tool_for_agent(agent, function_name, args)
+    return _exec
+
+
+def _curator_verdict(agent, args: dict, ctx: InlineToolContext) -> Any:
+    """Ingest-curator verdict submission (ADR-004 Phase 2) — agent-scoped: only a curator fork
+    carries the verdict sink; every other agent is refused inside the handler."""
+    from agent.ingest_curator import dispatch_curator_verdict_for_agent
+    return dispatch_curator_verdict_for_agent(agent, args)
 
 
 _read_preview = _callback_tool(
@@ -297,12 +320,41 @@ def _setup_mcp_shim(agent, args: dict, ctx: InlineToolContext) -> Any:
     }, ctx)
 
 
+def _model_status(agent, args: dict, ctx: InlineToolContext) -> Any:
+    from agent.runtime_control import model_status
+
+    return model_status(agent)
+
+
+def _model_switch(agent, args: dict, ctx: InlineToolContext) -> Any:
+    # Single tool-dispatch entry point (ADR-003 Phase 3c): forwarding of the LLM-facing
+    # ``route``/``reason`` surface is defined once in agent/runtime_control.py so the
+    # sequential and concurrent executors cannot drift.
+    from agent.runtime_control import dispatch_model_switch
+
+    return dispatch_model_switch(agent, args)
+
+
+_todo_list_call = _tool(
+    "tools.todo_tool", "todo_tool", ("todos", "todos"), ("merge", "merge", False),
+    store=lambda agent, ctx: agent._todo_store,
+)
+
+
+def _todo_list(agent, args: dict, ctx: InlineToolContext) -> Any:
+    # Zero the reminder counter: the model touched its todo list, so the periodic
+    # re-surfacing clock restarts (see agent/turn_todo_reminder.py).
+    # One site covers both the sequential and the concurrent dispatch paths.
+    agent._todo_loop_iterations_since_write = 0
+    return _todo_list_call(agent, args, ctx)
+
+
 # Order is the historical if/elif order of ``execute_tool_calls_sequential``.
 _RAW_INLINE_TOOL_EXECUTORS: dict[str, InlineToolExecutor] = {
-    "todo_list": _tool(
-        "tools.todo_tool", "todo_tool", ("todos", "todos"), ("merge", "merge", False),
-        store=lambda agent, ctx: agent._todo_store,
-    ),
+    # Core-owned runtime introspection/switching (agent/runtime_control.py): needs live agent state.
+    "model_status": _model_status,
+    "model_switch": _model_switch,
+    "todo_list": _todo_list,
     # Bot Mode teammate DM is injected, not registered: only a canonical Bot
     # Chat session carries the schema, and the tool re-gates on the title.
     "message_agent": _tool(
@@ -313,6 +365,10 @@ _RAW_INLINE_TOOL_EXECUTORS: dict[str, InlineToolExecutor] = {
     ),
     "session_search": _session_search,
     "memory": _memory,
+    "notes_write": _notes_tool("notes_write"),
+    "notes_read": _notes_tool("notes_read"),
+    "memory_propose": _notes_tool("memory_propose"),
+    "curator_verdict": _curator_verdict,
     "clarify": _tool(
         "tools.clarify_tool", "clarify_tool", ("questions", "questions"),
         callback=lambda agent, ctx: agent.clarify_callback,
@@ -367,10 +423,44 @@ INLINE_TOOL_EXECUTORS: dict[str, InlineToolExecutor] = {
     name: _coerced(name, executor) for name, executor in _RAW_INLINE_TOOL_EXECUTORS.items()
 }
 
-# ``invoke_tool`` (concurrent path) consults the memory manager right after these three
-# names and before the remaining inline tools; ``message_agent`` falls through to the
-# registry there (Bot Mode DM is only injected into the sequential path's schema).
-INVOKE_TOOL_PRE_MEMORY_MANAGER_NAMES = frozenset({"todo_list", "session_search", "memory"})
+
+def memory_manager_tool_call(agent, function_name: str, args: dict) -> Any:
+    """Route a memory-provider tool (memory_search etc.) through the manager and register the
+    result in the session's injected-span registry (ADR-004 §① origin-taint, Phase 2):
+    memory-derived text handed back to the agent must be taint-tagged at WAL time, on BOTH
+    dispatch paths — one ``_PARALLEL_SAFE_TOOLS`` allowlist edit must not silently reopen the
+    echo-chamber bypass. JSON envelopes are string-flattened so ensure_ascii-escaped text is
+    registered as the text the model actually read. Read-only hook, fail-open, never raises.
+
+    Gated on memory_ingest_allowed: an ingest-disabled fork (curator/background review) shares
+    the parent's LIVE session_id, so its whitelisted reads must not mutate the shared registry —
+    the shadow observer's reads would change live confirm-time admission outcomes. The fork's own
+    spans are never journaled (sync_all is gated on the same flag), so skipping registration
+    loses no taint coverage."""
+    result = agent._memory_manager.handle_tool_call(
+        function_name, args,
+        caller_gsk=(getattr(agent, "_gateway_session_key", "") or ""),
+    )
+    if result:
+        try:
+            from agent.memory_manager import memory_ingest_allowed
+            if memory_ingest_allowed(agent):
+                from agent import memory_taint
+                memory_taint.record_injected_tool_result(
+                    getattr(agent, "session_id", "") or "", str(result), source=function_name,
+                )
+        except Exception:
+            pass
+    return result
+
+
+# ``invoke_tool`` (concurrent path) consults the memory manager right after these
+# names (the notes tier rides with ``memory``) and before the remaining inline tools;
+# ``message_agent`` falls through to the registry there (Bot Mode DM is only injected into
+# the sequential path's schema).
+INVOKE_TOOL_PRE_MEMORY_MANAGER_NAMES = frozenset({
+    "todo_list", "session_search", "memory", "notes_write", "notes_read", "memory_propose", "curator_verdict",
+})
 
 
 def resolve_invoke_tool_executor(agent, function_name: str) -> Optional[InlineToolExecutor]:
@@ -382,10 +472,7 @@ def resolve_invoke_tool_executor(agent, function_name: str) -> Optional[InlineTo
     if function_name in INVOKE_TOOL_PRE_MEMORY_MANAGER_NAMES:
         return INLINE_TOOL_EXECUTORS[function_name]
     if is_memory_provider_tool(agent, function_name):
-        return lambda agent, args, ctx: agent._memory_manager.handle_tool_call(
-            function_name, args,
-            caller_gsk=(getattr(agent, "_gateway_session_key", "") or ""),
-        )
+        return lambda agent, args, ctx: memory_manager_tool_call(agent, function_name, args)
     if function_name == "message_agent":
         return None
     return INLINE_TOOL_EXECUTORS.get(function_name)

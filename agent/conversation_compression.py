@@ -32,6 +32,7 @@ from agent.context_compressor_summary import accepts_keyword_argument
 from agent.context_engine import CompactionProgressText, automatic_compaction_status_message, sanitize_memory_context
 from agent.conversation_compression_codex import _compress_context_via_codex_app_server
 from agent.conversation_compression_deadline import resolve_context_compression_timeouts
+from agent.conversation_compression_runtime_state import publish_runtime_state_after_split
 from agent.conversation_compression_scaffolding import _SYNTHETIC_USER_FLAGS, _message_text, is_user_role_scaffolding
 from agent.conversation_compression_telemetry import (
     _emit_aborted_attempt_telemetry, _emit_blocked_attempt_telemetry, _emit_bypassed_attempt_telemetry,
@@ -1586,7 +1587,8 @@ def _adopt_live_compression_child(
                 bind_state(session_db=context_engine_session_db(agent, session_db), session_id=child_session_id,
                            **context_engine_persistence(bind_state, store))
     with _swallow('memory manager compression-child adoption failed: %s'):
-        if agent._memory_manager:
+        from agent.memory_manager import memory_ingest_allowed as _ingest_allowed
+        if agent._memory_manager and _ingest_allowed(agent):
             agent._memory_manager.on_session_switch(
                 child_session_id, parent_session_id=parent_session_id, reset=False, reason="compression"
             )
@@ -2835,10 +2837,15 @@ def _pre_compress_memory_context(agent: Any, messages: list, checkpoint_required
     required checkpoint cannot be taken."""
     memory_context = ""
     memory_manager = getattr(agent, "_memory_manager", None)
+    # Ingest-disabled forks (ADR-004 Phase 0) must not trigger provider extraction from their
+    # harness transcript (forks pin compression_enabled=False anyway; this is the systematic guarantee).
+    from agent.memory_manager import memory_ingest_allowed
+    if memory_manager is not None and not memory_ingest_allowed(agent):
+        memory_manager = None
     evidence_messages = _direct_messages_for_pre_compress_memory(messages)
     # A detached review/side-question fork (no memory manager, session DB or persistence) cannot checkpoint by design.
-    if checkpoint_required and getattr(agent, "_persist_disabled", False) and memory_manager is None:
-        checkpoint_required = getattr(agent, "_session_db", None) is not None
+    from agent.conversation_compression_checkpoint import owns_no_durable_memory
+    checkpoint_required = checkpoint_required and not owns_no_durable_memory(agent, memory_manager)
     if checkpoint_required:
         supports_checkpoint = getattr(memory_manager, "supports_pre_compress_checkpoint", None)
         if memory_manager is None or not callable(supports_checkpoint):
@@ -3341,6 +3348,9 @@ def _finish_compaction_boundary(
             elif callable(_clear_labels := getattr(type(_labels_db), "clear_session_activity_labels", None)):
                 _clear_labels(_labels_db, _old_sid)
 
+    # Republish runtime state for the rotated session before later gates observe the new id.
+    publish_runtime_state_after_split(agent, _old_sid)
+
     # Plugin engines use boundary_reason="compression" to keep lineage/checkpoint
     # state. Fires in BOTH modes: in-place passes the same id, the boundary is real.
     if session_commit_succeeded and (bool(_old_sid) or compacted_in_place):
@@ -3354,7 +3364,8 @@ def _finish_compaction_boundary(
     # Providers refresh cached per-session state; reset=False, conversation goes on.
     # Fires in BOTH modes so buffers don't double-count dropped turns in-place.
     with _swallow('memory manager on_session_switch (compression): %s'):
-        if (bool(_old_sid) or in_place) and agent._memory_manager:
+        from agent.memory_manager import memory_ingest_allowed as _ingest_allowed
+        if (bool(_old_sid) or in_place) and agent._memory_manager and _ingest_allowed(agent):
             agent._memory_manager.on_session_switch(
                 agent.session_id or "", parent_session_id=_boundary_parent, reset=False, reason="compression"
             )
@@ -3447,6 +3458,16 @@ def _candidate_rejected(
     if compressed == messages_before_compression or (
         _strip_marker_for_comparison(compressed) == _strip_marker_for_comparison(messages_before_compression)
     ):
+        agent._last_compression_no_progress = True
+        # Gateway hygiene rebuilds the agent every attempt, so the in-memory backoff below never reaches it: persist
+        # the durable row its pre-agent check honours, or hygiene re-runs this no-op every turn. Only the row, with a
+        # hygiene-only error: this compressor keeps the backoff a grown transcript lifts (force=/compress overrides).
+        with _swallow('no-progress compression cooldown persist failed', exc_info=True):
+            from agent.context_compressor import _NO_PROGRESS_COOLDOWN_ERROR, _SUMMARY_FAILURE_COOLDOWN_SECONDS
+
+            if callable(_persist := getattr(agent.context_compressor, "_durable_write", None)):
+                _persist("record_compression_failure_cooldown", "no-progress compression cooldown",
+                         time.time() + _SUMMARY_FAILURE_COOLDOWN_SECONDS, _NO_PROGRESS_COOLDOWN_ERROR)
         logger.info(
             "Compression made no progress (session=%s) — skipping boundary rewrite.", agent.session_id or "none"
         )
@@ -3771,6 +3792,16 @@ def _run_summary_phase(
             agent, approx_tokens=approx_tokens, focus_topic=focus_topic, force=force, memory_context=memory_context,
             bypass_cooldown=bypass_cooldown,
         )
+        # Ingest-curator pre-compress boundary (ADR-004 Phase 2, SHADOW): snapshot synchronously,
+        # curation async on a daemon thread — this path runs mid-turn at context capacity, so
+        # nothing here may block (§4.3: the 10-worker pool saturation was the silent-stall
+        # incident). No-op unless curator.ingest_enabled; fail-open.
+        try:
+            from agent.ingest_curator import observe_pre_compress
+            observe_pre_compress(agent, messages)
+        except Exception:
+            logger.debug("ingest-curator pre-compress observation failed (fail-open)", exc_info=True)
+
         messages_before_compression = copy.deepcopy(messages)
         _activity_heartbeat = _CompressionActivityHeartbeat(
             agent, commit_fence=commit_fence, emit_client_status=lease.status_emitted,
@@ -3871,6 +3902,7 @@ def _begin_compression_attempt(
         raise RuntimeError("a compression notification is already pending")
     agent._last_compression_attempt_recorded = True
     agent._last_compression_attempt_in_place = None
+    agent._last_compression_no_progress = False
     agent._compression_skipped_due_to_lock = None
     # Clear the lock-skip signal at the VERY TOP, before the codex route and the breaker gates below can
     # early-return (per-attempt state rule, #58630/#69853). A stale ``True``/holder value from a prior

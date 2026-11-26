@@ -2243,12 +2243,17 @@ _AGENT_PENDING_SENTINEL = object()
 # eviction path (_evict_cached_agent) with resource cleanup; boundaries call it explicitly.
 _CONVERSATION_SCOPED_STATE: tuple = (
     "_session_model_overrides",
+    # One-shot desired-route intent from pre_gateway_dispatch runtime routers;
+    # stale route intent must not survive a conversation reset.
+    "_pending_runtime_route_states",
     "_pending_model_notes",
     # Stall-watchdog "already notified" latch; cleared on /new so a fresh conversation can warn again.
     # See #72016.
     "_session_stall_notified",
     # Transcript-lag streak counter (#114266); a fresh conversation starts with no lag history.
-    "_transcript_lag_streaks")
+    "_transcript_lag_streaks",
+    # Model router (ADR-003): downgrade streak and unconsumed fresh-apply flag die with the conversation.
+    "_model_router_state", "_model_router_fresh_applies")
 
 
 def _resolve_runtime_agent_kwargs() -> dict:

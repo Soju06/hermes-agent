@@ -19,6 +19,7 @@ from contextlib import suppress
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+from agent import turn_trace
 from agent.i18n import t
 from agent.interrupt_compat import _accepts_keyword
 from agent.replay_cleanup import canonicalize_replay_history
@@ -526,6 +527,45 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         agent.request_overrides = overrides
         agent._gateway_turn_request_overrides = turn_overrides
 
+    @staticmethod
+    def _make_runtime_update_callback(ctx, runner):
+        """Sync callback for ``agent.runtime_update_callback`` (agent/runtime_control.py): mirror a
+        session-scoped model/reasoning switch into the session override state and persist the
+        secret-free identifiers on the SessionEntry. A LOCAL (launch-policy) session commits it
+        through its owner's policy mutation instead (gateway/session_runtime_switch.py). Static
+        (ctx/runner passed in) so the wiring below stays drivable from bare test doubles that are
+        not TurnRunner instances."""
+
+        def _runtime_update_callback(*, scope: str, model_override=None, reasoning_config=None) -> None:
+            if scope != "session" or not ctx.session_key:
+                return
+            if not model_override and reasoning_config is None:
+                return
+            from gateway.session_runtime_switch import commit_local_runtime_switch
+            if commit_local_runtime_switch(runner, getattr(ctx, "source", None), model_override, reasoning_config):
+                return  # a LOCAL session's policy is its durable route; the override slot never reaches it
+            if model_override:
+                runner._session_state(ctx.session_key).conversation.model_override = {
+                    "model": model_override.get("model", ""),
+                    "provider": model_override.get("provider", ""),
+                    "api_key": model_override.get("api_key", ""),
+                    "base_url": model_override.get("base_url", ""),
+                    "api_mode": model_override.get("api_mode", ""),
+                }
+            if reasoning_config is not None:
+                runner._session_state(ctx.session_key).conversation.reasoning_override = dict(reasoning_config)
+            if model_override or reasoning_config is not None:
+                runner._persist_session_runtime_override(
+                    ctx.session_key,
+                    model=(model_override or {}).get("model"),
+                    provider=(model_override or {}).get("provider"),
+                    reasoning_config=reasoning_config,
+                    include_model=bool(model_override),
+                    include_reasoning=reasoning_config is not None,
+                )
+
+        return _runtime_update_callback
+
     def _wire_turn_agent_callbacks(self, agent, turn_route, reasoning_config,
                                    stream_delta_cb, interim_assistant_cb, want_interim_messages):
         """Per-message state (callbacks, reasoning, voice route) — never baked into the cached agent."""
@@ -562,15 +602,56 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         agent.notice_clear_callback = self._local_notice_clear_callback_sync if local_viewer_turn(self) else None
         agent.event_callback = ctx._event_callback_sync
         agent.reasoning_config, agent.service_tier = reasoning_config, turn_route.get("service_tier")
+        # Prompt-tail freeze: the rendered reasoning_source must be a pure function of the effective
+        # config (dict -> "agent", None -> "default"); a mid-turn model_switch leaves a stale
+        # attribution on the CACHED agent that a rebuilt agent would not have.
+        if hasattr(agent, "_runtime_reasoning_source"):
+            try:
+                delattr(agent, "_runtime_reasoning_source")
+            except AttributeError:
+                pass
         _load_daybreak = getattr(runner, "_load_daybreak", None)  # absent on minimal test runners
         agent.daybreak = callable(_load_daybreak) and _load_daybreak(ctx.source) is True
         _surface = getattr(runner, "_daybreak_surface", None)  # read by Daybreak delegation routes
         agent.daybreak_surface = callable(_surface) and _surface(ctx.source) is True
         self._merge_turn_request_overrides(agent, turn_route)
+        # One-shot desired-route intent (pre_gateway_dispatch runtime_override) for the
+        # Runtime/Route State block composed at API time (agent/system_prompt.py).
+        # The hook lives on GatewayAgentCacheMixin; a bare runner double (SimpleNamespace)
+        # has no pending state.
+        _consume_route_state = getattr(runner, "_consume_pending_runtime_route_state", None)
+        pending_runtime_route_state = (
+            _consume_route_state(ctx.session_key) if callable(_consume_route_state) else None
+        ) or {}
+        active_route_name = str(pending_runtime_route_state.pop("active_route_name", "") or "").strip()
+        if active_route_name:
+            agent._active_route_name = active_route_name
+        # run_conversation restores the primary runtime in its turn prologue before building
+        # provider kwargs. Keep that snapshot's per-turn reasoning value in sync so a cached agent
+        # cannot restore a stale config over a routed (or explicit session) override.
+        if isinstance(getattr(agent, "_primary_runtime", None), dict):
+            agent._primary_runtime["reasoning_config"] = (
+                dict(reasoning_config) if isinstance(reasoning_config, dict) else None
+            )
+        agent._runtime_route_state = pending_runtime_route_state or None
+        turn_sidecar_parts = runner._consume_pending_turn_sidecar_notes(ctx.session_key)
+        if agent._runtime_route_state:
+            # Routed directives ride the triggering turn's user message (one-shot) so the system
+            # prompt tail stays byte-stable across routing events.
+            try:
+                from agent.system_prompt import format_routing_directive
+                directive_line = format_routing_directive(agent._runtime_route_state)
+                if directive_line:
+                    turn_sidecar_parts.append(directive_line)
+            except Exception:
+                logger.debug("routing directive render failed", exc_info=True)
         from gateway.session_surface import arm_surface_turn
         # auxiliary.voice_chat route (a voice note, or an admission committed as a voice turn) and
         # this turn's must-deliver notes; a managed worker arms its agent through the same helper.
-        arm_surface_turn(agent, runner._consume_pending_turn_sidecar_notes(ctx.session_key), voice_turn=ctx.voice_turn)
+        arm_surface_turn(agent, turn_sidecar_parts, voice_turn=ctx.voice_turn)
+        # Session-scoped runtime switches (agent model_switch) mirror into the session override state
+        # and the durable SessionEntry runtime fields so the route survives cache eviction/restart.
+        agent.runtime_update_callback = TurnRunner._make_runtime_update_callback(ctx, runner)
         agent.background_review_callback, bg_release = self._make_bg_review_callbacks()
         # Register the release hook on the adapter so base.py's finally block fires it after the
         # main response is delivered.
@@ -1085,7 +1166,13 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         token = set_current_session_key(session_key)
         from gateway.run_turn_runner_approval_transport import approval_transport
         register_gateway_notify(session_key, approval_transport(self))
+        # getattr: upstream's TurnRunner tests drive this with SimpleNamespace ctx doubles (no trace).
+        _trace = getattr(ctx, "turn_trace_obj", None)
         try:
+            if _trace is not None:
+                # Bind the gateway's trace to the agent instance for the duration of the run so
+                # the loop / tool executors / finalizer find it via turn_trace.get_bound(agent).
+                turn_trace.bind(agent, _trace)
             run_message = self._native_image_run_message()
             api_message = _wrap_current_message_with_observed_context(run_message, observed_group_context)
             kwargs = {"conversation_history": agent_history, "task_id": ctx.session_id}
@@ -1155,6 +1242,8 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 from tools.clarify_gateway import clear_session
                 clear_session(session_key)
             reset_current_session_key(token)
+            if _trace is not None:
+                turn_trace.bind(agent, None)
 
     def _finish_stream_consumer(self, result, agent_history, stream_consumer):
         ctx = self._ctx
@@ -1362,6 +1451,11 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         )
         ctx = self._ctx
         runner = self._runner
+        # getattr: upstream's TurnRunner tests drive this with SimpleNamespace ctx doubles (no trace).
+        _trace = getattr(ctx, "turn_trace_obj", None)
+        if _trace is not None:
+            turn_trace.adopt(_trace)
+        _trace_setup_started = time.time() if _trace is not None else 0.0
         # Platform.LOCAL ("local") maps to the "cli" hint key the agent understands.
         # session_key is propagated via contextvars in _set_session_env() (_SESSION_KEY) and via
         # set_current_session_key() (_approval_session_key) below — both concurrency-safe and inherited by
@@ -1466,6 +1560,11 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         from agent.primary_auth_fallback import attach_primary_auth_failure
         attach_primary_auth_failure(agent, pending_primary_auth)
         self._wire_turn_agent_callbacks(agent, turn_route, reasoning_config, stream_delta_cb, interim_cb, want_interim)
+        if _trace is not None:
+            _trace.add_span(
+                "gateway.agent_setup", _trace_setup_started, time.time(),
+                rebuild=not reused_cached_agent,
+            )
         from gateway.run_turn_progress import local_viewer_turn
         local_sinks = None
         if local_viewer_turn(self) and not ctx.mute_notification_reply:

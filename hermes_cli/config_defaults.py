@@ -22,6 +22,8 @@ LEGACY_VERCEL_RUNTIME = "node24"  # the seeded pre-49 default, never a user choi
 DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
+    # Model routing catalog (ADR-003). Empty keeps routing dormant.
+    "model_routes": {},
     "fallback_providers": [],
     # min_switch_reset_seconds: opt-in (0 = off). When a rate-limited primary declares a reset
     # sooner than this many seconds, stay on it (the retry backoff rides out the window) instead
@@ -295,6 +297,10 @@ DEFAULT_CONFIG = {
         # after 72h) — NOT tmpfs /tmp, which is RAM-capped and fills under load. Must be an existing
         # absolute POSIX path; user-set paths are never auto-pruned.
         "temp_dir": "",
+        # Run non-PTY local background commands in transient user scopes and
+        # persist their output so they can survive a gateway service restart.
+        # Falls back to ordinary local spawning when systemd scopes are unavailable.
+        "durable_background": False,
         # CSS font-family for the desktop app's xterm.js terminal (e.g. "'CaskaydiaCoveNerdFont',
         # monospace"). Empty = built-in default ("'JetBrains Mono', 'Cascadia Code', 'SF Mono',
         # Menlo, Consolas, monospace"). Lets users use a Nerd Font without patching the app.
@@ -618,6 +624,8 @@ DEFAULT_CONFIG = {
         "micro_compact_defrag_threshold_tokens": 2000,
         # Gateway session-hygiene force-compress threshold, by message count.
         "hygiene_hard_message_limit": 5000,
+        # Gateway pre-agent hygiene trigger ratio, (0, 1]; keep it above compression.threshold.
+        "hygiene_threshold": 0.85,
         # Max seconds the gateway waits for pre-agent hygiene compression WITHOUT forward progress.
         # Inactivity budget: a slow model still streaming tokens extends the wait.
         "hygiene_timeout_seconds": 30,
@@ -794,6 +802,9 @@ DEFAULT_CONFIG = {
         # prompt-cache prefix (#30532). Set provider/model below to route the review to another model
         # if you want a different effort level; a one-time warning says so when the key is set.
         "background_review": {"enabled": True, **_aux(120)},
+        # ADR-004 ingest-curator fork. "auto" shares the main model and warm transcript; an
+        # explicit provider/model uses the cold WAL context.
+        "ingest_curator": _aux(300),
         # No reasoning_effort on MoA blocks by design — configured PER SLOT in the preset
         # (moa.presets.<name>.reference_models[].reasoning_effort / aggregator.reasoning_effort).
         "moa_reference": _aux(900, reasoning_effort=False),
@@ -1280,6 +1291,7 @@ DEFAULT_CONFIG = {
         "backends": {},
         "model": "",  # e.g. "google/gemini-3-flash-preview" (empty = inherit parent)
         "provider": "",  # e.g. "openrouter" (empty = inherit parent provider + credentials)
+        "default_route": "",  # optional model_routes route for unrouted delegate tasks (ADR-003 Phase 3a)
         # Fallback chain for delegated children (same entry format as the top-level list).
         # For an unpinned child, null = inherit the parent chain; [] = disable fallback.
         # A child pinned by provider, endpoint, or model gets no fallback unless this
@@ -1468,6 +1480,19 @@ DEFAULT_CONFIG = {
             "enabled": True,
             "keep": 2,  # retain last N regular snapshots
         },
+        # ADR-004 memory ingest curator. This is deliberately separate from the skill-maintenance
+        # `enabled` switch above and deploys inert.
+        "ingest_enabled": False,
+        "shadow_mode": True,
+        "salience": {
+            "threshold": 12,
+            "weight_proposal": 3,
+            "weight_tool_success": 2,
+            "weight_non_trivial": 1,
+            "fallback_turns": 10,
+        },
+        "idle_seconds": 600,
+        "session_end_min_turns": 3,
     },
     # IANA timezone (e.g. "Asia/Kolkata", "America/New_York"). Empty = server-local time.
     "timezone": "",

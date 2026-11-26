@@ -11,6 +11,7 @@ import os
 import queue
 import threading
 import time
+from agent import turn_trace
 from agent.i18n import t
 from agent.session_activity import format_iteration_progress
 from contextlib import nullcontext, suppress
@@ -69,6 +70,20 @@ def _resolve_policy_agent_runtime(runner, policy, *, fallback=True, record_notic
             runner._pre_agent_fallback_notice = notice
         return fallback_entry['model'], _runtime_agent_kwargs(runtime)
     return model, _runtime_agent_kwargs(runtime)
+
+
+def _persisted_runtime_bundle(override: dict) -> dict:
+    """Runtime kwargs of a rehydrated runtime route (``_rehydrate_persisted_runtime_route``): exactly
+    what its one provider resolution produced, so nothing is layered from the configured default."""
+    bundle_runtime = {
+        k: override.get(k) for k in ("api_key", "base_url", "provider", "api_mode", "credential_pool")
+    }
+    bundle_runtime["command"] = override.get("command")
+    bundle_runtime["args"] = list(override.get("args") or [])
+    for k in ("requested_provider", "max_tokens", "request_overrides", "capabilities"):
+        if override.get(k) is not None and override.get(k) != {}:
+            bundle_runtime[k] = override.get(k)
+    return bundle_runtime
 
 
 def _recover_or_remember_model(runner, skey, model):
@@ -225,6 +240,17 @@ class GatewayTurnPrepareMixin:
         if override:
             override_model = override.get("model", model)
             override_runtime = _session_override_snapshot(override)
+            if override.get("_runtime_bundle_complete") is True and not managed_oauth:
+                # Rehydrated runtime route: one atomic provider-resolution bundle (endpoint, mode,
+                # credentials, command, args, pool) — never mixed with the configured default.
+                # A managed OAuth bundle's key is a snapshot like any other: it takes the
+                # per-turn auth-store resolution below, still on its own provider.
+                bundle_runtime = _persisted_runtime_bundle(override)
+                logger.debug(
+                    "Persisted runtime bundle (fast): session=%s config_model=%s -> override_model=%s provider=%s",
+                    skey or "", model, override_model, bundle_runtime.get("provider"),
+                )
+                return override_model, bundle_runtime
             if override_runtime.get("api_key") and not managed_oauth:
                 if override_runtime.get("credential_pool") is None:
                     override_runtime["credential_pool"] = _credential_pool_for_provider(override.get("provider"))
@@ -549,6 +575,79 @@ class GatewayTurnPrepareMixin:
             )
         return session_entry
 
+    async def _consume_auto_reset_boundary(self, session_entry, session_key: str) -> None:
+        """Auto-reset conversation-boundary cleanup (was_auto_reset consume).
+
+        Treat auto-reset as a full conversation boundary — drop every session-scoped transient state
+        so the fresh session does not inherit the previous conversation's model/reasoning overrides
+        or a queued "/model switched" note.
+
+        Exception (#48031 class): when the model router's enforce mode applied an override earlier in
+        this SAME inbound turn (pre-dispatch, flagged in ``_model_router_fresh_applies``), the
+        override postdates the reset boundary and must survive it. Its store persistence died with
+        the popped session entry, so re-persist it onto the NEW entry. Mirrors how /model's
+        _finish_switch consumes was_auto_reset before storing its override (Closes #48031).
+
+        Self-guarding: a no-op unless ``session_entry.was_auto_reset`` is set (callers may pre-check
+        for their own flow, but the flag consume lives here, single source of truth).
+        """
+        if getattr(session_entry, "was_auto_reset", False):
+            # Consume the fresh-apply flag BEFORE the funnel (which would pop it): the flag protects
+            # exactly one boundary crossing, never a later genuine conversation reset.
+            _fresh_applies = getattr(self, "_model_router_fresh_applies", None)
+            _router_applied = bool(isinstance(_fresh_applies, dict) and _fresh_applies.pop(session_key, None))
+            # Snapshot the router-applied state the funnel is about to clear so it can be
+            # re-installed on the fresh entry (#48031 survival).
+            _saved_override = None
+            _saved_reasoning = None
+            _saved_note = None
+            _saved_route_state = None
+            if _router_applied:
+                _saved_override = self._session_model_overrides.get(session_key)
+                # The reasoning override lives on SessionState (``_set_session_reasoning_override``).
+                _state = self._peek_session_state(session_key)
+                if _state is not None:
+                    _saved_reasoning = _state.conversation.reasoning_override
+                _notes = getattr(self, "_pending_model_notes", None)
+                if isinstance(_notes, dict):
+                    _saved_note = _notes.get(session_key)
+                _route_states = getattr(self, "_pending_runtime_route_states", None)
+                if isinstance(_route_states, dict):
+                    _saved_route_state = _route_states.get(session_key)
+            # Treat auto-reset as a full conversation boundary — one funnel call clears every
+            # conversation-scoped per-session dict (model/reasoning overrides, pending model notes,
+            # last-resolved cache, router hysteresis streak, …) plus boundary security state
+            # (#48031, #58403). See _CONVERSATION_SCOPED_STATE.
+            self._clear_conversation_scope(session_key, reason="auto_reset")
+            if _router_applied and _saved_override:
+                # Keep the router-applied override (and its reasoning override / pending
+                # self-identification note): it was applied earlier in this SAME inbound turn, so it
+                # postdates the reset boundary. Re-persist the non-secret parts onto the fresh session
+                # entry (its previous store persistence died with the popped entry).
+                self._session_model_overrides[session_key] = _saved_override
+                if _saved_reasoning is not None:
+                    self._set_session_reasoning_override(session_key, _saved_reasoning)
+                if _saved_note:
+                    if not hasattr(self, "_pending_model_notes"):
+                        self._pending_model_notes = {}
+                    self._pending_model_notes[session_key] = _saved_note
+                if _saved_route_state:
+                    self._set_pending_runtime_route_state(session_key, _saved_route_state)
+                _persisted_override = dict(self._session_model_overrides[session_key])
+                if _saved_reasoning is not None:
+                    _persisted_override["reasoning_config"] = dict(_saved_reasoning)
+                try:
+                    await self.async_session_store.set_model_override(session_key, _persisted_override)
+                except Exception:
+                    logger.debug("model router: re-persist override after auto-reset failed", exc_info=True)
+            # Evict the cached agent so the fresh session does not inherit the previous
+            # conversation's context_compressor._previous_summary — the cache is keyed on the stable
+            # session_key, so an auto-reset otherwise reuses the old agent and leaks prior history
+            # into new compaction summaries. Mirrors /reset and the compression-exhausted path
+            # (#9893). Covers daily/idle/suspended auto-reset.
+            self._evict_cached_agent(session_key)
+            session_entry.was_auto_reset = False
+
     async def _hmwa_open_session(self, session_entry, session_key, source):
         """Consume auto-reset / fresh-reset flags and emit ``session:start`` for new sessions.
         Returns ``(_was_auto_reset, _is_new_session)``."""
@@ -556,15 +655,7 @@ class GatewayTurnPrepareMixin:
         # preventing the cleanup from wiping model/reasoning overrides set between turns (Closes #48031).
         _was_auto_reset = getattr(session_entry, "was_auto_reset", False)
         if _was_auto_reset:
-            # Conversation boundary: the funnel clears every conversation-scoped dict; evict the cached
-            # agent so context_compressor._previous_summary cannot leak into new summaries.
-            # Treat auto-reset as a full conversation boundary — clear every conversation-scoped per-session
-            # dict in one funnel call so the fresh session does not inherit the previous conversation's
-            # model/reasoning overrides, a queued "/model switched" note, or a stale resolved-model cache
-            # (#48031, #58403). See _CONVERSATION_SCOPED_STATE.
-            self._clear_conversation_scope(session_key, reason="auto_reset")
-            self._evict_cached_agent(session_key)
-            session_entry.was_auto_reset = False
+            await self._consume_auto_reset_boundary(session_entry, session_key)
 
         _is_fresh_reset = getattr(session_entry, "is_fresh_reset", False)
         _is_new_session = session_entry.created_at == session_entry.updated_at or _was_auto_reset or _is_fresh_reset
@@ -833,11 +924,18 @@ class GatewayTurnPrepareMixin:
 
         # An unreadable store is not an empty conversation: stop before the agent invents continuity
         # from []. Restore task-local context here (before the broad cleanup finally).
+        _trace = turn_trace.get_bound(event)  # turn trace begun in _handle_message_with_agent
         try:
+            _t_span = time.time() if _trace is not None else 0.0
             history = await self.async_session_store.load_transcript(session_entry.session_id)
+            if _trace is not None:
+                _trace.add_span("gateway.transcript_load", _t_span, time.time())
+                _t_span = time.time()
             history = await self._hmwa_run_session_hygiene(
                 event, source, session_entry, session_key, history, _quick_key, run_generation,
             )
+            if _trace is not None:
+                _trace.add_span("gateway.hygiene", _t_span, time.time())
         except TranscriptReadError:
             self._clear_session_env(_session_env_tokens)
             from gateway.session_results import record_unexecuted_failure

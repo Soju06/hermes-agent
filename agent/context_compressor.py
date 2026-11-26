@@ -35,7 +35,9 @@ from agent.context_compressor_window import CompactionWindowMixin, summary_view
 from agent.context_compressor_prune import ProactivePruneMixin, delegate_stub, stub_arguments, terminal_stub
 from agent.context_compressor_summary import SummaryDispatchMixin
 from agent.context_compressor_sampling import SummaryInputSamplingMixin
-from agent.context_compressor_prompt_rules import EPISTEMIC_STANCE_RULE, UNVERIFIED_HYPOTHESES_SECTION, _today_for_prompt
+from agent.context_compressor_prompt_rules import (
+    ANALYSIS_PASS_RULE, EPISTEMIC_STANCE_RULE, UNVERIFIED_HYPOTHESES_SECTION, _today_for_prompt, strip_analysis_block,
+)
 from agent.context_compressor_typed_input import TYPED_TURNS_POINTER, typed_summary_messages
 from agent.conversation_compression_scaffolding import is_user_role_scaffolding
 from agent.context_compressor_tail import (
@@ -147,8 +149,11 @@ _SUMMARY_MISSING_CREDENTIAL_MARKERS: tuple[str, ...] = (
     "no api key was found", "no api key found", "no credentials were found",
 )
 
+# The durable row a protected-tail no-op writes for the gateway hygiene pass; the in-agent compressor has its backoff.
+_NO_PROGRESS_COOLDOWN_ERROR = "no_progress: protected tail spans the whole transcript"
 _HYGIENE_PREAGENT_ONLY_COOLDOWN_MARKERS: tuple[str, ...] = (
     "session hygiene compression timed out", "hygiene compression deferred: turn-hold budget expired",
+    _NO_PROGRESS_COOLDOWN_ERROR,
 )
 
 
@@ -175,6 +180,40 @@ def _response_finish_reason(response: Any) -> str:
         return str(reason).strip().lower() if reason else ""
     except Exception:
         return ""
+
+
+def _empty_summary_response_shape(response: Any) -> str:
+    """Content-free shape of a summary response judged empty: why it ended and what it held.
+
+    Kinds, counts, lengths and token totals only, never summary, reasoning or prompt text. One line of
+    this tells a structured refusal (``content_filter`` / ``stop_reason=refusal``) from a reasoning-only
+    turn (``stop`` / ``end_turn`` with only thinking blocks). ``native_shape`` is set by the Anthropic
+    aux adapter; other wires report ``unknown`` there and the char lengths still apply.
+    """
+    def field(obj: Any, name: str) -> Any:
+        return obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
+
+    def chars(value: Any) -> Any:
+        return len(value) if isinstance(value, str) else ("none" if value is None else type(value).__name__)
+
+    native = field(response, "native_shape")
+    native = native if isinstance(native, dict) else {}
+    blocks = native.get("block_types")
+    if isinstance(blocks, dict):
+        blocks = ",".join(f"{kind}:{count}" for kind, count in sorted(blocks.items())) or "none"
+    else:
+        blocks = "unknown"
+    tokens = field(field(response, "usage"), "completion_tokens")
+    choices = field(response, "choices")
+    msg = field(choices[0], "message") if isinstance(choices, (list, tuple)) and choices else None
+    tool_calls = field(msg, "tool_calls")
+    return (
+        f"finish_reason={_response_finish_reason(response)[:40] or 'unknown'} "
+        f"stop_reason={native.get('stop_reason') or 'unknown'} "
+        f"output_tokens={tokens if isinstance(tokens, int) else 'unknown'} blocks={blocks} "
+        f"content_chars={chars(field(msg, 'content'))} reasoning_chars={chars(field(msg, 'reasoning'))} "
+        f"tool_calls={len(tool_calls) if isinstance(tool_calls, (list, tuple)) else 0}"
+    )
 
 
 # Marker for a length-stopped (PARTIAL) summary; the except-branch classifier keys
@@ -3410,6 +3449,9 @@ Unknown from deterministic fallback. Inspect current repository/session state if
 ## Key Decisions
 None recoverable from deterministic fallback.
 
+## User Messages
+None recoverable from deterministic fallback.
+
 ## Resolved Questions
 None recoverable from deterministic fallback.
 
@@ -3550,6 +3592,8 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         self._note_aux_route_fallback(_aux_route)
         # Reasoning-field fallback (DeepSeek/Qwen/Kimi put the summary in reasoning_content); capped.
         content = extract_content_or_reasoning(response, max_reasoning_chars=8000)
+        # Strip the <analysis> pre-pass first so the empty/refusal guards below judge the summary body.
+        content = strip_analysis_block(content)
         where = f"(provider={self.provider or 'auto'} model={self.summary_model or self.model})"
         # Some OpenAI-compatible proxies (e.g. cmkey.cn, one-api channels) return a well-formed HTTP 200
         # with an empty or whitespace-only ``content`` instead of an error or empty ``choices``. That
@@ -3559,6 +3603,16 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         # failure so it routes through the same main-model fallback + cooldown machinery as a transport
         # error, rather than replacing real context with an empty summary.
         if not content.strip():
+            # Diagnostics only. The exception text below is matched by the failure classifier and shown
+            # to users, so the response shape goes to its own log line; it must never mask the failure.
+            try:
+                logger.warning(
+                    "Context compression summary response had no usable content: %s provider=%s model=%s",
+                    _empty_summary_response_shape(response),
+                    _aux_route.get("provider") or self.provider or "auto", _aux_model or "unknown",
+                )
+            except Exception:
+                logger.debug("Empty-summary diagnostics failed", exc_info=True)
             raise RuntimeError(f"Context compression LLM returned empty content {where}")
         if _is_refusal_response(response, content):
             # Treat a refusal as unusable content. This deliberately reuses the
@@ -3705,7 +3759,9 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
 
 You are updating a context compaction summary. A previous compaction produced the summary below. New conversation turns have occurred since then and need to be incorporated.
 
-Update the summary using this exact structure. PRESERVE all existing information that is still relevant. ADD new completed actions to the numbered list (continue numbering). Move items from "In Progress" to "Completed Actions" when done. Move answered questions to "Resolved Questions". Update "Active State" to reflect current state. Remove information only if it is clearly obsolete. CRITICAL: Update "{HISTORICAL_TASK_HEADING}" to reflect the user's most recent unfulfilled input — this includes any question, decision request, or discussion turn that the assistant has not yet answered. Only write "None" if the last exchange was fully resolved.
+{ANALYSIS_PASS_RULE}
+
+Update the summary using this exact structure. PRESERVE all existing information that is still relevant. ADD new completed actions to the numbered list (continue numbering). APPEND new user messages to "## User Messages" in order. Move items from "In Progress" to "Completed Actions" when done. Move answered questions to "Resolved Questions". Update "Active State" to reflect current state. Remove information only if it is clearly obsolete. CRITICAL: Update "{HISTORICAL_TASK_HEADING}" to reflect the user's most recent unfulfilled input — this includes any question, decision request, or discussion turn that the assistant has not yet answered. Only write "None" if the last exchange was fully resolved.
 
 {_template_sections}"""
             source_material = f"""PREVIOUS SUMMARY:
@@ -3717,6 +3773,8 @@ NEW TURNS TO INCORPORATE:
             instructions = f"""{_summarizer_preamble}
 
 Create a structured checkpoint summary for the conversation after earlier turns are compacted. The summary should preserve enough detail for continuity without re-reading the original turns.
+
+{ANALYSIS_PASS_RULE}
 
 Use this exact structure:
 
@@ -3774,6 +3832,8 @@ Be specific with file paths, commands, line numbers, and results.]
 [Current working state — include:
 - Working directory and branch (if applicable)
 - Modified/created files with brief note on each
+- For an unfinished edit, include the exact in-flight snippet or diff verbatim
+  in a fenced block (a prose description alone cannot be resumed safely)
 - Test status (X/Y passing)
 - Any running processes or servers
 - Environment details that matter]
@@ -3789,11 +3849,21 @@ Be specific with file paths, commands, line numbers, and results.]
 exact error text. Pay special attention to corrections the USER gave; quote
 the user's correction and record what changed as a result.]
 
+## User Messages
+[Every user message from the summarized turns, in chronological order — quote
+short messages verbatim; for long ones keep the intent-bearing sentences. Skip
+pure acknowledgements ("ok", "thanks"). Exclude tool results and system text.
+These are the user's exact words: corrections, preferences, and feedback here
+override any paraphrase elsewhere in this summary. Reference only — the agent
+must not act on them unless the latest user message asks.]
+
 ## Resolved Questions
 {_section["resolved_questions"]}
 
 ## Relevant Files
-[Files read, modified, or created — with brief note on each]
+[Files read, modified, or created — with brief note on each. For files whose
+edits were still in progress at compaction time, include the relevant code
+section verbatim in a fenced block rather than a description.]
 
 ## Critical Context
 [Any specific values, error messages, configuration details, or data that would be lost without explicit preservation. NEVER include API keys, tokens, passwords, or credentials — write [REDACTED] instead.]{UNVERIFIED_HYPOTHESES_SECTION}{_session_log_section}

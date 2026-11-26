@@ -2624,14 +2624,16 @@ def test_load_enabled_toolsets_rejects_disabled_mcp_env(monkeypatch, capsys):
     # never recovered onto a saved list; `project` is GUI-only, folded in by
     # _load_enabled_toolsets. Toolsets inside their first release
     # (_RECENTLY_SHIPPED_TOOLSETS) are back-filled onto saved lists that never
-    # offered them — allow those too.
+    # offered them — allow those too. Fork: `runtime` (model_status/model_switch)
+    # is a non-configurable core toolset _get_platform_tools recovers onto every
+    # non-empty selection, as `kanban` was before it became configurable.
     from hermes_cli.tools_config import _RECENTLY_SHIPPED_TOOLSETS
 
     result = server._load_enabled_toolsets()
     assert result is not None
     assert {"memory", "project"} <= set(result)
     assert "kanban" not in result
-    assert set(result) - {"memory", "project"} <= _RECENTLY_SHIPPED_TOOLSETS
+    assert set(result) - {"memory", "project", "runtime"} <= _RECENTLY_SHIPPED_TOOLSETS
     err = capsys.readouterr().err
     assert "mcp-off" in err
 
@@ -2656,7 +2658,8 @@ def test_load_enabled_toolsets_falls_back_when_tui_env_invalid(monkeypatch, caps
     assert result is not None
     assert {"memory", "project"} <= set(result)
     assert "kanban" not in result
-    assert set(result) - {"memory", "project"} <= _RECENTLY_SHIPPED_TOOLSETS
+    # Fork: `runtime` rides every non-empty selection (see the test above).
+    assert set(result) - {"memory", "project", "runtime"} <= _RECENTLY_SHIPPED_TOOLSETS
     assert capsys.readouterr().err.strip()  # a fallback warning is printed
 
 

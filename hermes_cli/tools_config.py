@@ -617,6 +617,12 @@ def _get_platform_tools(config: dict, platform: str, *, include_default_mcp_serv
         enabled_toolsets = _composite_toolsets(toolset_names, platform, explicitly_configured)
 
     _recover_platform_native_toolsets(enabled_toolsets, platform, skip=configurable_keys | plugin_ts_keys | platform_default_keys)
+    if explicitly_configured and not set(toolset_names) - {"no_mcp"}:
+        # An explicit EMPTY list means none (#82010), and so does one naming only the ``no_mcp``
+        # sentinel. The fork's ``runtime`` toolset (model_status / model_switch, toolsets.py) is
+        # recovered above as a non-configurable core toolset, but it is agent introspection, not a
+        # capability of the platform: it never revives a zero-tool state.
+        enabled_toolsets.discard("runtime")
     if plugin_ts_keys:
         enabled_toolsets |= _enabled_plugin_toolsets(config, platform, toolset_names, plugin_ts_keys)
 
@@ -671,9 +677,12 @@ def _prune_toolsets_stripped_by_disabled(enabled_toolsets: set[str], disabled_na
 
 def _disabled_entry_tools(name: str) -> set[str]:
     """Tools one ``agent.disabled_toolsets`` entry removes at runtime: legacy names (``terminal_tools``)
-    and the bundle/posture non-core delta included, which ``resolve_toolset`` alone gets wrong."""
-    from model_tools import _apply_toolset_selection
+    and the bundle/posture non-core delta included, which ``resolve_toolset`` alone gets wrong, and just
+    the tool for a per-tool entry (``text_to_speech``)."""
+    from model_tools import _apply_toolset_selection, _is_tool_entry
 
+    if _is_tool_entry(name):
+        return {name}
     universe: set[str] = set()
     _apply_toolset_selection(universe, [name], quiet_mode=True, disable=False)
     kept = set(universe)
@@ -686,9 +695,10 @@ def toolsets_partially_stripped(config: dict, enabled_toolsets: set[str]) -> dic
     that ``agent.disabled_toolsets`` cuts down without removing (``web`` minus ``web_search`` via ``search``,
     #134593). ``_prune_toolsets_stripped_by_disabled`` keeps such a toolset "enabled" because some of its
     tools survive, so inspection surfaces need this to say which ones did not. The hint offers
-    ``hermes tools enable`` only when that save clears every entry (``_save_platform_tools`` coverage)."""
+    ``hermes tools enable`` only when that save clears every entry (``_save_platform_tools`` coverage): never
+    for a per-tool entry, a deliberate cut that save keeps while the toolset stays on."""
     from agent.skill_utils import parse_config_string_list
-    from model_tools import _apply_toolset_selection
+    from model_tools import _apply_toolset_selection, _is_tool_entry
     from toolsets import resolve_toolset, validate_toolset
 
     disabled = [n.strip() for n in parse_config_string_list((config.get("agent") or {}).get("disabled_toolsets")) if n.strip()]
@@ -703,7 +713,7 @@ def toolsets_partially_stripped(config: dict, enabled_toolsets: set[str]) -> dic
                 by[entry] = tools - kept
         if by:
             entries = sorted(by)
-            clears = all(_disabled_entry_tools(e) <= tools for e in entries)
+            clears = all(not _is_tool_entry(e) and _disabled_entry_tools(e) <= tools for e in entries)
             hint = (f"run `hermes tools enable {name}` to restore" if clears
                     else f"remove {', '.join(entries)} from agent.disabled_toolsets to restore")
             report[name] = (sorted(set().union(*by.values())), entries, hint)
@@ -822,16 +832,24 @@ def _save_platform_tools(config: dict, platform: str, enabled_toolset_keys: set[
         # Also clear entries whose tools are entirely covered by a newly enabled toolset: Blank Slate writes
         # subset toolsets like `search` (only web_search), which have no checklist row, so enabling `web`
         # left web_search stripped with no supported way to undo it (#134593).
+        from model_tools import _is_tool_entry
         from toolsets import resolve_toolset
         covered: set[str] = set()
         for ts in newly_enabled:
             covered.update(resolve_toolset(ts))  # [] for unknown names; never raises
 
         def _covered(ts: str) -> bool:
-            tools = _disabled_entry_tools(ts)
+            tools = set() if _is_tool_entry(ts) else _disabled_entry_tools(ts)
             return bool(tools) and tools <= covered
 
         remaining = [ts for ts in parsed_disabled if ts not in newly_enabled and not _covered(ts)]
+        # A per-tool entry is a deliberate cut inside a toolset that stays on, so it goes only when it is what still
+        # switches a checked toolset off entirely (pruned, so shown unchecked: the user just turned it back on).
+        by_toolset = [ts for ts in remaining if not _is_tool_entry(ts)]
+        reopened = set().union(*(resolve_toolset(ts) for ts in newly_enabled
+                                 if not _prune_toolsets_stripped_by_disabled({ts}, remaining)
+                                 and _prune_toolsets_stripped_by_disabled({ts}, by_toolset)))
+        remaining = [ts for ts in remaining if ts in by_toolset or ts not in reopened]
         if remaining != parsed_disabled:
             agent_cfg["disabled_toolsets"] = remaining
     save_config(config)

@@ -219,9 +219,66 @@ def _background_delete_gate(store, action, operations, target="memory", content=
             "batch); 'add' is still available.", success=False)
 
 
+# Memory actions that must carry a write reason (remove is exempt: it only frees room;
+# 'patch' is the span-edit successor of the retired 'replace').
+_REASON_GATED_ACTIONS = frozenset({"add", "patch"})
+
+
+def _validate_memory_write_reason(reason: str | None = "") -> Optional[str]:
+    """Validate the suitability reason required for memory add/patch.
+
+    The reason is a tool-boundary guardrail only; it is intentionally not
+    persisted with the memory entry. Keep this deliberately simple: require a
+    real sentence and reject the most common vacuous justifications. Semantic
+    routing between memory/skills remains the caller's responsibility and can be
+    further guarded by profile-local skill-gate rules.
+    """
+    normalized = " ".join(str(reason or "").strip().split())
+    generic_reasons = {
+        "important",
+        "user asked",
+        "remember this",
+        "durable",
+        "useful",
+        "preference",
+        "the user asked me to remember this",
+    }
+    if normalized.casefold() in generic_reasons:
+        return (
+            "reason is too generic for memory add/patch: explain why USER/MEMORY is "
+            "the right store instead of a skill, Graphiti, or session history."
+        )
+
+    if len(normalized) < 20:
+        return (
+            "reason is required for memory add/patch: briefly explain why this belongs "
+            "in USER/MEMORY rather than a skill, Graphiti, or session history."
+        )
+
+    return None
+
+
+def _reason_gate(action: str | None, reason: str | None,
+                 operations: Optional[list[dict[str, Any]]] = None) -> Optional[str]:
+    """JSON tool_error when a reason-gated write (add/patch, single or in a batch) lacks
+    an acceptable ``reason``; None to proceed. Runs before the approval gate so a
+    reasonless write is rejected now rather than staged."""
+    if operations is not None:
+        gated = any(isinstance(op, dict) and op.get("action") in _REASON_GATED_ACTIONS for op in operations)
+    else:
+        gated = action in _REASON_GATED_ACTIONS
+    if not gated:
+        return None
+    reason_error = _validate_memory_write_reason(reason)
+    if reason_error is None:
+        return None
+    FAILURE_CLASS.set("invalid_args")
+    return tool_error(reason_error, success=False)
+
+
 def memory_tool(action: str | None = None, target: str = "memory", content: str | None = None, old_text: str | None = None,
                 new_text: str | None = None, operations: Optional[list[dict[str, Any]]] = None,
-                store: Optional[MemoryStore] = None) -> str:
+                reason: str | None = "", store: Optional[MemoryStore] = None) -> str:
     """Tool entry point; returns a JSON string. Single op (action + content/old_text)
     or batch (``operations``, atomic against the final budget). ``new_text``
     aliases ``content``."""
@@ -229,7 +286,7 @@ def memory_tool(action: str | None = None, target: str = "memory", content: str 
         return tool_error("Memory is not available. It may be disabled in config or this environment.", success=False)
     token = FAILURE_CLASS.set("other")
     try:
-        outcome, result = _memory_tool(action, target, content, old_text, new_text, operations, store)
+        outcome, result = _memory_tool(action, target, content, old_text, new_text, operations, reason, store)
         failure_class = "none" if outcome == "success" else FAILURE_CLASS.get()
     finally:
         FAILURE_CLASS.reset(token)
@@ -247,7 +304,7 @@ def _invalid(message: str) -> tuple[str, str]:
     return "rejected", tool_error(message, success=False)
 
 
-def _memory_tool(action, target, content, old_text, new_text, operations, store) -> tuple[str, str]:
+def _memory_tool(action, target, content, old_text, new_text, operations, reason, store) -> tuple[str, str]:
     """``(outcome, result_json)``: ``rejected`` when refused or held before touching the store."""
     # An omitted optional string can arrive as "" (#90468): let the new_text alias fill it.
     if not content and new_text:
@@ -260,6 +317,9 @@ def _memory_tool(action, target, content, old_text, new_text, operations, store)
             return _invalid("operations must be a list of {action, content?, old_text?} objects.")
         if any(isinstance(op, dict) and op.get("action") == "replace" for op in operations):
             return _invalid(_REPLACE_REMOVED)
+        reason_denied = _reason_gate(action, reason, operations)
+        if reason_denied is not None:
+            return "rejected", reason_denied
         denied = _background_delete_gate(store, action, operations, target)
         if denied is not None:
             return "rejected", denied
@@ -282,6 +342,7 @@ def _memory_tool(action, target, content, old_text, new_text, operations, store)
     if action not in _STORE_ACTIONS:
         return _invalid(f"Unknown action '{action}'. Use: add, patch, remove")
     invalid = (_validate_single_op(store, action, target, content, old_text)
+               or _reason_gate(action, reason)
                or _background_delete_gate(store, action, None, target, content, old_text)
                or _apply_write_gate(store, action, target, content, old_text))
     if invalid is not None:
@@ -355,6 +416,12 @@ def apply_memory_pending(payload: dict[str, Any], store: MemoryStore) -> dict[st
     replace/remove applies to exactly its pinned ``matched_entry`` or is refused; a record
     staged before pinning has no verifiable target, so it is refused rather than replayed by
     old_text (which could hit a newer entry the approver never saw)."""
+    # Notes-tier staged writes share the memory subsystem's pending store (one
+    # memory.write_approval switch covers both durable tiers) but apply to the NotesStore,
+    # not MEMORY.md — route them to their own applier.
+    if payload.get("tool") == "notes_write":
+        from agent.memory_pipeline import apply_notes_pending
+        return apply_notes_pending(payload)
     action, target = payload.get("action"), payload.get("target")
     target_error = _memory_target_error(store, target, payload.get("operations"))
     if target_error is not None:
@@ -432,6 +499,14 @@ MEMORY_SCHEMA = {
                     "additionalProperties": False,
                 },
             },
+            "reason": {
+                "type": "string",
+                "description": (
+                    "Required for 'add' and 'patch'. Briefly explain why this belongs in "
+                    "USER/MEMORY rather than a skill, Graphiti, or session history. This "
+                    "reason is used only as a guardrail and is not stored."
+                )
+            },
         },
         "required": ["target", "operations"],
     },
@@ -471,6 +546,7 @@ registry.register(
     schema=MEMORY_SCHEMA,
     handler=lambda args, **kw: memory_tool(
         action=args.get("action", ""), target=args.get("target"), store=kw.get("store"),
+        reason=args.get("reason", ""),
         **{k: args.get(k) for k in ("content", "old_text", "new_text", "operations")}),
     check_fn=check_memory_requirements,
     emoji="🧠",

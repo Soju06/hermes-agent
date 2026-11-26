@@ -1819,6 +1819,34 @@ class TestRetryAfterCap:
 class TestConcurrentToolExecution:
     """Tests for _execute_tool_calls_concurrent and dispatch logic."""
 
+    def test_model_switch_batch_forces_sequential(self, agent):
+        """Model switches mutate agent state and must preserve tool order."""
+        tc1 = _mock_tool_call(
+            name="model_switch",
+            arguments='{"reasoning_effort":"high","scope":"turn"}',
+            call_id="c1",
+        )
+        tc2 = _mock_tool_call(name="web_search", arguments='{"q":"after"}', call_id="c2")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
+        messages = []
+        with patch.object(agent, "_execute_tool_calls_sequential") as mock_seq:
+            with patch.object(agent, "_execute_tool_calls_concurrent") as mock_con:
+                agent._execute_tool_calls(mock_msg, messages, "task-1")
+                mock_seq.assert_called_once()
+                mock_con.assert_not_called()
+
+    def test_non_dict_args_forces_sequential(self, agent):
+        """Tool arguments that parse to a non-dict type should fall back to sequential."""
+        tc1 = _mock_tool_call(name="web_search", arguments='{}', call_id="c1")
+        tc2 = _mock_tool_call(name="web_search", arguments='"just a string"', call_id="c2")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
+        messages = []
+        with patch.object(agent, "_execute_tool_calls_sequential") as mock_seq:
+            with patch.object(agent, "_execute_tool_calls_concurrent") as mock_con:
+                agent._execute_tool_calls(mock_msg, messages, "task-1")
+                mock_seq.assert_called_once()
+                mock_con.assert_not_called()
+
 
     def test_concurrent_executes_all_tools(self, agent):
         """Concurrent path should execute all tools and append results in order."""
@@ -1969,6 +1997,17 @@ class TestConcurrentToolExecution:
         assert progress[0][2].startswith("sk-pro")
         assert secret not in repr(starts + completes + progress)
 
+
+    def test_invoke_tool_handles_model_status_directly(self, agent):
+        """_invoke_tool should handle model_status without registry dispatch.
+
+        The payload speaks route language (ADR-003 Phase 3c): model +
+        reasoning, no raw provider/endpoint identifiers."""
+        result = agent._invoke_tool("model_status", {}, "task-1")
+        data = json.loads(result)
+        assert data["success"] is True
+        assert data["model"] == agent.model
+        assert "provider" not in data
 
     def test_sequential_blocked_tool_skips_checkpoints_and_callbacks(self, agent, monkeypatch):
         """Sequential path: blocked tool should not trigger checkpoints or start callbacks."""
@@ -2192,6 +2231,15 @@ class TestAgentRuntimePostHookOwnershipSync:
         ("manage_catalog", {"action": "search", "query": "blender"}),
         ("gui_tour", {"action": "stop"}),
         ("delegate_task", {"goal": "Check the child path"}),
+        # Core-owned runtime introspection/switching (agent/runtime_control.py) is inline too.
+        ("model_status", {}),
+        ("model_switch", {"reason": "post-hook ownership sync"}),
+        # Notes tier (ADR-004 Phase 1) rides the same inline table as ``memory``.
+        ("notes_write", {"step": "propose", "content": "post-hook ownership sync"}),
+        ("notes_read", {"action": "list"}),
+        ("memory_propose", {"content": "post-hook ownership sync"}),
+        # Ingest-curator verdict sink (ADR-004 Phase 2) — agent-scoped inline tool.
+        ("curator_verdict", {"verdict": "noop"}),
     )
 
     @pytest.mark.parametrize(("tool_name", "tool_args"), _CASES)
@@ -2221,6 +2269,14 @@ class TestAgentRuntimePostHookOwnershipSync:
         monkeypatch.setattr(
             "tools.memory_tool.memory_tool",
             lambda **kwargs: '{"ok":true}',
+        )
+        monkeypatch.setattr(
+            "tools.notes_tool.dispatch_notes_tool_for_agent",
+            lambda agent, function_name, args: '{"ok":true}',
+        )
+        monkeypatch.setattr(
+            "agent.ingest_curator.dispatch_curator_verdict_for_agent",
+            lambda agent, args: '{"ok":true}',
         )
         monkeypatch.setattr(
             "tools.clarify_tool.clarify_tool",
@@ -2634,8 +2690,11 @@ class TestHandleMaxIterations:
         agent.provider = "openai"
         agent._cached_system_prompt = "You are helpful."
         messages = [{"role": "user", "content": "do stuff"}]
+        # Fork (runtime-route-awareness): the ordinary request's system message is composed the way
+        # build_api_messages composes it (cached prompt + live Runtime/Route State block).
+        from agent.system_prompt import compose_effective_system_prompt
         ordinary = agent._build_api_kwargs(
-            [{"role": "system", "content": agent._cached_system_prompt}, *messages]
+            [{"role": "system", "content": compose_effective_system_prompt(agent, agent._cached_system_prompt)}, *messages]
         )
 
         result = agent._handle_max_iterations(messages, 60)
@@ -3125,7 +3184,10 @@ class TestRunConversation:
         assert result["completed"] is True
         system = agent.client.chat.completions.create.call_args.kwargs["messages"][0]
         assert system["role"] == "system"
-        assert system["content"] == [
+        # Fork (runtime-route-awareness): the live Runtime/Route State block is an API-time tail
+        # after the session prompt, so upstream's three-part layout applies (static prefix,
+        # session context, tail). The static and session parts are upstream's exact blocks.
+        assert system["content"][:2] == [
             {
                 "type": "text",
                 "text": "stable instructions",
@@ -3137,6 +3199,11 @@ class TestRunConversation:
                 "cache_control": {"type": "ephemeral"},
             },
         ]
+        assert len(system["content"]) == 3
+        tail = system["content"][2]
+        assert tail["type"] == "text"
+        assert tail["text"].startswith("\n\n# Runtime/Route State\n")
+        assert tail["cache_control"] == {"type": "ephemeral"}
 
     def test_codex_content_filter_incomplete_routes_to_policy_fallback(self, agent):
         self._setup_agent(agent)

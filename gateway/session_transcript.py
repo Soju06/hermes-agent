@@ -150,8 +150,10 @@ class SessionTranscriptMixin:
                 return entry
             if not self._heal_compression_tip_locked(entry, expected_session_id, target_session_id):
                 return None  # route moved (session_id != expected) or nothing to heal
-            self._save()  # bookkeeping, not user activity: leave ``updated_at`` alone
-            return entry
+        # Bookkeeping, not user activity: leave ``updated_at`` alone. Persisted after the lock is
+        # released so the durable write never stalls event-loop readers.
+        self._save_entry(session_key)
+        return entry
 
     def _get_transcript_drain_lock(self):
         """Return the lock that serializes pending-queue drain boundaries."""
@@ -268,7 +270,7 @@ class SessionTranscriptMixin:
             for entry in self._entries.values():
                 if entry.session_id == session_id:
                     entry.session_id = child_id
-            self._save()
+        self._save()  # full rewrite after the lock is released (``_save`` never retains ``_lock``)
         (getattr(self, "_session_owner_hints", None) or {}).pop(child_id, None)
 
     def _append_to_transcript_serialized(self, session_id: str, message: dict[str, Any]) -> None:
@@ -633,6 +635,24 @@ class SessionTranscriptMixin:
             return False
         except Exception as e:
             raise TranscriptReadError(session_id) from e
+
+    def deactivate_messages(self, session_id: str, message_ids: list[int]) -> int:
+        """Reversibly hide explicit active transcript rows (the refusal mask) on the store that owns
+        the session: ``messages.deactivate_message`` flips ``active`` and leaves ``compacted`` alone,
+        so a masked row keeps the rewind/undo meaning instead of becoming a compaction archive.
+        Returns the number of rows that were active and are now hidden (0 without a DB or on failure)."""
+        store = self._persistence_for_session_id(session_id)
+        if not store or not message_ids:
+            return 0
+        try:
+            active = set(store.messages.active_message_ids(session_id))
+            return sum(
+                1 for message_id in dict.fromkeys(int(i) for i in message_ids)
+                if message_id in active and store.messages.deactivate_message(session_id, message_id)
+            )
+        except Exception as e:
+            logger.debug("Failed to deactivate transcript messages: %s", e)
+            return 0
 
     def load_transcript(self, session_id: str) -> list[dict[str, Any]]:
         """Load all messages from a session's transcript (state.db is canonical). Reads follow the

@@ -38,6 +38,47 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
+# Dedup latch for _warn_hygiene_threshold_inversion (per-process; the
+# hygiene config read runs once per incoming gateway message).
+_last_hygiene_inversion_warned = None
+
+
+def _warn_hygiene_threshold_inversion(hygiene_pct, configured_threshold) -> None:
+    """Warn (never reject) when the hygiene/compressor layering is inverted.
+
+    Session hygiene is a pre-agent SAFETY NET and must trigger at a higher
+    context ratio than the agent's own compressor (``compression.threshold``).
+    If a config sets ``compression.threshold`` at or above
+    ``compression.hygiene_threshold``, the safety net starts firing before
+    the primary mechanism — hygiene compresses every turn while the agent's
+    compressor never gets a chance. Warning-only so existing deployments
+    keep working; unparsable values are ignored (the numeric validation of
+    each key happens at its own read site).
+
+    The hygiene block re-reads config on every incoming message, so the
+    warning is deduplicated per value pair — one line per misconfiguration,
+    not one per turn (it re-fires if the values change).
+    """
+    if configured_threshold is None:
+        return
+    try:
+        _threshold = float(configured_threshold)
+    except (TypeError, ValueError):
+        return
+    if _threshold >= hygiene_pct:
+        global _last_hygiene_inversion_warned
+        _pair = (_threshold, hygiene_pct)
+        if _last_hygiene_inversion_warned == _pair:
+            return
+        _last_hygiene_inversion_warned = _pair
+        logger.warning(
+            "compression.threshold (%.2f) >= compression.hygiene_threshold "
+            "(%.2f): the gateway hygiene safety net will fire before the "
+            "agent's own compressor. Set hygiene_threshold above "
+            "compression.threshold to restore the intended layering.",
+            _threshold, hygiene_pct,
+        )
+
 
 class GatewayTurnHygieneMixin:
     @dataclasses.dataclass
@@ -65,7 +106,9 @@ class GatewayTurnHygieneMixin:
             hs.provider = _model_cfg.get("provider") or None
             hs.base_url = _model_cfg.get("base_url") or None
 
-        # Only the enabled flag is shared with the agent's compression config (hygiene runs higher).
+        # Shared with the agent's compression config: the enabled flag and (optionally) the hygiene
+        # trigger ratio via compression.hygiene_threshold — a separate key from compression.threshold
+        # because hygiene runs higher.
         _comp_cfg = data.get("compression", {})
         if not isinstance(_comp_cfg, dict):
             return
@@ -90,6 +133,13 @@ class GatewayTurnHygieneMixin:
         hs.failure_cooldown_seconds = _knob(
             "hygiene_failure_cooldown_seconds", hs.failure_cooldown_seconds, float, allow_zero=True,
         )
+        # compression.hygiene_threshold: config exposure of the previously hardcoded 0.85 trigger
+        # ratio. Out-of-range (not in (0, 1]) or unparsable values keep the default. Hygiene is the
+        # safety net and must run HIGHER than the agent's compression.threshold (layering warned below).
+        _hyg_threshold = _knob("hygiene_threshold", hs.threshold_pct, float)
+        if _hyg_threshold <= 1.0:
+            hs.threshold_pct = _hyg_threshold
+        _warn_hygiene_threshold_inversion(hs.threshold_pct, _comp_cfg.get("threshold"))
 
     async def _hmwa_hygiene_settings(self, source, session_key):
         """Resolve model/provider/context-length + hygiene knobs (fail-soft: errors keep defaults).
@@ -216,11 +266,17 @@ class GatewayTurnHygieneMixin:
             _needs_compress = False
 
         if _needs_compress:
+            _hyg_trigger = (
+                f"hard_message_limit ({hs.hard_msg_limit})"
+                if _approx_tokens < _compress_token_threshold and _msg_count >= hs.hard_msg_limit
+                else "token_threshold"
+            )
             logger.info(
                 "Session hygiene: %s messages, ~%s tokens (%s) — auto-compressing "
-                "(threshold: %s%% of %s = %s tokens)",
+                "(threshold: %s%% of %s = %s tokens; trigger=%s)",
                 _msg_count, f"{_approx_tokens:,}", _token_source,
                 int(hs.threshold_pct * 100), f"{_hyg_context_length:,}", f"{_compress_token_threshold:,}",
+                _hyg_trigger,
             )
         return self._HygienePlan(_needs_compress, _approx_tokens, _msg_count, _warn_token_threshold)
 
@@ -294,8 +350,17 @@ class GatewayTurnHygieneMixin:
             if cancelled is None:
                 await asyncio.sleep(0.025)
             elif cancelled:
-                fence.release_cancelled_compression_lock()
-                self._hmwa_hygiene_defer_cleanup(attempt, context)
+                # Off-loop: the hook (the lease's release_holder_only) ends in a synchronous SQLite DELETE
+                # (the coordination store's release_compression_lock) that showed up in event-loop stall
+                # stack dumps when run inline. This is the cancellation
+                # path — nothing downstream orders against the release and the fence already blocks any
+                # future commit. The await opens a window the inline call did not have: a CancelledError
+                # there must still defer cleanup, else the caller's ``finally`` tears the agent down under
+                # the still-running executor worker.
+                try:
+                    await asyncio.to_thread(fence.release_cancelled_compression_lock)
+                finally:
+                    self._hmwa_hygiene_defer_cleanup(attempt, context)
                 return None
             else:
                 break
@@ -566,11 +631,20 @@ class GatewayTurnHygieneMixin:
             # No rewrite happened — post-compression counts equal the pre-compression ones.
             _new_count = plan.msg_count
             _new_tokens = plan.approx_tokens
-            logger.warning(
-                "Gateway hygiene compression for session %s did not rotate or compact in place (%s) — "
-                "preserving the original transcript instead of overwriting it with the summary (#21301).",
-                session_entry.session_id, hygiene_no_commit_reason(_hyg_agent),
-            )
+            if getattr(_hyg_agent, "_last_compression_no_progress", False):
+                # A protected-tail no-op is expected, not an aborted attempt or the #21301 path; the
+                # durable cooldown it recorded stops hygiene from re-running it every turn.
+                logger.info(
+                    "Gateway hygiene compression for session %s made no progress: the protected tail "
+                    "exceeds the compressible budget. Preserving the original transcript; the "
+                    "compression-failure cooldown was recorded.", session_entry.session_id,
+                )
+            else:
+                logger.warning(
+                    "Gateway hygiene compression for session %s did not rotate or compact in place (%s) — "
+                    "preserving the original transcript instead of overwriting it with the summary (#21301).",
+                    session_entry.session_id, hygiene_no_commit_reason(_hyg_agent),
+                )
 
         logger.info(
             "Session hygiene: compressed %s → %s msgs, ~%s → ~%s tokens",
@@ -684,17 +758,59 @@ class GatewayTurnHygieneMixin:
         _hyg_checkpoint_required = _is_truthy(
             ((_load_cfg() or {}).get("compression") or {}).get("checkpoint_required"), default=False,
         )
-        _hyg_agent = AIAgent(
-            **_hyg_runtime, model=_hyg_model, max_iterations=4, quiet_mode=True,
-            skip_memory=not _hyg_checkpoint_required, enabled_toolsets=["memory"],
-            session_id=session_entry.session_id, persistence=_hyg_session_db,
-        )
-        _seed_hygiene_system_prompt(_hyg_agent, _hyg_session_row)
-        # The stamp only marks this agent as no real surface. Since #104414 Platform is not a
-        # restore-identity field, so it no longer forces the next live turn to rebuild; the seed's
-        # retain flag is what keeps the reduced-toolset build out of the session row (#122822).
-        _hyg_agent.platform = _GATEWAY_HYGIENE_PLATFORM
-        refresh_auto_cache_ttl(_hyg_agent)
+        _hyg_sid = session_entry.session_id
+
+        def _hyg_build_agent():
+            # AIAgent.__init__ and bind_session_state read the session's store synchronously (the
+            # writer lock on the SQLite backend). They must NEVER run on the event loop: a writer-lock
+            # convoy here freezes every platform heartbeat (2026-07-28 outage: 160s Discord stall
+            # dumped this exact stack). Build in the executor, same thread pool as the compression.
+            agent = AIAgent(
+                **_hyg_runtime, model=_hyg_model, max_iterations=4, quiet_mode=True,
+                skip_memory=not _hyg_checkpoint_required, enabled_toolsets=["memory"],
+                session_id=_hyg_sid, persistence=_hyg_session_db,
+            )
+            _seed_hygiene_system_prompt(agent, _hyg_session_row)
+            # The stamp only marks this agent as no real surface. Since #104414 Platform is not a
+            # restore-identity field, so it no longer forces the next live turn to rebuild; the seed's
+            # retain flag is what keeps the reduced-toolset build out of the session row (#122822).
+            agent.platform = _GATEWAY_HYGIENE_PLATFORM
+            refresh_auto_cache_ttl(agent)
+            # Hygiene owns the session binding, so prefer in-place compaction over minting a
+            # continuation child. Without a SessionDB this stays False.
+            agent.compression_in_place = True
+            _hyg_engine = getattr(agent, "context_compressor", None)
+            _bind_hyg_state = getattr(_hyg_engine, "bind_session_state", None)
+            if callable(_bind_hyg_state):
+                from agent.conversation_compression import context_engine_persistence, context_engine_session_db
+
+                # A plugin engine rebinds the SessionDB the agent bound it with, which the agent's close() closes.
+                _bind_hyg_state(context_engine_session_db(agent, _hyg_session_db), _hyg_sid,
+                                **context_engine_persistence(_bind_hyg_state, _hyg_session_db))
+            # Never finalize on close() — that would end the live gateway session row.
+            agent._end_session_on_close = False
+            agent._print_fn = lambda *a, **kw: None
+            return agent
+
+        # Same contextvars contract as the compression call below: under multiplex_profiles the
+        # profile secret scope / HERMES_HOME override live in ContextVars.
+        loop = asyncio.get_running_loop()
+        _hyg_build = loop.run_in_executor(None, copy_context().run, _hyg_build_agent)
+        # The build is default-executor hygiene work with synchronous store reads, so it registers with
+        # shutdown at submit time like the compression worker: stop() then skips the state.db
+        # close/checkpoint while it runs. There is no agent to interrupt yet (that pass skips None).
+        self._track_deferred_agent_worker(_hyg_build, None)
+        try:
+            # Shielded: cancelling the turn cannot stop a running executor job, only orphan its agent.
+            _hyg_agent = await asyncio.shield(_hyg_build)
+        except asyncio.CancelledError:
+            # The detached attempt never receives this agent, so its finally cannot release it.
+            def _release_orphaned_build(done):
+                if not done.cancelled() and done.exception() is None:
+                    self._defer_agent_cleanup_until_future_done(done, done.result(), context="session hygiene")
+
+            _hyg_build.add_done_callback(_release_orphaned_build)
+            raise
         return _hyg_agent, _hyg_session_db
 
     async def _hmwa_hygiene_detached_attempt(
@@ -705,24 +821,11 @@ class GatewayTurnHygieneMixin:
         continue with (compressed or original) on ``attempt.history``."""
         from gateway.run import HygieneTurnHoldExceeded
         from agent.conversation_compression import CompressionCommitFence
+        # Construction AND session-state binding run in the executor (see _hmwa_hygiene_build_agent):
+        # both read the session's store synchronously and must stay off the event loop.
         _hyg_agent, _hyg_session_db = await self._hmwa_hygiene_build_agent(_hyg_model, _hyg_runtime, session_entry)
         attempt.agent = _hyg_agent
         try:
-            # Hygiene owns the session binding, so prefer in-place compaction over minting a
-            # continuation child. Without a SessionDB this stays False.
-            _hyg_agent.compression_in_place = True
-            _hyg_engine = getattr(_hyg_agent, "context_compressor", None)
-            _bind_hyg_state = getattr(_hyg_engine, "bind_session_state", None)
-            if callable(_bind_hyg_state):
-                from agent.conversation_compression import context_engine_persistence, context_engine_session_db
-
-                # A plugin engine rebinds the SessionDB the agent bound it with, which the agent's close() closes.
-                _bind_hyg_state(context_engine_session_db(_hyg_agent, _hyg_session_db), session_entry.session_id,
-                                **context_engine_persistence(_bind_hyg_state, _hyg_session_db))
-            # Never finalize on close() — that would end the live gateway session row.
-            _hyg_agent._end_session_on_close = False
-            _hyg_agent._print_fn = lambda *a, **kw: None
-
             loop = asyncio.get_running_loop()
             _hyg_commit_fence = CompressionCommitFence(total_ceiling_seconds=hs.total_ceiling_seconds)
             # Default executor (NOT self._get_executor): a hung summary must never occupy an
@@ -811,7 +914,10 @@ class GatewayTurnHygieneMixin:
             # deployments read as permanently broken (#97963; surfaced by @686f6c61 in PR #99657).
             pass
         except Exception as e:
-            logger.warning("Session hygiene auto-compress failed: %s", e)
+            # %r plus the class name, NOT %s: the most common escapee here is asyncio.TimeoutError,
+            # whose str() is empty — "auto-compress failed: " with no cause made recurring hygiene
+            # failures undiagnosable.
+            logger.warning("Session hygiene auto-compress failed: %r (%s)", e, type(e).__name__)
         # A landed compression published a NEW transcript on attempt.history: leave it byte-identical.
         # Anything else (turn-hold, timeout, unwind, codex path) left the FULL uncompressed transcript
         # there — that is the fail-closed case (#111988).

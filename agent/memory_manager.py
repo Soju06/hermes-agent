@@ -14,6 +14,7 @@ import re
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, wait
+from contextlib import contextmanager
 from functools import partial
 from typing import Any, Callable, Dict, List, Optional
 
@@ -27,6 +28,7 @@ from session_rules.turns import sanitize_context
 from agent.memory_manager_tools import (inject_memory_provider_tools, memory_provider_tools_enabled,
                                         memory_provider_tools_exposed, normalize_tool_schema)
 from agent.memory_provider import MemoryProvider, PRE_COMPRESS_CHECKPOINT_API_VERSION, ctx_bound, spawn_context_thread
+from agent.memory_journal import L0Mirror, PendingTurnWAL, run_pending_startup_scan_once
 from session_rules.turns import extract_user_instruction_from_skill_message
 from hermes_constants import hermes_home_key
 from tools.hook_output_spill import get_spill_config, spill_if_oversized
@@ -56,6 +58,36 @@ _PROBE_INTERVAL_S = 60.0
 # Hard cap on calls in flight per (home, provider), orphans included: failed probes pin one more thread
 # each, so admission (probes too) stops here and a backend that stays wedged pins a bounded number.
 _MAX_INFLIGHT_CALLS = 16
+
+# Origin tag for memory READS issued by machinery rather than the live agent
+# (ADR-004 §⑤: the plugin-side retrieval ledger feeds the dream-promotion
+# "explicit memory_search hit" signal, which must exclude curator/prefetch
+# lookups or memory that gets curated gets re-promoted by its own curation —
+# the rich-get-richer loop the ADR excludes prefetch hits for). ContextVar,
+# not thread-local, so tools.thread_context.propagate_context_to_thread
+# carries it onto offloaded tool-dispatch threads.
+_retrieval_origin_var: "contextvars.ContextVar[Optional[str]]" = (
+    contextvars.ContextVar("hermes_memory_retrieval_origin", default=None)
+)
+
+
+@contextmanager
+def retrieval_origin(origin: str):
+    """Tag every ``MemoryManager.handle_tool_call`` issued from this context
+    with ``origin=<origin>`` (forwarded as a provider kwarg; the keyword filter
+    in ``handle_tool_call`` drops it for providers that declare neither
+    ``origin`` nor ``**kwargs``). The graphiti plugin's retrieval ledger
+    consumes the tag to keep non-agent lookups out of the §⑤ promotion signal."""
+    token = _retrieval_origin_var.set(str(origin))
+    try:
+        yield
+    finally:
+        _retrieval_origin_var.reset(token)
+
+
+def current_retrieval_origin() -> Optional[str]:
+    """The origin tag for the current context, or None for live-agent reads."""
+    return _retrieval_origin_var.get()
 
 
 # -- Signature introspection (providers are duck-typed; call shapes vary) -----
@@ -142,6 +174,11 @@ def _redact_messages_for_egress(messages: Optional[list[Any]]) -> Optional[list[
     (display-only metadata) never leaves the host."""
     from agent.message_metadata import without_withheld_prompts
     return None if messages is None else list(_redact_for_provider(without_withheld_prompts(messages)))
+
+
+def memory_ingest_allowed(agent: Any) -> bool:
+    """Return whether this agent may write/ingest into memory providers."""
+    return not getattr(agent, "_memory_ingest_disabled", False)
 
 
 class _StuckCallGate:
@@ -242,6 +279,28 @@ class MemoryManager:
         # construction path keeps writing.
         self._agent_context = "primary"
         self._tool_call_keywords_cache: dict[int, Optional[frozenset[str]]] = {}
+        # ADR-004 Phase 0 (§4.2): durable per-turn WAL. Turns are journaled
+        # BEFORE ingest dispatch and ack-marked after success, so buffered
+        # turns survive process restarts. Strictly fail-open — a broken
+        # journal must never affect the sync path.
+        self._pending_wal: Optional[PendingTurnWAL] = None
+        try:
+            self._pending_wal = PendingTurnWAL()
+            run_pending_startup_scan_once(self._pending_wal)
+        except Exception:  # pragma: no cover - constructor is allocation-only
+            logger.debug("memory-pending WAL unavailable (fail-open)", exc_info=True)
+            self._pending_wal = None
+        # ADR-004 Phase 0 (§② L0-mirror): local evidence journal. Every
+        # payload that leaves for external memory (per-turn sync, session-end
+        # extraction input, pre-compress extraction input) is mirrored to a
+        # monthly JSONL on this host, so the graph is no longer the only copy
+        # of the evidence. Fail-open, zero LLM calls, disk only.
+        self._l0_mirror: Optional[L0Mirror] = None
+        try:
+            self._l0_mirror = L0Mirror()
+        except Exception:  # pragma: no cover - constructor is allocation-only
+            logger.debug("l0-mirror unavailable (fail-open)", exc_info=True)
+            self._l0_mirror = None
 
     def _each_provider(self, label: str, call: Callable[[MemoryProvider], Any], *, level: int = logging.DEBUG,
                        providers: Optional[list[MemoryProvider]] = None, exc_info: bool = False) -> list[Any]:
@@ -480,18 +539,50 @@ class MemoryManager:
         clean_user_content, assistant_content, redacted_messages = _redact_for_provider(
             clean_user_content, assistant_content, messages)
         optional_kwargs = {"messages": redacted_messages, "turn_author": turn_author}
+        # Turn-boundary timestamp, captured HERE on the foreground thread: it becomes both
+        # journals' record ts and the taint verdict's as_of bound (ADR-004 §①). If the mem-sync
+        # worker is backed up and journals this turn minutes late, injected-span registrations
+        # from LATER turns must not taint this turn's assistant span — the span was authored
+        # before they existed.
+        turn_ts = time.time()
 
-        def _sync(provider: MemoryProvider) -> None:
+        def _sync(provider: MemoryProvider) -> bool:
             kwargs: dict[str, Any] = {"session_id": session_id}
             for keyword, value in optional_kwargs.items():
                 if value is not None and self._provider_sync_accepts(provider, keyword):
                     kwargs[keyword] = value
-            self._call_unless_stalled(
+            return self._call_unless_stalled(
                 provider, lambda: provider.sync_turn(clean_user_content, assistant_content, **kwargs))
 
-        self._submit_background(
-            lambda: self._each_provider("sync_turn failed", _sync, level=logging.WARNING, providers=providers)
-        )
+        def _run() -> None:
+            # ADR-004 Phase 0 (§4.2): journal the turn durably BEFORE any provider ingest is
+            # attempted. Runs on the mem-sync worker (not the hot path) and is fail-open —
+            # append_turn returns None on any failure and never raises.
+            wal = self._pending_wal
+            wal_entry_id = (
+                wal.append_turn(session_id, clean_user_content, assistant_content, ts=turn_ts)
+                if wal is not None else None
+            )
+            # ADR-004 Phase 0 (§② L0-mirror): mirror the outgoing episode payload locally just
+            # before ingest submit. Fail-open.
+            if self._l0_mirror is not None:
+                self._l0_mirror.append_turn(
+                    session_id,
+                    clean_user_content,
+                    assistant_content,
+                    provider_names=[p.name for p in providers],
+                    wal_entry_id=wal_entry_id,
+                    ts=turn_ts,
+                )
+            synced = self._each_provider("sync_turn failed", _sync, level=logging.WARNING, providers=providers)
+            # Ack only after every provider accepted the turn (``_each_provider`` returns one entry per
+            # provider that did not raise; an entry is False when the stuck-call gate skipped that
+            # provider) — a failed or skipped ingest leaves the entry unconsumed so it survives for the
+            # Phase-2 curator's replay (and is counted by the startup scan).
+            if wal is not None and wal_entry_id and len(synced) == len(providers) and all(synced):
+                wal.ack(session_id, wal_entry_id)
+
+        self._submit_background(_run)
 
     def _submit_background(self, fn, *, kind: str = "write") -> None:
         """Queue ``fn`` on the serialized worker (created lazily; None once shutting down) and track its
@@ -532,13 +623,13 @@ class MemoryManager:
         except Exception as e:  # pragma: no cover - fn guards internally
             logger.debug("Inline memory background task failed: %s", e)
 
-    def _call_unless_stalled(self, provider: MemoryProvider, call: Callable[[], Any]) -> None:
+    def _call_unless_stalled(self, provider: MemoryProvider, call: Callable[[], Any]) -> bool:
         """Run a background provider call unless _BACKGROUND_GATE skips it (the provider has stuck calls);
         skipping costs that turn's write/prefetch but stops a wedged backend from pinning one more
-        thread per fresh manager. The builtin provider is never gated."""
+        thread per fresh manager. The builtin provider is never gated. Returns whether ``call`` ran."""
         if provider.name == "builtin":
             call()
-            return
+            return True
         key = self._registry_key(provider)
         token = object()
         skipped = self._BACKGROUND_GATE.enter(key, token, _BACKGROUND_CALL_STALL_S)
@@ -550,13 +641,14 @@ class MemoryManager:
                     "skipping its sync/prefetch until it recovers (%d skipped)", provider.name, stuck,
                     _BACKGROUND_CALL_STALL_S, in_flight, skips,
                 )
-            return
+            return False
         ok = False
         try:
             call()
             ok = True
         finally:
             self._BACKGROUND_GATE.leave(key, token, ok=ok)
+        return True
 
     def _registry_key(self, provider: MemoryProvider) -> tuple[str, str]:
         """Process-wide registry key: the home the providers were bound to (``initialize_all``, which may
@@ -617,6 +709,9 @@ class MemoryManager:
         if scope is None:
             return tool_error(refused_tool_message(tool_name))
         kwargs = {**kwargs, **scope}
+        origin = _retrieval_origin_var.get()
+        if origin and "origin" not in kwargs:
+            kwargs["origin"] = origin
         # A provider written against ``handle_tool_call(tool_name, args)`` gets only what it declares.
         accepted = self._tool_call_keywords(provider)
         if accepted is not None:
@@ -631,6 +726,25 @@ class MemoryManager:
             return tool_error(f"Memory tool '{tool_name}' failed: {e}")
         record_provider_memory_call(provider.name, tool_name, args, result)
         return result
+
+    def _mirror_boundary(self, kind: str, messages: list[dict[str, Any]]) -> None:
+        """Journal a boundary extraction marker to the L0-mirror, off-thread.
+
+        The marker record is derived inline (pure, content-free, cheap — message dicts must not
+        be walked later on another thread while the caller keeps mutating them) and the disk
+        append is submitted to the single background worker, so boundary hooks never pay journal
+        I/O on the calling thread. Fail-open; skipped when no provider will consume the payload.
+        """
+        mirror = self._l0_mirror
+        if not self._providers or mirror is None:
+            return
+        record = mirror.build_boundary_record(
+            kind,
+            messages,
+            provider_names=[p.name for p in self._providers],
+        )
+        if record is not None:
+            self._submit_background(lambda: mirror.append_record(record))
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         if self._fork_turn_hooks_suppressed() or not self._owner_allows("on_turn_start"):
@@ -655,6 +769,12 @@ class MemoryManager:
         if self._fork_turn_hooks_suppressed() or not self._owner_allows("on_session_end"):
             return
         messages = _redact_messages_for_egress(messages or [])
+        # ADR-004 Phase 0 (§② L0-mirror): record that a session-end extraction payload left for
+        # providers. The content itself is already mirrored per-turn by sync_all, so only a compact
+        # boundary MARKER is derived here (cheap, pure — see build_boundary_record) and the disk
+        # append is dispatched to the background worker: this method runs on the calling thread, and
+        # inline journal I/O on provider paths is exactly what _submit_background exists to avoid.
+        self._mirror_boundary("session_end", messages)
         self._each_provider("on_session_end failed", lambda p: p.on_session_end(messages), level=logging.WARNING,
                             exc_info=True)
 
@@ -733,6 +853,12 @@ class MemoryManager:
             if require_checkpoint:  # the caller keeps the uncompressed transcript
                 raise RuntimeError("Memory pre-compress checkpoint refused; see `hermes logs errors`")
             return ""
+        # ADR-004 Phase 0 (§② L0-mirror): record the pre-compression
+        # extraction boundary. on_pre_compress fires MID-TURN inside
+        # compress_context, so only the cheap content-free marker is derived
+        # inline; the append runs on the background worker (per-turn content
+        # is already mirrored by sync_all).
+        self._mirror_boundary("pre_compress", messages)
         parts = []
         checkpoint_succeeded = False
         from agent.message_metadata import without_withheld_prompts
@@ -857,6 +983,89 @@ class MemoryManager:
                 self.on_memory_write(mirrored_action, target, content, metadata=metadata)
             except Exception as e:
                 logger.debug("notify_memory_tool_write failed for op %s: %s", action, e)
+
+    def sync_note_backfill(self, note_path: str, content: str, *, session_id: str = "",
+                           metadata: Optional[dict[str, Any]] = None) -> None:
+        """Backfill a notes/ write as a typed idempotent episode (ADR-004 §③ step 7 / §6.1: every
+        note write round-trips into the graph under ``source_name="hermes-notes"``,
+        ``source_id=note_path`` so memory_search stays the single read surface and a re-ingest of
+        the same note supersedes its previous episode).
+
+        The CALLER gates this on ``memory.notes_backfill_enabled`` (default OFF — the daemon-side
+        IngestRequest pass-through is merged but not yet deployed; see
+        agent.memory_pipeline.notes_backfill_enabled). Runs on the same single mem-sync worker as
+        every other external write (§③ serialization: notes writes ride the existing chain, no
+        second writer). Fail-open per provider. Like every provider fan-out it runs only from the
+        owning profile and its payload goes through the egress scrub; the background call goes
+        through the stuck-call gate like ``sync_turn``.
+        """
+        providers = [p for p in self._providers if p.name != "builtin"]
+        if not providers or not content or not self._owner_allows("note_backfill"):
+            return
+
+        content, meta = _redact_for_provider(content, {
+            "source_name": "hermes-notes",
+            "source_id": note_path,
+            "session_id": session_id,
+            **(metadata or {}),
+        })
+
+        def _write(provider: MemoryProvider) -> None:
+            metadata_mode = self._provider_memory_write_metadata_mode(provider)
+            if metadata_mode == "keyword":
+                provider.on_memory_write("add", "notes", content, metadata=dict(meta))
+            elif metadata_mode == "positional":
+                provider.on_memory_write("add", "notes", content, dict(meta))
+            else:
+                provider.on_memory_write("add", "notes", content)
+
+        def _backfill(provider: MemoryProvider) -> None:
+            self._call_unless_stalled(provider, lambda: _write(provider))
+
+        self._submit_background(
+            lambda: self._each_provider("note backfill failed", _backfill, level=logging.WARNING, providers=providers)
+        )
+
+    def sync_curated_episode(self, content: str, *, session_id: str = "",
+                             metadata: Optional[dict[str, Any]] = None) -> None:
+        """Send one curator-approved episode to external providers (ADR-004 §4.5 cutover seam —
+        Phase 2 ships this UNREACHABLE: the only caller, ``agent.ingest_curator.submit_curated``,
+        is double-gated behind ``curator.ingest_enabled`` (default False) AND
+        ``curator.shadow_mode`` (default True)).
+
+        Rides the same single mem-sync worker as every other external write (§4.5 backpressure:
+        curated ingests are an internal allocation of the existing chain — mem-sync worker →
+        plugin breaker/DLQ → daemon bulkhead — never a second writer). The pass-through fields
+        (``source_name``/``source_id``/``episode_type``/``curated_*``) ride the metadata dict
+        exactly like the notes backfill; the daemon-side IngestRequest pass-through consumes them
+        once deployed. Fail-open per provider. Same fan-out contract as ``sync_note_backfill``:
+        owning profile only, egress-scrubbed payload, stuck-call gate on the background call.
+        """
+        providers = [p for p in self._providers if p.name != "builtin"]
+        if not providers or not content or not self._owner_allows("curated_ingest"):
+            return
+
+        content, meta = _redact_for_provider(content, {
+            "source_name": "hermes-curated",
+            "session_id": session_id,
+            **(metadata or {}),
+        })
+
+        def _write(provider: MemoryProvider) -> None:
+            metadata_mode = self._provider_memory_write_metadata_mode(provider)
+            if metadata_mode == "keyword":
+                provider.on_memory_write("add", "curated", content, metadata=dict(meta))
+            elif metadata_mode == "positional":
+                provider.on_memory_write("add", "curated", content, dict(meta))
+            else:
+                provider.on_memory_write("add", "curated", content)
+
+        def _ingest(provider: MemoryProvider) -> None:
+            self._call_unless_stalled(provider, lambda: _write(provider))
+
+        self._submit_background(
+            lambda: self._each_provider("curated ingest failed", _ingest, level=logging.WARNING, providers=providers)
+        )
 
     def on_delegation(self, task: str, result: str, *, child_session_id: str = "", **kwargs) -> None:
         if self._fork_turn_hooks_suppressed() or not self._owner_allows("on_delegation"):

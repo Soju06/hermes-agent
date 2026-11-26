@@ -228,6 +228,10 @@ def _export_dump_excluding_session_vars(
         # env; a snapshot taken inside that window would re-assert them on every
         # later ``source`` and fence the PARENT session's kanban CLI (#90782).
         "HERMES_DELEGATED_CHILD_CONTEXT HERMES_CRON_SESSION "
+        # The dispatcher's Kanban identity is a per-command Popen-env fact
+        # (agent.delegation_context.scrub_kanban_env); persisting it would re-export
+        # the worker's identity over a delegated child's scrubbed env.
+        "${!HERMES_KANBAN_*} "
         # Remote code-execution channel vars (RPC token, kernel/rpc dirs): a
         # leaked token in the snapshot would re-export into every later command
         # on the backend and outlive the private dir it protects.

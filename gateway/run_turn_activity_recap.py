@@ -1,0 +1,118 @@
+"""LLM activity recap for ``display.long_running_notifications: recap``.
+
+``GatewayTurnMixin._run_agent_notify_long_running`` asks this mixin for a one-line, present-tense
+recap of what the running agent is doing instead of the terse "Working — N min" heartbeat. The
+agent side of the snapshot is ``AIAgent.get_activity_recap_context`` (``agent/activity_recap.py``).
+
+The aux call runs from the notify task on the event loop, outside the turn's ``policy_scope``: a
+LOCAL policy-bound session resolves ``auxiliary.activity_recap`` from live config.yaml, not from its
+frozen auxiliary section. Messaging platforms carry no session policy, so they are unaffected.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+
+# Log-record parity with the origin module.
+logger = logging.getLogger("gateway.run")
+
+
+def _recap_main_runtime(agent) -> dict:
+    """The agent's live main runtime, as the compression rail passes it (``auth_mode`` and
+    ``session_id`` included, for aux session affinity and prompt-cache scope). An agent without
+    ``_current_main_runtime`` falls back to its plain route attributes."""
+    current = getattr(agent, "_current_main_runtime", None)
+    if callable(current):
+        runtime = current()
+        if isinstance(runtime, dict):
+            return runtime
+    return {key: getattr(agent, key, None) for key in ("model", "provider", "base_url", "api_key", "api_mode")}
+
+
+class GatewayTurnActivityRecapMixin:
+    async def _llm_activity_recap(self, agent, session_key: str):
+        """One-line LLM recap of what the running agent is doing right now.
+
+        Powers ``display.long_running_notifications: recap``. Uses the
+        auxiliary LLM route (same rail as compression summaries) with a hard
+        timeout; any failure falls back to the terse built-in heartbeat.
+        Regenerates only when the activity context actually changed — a long
+        wait on one tool reuses the cached line instead of re-billing.
+        """
+        try:
+            ctx = agent.get_activity_recap_context()
+        except Exception:
+            return None
+        cache = getattr(self, "_activity_recap_cache", None)
+        if cache is None:
+            cache = {}
+            self._activity_recap_cache = cache
+        ctx_key = hash((
+            ctx.get("goal"),
+            tuple(ctx.get("recent_tools") or ()),
+            ctx.get("current_tool"),
+            tuple(ctx.get("voice_samples") or ()),
+            bool(ctx.get("persona_snippet")),
+        ))
+        cached = cache.get(session_key)
+        if cached and cached[0] == ctx_key:
+            return cached[1]
+
+        def _generate():
+            from agent.auxiliary_client import call_llm
+
+            tools_str = "; ".join(ctx.get("recent_tools") or []) or "(none yet)"
+            current = ctx.get("current_tool") or ctx.get("last_activity_desc") or "thinking"
+            samples = ctx.get("voice_samples") or []
+            voice_block = ""
+            if samples:
+                joined = "\n".join(f"- {s}" for s in samples)
+                voice_block = (
+                    "Your recent messages in this conversation (this is YOUR "
+                    f"voice — match its language, tone, and persona exactly):\n{joined}\n"
+                )
+            elif ctx.get("persona_snippet"):
+                # Fresh session, nothing said yet: the persona definition
+                # (SOUL identity + conversation-style rules) IS the voice.
+                voice_block = (
+                    "Your persona and conversation-style definition (write "
+                    f"in this voice):\n{ctx['persona_snippet']}\n"
+                )
+            extra = ""
+            if ctx.get("last_tool_result"):
+                extra += f"Last tool result (truncated): {ctx['last_tool_result']}\n"
+            prompt = (
+                "You are the AI agent in the middle of a long-running turn. "
+                "Write YOUR OWN one-line status update to the user: what you "
+                "are doing right now and what you are waiting on. ONE line, "
+                "max 100 chars, present tense, no prefix/quotes.\n"
+                + voice_block +
+                f"Goal of this turn: {ctx.get('goal') or '(unknown)'}\n"
+                f"Your recent tool calls (oldest first): {tools_str}\n"
+                + extra +
+                f"Currently: {current} "
+                f"({int(ctx.get('seconds_since_activity') or 0)}s since last activity, "
+                f"iteration {ctx.get('iteration')}/{ctx.get('max_iterations')})"
+            )
+            response = call_llm(
+                task="activity_recap",
+                main_runtime=_recap_main_runtime(agent),
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=80,
+                timeout=8,
+            )
+            message = response.choices[0].message
+            content = message.get("content") if isinstance(message, dict) else getattr(message, "content", "")
+            line = str(content or "").strip().splitlines()
+            return line[0][:140].strip() if line else ""
+
+        try:
+            text = await asyncio.wait_for(asyncio.to_thread(_generate), timeout=10)
+        except Exception as exc:
+            logger.debug("activity recap generation failed: %s", exc)
+            return None
+        if not text:
+            return None
+        cache[session_key] = (ctx_key, text)
+        return text

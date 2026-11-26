@@ -400,6 +400,29 @@ hermes_home = Path(os.environ["HERMES_HOME"])
 real_home = Path(os.environ.get("HERMES_REAL_HOME", os.environ["HOME"]))
 ```
 
+#### `terminal.durable_background`
+
+```yaml
+terminal:
+  durable_background: true   # default: false
+```
+
+Opt-in. With it on, a local background command without a PTY starts in its own
+transient systemd user scope (`hermes-bg-<id>.scope`) and writes its output to a
+log file instead of a pipe. The process then survives a restart of the gateway
+service: shutdown leaves it running, and the next gateway start re-adopts it from
+the process checkpoint and keeps reading its log. `process` kill still stops it.
+
+- Linux only, with systemd as PID 1 and a user manager the gateway's user can reach.
+  A system-level gateway unit needs that user's lingering manager
+  (`loginctl enable-linger <user>`).
+- Applies where background jobs are not owned by the process that started them,
+  which is the gateway host that the CLI, TUI, Desktop and messaging run their tools
+  in. A process that owns its jobs keeps stopping them with itself.
+- PTY sessions and remote backends are unchanged.
+- When a scope cannot start (no `systemd-run`, no user bus, or the scope does not
+  report ready in time), Hermes logs one warning and starts the command the ordinary way.
+
 :::warning
 The agent has the same filesystem access as your user account. Use `hermes tools` to disable tools you don't want, or switch to Docker for sandboxing.
 :::
@@ -956,6 +979,26 @@ memory:
 
 With `memory.write_approval: true`, writes made through the `memory` tool need your approval before they land: interactive CLI turns prompt inline; messaging sessions and the background self-improvement review stage the write for `/memory pending` → `/memory approve <id>` / `/memory reject <id>` review. Toggle at runtime with `/memory approval on|off`. See [Controlling memory writes](./features/memory.md#controlling-memory-writes-write_approval).
 
+### Memory ingest curator
+
+The memory ingest curator is a background fork that reviews recent turns from the memory write-ahead log and drafts a routing verdict per span (full extraction, raw only, merge batch, note or skill proposal, or no-op). It is separate from the [skill curator](./features/curator.md): its keys sit in the same `curator:` section, but `curator.enabled` does not switch it on or off. It ships inert. With `curator.ingest_enabled: true` and `curator.shadow_mode: true`, a run only appends its verdicts to `~/.hermes/state/curator-ledger.jsonl`; nothing is ingested and no note, skill or `MEMORY.md` write results from it.
+
+```yaml
+curator:
+  ingest_enabled: false        # master switch for the memory ingest curator (independent of curator.enabled)
+  shadow_mode: true            # true = record verdicts in the shadow ledger only; false = send curated spans to the memory provider
+  salience:
+    threshold: 12              # accumulated turn score that starts a run
+    weight_proposal: 3         # score added per memory_propose call in a turn
+    weight_tool_success: 2     # score added for a tool-heavy turn (3+ tool results, at most 20% errors)
+    weight_non_trivial: 1      # score added for a turn with a tool result or a user message of 40+ chars
+    fallback_turns: 10         # most user turns allowed between two runs, whatever the score
+  idle_seconds: 600            # run after this long idle with unreviewed turns; 0 disables the idle trigger
+  session_end_min_turns: 3     # session end starts a run only after at least this many turns
+```
+
+Salience and fallback runs replay the conversation snapshot; session end, idle and pre-compression runs read only the new log spans. The fork uses the `auxiliary.ingest_curator` slot (default `auto`, the main model, with a 300-second timeout); see [Auxiliary Models](#auxiliary-models) to route it to another provider or model.
+
 ## Context File Truncation
 
 Controls how much content Hermes loads from each automatic context file before applying head/tail truncation. This applies to files injected into the system prompt such as `SOUL.md`, `.hermes.md`, `AGENTS.md`, `CLAUDE.md`, and `.cursorrules`. It does **not** affect the `read_file` tool.
@@ -1116,6 +1159,7 @@ compression:
   idle_compact_after_seconds: 0                     # Opt-in idle compaction (0 = disabled) — see below
   prepare_ahead: false                              # Opt-in: prepare the next summary in the background — see below
   hygiene_hard_message_limit: 5000                  # Gateway safety valve — see below
+  hygiene_threshold: 0.85                           # Gateway pre-agent hygiene trigger ratio; keep it above threshold, see below
   hygiene_timeout_seconds: 30                       # Max seconds of NO summary-model output before hygiene compression is cut off
   hygiene_total_ceiling_seconds: 600                # Absolute cap on the hygiene wait even while tokens are still streaming
   hygiene_max_turn_hold_seconds: 10                 # Max wall-clock the incoming turn waits on hygiene compression before proceeding uncompressed — see below
@@ -1143,6 +1187,8 @@ Older configs with `compression.summary_model`, `compression.summary_provider`, 
 `hygiene_hard_message_limit` is a gateway-only **pre-compression safety valve**. It exists to break a death spiral: when API calls keep disconnecting on an oversized session, the gateway never receives token-usage data, so the token-based threshold can't fire, so the transcript keeps growing and disconnects get worse. This count-based floor fires on message count alone (always known, regardless of API failures) to force compression and recover the session. Default `5000` — far above any normal session, including large-context (1M+) models doing thousands of short turns, which compress on the token threshold long before this. Raise it further for unusual platforms, lower it to force more aggressive compression. Editing this value on a running gateway takes effect on the next message (see below).
 
 The same limit is also a **fail-closed bound on what the model is sent** whenever hygiene does not land by the time a turn starts — the turn-hold budget expired, the summary timed out or failed, a failure cooldown is active, another compression is still in flight, or compression is disabled. In that case the gateway keeps the leading system/setup rows plus the newest messages, total at most `hygiene_hard_message_limit`, and never starts the kept tail on an orphaned tool result. Only the payload of that one turn is clipped: the transcript on disk is untouched, nothing is deleted, and a summary that lands later is adopted as-is. This is what keeps a week-long DM from feeding the model the full uncompressed history when a compression pass keeps missing.
+
+`hygiene_threshold` (default `0.85`) is the context-usage ratio at which the gateway's pre-agent hygiene pass compresses a session before the turn starts. Hygiene is the safety net for sessions that grew between turns, so keep it above the agent's own `threshold`; when `threshold` is at or above it, the gateway logs a one-time warning. Values outside (0, 1] are ignored and keep the default. Editing it on a running gateway takes effect on the next message.
 
 `hygiene_timeout_seconds` is the gateway's **inactivity budget** for this pre-agent compression pass — not a total wall-clock cap. The compression summary call streams from the model, and each arriving token counts as forward progress: a slow reasoning model that is still generating keeps extending its own deadline, so slow-but-healthy summary models are never cut off mid-generation. Only when the summary model produces **no output** for this many seconds (backend down, hung connection, silent provider) does the gateway warn the user, continue the incoming message without compression, and record a temporary per-session failure cooldown instead of appearing stuck.
 

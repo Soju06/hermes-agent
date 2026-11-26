@@ -30,6 +30,8 @@ def test_memory_alias_persists_with_content_precedence(tmp_path, monkeypatch):
     ctx = InlineToolContext(effective_task_id="task-1", tool_call_id="call-1")
 
     def call(**args):
+        # add/patch must carry a write reason (fork patch: memory-write-reason-gate).
+        args.setdefault("reason", "Durable user profile fact that should persist across sessions.")
         return json.loads(INLINE_TOOL_EXECUTORS["memory"](agent, args, ctx))
 
     assert call(action="add", target="user", content="Household owns an estate.")["success"]

@@ -258,21 +258,25 @@ _REVIEW_INPUT_CONTEXT_FRACTION = 0.75
 _REVIEW_MAX_INPUT_TOKENS_FALLBACK = 120_000
 
 
-def _task_block(cfg: Any) -> dict[str, Any]:
-    """``cfg["auxiliary"]["background_review"]`` as a dict (``{}`` on any shape mismatch)."""
+def _task_block(cfg: Any, aux_task: str = "background_review") -> dict[str, Any]:
+    """``cfg["auxiliary"][aux_task]`` as a dict (``{}`` on any shape mismatch)."""
     aux = cfg.get("auxiliary", {}) if isinstance(cfg.get("auxiliary"), dict) else {}
-    task = aux.get("background_review", {})
+    task = aux.get(aux_task, {})
     return task if isinstance(task, dict) else {}
 
 
-def _background_review_task_config(task_cfg: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-    """``auxiliary.background_review`` (or ``{}`` on any failure); pass a pre-loaded ``task_cfg``
-    so the spawn / resolve / prompt paths do not re-read config on every turn."""
+def _background_review_task_config(
+    task_cfg: Optional[dict[str, Any]] = None, aux_task: str = "background_review",
+) -> dict[str, Any]:
+    """``auxiliary.<aux_task>`` review-task block (or ``{}`` on any failure); pass a pre-loaded
+    ``task_cfg`` so the spawn / resolve / prompt paths do not re-read config on every turn.
+    ``aux_task`` defaults to ``background_review`` (unchanged behavior); the ADR-004 ingest
+    curator passes ``ingest_curator``."""
     if task_cfg is not None:
         return task_cfg if isinstance(task_cfg, dict) else {}
     try:
         from hermes_cli.config import load_config_readonly
-        return _task_block(load_config_readonly())
+        return _task_block(load_config_readonly(), aux_task)
     except Exception:
         return {}
 
@@ -326,11 +330,17 @@ def load_background_review_settings() -> tuple[bool, dict[str, Any]]:
         return True, {}
 
 
-def _resolve_review_runtime(agent: Any, task_cfg: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-    """Resolve provider/model/credentials for the review fork. Default (auto / unset / same as
+def _resolve_review_runtime(
+    agent: Any, task_cfg: Optional[dict[str, Any]] = None, aux_task: str = "background_review",
+) -> dict[str, Any]:
+    """Resolve provider/model/credentials for a review-style fork. Default (auto / unset / same as
     parent): the parent's live runtime with ``routed=False`` (codex_app_server -> codex_responses
-    downgrade applied). When ``auxiliary.background_review.{provider,model}`` names a different
-    concrete model, resolve that runtime and set ``routed=True``."""
+    downgrade applied). When ``auxiliary.<aux_task>.{provider,model}`` names a different
+    concrete model, resolve that runtime and set ``routed=True``.
+
+    ``aux_task`` selects the auxiliary config block: ``background_review`` (default, unchanged
+    behavior) or ``ingest_curator`` (the ADR-004 §4.4 curator fork, which shares this exact
+    resolution policy by design)."""
     parent_runtime = agent._current_main_runtime()
     parent_api_mode = parent_runtime.get("api_mode") or None
     parent = {
@@ -342,7 +352,7 @@ def _resolve_review_runtime(agent: Any, task_cfg: Optional[dict[str, Any]] = Non
         "max_tokens": getattr(agent, "max_tokens", None), "command": getattr(agent, "acp_command", None),
         "args": list(getattr(agent, "acp_args", []) or []), "routed": False,
     }
-    task = _background_review_task_config(task_cfg)
+    task = _background_review_task_config(task_cfg, aux_task=aux_task)
     task_provider, task_model, task_base_url, task_api_key = (
         str(task.get(key, "")).strip() or None for key in ("provider", "model", "base_url", "api_key")
     )
@@ -363,7 +373,11 @@ def _resolve_review_runtime(agent: Any, task_cfg: Optional[dict[str, Any]] = Non
             "args": list(rp.get("args") or []), "routed": True,
         }
     except Exception as e:
-        _warn_review_routing_fallback(agent, task_provider, task_model, e)
+        if aux_task == "background_review":
+            _warn_review_routing_fallback(agent, task_provider, task_model, e)
+        else:  # the ADR-004 ingest curator runs in shadow: logged, no user-facing review notice
+            logger.warning("auxiliary.%s.provider=%r (model %r) could not be resolved (%s); using the main model",
+                           aux_task, task_provider, task_model, e)
         return parent
 
 
@@ -464,11 +478,37 @@ _MEMORY_ROUTING_BLOCK = (
     "out — a wrong fact misleads every future session.\n\n"
 )
 
+_MEMORY_WRITE_CONTRACT = (
+    "Memory write contract (hard gate): USER.md and MEMORY.md are always-injected scarce context, "
+    "so most conversation facts must NOT be written there.\n"
+    "Only call memory(add|patch) when the fact is useful across unrelated session types "
+    "(ordinary chat, research, writing, and development) or is a global agent/environment/routing "
+    "invariant. Stable-but-scoped project, infra, host, repo, PR, service, workflow, and task-state "
+    "facts belong to Graphiti/session history, or to a skill only if they are reusable procedures "
+    "or pitfalls.\n"
+    "If you call memory(add|patch), the `reason` argument MUST be a JSON object string with "
+    "`declared_scope` and `declared_category`, plus concrete `evidence`, `why_always_injected`, "
+    "`why_not_skill`, and `why_not_graphiti`. For target='user', include `applies_to` covering at "
+    "least three of: ordinary_chat, research, writing, development.\n"
+    "If the candidate does not satisfy that contract, do not attempt memory; say 'Nothing to "
+    "save.' for memory and move on.\n\n"
+)
+
+_SKILL_REVIEW_CALIBRATION = (
+    "Skill review calibration: be selective, not eager. Update skills only when there is a real "
+    "reusable learning signal: a user correction to approach or style, a non-trivial proven "
+    "technique/workaround/debugging path, or a loaded skill that was wrong, missing a step, or "
+    "outdated. Most ordinary turns, one-off tasks, status checks, and transient errors should "
+    "result in 'Nothing to save.' Do not create work just to satisfy the review.\n\n"
+)
+
 _MEMORY_REVIEW_PROMPT = (
     "Review the conversation above and consider saving to memory if appropriate.\n\n"
-    "Memory has " + _MEMORY_ROUTING_BLOCK +
-    "If something stands out, save it once, in the right store, using the memory tool with the "
-    "matching target. If nothing is worth saving, just say 'Nothing to save.' and stop."
+    + _MEMORY_WRITE_CONTRACT +
+    "For a candidate that passes the contract, memory has " + _MEMORY_ROUTING_BLOCK +
+    "If a candidate satisfies the memory write contract, save it once, in the right store, using "
+    "the memory tool with the matching target and the required structured JSON reason. If nothing "
+    "satisfies the contract, just say 'Nothing to save.' and stop."
 )
 
 # Shared shape contract for anything written into a skill. The failure mode this prevents is the
@@ -530,14 +570,14 @@ _DO_NOT_CAPTURE_BLOCK = (
 )
 
 _SKILL_REVIEW_PROMPT = (
-    "Review the conversation above and update the skill library. Be ACTIVE — most sessions produce "
-    "at least one skill update, even if small. A pass that does nothing is a missed learning "
-    "opportunity, not a neutral outcome.\n\n"
+    "Review the conversation above and update the skill library only when the conversation "
+    "contains a real reusable learning signal.\n\n"
+    + _SKILL_REVIEW_CALIBRATION +
     "Target shape of the library: CLASS-LEVEL skills, each with a SKILL.md of always-on rules and a "
     "small `references/` set of topical depth. Not a flat list of narrow one-session skills, and "
     "not an umbrella hoarding a references/ file per session. This shapes HOW you update, not "
     "WHETHER you update.\n\n" + _LESSON_LAYER_BLOCK +
-    "Signals to look for (any one of these warrants action):\n"
+    "Signals to look for (these may warrant action when concrete and reusable):\n"
     "  • User corrected your style, tone, format, legibility, or verbosity. Frustration signals "
     "like 'stop doing X', 'this is too verbose', 'don't format like this', 'why are you "
     "explaining', 'just give me the answer', 'you always do Y and I hate it', or an explicit "
@@ -549,8 +589,8 @@ _SKILL_REVIEW_PROMPT = (
     "that a future session would benefit from. Capture it.\n"
     "  • A skill that got loaded or consulted this session turned out to be wrong, missing a step, "
     "or outdated. Patch it NOW.\n\n"
-    "Preference order — prefer the earliest action that fits, but do pick one when a signal above "
-    "fired:\n"
+    "Preference order — if a concrete reusable signal exists, prefer the earliest action that "
+    "fits:\n"
     "  1. UPDATE A CURRENTLY-LOADED SKILL. Look back through the conversation for skills the user "
     "loaded via /skill-name or you read via skill_view. If any of them covers the territory of the "
     "new learning, PATCH that one first (re-load it with skill_view during this review — see "
@@ -597,21 +637,24 @@ _SKILL_REVIEW_PROMPT = (
     "If you notice two existing skills that overlap, note it in your reply — the background "
     "curator handles consolidation at scale. Never delete a skill here.\n\n"
     "Do NOT capture" + _DO_NOT_CAPTURE_BLOCK +
-    "'Nothing to save.' is a real option but should NOT be the default. If the session ran "
-    "smoothly with no corrections and produced no new technique, just say 'Nothing to save.' and "
-    "stop. Otherwise, act."
+    "'Nothing to save.' is the correct answer when the session has no concrete reusable "
+    "correction, technique, or skill defect. If the session ran smoothly with no corrections and "
+    "produced no new reusable technique, say 'Nothing to save.' and stop. Otherwise, act only on "
+    "the concrete signal."
 )
 
 _COMBINED_REVIEW_PROMPT = (
-    "Review the conversation above and update two things:\n\n"
-    "**Memory**: " + _MEMORY_ROUTING_BLOCK +
-    "**Skills**: how to do this class of task. Be ACTIVE — most sessions produce at least one "
-    "skill update. A pass that does nothing is a missed learning opportunity, not a neutral "
-    "outcome.\n\n"
+    "Review the conversation above and update two dimensions only when each has a real durable "
+    "signal:\n\n"
+    "**Memory**: who the user is or global agent/runtime invariants.\n"
+    + _MEMORY_WRITE_CONTRACT +
+    "For a candidate that passes the contract, memory has " + _MEMORY_ROUTING_BLOCK +
+    "**Skills**: how to do a class of task for this user.\n"
+    + _SKILL_REVIEW_CALIBRATION +
     "Target shape of the skill library: CLASS-LEVEL skills with a SKILL.md of always-on rules and a "
     "small `references/` set of topical depth — not narrow one-session skills, and not an umbrella "
     "hoarding a references/ file per session.\n\n" + _LESSON_LAYER_BLOCK +
-    "Signals that warrant a skill update (any one is enough):\n"
+    "Signals that may warrant a skill update when concrete and reusable:\n"
     "  • User corrected your style, tone, format, legibility, verbosity, or approach. Frustration "
     "is a FIRST-CLASS skill signal, not just a memory signal. 'stop doing X', 'don't format like "
     "this', 'I hate when you Y' — embed the lesson in the skill that governs that task so the next "
@@ -650,8 +693,9 @@ _COMBINED_REVIEW_PROMPT = (
     "If you notice overlapping existing skills, mention it — the background curator handles "
     "consolidation. Never delete a skill here.\n\n"
     "Do NOT capture as skills" + _DO_NOT_CAPTURE_BLOCK +
-    "Act on whichever of the two dimensions has real signal. If genuinely nothing stands out on "
-    "either, say 'Nothing to save.' and stop — but don't reach for that conclusion as a default."
+    "Act on whichever dimension has a real concrete signal. If genuinely nothing stands out on "
+    "either, say 'Nothing to save.' and stop. Do not create memory or skill updates for weak, "
+    "scoped, or one-off signals."
 )
 
 
@@ -1035,6 +1079,7 @@ def _fork_init_kwargs(agent: Any, rt: dict[str, Any], routed: bool, max_iteratio
         "request_overrides": rt.get("request_overrides") or {}, "parent_session_id": agent.session_id,
         "enabled_toolsets": getattr(agent, "enabled_toolsets", None),
         "disabled_toolsets": getattr(agent, "disabled_toolsets", None), "skip_memory": True,
+        "persist_disabled": True,
     }
     if isinstance(rt.get("max_tokens"), int):
         kwargs["max_tokens"] = rt["max_tokens"]
@@ -1099,6 +1144,13 @@ def build_cache_parity_fork(
     # same-model path), so its turn-start/turn-exit log lines are otherwise
     # indistinguishable from live turns (#118693).
     review_agent._turn_origin = write_origin
+    # ADR-004 Phase 0: systematic guarantee against graph-write leaks. skip_memory=True above
+    # already prevents this fork from BUILDING a memory manager, but the ingest-curator recipe
+    # (and any future variant) rebinds the PARENT's manager onto the fork for memory_search read
+    # access — this flag is what keeps that safe: every sync/ingest/prefetch call site gates on it
+    # (agent.memory_manager.memory_ingest_allowed), so the fork's harness prompt can never reach
+    # the external graph.
+    review_agent._memory_ingest_disabled = True
     review_agent._memory_store = agent._memory_store
     review_agent._memory_enabled = agent._memory_enabled
     review_agent._user_profile_enabled = agent._user_profile_enabled
@@ -1109,7 +1161,7 @@ def build_cache_parity_fork(
     # which the next live turn re-reads as a standing instruction; close() must likewise not
     # finalize the parent's still-active session row. suppress_status_output: fork status/warning
     # emits go via _print_fn/status_callback, which bypass the stdout redirect.
-    review_agent._skip_mcp_refresh = review_agent._persist_disabled = review_agent.suppress_status_output = True
+    review_agent._skip_mcp_refresh = review_agent.suppress_status_output = True  # persist_disabled: at init
     review_agent._end_session_on_close = False
     review_agent._session_db = review_agent.persistence = None
     review_agent.session_id = agent.session_id

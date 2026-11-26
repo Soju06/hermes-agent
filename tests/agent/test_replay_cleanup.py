@@ -128,7 +128,11 @@ def _send(agent, history, idx=None):
         agent, history, current_turn_user_idx=len(history) - 1 if idx is None else idx,
         ext_prefetch_cache="", plugin_user_context="", moa_config=None, active_system_prompt="",
     )
-    return request
+    # Fork (runtime-route-awareness): compose_effective_system_prompt gives every request a
+    # system row carrying the live Runtime/Route State block, even with an empty cached prompt.
+    # This parity test covers the replayed rows only, so drop that row after pinning it.
+    assert request[0]["role"] == "system" and request[0]["content"].startswith("# Runtime/Route State")
+    return request[1:]
 
 
 def test_send_wire_matches_replay_wire_after_db_round_trip(tmp_path):

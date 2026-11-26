@@ -13,7 +13,8 @@ def test_recovery_payload_memory_does_not_scale_with_backlog(
 ) -> None:
     monkeypatch.setattr(shutdown_flush, "_get_flush_dir", lambda: tmp_path)
     content = "x" * (256 * 1024)
-    for seq in range(24):
+
+    def spool(seq: int) -> None:
         shutdown_flush.spool_dropped_transcript_message(
             "sess", {"role": "user", "content": content, "timestamp": seq},
         )
@@ -24,6 +25,14 @@ def test_recovery_payload_memory_does_not_scale_with_backlog(
 
     class Sink:
         messages = Messages()
+
+    # Replay one payload before tracing, so the modules recovery imports lazily are already loaded.
+    # Their import allocations grow with the import graph, not with the backlog, and would otherwise
+    # count against the payload budget below.
+    spool(-1)
+    assert shutdown_flush.recover_pending_to_db(Sink()) == 1
+    for seq in range(24):
+        spool(seq)
 
     tracemalloc.start()
     try:

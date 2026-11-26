@@ -33,6 +33,7 @@
   "dashboard.compute_host_respawn_max",
   "database.journal_size_limit",
   "database.wal_autocheckpoint",
+  "delegation.default_route",
   "delegation.inherit_mcp_toolsets",
   "delegation.max_summary_chars",
   "delegation.subagent_auto_approve",

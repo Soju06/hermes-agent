@@ -46,6 +46,15 @@ class TurnRetryState:
     has_retried_429: bool = False
     # Credit-limited 402 ("can only afford N tokens") already retried with a lowered output cap.
     affordable_402_clamp_attempted: bool = False
+    # Consecutive transport failures that died in under ~2s (connection
+    # refused/reset before any response). A streak means the endpoint is
+    # DOWN, not congested — backoff cannot help within this turn, and a
+    # full max_retries cycle reads as a silent multi-minute stall.
+    fast_transport_failures: int = 0
+    # Wall-clock start of the in-flight transport attempt (stamped by the retry loop
+    # right before the API call; read by the error router to classify the failure as
+    # instant vs. slow). 0.0 = never stamped -> treated as slow (streak resets).
+    attempt_started_at: float = 0.0
     # Persistent 401/403 already escalated to the fallback chain once this attempt.
     auth_failover_attempted: bool = False
     # Post-exhaustion auto-recovery cycles spent on this API call (agent.auto_recovery_cycles caps it).

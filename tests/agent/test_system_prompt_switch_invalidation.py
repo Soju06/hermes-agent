@@ -110,6 +110,9 @@ def _turn_agent(store, model: str, provider: str, prose: str = "") -> MagicMock:
     agent.pass_session_id = False
     agent.session_start = None
     agent._bot_chat_timeless_prompt = False
+    # The fork's audience-persona trailer reads _audience_mode; a MagicMock would fabricate a truthy
+    # value and stamp "AudienceMode: <MagicMock>" into the rebuilt prompt. No persona pack here.
+    agent._audience_mode = ""
     agent._persist_disabled = False
     agent._use_prompt_caching = False
     agent._session_db = agent.persistence = store

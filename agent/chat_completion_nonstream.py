@@ -2,6 +2,7 @@
 
 from agent import chat_completion_helpers as h
 from agent import chat_completion_wait_notice as wn
+from agent import passive_provider_health as _passive_health
 
 
 class _NonStreamRequest:
@@ -316,4 +317,5 @@ class _NonStreamRequest:
         # Success — the provider proved responsive: clear the breaker (#58962).
         if self.result["response"] is not None:
             h._reset_stale_streak(agent)
+            _passive_health.note_provider_success(agent)
         return self.result["response"]

@@ -13,10 +13,12 @@ import logging
 import time
 from typing import Any, Dict, Optional
 
+from agent import turn_trace
 from agent.error_classifier import FailoverReason
 from agent.prompt_cache_lifecycle import start_prompt_cache_warming
 from agent.turn_api_call import stop_thinking_spinner
 from agent.turn_failure_copy import invalid_response_failure_reason, provider_label_for, site_copy, stamp_failure
+from agent.turn_trace_loop import tag_exit
 from agent.turn_truncation import handle_content_policy_refusal, recover_from_truncation
 from agent.turn_usage import record_response_usage
 
@@ -185,7 +187,7 @@ def check_api_response(
             length_continue_retries=length_continue_retries,
             truncated_response_parts=truncated_response_parts,
             truncated_tool_call_retries=truncated_tool_call_retries, retry_count=retry_count,
-            compression_attempts=compression_attempts,
+            compression_attempts=compression_attempts, api_messages=api_messages,
         )
         messages = _tv.messages
         length_continue_retries = _tv.length_continue_retries
@@ -198,6 +200,8 @@ def check_api_response(
 
     # Fold provider usage into compressor / anchors / session counters / state.db
     # (agent/turn_usage.py). A rearmed budget also clears the preflight-block latch.
+    _tt = turn_trace.get_bound(agent)
+    _acct_started = time.time() if _tt is not None else None
     _usage_outcome = record_response_usage(
         agent, response, messages=messages, api_call_count=api_call_count,
         api_duration=api_duration, compression_attempts=compression_attempts,
@@ -207,6 +211,19 @@ def check_api_response(
     if _usage_outcome.rearmed:
         _preflight_compression_blocked = False
         _last_preflight_pressure = None
+    if _acct_started is not None:
+        try:
+            _acct_tags = {}
+            # record_response_usage leaves the canonical usage dict on the agent.
+            _lu = getattr(agent, "_last_turn_usage", None)
+            if (hasattr(response, "usage") and response.usage and isinstance(_lu, dict)
+                    and _lu.get("cache_read_tokens") and _lu.get("prompt_tokens")):
+                _acct_tags["cache_pct"] = round(
+                    100.0 * _lu["cache_read_tokens"] / _lu["prompt_tokens"], 1
+                )
+        except Exception:
+            _acct_tags = {}
+        _tt.add_span("llm.accounting", _acct_started, time.time(), **_acct_tags)
     # Arm a bounded replay (smallest output cap) of THIS request before the clock's guaranteed window
     # ends, so a tool round longer than the TTL does not turn the next request into a full-price cache write.
     start_prompt_cache_warming(agent, api_kwargs, response)
@@ -289,11 +306,18 @@ def retry_invalid_response(
             agent._buffer_diagnostic_status(f"🔄 Codex soft failure ({_soft.reason.value}) — switched to the next pool credential, retrying...")
             return _verdict("continue")
     retry_count += 1
+    # A Codex safety refusal is the same HTTP-200 soft failure: forward its reason so the fallback
+    # records why it activated (``_fallback_reason`` / runtime_state). Content-policy only — a
+    # rate_limit/billing reason would arm the primary cooldown, which this path never did.
+    _fallback_kwargs = (
+        {"reason": FailoverReason.content_policy_blocked}
+        if _soft is not None and _soft.reason == FailoverReason.content_policy_blocked else {}
+    )
 
     # Eager fallback: empty/malformed responses often mean rate limiting.
     if agent._fallback_index < len(agent._fallback_chain):
         agent._buffer_diagnostic_status("⚠️ Empty/malformed response — switching to fallback...")
-    if agent._try_activate_fallback():
+    if agent._try_activate_fallback(**_fallback_kwargs):
         # The buffered status above is dropped once the fallback answers: log the trigger (#152101).
         logger.warning("%sInvalid API response (%s) — switched to fallback", agent.log_prefix, ", ".join(error_details))
         active_system_prompt = _arm_fallback_restart(
@@ -313,7 +337,7 @@ def retry_invalid_response(
     if retry_count >= max_retries:
         if agent._has_pending_fallback():
             agent._buffer_diagnostic_status(f"⚠️ Max retries ({max_retries}) for invalid responses — trying fallback...")
-        if agent._try_activate_fallback():
+        if agent._try_activate_fallback(**_fallback_kwargs):
             active_system_prompt = _arm_fallback_restart(
                 agent, api_messages, active_system_prompt, _retry)
             retry_count = 0
@@ -333,6 +357,7 @@ def retry_invalid_response(
         _final_response = site_copy(
             "invalid_response", label=_label, attempts=max_retries, detail=_failure_hint,
         )
+        tag_exit("invalid_response_retries_exhausted")
         return _verdict("return", stamp_failure({
             "final_response": _final_response,
             "messages": messages,
@@ -356,6 +381,7 @@ def retry_invalid_response(
         activity_label=f"retry backoff ({retry_count}/{max_retries})",
     )
     if _interrupted is not None:
+        tag_exit("interrupted_during_retry_wait")
         return _verdict("return", _interrupted)
     if _retry.restart_with_redirected_messages:
         return _verdict("break")  # rebuild this iteration from the correction

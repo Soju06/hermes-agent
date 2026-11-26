@@ -1,0 +1,21 @@
+{
+  "description": "Switch the agent runtime by selecting a declared route (purpose category). The route picks the provider, model, and reasoning effort from the config-declared catalog with health-checked fallbacks — these are not model inputs. All switches are session-scoped and persist until /new. Global config changes are intentionally unsupported.",
+  "name": "model_switch",
+  "parameters": {
+    "additionalProperties": false,
+    "properties": {
+      "reason": {
+        "description": "Short explanation for why the route switch is needed.",
+        "type": "string"
+      },
+      "route": {
+        "description": "Target route (purpose category) from the declared catalog.",
+        "type": "string"
+      }
+    },
+    "required": [
+      "route"
+    ],
+    "type": "object"
+  }
+}

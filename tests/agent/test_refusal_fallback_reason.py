@@ -1,0 +1,1076 @@
+"""Tests for fallback-activation reason plumbing (refusal-fallback-reason).
+
+When ``_try_activate_fallback()`` swaps to a fallback model, the reason the
+swap happened (e.g. a safety refusal → ``content_policy_blocked``) is recorded
+on ``agent._fallback_reason`` and published to plugins via the
+``runtime_state`` hook.  Capability-gating plugins (skill-gate) use this to
+distinguish a refusal-driven temporary fallback from any other state.
+
+Covers:
+1. The reason is stored on successful activation and stays None otherwise
+2. ``_restore_primary_runtime()`` clears it; the cooldown gate does not
+3. ``get_runtime_state()`` exposes fallback_activated / fallback_reason
+4. The runtime_state hook fires on activation (event="fallback") and
+   restoration (event="restore")
+5. switch_model and the transport-recovery reset clear the reason
+6. The conversation-loop refusal branches forward the reason into
+   ``_try_activate_fallback()`` (the wiring skill-gate depends on)
+"""
+
+import logging
+import time
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+from agent.error_classifier import FailoverReason
+from agent.refusal_fallback import build_refusal_fallback_chain
+from agent.runtime_control import get_runtime_state
+from hermes_constants import FINISH_REASON_LENGTH, PARTIAL_STREAM_STUB_ID
+from run_agent import AIAgent
+
+
+def _make_agent(fallback_model=None):
+    """Create a minimal AIAgent with optional fallback config."""
+    with (
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            fallback_model=fallback_model,
+        )
+        agent.client = MagicMock()
+        return agent
+
+
+def _mock_client(base_url="https://api.example.com/v1", api_key="fb-key"):
+    mock = MagicMock()
+    mock.base_url = base_url
+    mock.api_key = api_key
+    return mock
+
+
+_FB = {"provider": "openai", "model": "gpt-4o"}
+
+
+def _refusal_routes_config(
+    *, enabled=True, api_fallback=True, clean_fork=True, keep_user_turns=5,
+):
+    return {
+        "providers": {
+            "openai": {"base_url": "https://api.openai.com/v1"},
+        },
+        "model_routes": {
+            "health": {"enabled": False},
+            "routes": {
+                "PERMISSIVE_DEV": {
+                    "description": "permissive development runtime",
+                    "provider": "openai",
+                    "model": "gpt-5.6",
+                    "reasoning_effort": "high",
+                },
+                "PERMISSIVE_CHAT": {
+                    "description": "permissive chat runtime",
+                    "provider": "zai",
+                    "model": "glm-4.7",
+                },
+            },
+            "router": {
+                "refusal": {
+                    "enabled": enabled,
+                    "api_fallback": api_fallback,
+                    "clean_fork": clean_fork,
+                    "keep_user_turns": keep_user_turns,
+                    "dev_route": "PERMISSIVE_DEV",
+                    "chat_route": "PERMISSIVE_CHAT",
+                }
+            },
+        }
+    }
+
+
+def _loop_response(
+    content="Recovered on fallback.", finish_reason="stop", tool_calls=None,
+):
+    """Minimal OpenAI-style response for driving run_conversation()."""
+    msg = SimpleNamespace(content=content, tool_calls=tool_calls)
+    choice = SimpleNamespace(index=0, message=msg, finish_reason=finish_reason)
+    return SimpleNamespace(choices=[choice], model="test/model", usage=None)
+
+
+def _anthropic_response(*blocks, stop_reason="end_turn"):
+    return SimpleNamespace(
+        content=list(blocks),
+        stop_reason=stop_reason,
+        model="claude-test",
+        usage=None,
+    )
+
+
+def _enable_test_tool(agent):
+    agent.tools = [{
+        "type": "function",
+        "function": {
+            "name": "terminal",
+            "description": "Run a test command.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }]
+    agent.valid_tool_names = {"terminal"}
+
+
+# ── Reason recorded on activation ─────────────────────────────────────────
+
+
+class TestFallbackReasonRecording:
+    def test_defaults_to_none_at_init(self):
+        agent = _make_agent(fallback_model=[_FB])
+        assert agent._fallback_reason is None
+
+    def test_activation_with_reason_stores_enum_value(self):
+        agent = _make_agent(fallback_model=[_FB])
+        with patch("agent.auxiliary_client.resolve_provider_client",
+                    return_value=(_mock_client(), "gpt-4o")):
+            assert agent._try_activate_fallback(
+                reason=FailoverReason.content_policy_blocked
+            ) is True
+        assert agent._fallback_reason == "content_policy_blocked"
+
+    def test_activation_without_reason_stores_none(self):
+        agent = _make_agent(fallback_model=[_FB])
+        with patch("agent.auxiliary_client.resolve_provider_client",
+                    return_value=(_mock_client(), "gpt-4o")):
+            assert agent._try_activate_fallback() is True
+        assert agent._fallback_activated is True
+        assert agent._fallback_reason is None
+
+    def test_failed_activation_leaves_reason_none(self):
+        """Chain exhaustion (empty chain) must not record a reason."""
+        agent = _make_agent(fallback_model=None)
+        assert agent._try_activate_fallback(
+            reason=FailoverReason.content_policy_blocked
+        ) is False
+        assert agent._fallback_reason is None
+
+    def test_reason_flows_through_chain_skip_recursion(self):
+        """When the first entry is unavailable, the recursive retry must
+        still record the reason at the entry that actually activates."""
+        agent = _make_agent(fallback_model=[
+            {"provider": "broken", "model": "nope"},
+            _FB,
+        ])
+        with patch("agent.auxiliary_client.resolve_provider_client") as mock_rpc:
+            mock_rpc.side_effect = [
+                (None, None),                # broken provider skipped
+                (_mock_client(), "gpt-4o"),  # second entry activates
+            ]
+            assert agent._try_activate_fallback(
+                reason=FailoverReason.content_policy_blocked
+            ) is True
+        assert agent._fallback_reason == "content_policy_blocked"
+
+    def test_reason_survives_second_activation_in_same_turn(self):
+        """Chain-switching mid-turn overwrites with the new reason."""
+        agent = _make_agent(fallback_model=[
+            _FB,
+            {"provider": "zai", "model": "glm-4.7"},
+        ])
+        with patch("agent.auxiliary_client.resolve_provider_client",
+                    return_value=(_mock_client(), "resolved")):
+            agent._try_activate_fallback(reason=FailoverReason.content_policy_blocked)
+            agent._try_activate_fallback(reason=FailoverReason.auth)
+        assert agent._fallback_reason == "auth"
+
+
+# ── API-level refusal route preference ───────────────────────────────────
+
+
+class TestApiRefusalRouteFallback:
+    def _dev_agent(self):
+        agent = _make_agent(fallback_model=[
+            {"provider": "openrouter", "model": "anthropic/claude-opus-4.8"},
+        ])
+        agent.provider = "claude-lb"
+        agent.model = "claude-fable"
+        agent.base_url = "https://claude-lb.example/v1"
+        # Keep primary identity for PERMISSIVE ordering after generic hop.
+        agent._primary_runtime = {
+            "provider": "claude-lb",
+            "model": "claude-fable",
+            "base_url": "https://claude-lb.example/v1",
+        }
+        return agent
+
+    def test_content_policy_uses_generic_before_permissive(self):
+        agent = self._dev_agent()
+        calls = []
+
+        def resolve(provider, model=None, **kwargs):
+            calls.append((provider, model))
+            return _mock_client(), model
+
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value=_refusal_routes_config(),
+            ),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                side_effect=resolve,
+            ),
+        ):
+            assert agent._try_activate_fallback(
+                reason=SimpleNamespace(value="content_policy_blocked")
+            ) is True
+
+        # First hop is still generic fallback_providers (opus), not PERMISSIVE.
+        assert calls == [("openrouter", "anthropic/claude-opus-4.8")]
+        assert agent.provider == "openrouter"
+        assert agent.model == "anthropic/claude-opus-4.8"
+        assert agent._fallback_index == 1
+        assert agent._fallback_reason == "content_policy_blocked"
+
+    def test_repeated_refusals_advance_generic_then_permissive(self):
+        agent = self._dev_agent()
+        calls = []
+
+        def resolve(provider, model=None, **kwargs):
+            calls.append((provider, model))
+            return _mock_client(), model
+
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value=_refusal_routes_config(),
+            ),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                side_effect=resolve,
+            ),
+        ):
+            for expected_provider in ("openrouter", "openai", "zai"):
+                assert agent._try_activate_fallback(
+                    reason=FailoverReason.content_policy_blocked
+                ) is True
+                assert agent.provider == expected_provider
+
+        assert calls == [
+            ("openrouter", "anthropic/claude-opus-4.8"),
+            ("openai", "gpt-5.6"),
+            ("zai", "glm-4.7"),
+        ]
+        # Generic chain exhausted; PERMISSIVE walk advanced past first entry.
+        assert agent._fallback_index == 1
+
+    def test_chat_primary_prefers_permissive_chat_after_generic(self):
+        agent = self._dev_agent()
+        agent.provider = "openrouter"
+        agent.model = "google/gemini-3-flash-preview"
+        agent.base_url = "https://openrouter.ai/api/v1"
+        agent._primary_runtime = {
+            "provider": "openrouter",
+            "model": "google/gemini-3-flash-preview",
+            "base_url": "https://openrouter.ai/api/v1",
+        }
+        agent._fallback_chain = []  # no generic hop available
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value=_refusal_routes_config(),
+            ),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_mock_client(), "glm-4.7"),
+            ) as resolve,
+        ):
+            assert agent._try_activate_fallback(
+                reason=FailoverReason.content_policy_blocked
+            ) is True
+
+        assert resolve.call_args.args == ("zai",)
+        assert agent.provider == "zai"
+
+    def test_route_identity_uses_configured_base_url_for_alias_skip(self):
+        agent = self._dev_agent()
+        agent.provider = "alias-a"
+        agent.model = "shared-model"
+        agent.base_url = "https://shared.example/v1"
+        agent._fallback_chain = []
+        cfg = _refusal_routes_config()
+        cfg["providers"]["alias-b"] = {
+            "base_url": "https://shared.example/v1",
+        }
+        cfg["model_routes"]["routes"]["PERMISSIVE_CHAT"].update({
+            "provider": "alias-b",
+            "model": "shared-model",
+        })
+
+        with (
+            patch("hermes_cli.config.load_config", return_value=cfg),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_mock_client(), "gpt-5.6"),
+            ) as resolve,
+        ):
+            assert agent._try_activate_fallback(
+                reason=FailoverReason.content_policy_blocked
+            ) is True
+
+        assert resolve.call_args.args == ("openai",)
+        assert agent.provider == "openai"
+
+    def test_exhausted_generic_continues_to_permissive(self):
+        agent = self._dev_agent()
+        calls = []
+
+        def resolve(provider, model=None, **kwargs):
+            calls.append((provider, model))
+            if provider == "openrouter":
+                return None, None
+            return _mock_client(), model
+
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value=_refusal_routes_config(),
+            ),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                side_effect=resolve,
+            ),
+        ):
+            assert agent._try_activate_fallback(
+                reason=FailoverReason.content_policy_blocked
+            ) is True
+
+        assert calls == [
+            ("openrouter", "anthropic/claude-opus-4.8"),
+            ("openai", "gpt-5.6"),
+        ]
+        assert agent.provider == "openai"
+        assert agent._fallback_reason == "content_policy_blocked"
+
+    def test_built_refusal_chain_logs_provider_model_pairs(self, caplog):
+        agent = self._dev_agent()
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value=_refusal_routes_config(),
+            ),
+            caplog.at_level(logging.INFO, logger="agent.refusal_fallback"),
+        ):
+            chain = build_refusal_fallback_chain(agent)
+
+        assert chain
+        assert "Refusal fallback chain built:" in caplog.text
+        for entry in chain:
+            assert f"{entry['provider']}/{entry['model']}" in caplog.text
+
+    def test_refusal_chain_collapses_routes_on_the_same_backend(self):
+        agent = self._dev_agent()
+        cfg = _refusal_routes_config()
+        cfg["model_routes"]["routes"]["PERMISSIVE_CHAT"].update({
+            "provider": "openai",
+            "model": "gpt-5.6",
+        })
+        with patch("hermes_cli.config.load_config", return_value=cfg):
+            chain = build_refusal_fallback_chain(agent)
+
+        assert [(e["provider"], e["model"]) for e in chain] == [
+            ("openai", "gpt-5.6"),
+        ]
+
+    def test_refusal_chain_keeps_distinct_backends(self):
+        agent = self._dev_agent()
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value=_refusal_routes_config(),
+        ):
+            chain = build_refusal_fallback_chain(agent)
+
+        assert [(e["provider"], e["model"]) for e in chain] == [
+            ("openai", "gpt-5.6"),
+            ("zai", "glm-4.7"),
+        ]
+
+    def test_empty_refusal_chain_logs_warning(self, caplog):
+        agent = self._dev_agent()
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value=_refusal_routes_config(api_fallback=False),
+            ),
+            caplog.at_level(logging.WARNING, logger="agent.refusal_fallback"),
+        ):
+            assert build_refusal_fallback_chain(agent) == []
+
+        assert "Refusal fallback chain empty:" in caplog.text
+
+    def test_disabled_api_fallback_uses_generic_chain_only(self):
+        agent = self._dev_agent()
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value=_refusal_routes_config(api_fallback=False),
+            ),
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_mock_client(), "anthropic/claude-opus-4.8"),
+            ) as resolve,
+        ):
+            assert agent._try_activate_fallback(
+                reason=FailoverReason.content_policy_blocked
+            ) is True
+
+        assert resolve.call_args.args == ("openrouter",)
+        assert resolve.call_args.kwargs["model"] == "anthropic/claude-opus-4.8"
+
+    def test_non_refusal_reason_ignores_permissive_routes(self):
+        agent = self._dev_agent()
+        with (
+            patch(
+                "hermes_cli.config.load_config",
+                return_value=_refusal_routes_config(),
+            ) as load_config,
+            patch(
+                "agent.auxiliary_client.resolve_provider_client",
+                return_value=(_mock_client(), "anthropic/claude-opus-4.8"),
+            ) as resolve,
+        ):
+            assert agent._try_activate_fallback(reason=FailoverReason.auth) is True
+
+        # The generic activation path may load config for reasoning/api-mode,
+        # but it must not resolve either PERMISSIVE provider.
+        assert load_config.called
+        assert resolve.call_args.args == ("openrouter",)
+        assert resolve.call_args.kwargs["model"] == "anthropic/claude-opus-4.8"
+
+
+# ── restore_primary_runtime lifecycle ─────────────────────────────────────
+
+
+class TestRestoreClearsReason:
+    def _activated_agent(self):
+        agent = _make_agent(fallback_model=[_FB])
+        with patch("agent.auxiliary_client.resolve_provider_client",
+                    return_value=(_mock_client(), "gpt-4o")):
+            assert agent._try_activate_fallback(
+                reason=FailoverReason.content_policy_blocked
+            ) is True
+        return agent
+
+    def test_restore_clears_reason_and_flag(self):
+        agent = self._activated_agent()
+        with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
+            assert agent._restore_primary_runtime() is True
+        assert agent._fallback_activated is False
+        assert agent._fallback_reason is None
+
+    def test_cooldown_early_return_keeps_reason(self):
+        """While the primary is cooling down the agent stays on the fallback,
+        so the reason must survive for plugins to keep honoring it."""
+        agent = self._activated_agent()
+        agent._rate_limited_until = time.monotonic() + 60
+        assert agent._restore_primary_runtime() is False
+        assert agent._fallback_activated is True
+        assert agent._fallback_reason == "content_policy_blocked"
+
+
+# ── get_runtime_state exposure ────────────────────────────────────────────
+
+
+class TestRuntimeStateKeys:
+    def test_state_before_activation(self):
+        agent = _make_agent(fallback_model=[_FB])
+        state = get_runtime_state(agent)
+        assert state["fallback_activated"] is False
+        assert state["fallback_reason"] is None
+
+    def test_state_after_activation(self):
+        agent = _make_agent(fallback_model=[_FB])
+        with patch("agent.auxiliary_client.resolve_provider_client",
+                    return_value=(_mock_client(), "gpt-4o")):
+            agent._try_activate_fallback(reason=FailoverReason.content_policy_blocked)
+        state = get_runtime_state(agent)
+        assert state["fallback_activated"] is True
+        assert state["fallback_reason"] == "content_policy_blocked"
+
+    def test_state_defaults_on_bare_agent(self):
+        """Agents predating the attribute (restored sessions) degrade safely."""
+        class Bare:
+            pass
+        state = get_runtime_state(Bare())
+        assert state["fallback_activated"] is False
+        assert state["fallback_reason"] is None
+
+
+# ── runtime_state hook publication ────────────────────────────────────────
+
+
+def _hook_calls_for_event(mock_hook, event):
+    return [
+        call for call in mock_hook.call_args_list
+        if call.args and call.args[0] == "runtime_state"
+        and call.kwargs.get("event") == event
+    ]
+
+
+class TestRuntimeStateHook:
+    def test_hook_fires_on_activation(self):
+        agent = _make_agent(fallback_model=[_FB])
+        with (
+            patch("agent.auxiliary_client.resolve_provider_client",
+                  return_value=(_mock_client(), "gpt-4o")),
+            patch("hermes_cli.plugins.invoke_hook") as mock_hook,
+        ):
+            assert agent._try_activate_fallback(
+                reason=FailoverReason.content_policy_blocked
+            ) is True
+        calls = _hook_calls_for_event(mock_hook, "fallback")
+        assert len(calls) == 1
+        state = calls[0].kwargs["state"]
+        assert state["fallback_activated"] is True
+        assert state["fallback_reason"] == "content_policy_blocked"
+        assert state["model"] == "gpt-4o"
+
+    def test_hook_failure_does_not_break_activation(self):
+        agent = _make_agent(fallback_model=[_FB])
+        with (
+            patch("agent.auxiliary_client.resolve_provider_client",
+                  return_value=(_mock_client(), "gpt-4o")),
+            patch("hermes_cli.plugins.invoke_hook",
+                  side_effect=RuntimeError("plugin exploded")),
+        ):
+            assert agent._try_activate_fallback(
+                reason=FailoverReason.content_policy_blocked
+            ) is True
+        assert agent._fallback_activated is True
+
+    def test_hook_fires_on_restore(self):
+        agent = _make_agent(fallback_model=[_FB])
+        with patch("agent.auxiliary_client.resolve_provider_client",
+                    return_value=(_mock_client(), "gpt-4o")):
+            agent._try_activate_fallback(reason=FailoverReason.content_policy_blocked)
+        with (
+            patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()),
+            patch("hermes_cli.plugins.invoke_hook") as mock_hook,
+        ):
+            assert agent._restore_primary_runtime() is True
+        calls = _hook_calls_for_event(mock_hook, "restore")
+        assert len(calls) == 1
+        state = calls[0].kwargs["state"]
+        assert state["fallback_activated"] is False
+        assert state["fallback_reason"] is None
+
+    def test_no_fallback_event_when_activation_fails(self):
+        agent = _make_agent(fallback_model=None)
+        with patch("hermes_cli.plugins.invoke_hook") as mock_hook:
+            assert agent._try_activate_fallback() is False
+        assert _hook_calls_for_event(mock_hook, "fallback") == []
+
+
+# ── Other reset paths ─────────────────────────────────────────────────────
+
+
+class TestOtherResetPaths:
+    def test_switch_model_clears_reason(self):
+        """A deliberate primary switch resets all fallback state."""
+        agent = _make_agent(fallback_model=[_FB])
+        with patch("agent.auxiliary_client.resolve_provider_client",
+                    return_value=(_mock_client(), "gpt-4o")):
+            agent._try_activate_fallback(reason=FailoverReason.content_policy_blocked)
+        assert agent._fallback_reason == "content_policy_blocked"
+        with (
+            patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()),
+            patch("hermes_cli.timeouts.get_provider_request_timeout", return_value=None),
+        ):
+            agent.switch_model(
+                new_model="glm-4.7",
+                new_provider="zai",
+                api_key="zai-key",
+                base_url="https://api.z.ai/v1",
+                api_mode="chat_completions",
+            )
+        assert agent._fallback_activated is False
+        assert agent._fallback_reason is None
+
+    def test_transport_recovery_reset_clears_reason(self):
+        """The transport-recovery reset lives inline in run_conversation's
+        retry loop; drive retry exhaustion into a (mocked) successful
+        primary-transport recovery and assert the reset clears
+        _fallback_reason alongside _fallback_activated.  The cleared reason
+        is stale pre-recovery bookkeeping — _try_recover_primary_transport
+        refuses while a fallback is actually live — so seed a recorded reason
+        with no activation and no fallback chain."""
+
+        class ReadTimeout(Exception):
+            pass
+
+        # No fallback chain: this test exercises primary transport recovery,
+        # and must not become order-sensitive if another setup path reopens a
+        # previously exhausted chain index.
+        agent = _make_agent(fallback_model=None)
+        agent._api_max_retries = 2
+        agent._fallback_reason = "content_policy_blocked"
+
+        responses = [
+            ReadTimeout("read timed out"),
+            ReadTimeout("read timed out"),
+            _loop_response("Recovered on rebuilt primary."),
+        ]
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=responses),
+            patch.object(agent, "_try_recover_primary_transport", return_value=True),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("agent.agent_runtime_helpers.time.sleep"),
+            patch("agent.model_metadata.get_model_context_length", return_value=200000),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["final_response"] == "Recovered on rebuilt primary."
+        assert agent._fallback_activated is False
+        assert agent._fallback_reason is None
+
+    def test_voice_turn_route_end_discards_reason_with_the_fallback(self, tmp_path, monkeypatch):
+        """A fallback activated inside a voice turn is discarded when the voice route ends
+        (``_fallback_activated`` returns to its pre-voice value); its reason must go with it,
+        or the next turn publishes a refusal fallback that is no longer live."""
+        from agent.voice_turn_route import begin_voice_turn_route, end_voice_turn_route
+        from tests.fakes.fake_llm_provider import FakeLLMServer, write_hermes_home
+
+        with FakeLLMServer([]) as main, FakeLLMServer([]) as voice, FakeLLMServer([]) as fb:
+            home = write_hermes_home(tmp_path / ".hermes", main.base_url, extra_config=(
+                "auxiliary:\n  voice_chat:\n    provider: custom\n"
+                f"    base_url: {voice.base_url}\n    model: voice-model\n    api_key: sk-fake-voice\n"
+            ))
+            monkeypatch.setenv("HERMES_HOME", str(home))
+            agent = AIAgent(
+                model="fake-model", provider="custom", base_url=main.base_url, api_key="sk-fake-e2e",
+                quiet_mode=True, skip_context_files=True, skip_memory=True, enabled_toolsets=["memory"],
+                fallback_model={"provider": "custom", "model": "fb-model", "base_url": fb.base_url,
+                                "api_key": "sk-fake-fb"},
+            )
+            agent._voice_turn_pending = True
+            begin_voice_turn_route(agent, [{"role": "user", "content": "hi"}], "system")
+            assert agent.model == "voice-model"
+            assert agent._try_activate_fallback(reason=FailoverReason.content_policy_blocked) is True
+            assert (agent.model, agent._fallback_reason) == ("fb-model", "content_policy_blocked")
+            end_voice_turn_route(agent)
+        assert agent.model == "fake-model"
+        assert agent._fallback_activated is False
+        assert agent._fallback_reason is None
+        assert get_runtime_state(agent)["fallback_reason"] is None
+
+    def test_runtime_snapshot_roundtrip_carries_reason(self):
+        """snapshot_runtime/restore_runtime must copy the reason with the flag."""
+        from agent.runtime_control import restore_runtime, snapshot_runtime
+
+        agent = _make_agent(fallback_model=[_FB])
+        with patch("agent.auxiliary_client.resolve_provider_client",
+                    return_value=(_mock_client(), "gpt-4o")):
+            agent._try_activate_fallback(reason=FailoverReason.content_policy_blocked)
+        snapshot = snapshot_runtime(agent)
+        assert snapshot["fallback_reason"] == "content_policy_blocked"
+
+        agent._fallback_reason = None
+        agent._fallback_activated = False
+        with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
+            restore_runtime(agent, snapshot)
+        assert agent._fallback_activated is True
+        assert agent._fallback_reason == "content_policy_blocked"
+
+
+# ── Conversation-loop call sites forward the reason ───────────────────────
+
+
+class TestLoopCallSitesForwardReason:
+    """Drive run_conversation() through each refusal branch and assert the
+    call site forwards the reason into ``_try_activate_fallback()``.  This
+    is the linchpin wiring for skill-gate's refusal-fallback exemption: if
+    a rebase or refactor drops the kwarg, the reason stays None and the
+    exemption goes permanently dead with no other test failing."""
+
+    def _run(self, agent, responses):
+        """Run one turn with ``_interruptible_api_call`` staged and a spy
+        wrapping the real ``_try_activate_fallback`` (activation succeeds
+        via the patched provider resolver)."""
+        real_activate = agent._try_activate_fallback
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=responses),
+            patch.object(agent, "_try_activate_fallback",
+                         side_effect=real_activate) as spy,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()),
+            patch("agent.agent_runtime_helpers.time.sleep"),
+            patch("agent.auxiliary_client.resolve_provider_client",
+                  return_value=(_mock_client(), "gpt-4o")),
+            patch("agent.model_metadata.get_model_context_length",
+                  return_value=200000),
+        ):
+            result = agent.run_conversation("hello")
+        return result, spy
+
+    def test_http200_content_filter_branch_forwards_reason(self):
+        """HTTP-200 refusal (finish_reason="content_filter") must activate
+        the fallback with reason=content_policy_blocked."""
+        agent = _make_agent(fallback_model=[_FB])
+        refusal = _loop_response(content="", finish_reason="content_filter")
+        result, spy = self._run(agent, [refusal, _loop_response()])
+        assert result["final_response"] == "Recovered on fallback."
+        assert spy.call_count == 1
+        assert spy.call_args.kwargs["reason"] is FailoverReason.content_policy_blocked
+        assert agent._fallback_reason == "content_policy_blocked"
+
+    def test_http200_refusal_hop_preserves_retry_request_history(self, caplog):
+        agent = _make_agent(fallback_model=[_FB])
+        requests = []
+        responses = iter([
+            _loop_response(content="I cannot help.", finish_reason="content_filter"),
+            _loop_response("Recovered without refusal framing."),
+        ])
+
+        def call(api_kwargs):
+            requests.append([dict(message) for message in api_kwargs["messages"]])
+            return next(responses)
+
+        history = [
+            {"role": "user", "content": "earlier request"},
+            {"role": "assistant", "content": "I can't help with that."},
+        ]
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=call),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()),
+            patch("agent.agent_runtime_helpers.time.sleep"),
+            patch("agent.auxiliary_client.resolve_provider_client",
+                  return_value=(_mock_client(), "gpt-4o")),
+            patch("agent.model_metadata.get_model_context_length",
+                  return_value=200000),
+            caplog.at_level(logging.INFO, logger="agent.refusal_history"),
+        ):
+            result = agent.run_conversation(
+                "latest request",
+                conversation_history=history,
+            )
+
+        assert result["final_response"] == "Recovered without refusal framing."
+        assert len(requests) == 2
+        assert any(
+            message.get("content") == "I can't help with that."
+            for message in requests[0]
+        )
+        assert any(
+            message.get("content") == "I can't help with that."
+            for message in requests[1]
+        )
+        assert any(
+            message.get("content") == "I can't help with that."
+            for message in result["messages"]
+        )
+        assert agent._refusal_clean_fork_active is False
+        assert "source=provider_output_filter" in caplog.text
+        assert "apply=False" in caplog.text
+
+    def test_anthropic_refusal_after_tool_result_preserves_incident_context(
+        self, caplog,
+    ):
+        """2026-08-19 incident: Anthropic refusal after active tool work
+        must fallback without dropping the tool call/result from its input."""
+        fallback = {
+            "provider": "anthropic",
+            "model": "claude-opus-5",
+            "api_mode": "anthropic_messages",
+        }
+        agent = _make_agent(fallback_model=[fallback])
+        agent.api_mode = "anthropic_messages"
+        agent.provider = "anthropic"
+        _enable_test_tool(agent)
+        requests = []
+        responses = iter([
+            _anthropic_response(
+                SimpleNamespace(
+                    type="tool_use",
+                    id="call-incident",
+                    name="terminal",
+                    input={"command": "inspect-progress"},
+                ),
+                stop_reason="tool_use",
+            ),
+            _anthropic_response(stop_reason="refusal"),
+            _anthropic_response(
+                SimpleNamespace(
+                    type="text", text="Recovered with preserved tool context."
+                ),
+            ),
+        ])
+
+        def call(api_kwargs):
+            requests.append(api_kwargs["messages"])
+            return next(responses)
+
+        def activate(reason=None):
+            agent._fallback_index = len(agent._fallback_chain)
+            agent._fallback_activated = True
+            agent._fallback_reason = getattr(reason, "value", reason)
+            agent.model = "claude-opus-5"
+            return True
+
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=call),
+            patch.object(agent, "_try_activate_fallback", side_effect=activate),
+            patch("model_tools.handle_function_call",
+                  return_value="incident tool result: scope already inspected"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()),
+            patch("agent.agent_runtime_helpers.time.sleep"),
+            patch("agent.model_metadata.get_model_context_length",
+                  return_value=200000),
+            caplog.at_level(logging.INFO, logger="agent.refusal_history"),
+        ):
+            result = agent.run_conversation("continue the in-progress work")
+
+        assert result["final_response"] == "Recovered with preserved tool context."
+        assert len(requests) == 3
+        fallback_input = repr(requests[-1])
+        assert "call-incident" in fallback_input
+        assert "incident tool result: scope already inspected" in fallback_input
+        assert agent._fallback_reason == "content_policy_blocked"
+        assert agent._refusal_clean_fork_active is False
+        assert "source=api_structured_refusal" in caplog.text
+        assert "apply=False" in caplog.text
+
+    def test_http200_refusal_hop_respects_clean_fork_disabled(self):
+        agent = _make_agent(fallback_model=[_FB])
+        requests = []
+        responses = iter([
+            _loop_response(content="", finish_reason="content_filter"),
+            _loop_response(),
+        ])
+
+        def call(api_kwargs):
+            requests.append([dict(message) for message in api_kwargs["messages"]])
+            return next(responses)
+
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=call),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()),
+            patch("agent.agent_runtime_helpers.time.sleep"),
+            patch("hermes_cli.config.load_config",
+                  return_value=_refusal_routes_config(clean_fork=False)),
+            patch("agent.auxiliary_client.resolve_provider_client",
+                  return_value=(_mock_client(), "gpt-4o")),
+            patch("agent.model_metadata.get_model_context_length",
+                  return_value=200000),
+        ):
+            result = agent.run_conversation(
+                "latest request",
+                conversation_history=[
+                    {"role": "user", "content": "earlier request"},
+                    {"role": "assistant", "content": "refusal text"},
+                ],
+            )
+
+        assert result["final_response"] == "Recovered on fallback."
+        assert any(
+            message.get("content") == "refusal text"
+            for message in requests[1]
+        )
+        assert agent._refusal_clean_fork_active is False
+
+    def test_midstream_content_filter_stub_forwards_reason(self):
+        """A content-filter-terminated partial-stream stub (#32421) must
+        activate the fallback with reason=content_policy_blocked."""
+        agent = _make_agent(fallback_model=[_FB])
+        stub = SimpleNamespace(
+            id=PARTIAL_STREAM_STUB_ID,
+            model="test/model",
+            choices=[SimpleNamespace(
+                index=0,
+                message=SimpleNamespace(content="partial ", tool_calls=None),
+                finish_reason=FINISH_REASON_LENGTH,
+            )],
+            usage=None,
+            _content_filter_terminated=True,
+        )
+        result, spy = self._run(agent, [stub, _loop_response()])
+        assert result["final_response"] == "Recovered on fallback."
+        assert spy.call_count == 1
+        assert spy.call_args.kwargs["reason"] is FailoverReason.content_policy_blocked
+        assert agent._fallback_reason == "content_policy_blocked"
+
+    def test_midstream_filter_preserves_current_tool_result(self, caplog):
+        agent = _make_agent(fallback_model=[_FB])
+        _enable_test_tool(agent)
+        requests = []
+        tool_call = SimpleNamespace(
+            id="call-stream",
+            type="function",
+            function=SimpleNamespace(name="terminal", arguments="{}"),
+        )
+        stub = SimpleNamespace(
+            id=PARTIAL_STREAM_STUB_ID,
+            model="test/model",
+            choices=[SimpleNamespace(
+                index=0,
+                message=SimpleNamespace(content="", tool_calls=None),
+                finish_reason=FINISH_REASON_LENGTH,
+            )],
+            usage=None,
+            _content_filter_terminated=True,
+        )
+        responses = iter([
+            _loop_response("", "tool_calls", [tool_call]),
+            stub,
+            _loop_response("Recovered after stream filter."),
+        ])
+
+        def call(api_kwargs):
+            requests.append([dict(message) for message in api_kwargs["messages"]])
+            return next(responses)
+
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=call),
+            patch("model_tools.handle_function_call",
+                  return_value="stream filter tool result"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()),
+            patch("agent.agent_runtime_helpers.time.sleep"),
+            patch("agent.auxiliary_client.resolve_provider_client",
+                  return_value=(_mock_client(), "gpt-4o")),
+            patch("agent.model_metadata.get_model_context_length",
+                  return_value=200000),
+            caplog.at_level(logging.INFO, logger="agent.refusal_history"),
+        ):
+            result = agent.run_conversation("continue with tools")
+
+        assert result["final_response"] == "Recovered after stream filter."
+        assert "stream filter tool result" in repr(requests[-1])
+        assert agent._refusal_clean_fork_active is False
+        assert "source=stream_filter_error" in caplog.text
+        assert "apply=False" in caplog.text
+
+    def test_nonretryable_refusal_exception_forwards_classified_reason(self):
+        """A status-less safety refusal raised as an exception (#18028
+        shape) must reach the is_client_error branch and forward
+        classified.reason into the activation."""
+        agent = _make_agent(fallback_model=[_FB])
+        refusal_exc = Exception(
+            "This content was flagged for possible cybersecurity risk."
+        )
+        result, spy = self._run(agent, [refusal_exc, _loop_response()])
+        assert result["final_response"] == "Recovered on fallback."
+        assert spy.call_count == 1
+        assert spy.call_args.kwargs["reason"] is FailoverReason.content_policy_blocked
+        assert agent._fallback_reason == "content_policy_blocked"
+
+    @staticmethod
+    def _as_codex_primary(agent):
+        """Reshape the agent onto a ChatGPT Codex (Responses API) primary."""
+        agent.api_mode = "codex_responses"
+        agent.provider = "openai-codex"
+        agent.base_url = "https://chatgpt.com/backend-api/codex"
+        agent._base_url_lower = agent.base_url.lower()
+        agent._base_url_hostname = "chatgpt.com"
+        agent.model = "gpt-5.5"
+
+    @staticmethod
+    def _codex_soft_failure(code, message):
+        """Codex HTTP-200 ``status=failed`` Response: the SDK never raises on it."""
+        return SimpleNamespace(
+            status="failed", output=[], output_text="", model="gpt-5.5", usage=None,
+            incomplete_details=None, error=SimpleNamespace(code=code, message=message),
+        )
+
+    def test_codex_soft_failure_safety_refusal_forwards_reason(self):
+        """A Codex safety refusal delivered as HTTP-200 ``status=failed`` goes through
+        retry_invalid_response's eager fallback, not the content_filter branch; it must
+        still activate the fallback with reason=content_policy_blocked."""
+        agent = _make_agent(fallback_model=[_FB])
+        self._as_codex_primary(agent)
+        refusal = self._codex_soft_failure(
+            "content_policy_violation",
+            "This content was flagged for possible cybersecurity risk.",
+        )
+        result, spy = self._run(agent, [refusal, _loop_response()])
+        assert result["final_response"] == "Recovered on fallback."
+        assert spy.call_count == 1
+        assert spy.call_args.kwargs["reason"] is FailoverReason.content_policy_blocked
+        assert agent._fallback_reason == "content_policy_blocked"
+
+    def test_codex_soft_failure_non_refusal_keeps_bare_activation(self):
+        """Only the content-policy reason is forwarded from that path: a rate-limit soft
+        failure must not reach _try_activate_fallback as reason=rate_limit (that would arm
+        the primary cooldown), and records no reason."""
+        agent = _make_agent(fallback_model=[_FB])
+        self._as_codex_primary(agent)
+        throttled = self._codex_soft_failure(
+            "rate_limit_exceeded", "Rate limit reached, please try again later",
+        )
+        result, spy = self._run(agent, [throttled, _loop_response()])
+        assert result["final_response"] == "Recovered on fallback."
+        assert spy.call_count == 1
+        assert spy.call_args.kwargs == {}
+        assert agent._fallback_reason is None
+
+    def test_exception_content_policy_preserves_current_tool_result(self, caplog):
+        agent = _make_agent(fallback_model=[_FB])
+        _enable_test_tool(agent)
+        requests = []
+        tool_call = SimpleNamespace(
+            id="call-exception",
+            type="function",
+            function=SimpleNamespace(name="terminal", arguments="{}"),
+        )
+        responses = iter([
+            _loop_response("", "tool_calls", [tool_call]),
+            Exception("This content was flagged for possible cybersecurity risk."),
+            _loop_response("Recovered after exception policy block."),
+        ])
+
+        def call(api_kwargs):
+            requests.append([dict(message) for message in api_kwargs["messages"]])
+            response = next(responses)
+            if isinstance(response, Exception):
+                raise response
+            return response
+
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=call),
+            patch("model_tools.handle_function_call",
+                  return_value="exception policy tool result"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()),
+            patch("agent.agent_runtime_helpers.time.sleep"),
+            patch("agent.auxiliary_client.resolve_provider_client",
+                  return_value=(_mock_client(), "gpt-4o")),
+            patch("agent.model_metadata.get_model_context_length",
+                  return_value=200000),
+            caplog.at_level(logging.INFO, logger="agent.refusal_history"),
+        ):
+            result = agent.run_conversation("continue with tools")
+
+        assert result["final_response"] == "Recovered after exception policy block."
+        assert "exception policy tool result" in repr(requests[-1])
+        assert agent._refusal_clean_fork_active is False
+        assert "source=exception_content_policy" in caplog.text
+        assert "apply=False" in caplog.text

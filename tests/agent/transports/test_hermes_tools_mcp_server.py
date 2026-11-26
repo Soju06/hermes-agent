@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import inspect
 
+import pytest
+
 from agent.transports.hermes_tools_mcp_server import (
     _signature_from_schema,
 )
@@ -137,3 +139,36 @@ class TestMain:
         monkeypatch.setattr(m, "_build_server", lambda: CrashingServer())
         rc = m.main([])
         assert rc == 1
+
+
+class TestDisabledToolsetsHonored:
+    """agent.disabled_toolsets reaches the sidecar's exposed surface (per-tool-disable patch).
+
+    Real build against the temp HERMES_HOME config: a tool turned off by name must not be
+    re-exposed on Codex-routed turns, in every config form the other surfaces accept.
+    """
+
+    @staticmethod
+    def _exposed_names():
+        import asyncio
+
+        pytest.importorskip("mcp.server")
+        from agent.transports.hermes_tools_mcp_server import _build_server
+
+        return {tool.name for tool in asyncio.run(_build_server().list_tools())}
+
+    @pytest.mark.parametrize(
+        "value",
+        ['["skill_view"]', "skill_view", "\"['skill_view']\""],
+        ids=["list", "bare-name", "json-array-string"],
+    )
+    def test_disabled_tool_is_not_exposed(self, value):
+        from hermes_constants import get_hermes_home
+
+        assert "skill_view" in self._exposed_names(), "precondition: skill_view exposed by default"
+        (get_hermes_home() / "config.yaml").write_text(
+            f"agent:\n  disabled_toolsets: {value}\n", encoding="utf-8"
+        )
+        exposed = self._exposed_names()
+        assert "skill_view" not in exposed
+        assert "skills_list" in exposed, "only the disabled tool leaves the surface"

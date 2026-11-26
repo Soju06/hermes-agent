@@ -14,6 +14,7 @@ cached prefix on every call. Only the known last-turn-only generations
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any
 
@@ -25,7 +26,10 @@ from agent.anthropic_endpoints import (
     _is_nous_portal_endpoint,
     _is_third_party_anthropic_endpoint,
     _model_name_is_deepseek_thinking,
+    _normalized_lower,
 )
+
+logger = logging.getLogger(__name__)
 
 
 _CLAUDE_VERSION_RE = re.compile(
@@ -67,8 +71,61 @@ def model_preserves_prior_thinking(model: Any) -> bool:
 SIGNED_REPLAY_ROUTES = frozenset({"native", "minimax"})
 
 
+# hermes_home_key() -> normalized base URLs of the providers that profile flags
+# ``anthropic_signature_passthrough``. One process serves many profiles, so never one global set.
+_signature_passthrough_urls_cache: dict[str, frozenset[str]] = {}
+
+
+def _read_signature_passthrough_urls() -> frozenset[str]:
+    from hermes_cli.config_backend import ConfigBackendUnavailable
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        providers = load_config_readonly().get("providers") or {}
+        entries = providers.values() if isinstance(providers, dict) else ()
+        return frozenset(
+            url for pcfg in entries
+            if isinstance(pcfg, dict) and pcfg.get("anthropic_signature_passthrough")
+            and (url := _normalized_lower(pcfg.get("base_url")))
+        )
+    # A refused backend read is a SystemExit subclass: it must not end the turn that asked for a route.
+    except (Exception, ConfigBackendUnavailable):  # health: allow BLE001 -- an unreadable config trusts no endpoint (fails closed)
+        logger.debug("signature-passthrough config read failed", exc_info=True)
+        return frozenset()
+
+
+def _get_signature_passthrough_urls() -> frozenset[str]:
+    """Base URLs of Anthropic passthrough proxies that preserve thinking signatures.
+
+    A provider opts in with ``anthropic_signature_passthrough: true`` under ``providers.<name>`` in
+    ``config.yaml``, read through the config loader (``load_config_readonly``). The flag
+    asserts that the endpoint forwards message content blocks to real Anthropic verbatim (no
+    reordering, merging or block mutation), so thinking signatures generated through it validate on
+    replay. Read once per profile home: provider base URLs are static for the process lifetime.
+    """
+    from hermes_constants import hermes_home_key
+
+    home_key = hermes_home_key()
+    urls = _signature_passthrough_urls_cache.get(home_key)
+    if urls is None:
+        urls = _signature_passthrough_urls_cache[home_key] = _read_signature_passthrough_urls()
+    return urls
+
+
+def _is_signature_passthrough_endpoint(base_url: Any) -> bool:
+    """True when ``base_url`` belongs to a provider flagged ``anthropic_signature_passthrough``: it takes
+    the ``native`` replay contract although :func:`_is_third_party_anthropic_endpoint` classifies it as
+    third-party for auth purposes."""
+    normalized = _normalized_lower(base_url)
+    return bool(normalized) and normalized in _get_signature_passthrough_urls()
+
+
 def _is_off_anthropic(base_url: Any) -> bool:
-    return _is_third_party_anthropic_endpoint(base_url) and not _is_nous_portal_endpoint(base_url)
+    return (
+        _is_third_party_anthropic_endpoint(base_url)
+        and not _is_nous_portal_endpoint(base_url)
+        and not _is_signature_passthrough_endpoint(base_url)
+    )
 
 
 # First match wins; an unmatched relay host is ``third_party``. DeepSeek models never sign, so they keep
@@ -85,9 +142,10 @@ _ROUTE_RULES = (
 def anthropic_thinking_route(base_url: Any, model: Any) -> str:
     """Which thinking-replay contract an Anthropic Messages request follows: ``kimi`` (replay as-is),
     ``deepseek`` (unsigned only), ``native`` (Anthropic-signed blocks: the direct API, Nous Portal,
-    Bedrock, Vertex AI, Azure AI Foundry), ``minimax`` (its own signed blocks, returned unchanged on
-    every turn as its docs require) or ``third_party`` (an unknown relay that cannot verify Anthropic
-    signatures: strip all). The converter, accounting and signature-rejection state share this."""
+    Bedrock, Vertex AI, Azure AI Foundry, a provider flagged ``anthropic_signature_passthrough``),
+    ``minimax`` (its own signed blocks, returned unchanged on every turn as its docs require) or
+    ``third_party`` (an unknown relay that cannot verify Anthropic signatures: strip all). The
+    converter, accounting and signature-rejection state share this."""
     return next((route for route, matches in _ROUTE_RULES if matches(base_url, model)), "third_party")
 
 

@@ -46,7 +46,7 @@ def runtime_command(repo_root: Path, args=(), *, module: str = "hermes_cli.main"
     No selected generation or ambient PYTHONPATH is captured in the command.
     """
     root = Path(repo_root).resolve()
-    python = python or resolve_store_python(root) or Path(sys.executable)
+    python = python or service_python(root)
     entry = f"exec({_inline_string_literal(code)})" if code is not None else (
         f"runpy.run_module({_inline_string_literal(module)}, run_name='__main__', alter_sys=True)")
     # A literal home is pinned up front; the default one needs ``hermes_constants`` from the
@@ -98,6 +98,9 @@ def installation_command(repo_root: Path, args=(), *, module: str = "hermes_cli.
         return [str(sealed), *prefix, *args]
     if resolve_store_python(root) is None:
         return runtime_command(root, args, module=module, python=python, home=home)
+    if external_runtime(root):
+        # A store Python beside an externally built tree holds no dependency generation of ours.
+        return [str(python or service_python(root)), "-m", module, *args]
     return [str(root / ".hermes" / "bin" / "hermes"), *prefix, *args]
 
 
@@ -119,8 +122,30 @@ def sealed_service_launcher(repo_root: Path) -> Path | None:
 
 def publishes_service_launcher(repo_root: Path) -> bool:
     """Whether service definitions run a store launcher this install must publish first."""
-    return (sealed_service_launcher(repo_root) is None
+    return (sealed_service_launcher(repo_root) is None and not external_runtime(repo_root)
             and resolve_store_python(repo_root, publication=True) is not None)
+
+
+def external_runtime(repo_root: Path) -> bool:
+    """The tree's stamp hands its runtime to an external owner (Nix, Docker, a fork's own venv)."""
+    from hermes_cli.steward import read_install_stamp
+
+    return read_install_stamp(Path(repo_root)).get("updateMechanism") == "external"
+
+
+def service_python(repo_root: Path) -> Path:
+    """The interpreter a persisted or detached command runs: the running one for an external tree,
+    which owns its environment (a store Python beside it has no generation of it), else PM's store."""
+    if external_runtime(repo_root):
+        return Path(sys.executable)
+    return resolve_store_python(repo_root) or Path(sys.executable)
+
+
+def service_venv(repo_root: Path) -> Path | None:
+    """The virtualenv an external tree's service keeps on PATH and in VIRTUAL_ENV (the running one)."""
+    if external_runtime(repo_root) and sys.prefix != sys.base_prefix:
+        return Path(sys.prefix)
+    return None
 
 
 #: Launcher command names — keep in lockstep with scripts/install.ps1
@@ -919,13 +944,11 @@ def expose_cli(project_root: Path | None = None, *, create: bool = True) -> dict
         cli_cfg = (load_config() or {}).get("cli", {})
         if isinstance(cli_cfg, dict) and not cli_cfg.get("expose_on_path", True):
             return {"ok": True, "skipped": "config-disabled"}
-    from hermes_cli.steward import read_install_stamp
-
     if _is_bundled_payload(root):
         if create and sys.platform == "darwin":
             return _symlink_sealed_launchers(root.parent / "bin")
         return {"ok": True, "skipped": "bundle-owns-launchers"}
-    if read_install_stamp(root).get("updateMechanism") == "external":
+    if external_runtime(root):
         return {"ok": True, "skipped": "externally-owned"}
     if resolve_store_python(root, publication=True) is None:
         return {"ok": True, "skipped": "no-store-python"}

@@ -297,6 +297,11 @@ def _tool_defs_cache_key(
     )
 
 
+def _is_tool_entry(name: str) -> bool:
+    """Whether a ``disabled_toolsets`` entry names one registered tool, not a toolset or legacy name."""
+    return not validate_toolset(name) and name not in _LEGACY_TOOLSET_MAP and registry.get_entry(name) is not None
+
+
 def _apply_toolset_selection(tools: set, names: list[str], quiet_mode: bool, *, disable: bool) -> None:
     """Add (or subtract) every toolset in *names* to/from *tools*, printing the selection unless quiet."""
     from toolsets import bundle_non_core_tools, get_toolset
@@ -321,9 +326,24 @@ def _apply_toolset_selection(tools: set, names: list[str], quiet_mode: bool, *, 
         elif name in _LEGACY_TOOLSET_MAP:
             label = f"{verb} legacy toolset"
             resolved = _LEGACY_TOOLSET_MAP[name]
+        elif disable and _is_tool_entry(name):
+            # Not a toolset — but a registered tool name. Subtract the single
+            # tool. This lets `disabled_toolsets` turn off an individual tool
+            # (e.g. `text_to_speech`, a browser action) without having to own
+            # a one-tool toolset. Toolset names are matched first above, so a
+            # name that is BOTH a toolset and a tool (e.g. `memory`, `terminal`)
+            # always resolves as the toolset; disable such a tool by its
+            # toolset. Because every surface (CLI, gateway, cron, delegate
+            # children, the tool_search bridge scope) already threads
+            # `disabled_toolsets` through this one choke point, a tool
+            # disabled here can never be resurrected by tool_search.
+            tools.discard(name)
+            if not quiet_mode:
+                print(f"🚫 Disabled tool '{name}'")
+            continue
         else:
             if not quiet_mode:
-                print(f"⚠️  Unknown toolset: {name}")
+                print(f"⚠️  Unknown toolset or tool: {name}" if disable else f"⚠️  Unknown toolset: {name}")
             continue
         (tools.difference_update if disable else tools.update)(resolved)
         if not quiet_mode:
@@ -629,7 +649,7 @@ def _resolve_active_context_length() -> int:
 # =============================================================================
 
 # Intercepted by the agent loop (need agent-level state); dispatch returns a stub error.
-_AGENT_LOOP_TOOLS = {"todo_list", "memory", "session_search", "delegate_task"}
+_AGENT_LOOP_TOOLS = {"todo_list", "memory", "session_search", "delegate_task", "model_status", "model_switch"}
 
 # Legacy tool-name aliases accepted at every dispatch seam (old sessions/saved
 # prompts keep working); schemas advertise only new names.

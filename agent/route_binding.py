@@ -185,3 +185,4 @@ def reinstall_primary_runtime(
     agent._fallback_activated = False
     agent._fallback_index = 0
     agent._rate_limit_backoff_count = 0
+    agent._fallback_reason = None

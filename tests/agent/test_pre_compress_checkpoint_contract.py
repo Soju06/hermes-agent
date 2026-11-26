@@ -615,3 +615,30 @@ def test_persistence_isolated_fork_skips_the_checkpoint_gate_but_durable_agents_
     durable = SimpleNamespace(_persist_disabled=False, _session_db=None, _memory_manager=None)
     with pytest.raises(CompressionCheckpointUnavailable):
         _pre_compress_memory_context(durable, messages, True)
+
+
+def test_review_fork_is_built_detached_so_only_durable_agents_warn(tmp_path, monkeypatch, caplog):
+    """A background-review fork owns no durable memory, so its compression skips the checkpoint and
+    its construction must not warn that compression will fail closed. That warning fired on every
+    review turn after v0.22.5: the fork was detached only after the constructor had warned. A parent
+    with persistence and no capable provider still warns and still fails closed."""
+    from agent.background_review import build_cache_parity_fork
+    from run_agent import AIAgent
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text("compression:\n  checkpoint_required: true\n", encoding="utf-8")
+    messages = [{"role": "user", "content": "evidence"}]
+    with caplog.at_level(logging.WARNING, logger="agent.conversation_compression"):
+        parent = AIAgent(model="fixture/model", provider="custom", base_url="http://127.0.0.1:9/v1",
+                         api_key="fixture", quiet_mode=True, skip_memory=True, skip_context_files=True)
+    assert "compression.checkpoint_required" in _warn_text(caplog)
+    caplog.clear()
+
+    with caplog.at_level(logging.WARNING, logger="agent.conversation_compression"):
+        fork, _rt, _routed = build_cache_parity_fork(parent, max_iterations=2)
+
+    assert fork.compression_checkpoint_required is True
+    assert "compression.checkpoint_required" not in _warn_text(caplog)
+    assert _pre_compress_memory_context(fork, messages, True) == ""
+    with pytest.raises(CompressionCheckpointUnavailable):
+        _pre_compress_memory_context(parent, messages, True)

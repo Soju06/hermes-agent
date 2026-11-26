@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Tuple
 from agent.display import KawaiiSpinner
 from agent.interrupt_control import interrupt_issuer, interrupted_during_api_call_reason
 from agent.turn_context_compaction import _reanchor
+from agent.turn_todo_reminder import _maybe_inject_todo_reminder
 from agent.turn_truncation import boosted_output_cap
 
 logger = logging.getLogger("agent.conversation_loop")
@@ -184,6 +185,16 @@ def prepare_iteration(
     # newest tool result; off with no budget.
     if getattr(agent, "run_budget_seconds", None):
         _maybe_inject_run_budget_wrapup(agent, messages)
+
+    # Periodic todo reminder (Claude Code attachment parity): re-surface unfinished todo items
+    # when the todo tool has gone unused for a stretch of iterations. Same cache-safe tail
+    # channel as the run-budget notice; dormant when the list is empty or fully completed.
+    # Counters are bumped here (one per tool-loop iteration) and zeroed by the todo executor.
+    agent._todo_loop_iterations_since_write = getattr(agent, "_todo_loop_iterations_since_write", 0) + 1
+    agent._todo_loop_iterations_since_reminder = (
+        getattr(agent, "_todo_loop_iterations_since_reminder", 0) + 1
+    )
+    _maybe_inject_todo_reminder(agent, messages)
 
     # Appended to the newest tool result; never a synthetic user/system row.
     _maybe_inject_iteration_budget_warning(agent, messages)
@@ -543,6 +554,12 @@ def apply_retry_restarts(
         # Failover shrank the compressor window: clear the preflight block so
         # preflight re-runs before the first fallback call (single consumer).
         _preflight_compression_blocked = False
+        # A refusal clean-fork may have rewritten ``messages`` in place: re-anchor the
+        # current-turn user index so persistence and later phases point at the live row.
+        if getattr(agent, "_refusal_clean_fork_active", False):
+            from agent.turn_context import reanchor_current_turn_user_idx
+            current_turn_user_idx = reanchor_current_turn_user_idx(messages, user_message)
+            agent._persist_user_message_idx = current_turn_user_idx
         return _verdict("continue")
 
     if _retry.restart_with_length_continuation:

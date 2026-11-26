@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 from contextlib import contextmanager
-from contextvars import ContextVar, Token
+from contextvars import Context, ContextVar, Token
 from typing import Iterator, Mapping, MutableMapping, overload
 
 _DELEGATED_CHILD_CONTEXT: ContextVar[bool] = ContextVar("hermes_delegated_child_context", default=False)
@@ -104,9 +104,68 @@ def owned_kanban_task() -> str:
     return (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
 
 
+def reset_delegated_child_context_in(ctx: Context) -> None:
+    """Clear the delegated-child marker inside a *copied* Context.
+
+    ``contextvars.Context`` cannot be written from the outside, but a value set
+    while running inside it persists in that object — so this is the supported
+    way to hand a worker thread a context that is otherwise identical to its
+    parent's but is NOT flagged as delegated-child. Used by
+    ``tools.thread_context.propagate_context_to_thread``: the marker is a scope
+    around one synchronous child run, not an inheritable identity, and detached
+    daemon threads (ingest-curator, bg-review, async delegation) outlive that
+    scope. In-turn workers such as the execute_code RPC loops keep the marker.
+    """
+    ctx.run(_DELEGATED_CHILD_CONTEXT.set, False)
+
+
 def is_delegated_child_process_context() -> bool:
-    """Return True in this process or a subprocess spawned by a child."""
-    return bool(_DELEGATED_CHILD_CONTEXT.get()) or bool(os.environ.get(DELEGATED_CHILD_ENV_MARKER))
+    """Return True in this process or a subprocess spawned by a child.
+
+    The env marker is the cross-process half of the signal: a subprocess a
+    delegated child spawns has no ContextVar, so ``scrub_kanban_env`` stamps
+    ``HERMES_DELEGATED_CHILD_CONTEXT`` into its environment instead.
+
+    A mismatch — marker present in ``os.environ`` while the ContextVar is
+    unset — means this process inherited the marker rather than being scoped by
+    it. That is normal and correct for a genuine grandchild subprocess, but it
+    is also exactly what a *latched* marker looks like: a long-lived gateway
+    that once picked the marker up (e.g. from a poisoned bash session snapshot)
+    will fail every Kanban mutation for the rest of its life with no visible
+    cause. Emit one debug line per process so the state is diagnosable from
+    logs without changing behavior.
+    """
+    ctx_flag = bool(_DELEGATED_CHILD_CONTEXT.get())
+    env_flag = bool(os.environ.get(DELEGATED_CHILD_ENV_MARKER))
+    if env_flag and not ctx_flag:
+        _warn_marker_without_context_once()
+    return ctx_flag or env_flag
+
+
+_MARKER_MISMATCH_WARNED = False
+
+
+def _warn_marker_without_context_once() -> None:
+    """Log the env-marker-without-ContextVar state once per process."""
+    global _MARKER_MISMATCH_WARNED
+    if _MARKER_MISMATCH_WARNED:
+        return
+    _MARKER_MISMATCH_WARNED = True
+    try:
+        import logging
+
+        logging.getLogger(__name__).debug(
+            "%s is set in os.environ but no delegated-child ContextVar is "
+            "active (pid=%s). Expected for a subprocess spawned by a "
+            "delegate_task child; in a long-lived gateway process it means the "
+            "marker was inherited or latched, and every Kanban mutation will "
+            "be refused. Check the bash session snapshot "
+            "(/tmp/hermes-snap-*.sh) and the parent process environment.",
+            DELEGATED_CHILD_ENV_MARKER,
+            os.getpid(),
+        )
+    except Exception:
+        pass
 
 
 def _fenced_kanban_root() -> str:

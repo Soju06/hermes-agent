@@ -135,7 +135,7 @@ _PATTERNS: list[tuple[str, str, str]] = [
      r'[^\n]{0,512}(?:\$HOME/\.ssh|~/\.ssh)', "ssh_access", "strict"),
     (r'\$HOME/\.hermes/\.env|\~/\.hermes/\.env', "hermes_env", "strict"),
     (rf'{_MODIFY}(?:AGENTS\.md|CLAUDE\.md|\.cursorrules|\.clinerules)', "agent_config_mod", "strict"),
-    (rf'{_MODIFY}\.hermes/(config\.yaml|SOUL\.md)', "hermes_config_mod", "strict"),
+    (rf'{_MODIFY}\.hermes/(config\.yaml|SOUL\.md|personas/)', "hermes_config_mod", "strict"),
 
     # ── Hardcoded secrets ────────────────────────────────────────────
     # The lookahead skips a value that is itself an environment-variable NAME

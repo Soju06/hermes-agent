@@ -454,6 +454,11 @@ from agent.file_safety import deny_path_under
 from gateway.session import SessionSource, build_session_key
 from gateway.session_dm_threads import dm_thread_batch_suffix, dm_thread_key_source, session_db_for_source
 from gateway.session_transcript import TranscriptReadError
+
+try:
+    from agent import turn_trace as _turn_trace_mod
+except Exception:  # pragma: no cover
+    _turn_trace_mod = None
 from hermes_constants import CONNECTOR_DOWNLOADS_SUBDIR, get_default_hermes_root, get_hermes_dir, get_hermes_home, get_real_home
 from agent.provider_media import GENERATED_SUBDIR, MEDIA_CACHE_MAX_AGE_HOURS
 
@@ -2447,6 +2452,9 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
         existing = self._pending_text_batches.get(key)
         if existing is None:
             existing = self._pending_text_batches[key] = event
+            # First-chunk enqueue time; the gateway runner uses it to surface
+            # the debounce delay in turn traces (transport.inbound_debounce).
+            event._hermes_debounce_enqueue_ts = time.time()  # type: ignore[attr-defined]
         else:
             if event.text:
                 existing.text = _append_text(existing.text, event.text)
@@ -3447,22 +3455,44 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
             ttl = 0
         return response.text, int(ttl or 0)
 
+    def _finish_inline_turn_trace(self, event: MessageEvent) -> None:
+        """Finish (idempotent) a turn trace begun for an inline dispatch.
+
+        Call sites that await ``self._message_handler(event)`` OUTSIDE
+        ``_process_message_background`` (bypass commands, the clarify
+        text-intercept) own the trace lifecycle themselves: nothing downstream
+        finishes a trace the runner began and bound to the event, so without
+        this the record would be dropped un-emitted.
+        """
+        try:
+            _t = _turn_trace_mod.get_bound(event) if _turn_trace_mod is not None else None
+            if _t is None and _turn_trace_mod is not None:
+                _t = _turn_trace_mod.get_bound(getattr(event, "source", None))
+            if _t is not None:
+                _t.finish(status="ok")
+                _turn_trace_mod.bind(getattr(event, "source", None), None)
+        except Exception:
+            pass
+
     async def _dispatch_inline_reply(self, event: MessageEvent, *, log_cmd: Optional[str] = None) -> None:
         """Call the handler and send its reply inline, with retry, threading and
         ephemeral deletion — no session lifecycle (active-session bypass paths)."""
-        thread_meta = _thread_metadata_for_event(event)
-        response = await self._message_handler(event)
-        text, eph_ttl = self._unwrap_ephemeral(response)
-        if not text:
-            return
-        if log_cmd is not None:
-            logger.info("[%s] Sending command '/%s' response (%d chars) to %s", self.name, log_cmd,
-                        len(text), event.source.chat_id)
-        result = await self._send_with_retry(
-            chat_id=event.source.chat_id, content=text, reply_to=_reply_anchor_for_event(event),
-            metadata=_mark_notify_metadata(thread_meta))
-        if eph_ttl > 0 and result.success and result.message_id:
-            self._schedule_ephemeral_delete(event.source.chat_id, result.message_id, eph_ttl)
+        try:
+            thread_meta = _thread_metadata_for_event(event)
+            response = await self._message_handler(event)
+            text, eph_ttl = self._unwrap_ephemeral(response)
+            if not text:
+                return
+            if log_cmd is not None:
+                logger.info("[%s] Sending command '/%s' response (%d chars) to %s", self.name, log_cmd,
+                            len(text), event.source.chat_id)
+            result = await self._send_with_retry(
+                chat_id=event.source.chat_id, content=text, reply_to=_reply_anchor_for_event(event),
+                metadata=_mark_notify_metadata(thread_meta))
+            if eph_ttl > 0 and result.success and result.message_id:
+                self._schedule_ephemeral_delete(event.source.chat_id, result.message_id, eph_ttl)
+        finally:
+            self._finish_inline_turn_trace(event)
 
     def _media_delivery_scope(self, source: Optional[SessionSource]):
         """Routed home + terminal policy for post-handler text, media and error delivery;
@@ -4347,11 +4377,41 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
             self, event.source.chat_id, _reply_anchor_for_event(event), _thread_metadata)
         typing_task = self._start_typing_refresh(event, interrupt_event, _typing_metadata)
         generation = None
+
+        def _resolve_turn_trace():
+            # The runner binds the trace to the event AND to event.source: the
+            # pre-dispatch hook loop may have swapped the runner's event for a
+            # dataclasses.replace copy (prepend/rewrite directives), in which
+            # case only the shared SessionSource still carries the binding.
+            if _turn_trace_mod is None:
+                return None
+            _t = _turn_trace_mod.get_bound(event)
+            if _t is None:
+                _t = _turn_trace_mod.get_bound(getattr(event, "source", None))
+            return _t
+
+        def _finish_turn_trace(status: str) -> None:
+            # Gateway owns the turn-trace lifecycle: the runner begin()s it at
+            # message ingress and binds it to this event; delivery timing and
+            # the (idempotent, first-status-wins) finish() happen here so the
+            # trace covers the full ingress → delivery interval.  Clear the
+            # source binding afterwards — SessionSource can outlive the event,
+            # and a stale trace must not leak into a later turn.
+            try:
+                _t = _resolve_turn_trace()
+                if _t is not None:
+                    _t.finish(status=status)
+                    _turn_trace_mod.bind(getattr(event, "source", None), None)
+            except Exception:
+                pass
+
+        _turn_trace = None
         try:
             await self._run_processing_hook("on_processing_start", event)
             event._turn_marker_handoff = self.gateway_runner is not None  # it can release the marker
             response = await self._message_handler(event)
             generation = getattr(interrupt_event, "_hermes_run_generation", None)
+            _turn_trace = _resolve_turn_trace()
             # A muted diagnostic wake ran for the session; its reply is not presented. The
             # policy read binds the routed profile; delivery itself stays in the launch scope.
             with self._media_delivery_scope(event.source):
@@ -4365,6 +4425,7 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
                 logger.info("[%s] Suppressing stale response for interrupted session %s", self.name,
                             session_key)
                 response = None
+            _delivery_start = time.time() if _turn_trace is not None else 0.0
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             else:
@@ -4410,6 +4471,16 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
                     event, extracted, _final_thread_metadata,
                     anything_sent=delivery_attempted or _tts_caption_delivered,
                     record_delivery=_record_delivery)
+            if _turn_trace is not None:
+                if response:
+                    _turn_trace.add_span(
+                        "transport.delivery", _delivery_start, time.time(),
+                        delivered=delivery_succeeded,
+                    )
+                _turn_trace.finish(status="ok")
+                if _turn_trace_mod is not None:
+                    _turn_trace_mod.bind(getattr(event, "source", None), None)
+
             await self._release_turn_marker(event)
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
             # Clean up the per-turn streaming-TTS flag.
@@ -4434,12 +4505,14 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
                 self._spawn_drain_task(pending_event, session_key, delay=delay)
                 return  # Drain task owns the session now.
         except asyncio.CancelledError:
+            _finish_turn_trace("cancelled")
             expected = asyncio.current_task() in self._expected_cancelled_tasks
             await self._run_processing_hook(
                 "on_processing_complete", event,
                 ProcessingOutcome.CANCELLED if expected else ProcessingOutcome.FAILURE)
             raise
         except BaseException as e:
+            _finish_turn_trace("error")
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             await self._notify_turn_error(event, e)
@@ -4447,6 +4520,9 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
             if isinstance(e, (SystemExit, KeyboardInterrupt)) and not isinstance(e, _outage):  # rest contained
                 raise
         finally:
+            # Belt-and-braces: every exit path above already finished the trace (finish() is
+            # idempotent, so this only fires if one was somehow missed).
+            _finish_turn_trace("error")
             await self._release_turn_marker(event)
             event._turn_marker_handoff = False  # a later run of this object clears its own marker
             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it alive.

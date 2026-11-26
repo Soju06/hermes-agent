@@ -761,6 +761,13 @@ def _finish_codex_turn(agent, turn, messages: list[dict[str, Any]], *, original_
         _call_guarded(getattr(agent, "_sync_external_memory_for_turn", None), "external memory sync raised", kwargs=dict(
             original_user_message=original_user_message, final_response=final_response, interrupted=False, messages=messages,
         ))
+        # Ingest-curator trigger observation (ADR-004 Phase 2, SHADOW) — mirrors the turn_finalizer
+        # hook so the codex app-server path feeds the same mechanical salience accumulator. Fail-open.
+        try:
+            from agent.ingest_curator import observe_turn_completed
+            observe_turn_completed(agent, messages)
+        except Exception:
+            logger.debug("ingest-curator turn observation failed (fail-open)", exc_info=True)
     # Background review fork: only when a trigger tripped AND a real final response exists.
     if turn.final_text and not turn.interrupted and (should_review_memory or should_review_skills):
         _call_guarded(getattr(agent, "_spawn_background_review", None), "background review spawn raised", kwargs=dict(

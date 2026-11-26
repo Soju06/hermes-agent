@@ -197,8 +197,10 @@ def check_entry_live(entry: dict[str, Any], result: EntryCheck) -> EntryCheck:
         secrets += _secret_values(getattr(client, "api_key", None))
         base_url = str(getattr(client, "base_url", "") or "")
         timeout = get_provider_request_timeout(provider, model) or _LIVE_TIMEOUT_S
-        kwargs = _build_call_kwargs(provider, model, list(_LIVE_PROMPT),
-                                    max_tokens=_LIVE_MAX_TOKENS, timeout=timeout, base_url=base_url)
+        # api_mode: the wire the client was built for, so a declared anthropic_messages route keeps
+        # the cap on a host the provider/URL gate does not recognise.
+        kwargs = _build_call_kwargs(provider, model, list(_LIVE_PROMPT), max_tokens=_LIVE_MAX_TOKENS,
+                                    timeout=timeout, base_url=base_url, api_mode=route.api_mode)
         started = time.monotonic()  # provider latency, not SDK import / client construction
         raw = _create_with_progress_once(client, kwargs, None, provider=provider,
                                          force_stream=_provider_requires_stream(provider, base_url))

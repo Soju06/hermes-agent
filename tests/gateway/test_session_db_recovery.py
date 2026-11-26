@@ -345,7 +345,7 @@ def test_recovered_db_rows_survive_fallback_structural_save(monkeypatch, tmp_pat
         store._entries.pop(deleted.session_key)
         store._entries[changed.session_key].session_id = "changed-during-fallback"
         store._entries[current.session_key] = current
-        store._save()
+        store._save(lock_held=True)
 
     rows = store.persistence.routing.load_routing_entries(routing_scope=scope)
     assert set(rows) == {durable.session_key, changed.session_key, current.session_key}

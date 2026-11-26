@@ -346,6 +346,11 @@ def _notify_memory_manager(results, task_list, child_by_index, parent_agent) -> 
     memory = getattr(parent_agent, "_memory_manager", None) if parent_agent else None
     if not memory:
         return
+    # ADR-004 Phase 0: delegation observations are provider writes; an ingest-disabled fork
+    # (background review, ingest curator) must not fan them out to the external graph.
+    from agent.memory_manager import memory_ingest_allowed
+    if not memory_ingest_allowed(parent_agent):
+        return
     for entry in results:
         try:
             task_index = entry.get("task_index", -1)

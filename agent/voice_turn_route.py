@@ -31,7 +31,7 @@ TASK = "voice_chat"
 _EXTRA_FIELDS = (
     "_fallback_activated", "_fallback_index", "_provider_fallback_active", "_provider_fallback_route",
     "_rate_limit_backoff_count", "_credential_pool", "_credential_pool_entry_id", "_config_context_length",
-    *ROUTE_VERDICT_FIELDS,
+    "_fallback_reason", *ROUTE_VERDICT_FIELDS,
 )
 
 

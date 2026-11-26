@@ -111,14 +111,16 @@ def test_explicit_empty_gateway_platform_toolsets_keep_mcp_controls():
     server still narrows to itself, and a non-empty list still inherits the enabled servers."""
     servers = {"alpha": {"url": "http://x"}, "beta": {"url": "http://y"}}
 
+    def named(selection):
+        # Fork (runtime-control): the non-configurable ``runtime`` toolset (model_status /
+        # model_switch) rides every non-empty selection; these assertions are about the MCP servers.
+        return _get_platform_tools({"mcp_servers": servers, "platform_toolsets": {"email": selection}},
+                                   "email") - {"runtime"}
+
     assert _get_platform_tools({"mcp_servers": servers, "platform_toolsets": {"email": []}}, "email") == set()
     assert {"alpha", "beta"} <= _get_platform_tools({"mcp_servers": servers}, "email")
-    assert _get_platform_tools(
-        {"mcp_servers": servers, "platform_toolsets": {"email": ["terminal", "alpha"]}}, "email",
-    ) == {"terminal", "alpha"}
-    assert _get_platform_tools(
-        {"mcp_servers": servers, "platform_toolsets": {"email": ["terminal"]}}, "email",
-    ) == {"terminal", "alpha", "beta"}
+    assert named(["terminal", "alpha"]) == {"terminal", "alpha"}
+    assert named(["terminal"]) == {"terminal", "alpha", "beta"}
 
 
 def test_scalar_platform_toolsets_fall_back_to_platform_default():

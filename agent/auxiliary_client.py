@@ -1658,6 +1658,21 @@ def _translate_anthropic_response_format(anthropic_kwargs: dict[str, Any], respo
     output_config["format"] = {"type": "json_schema", "schema": schema}
 
 
+def _anthropic_native_shape(response: Any) -> Optional[Dict[str, Any]]:
+    """Content-free shape of a native Anthropic response: raw ``stop_reason`` and block-type counts.
+    The chat.completions shim below drops both, and failure diagnostics (an empty compression
+    summary) need them to tell a structured refusal from a reasoning-only turn. Never carries block
+    text. ``None`` when unreadable."""
+    try:
+        counts: Dict[str, int] = {}
+        for block in getattr(response, "content", None) or []:
+            kind = str(_field(block, "type") or "unknown")[:40]
+            counts[kind] = counts.get(kind, 0) + 1
+        return {"stop_reason": str(getattr(response, "stop_reason", None) or "")[:40] or None, "block_types": counts}
+    except Exception:
+        return None
+
+
 class _AnthropicCompletionsAdapter:
     """OpenAI-client-compatible adapter for Anthropic Messages API."""
 
@@ -1770,7 +1785,9 @@ class _AnthropicCompletionsAdapter:
             message=SimpleNamespace(content=_nr.content, tool_calls=_nr.tool_calls, reasoning=_nr.reasoning),
             finish_reason=_nr.finish_reason,
         )
-        return SimpleNamespace(choices=[choice], model=model, usage=usage)
+        return SimpleNamespace(
+            choices=[choice], model=model, usage=usage, native_shape=_anthropic_native_shape(response),
+        )
 
 
 class AnthropicAuxiliaryClient:
@@ -3569,7 +3586,7 @@ def _prepare_same_provider_retry(
         effective_provider or resolved_provider, retry_model or final_model, messages,
         temperature=temperature, max_tokens=max_tokens, tools=tools, timeout=effective_timeout,
         extra_body=effective_extra_body, reasoning_config=reasoning_config,
-        base_url=retry_base or resolved_base_url, task=task,
+        base_url=retry_base or resolved_base_url, task=task, api_mode=resolved_api_mode,
     )
     # Preserve per-request attribution headers (a profile's ``request_headers``) across the rebuilt-client
     # retry: dropping them would let a recovery retry silently lose capability gating (#60293).
@@ -3833,7 +3850,8 @@ def _fallback_request_kwargs(
     fb_kwargs = _build_call_kwargs(
         destination.provider, destination.model, fallback_messages,
         temperature=temperature, max_tokens=fallback_max_tokens, tools=fallback_tools, timeout=effective_timeout,
-        extra_body=fallback_extra_body, reasoning_config=reasoning_config, base_url=destination.base_url, task=task)
+        extra_body=fallback_extra_body, reasoning_config=reasoning_config, base_url=destination.base_url, task=task,
+        api_mode=destination.api_mode)
     return fb_kwargs
 
 
@@ -6363,8 +6381,16 @@ def _is_gemini_native_route(provider_norm: str, effective_base: str) -> bool:
         return False
 
 
-def _forwards_max_tokens(provider: str, provider_norm: str, model: str, effective_base: str, task: Optional[str]) -> bool:
+def _forwards_max_tokens(
+    provider: str, provider_norm: str, model: str, effective_base: str, task: Optional[str],
+    api_mode: Optional[str] = None,
+) -> bool:
     """Whether an explicit max_tokens is forwarded on this route.
+
+    ``api_mode`` is the RESOLVED API mode of the route: a declared ``anthropic_messages`` route
+    selects the Anthropic transport even when the provider/URL gates below do not recognise the
+    endpoint, and the Messages wire 400s without max_tokens — so it is one more Anthropic-compatible
+    signal (never a reason to forward caps to chat-completions providers).
 
     No default cap elsewhere (omitted = provider default; avoids max_completion_tokens / ZAI-vision
     quirks). Forward only where mandatory or honored: Anthropic Messages wire (400 without it);
@@ -6375,6 +6401,7 @@ def _forwards_max_tokens(provider: str, provider_norm: str, model: str, effectiv
     """
     return (
         _is_anthropic_compat_endpoint(provider, effective_base)
+        or api_mode == "anthropic_messages"
         or _nous_on_messages_wire(provider_norm, model)
         or provider_norm in _NVIDIA_PROVIDER_NAMES
         or base_url_host_matches(effective_base, "integrate.api.nvidia.com")
@@ -6519,12 +6546,14 @@ def _build_call_kwargs(
     max_tokens: Optional[int] = None, tools: Optional[list] = None, timeout: float = 30.0,
     extra_body: Optional[dict] = None, reasoning_config: Optional[dict] = None,
     base_url: Optional[str] = None, task: Optional[str] = None,
-    no_progress_timeout: Optional[float] = None,
+    no_progress_timeout: Optional[float] = None, api_mode: Optional[str] = None,
 ) -> dict:
     """Build kwargs for .chat.completions.create() with model/provider adjustments.
     ``no_progress_timeout`` is a Codex-Responses-only extra (consumed by
     ``_CodexCompletionsAdapter.create``'s ``**kwargs`` catch-all); callers must only pass it
-    when the resolved client is a ``CodexAuxiliaryClient`` — real SDK clients don't accept it."""
+    when the resolved client is a ``CodexAuxiliaryClient`` — real SDK clients don't accept it.
+    ``api_mode`` is the resolved route API mode (``anthropic_messages`` forwards an explicit
+    max_tokens)."""
     kwargs: dict[str, Any] = {"model": model, "messages": messages, "timeout": timeout}
     if no_progress_timeout is not None:
         kwargs["no_progress_timeout"] = no_progress_timeout
@@ -6542,7 +6571,7 @@ def _build_call_kwargs(
         if not _forbids_sampling_params(model):
             kwargs["temperature"] = temperature
     provider_norm = str(provider or "").strip().lower()
-    if max_tokens is not None and _forwards_max_tokens(provider, provider_norm, model, effective_base, task):
+    if max_tokens is not None and _forwards_max_tokens(provider, provider_norm, model, effective_base, task, api_mode):
         kwargs.update(auxiliary_max_tokens_param(max_tokens, model=model))  # picks max_completion_tokens where needed
     if tools:
         kwargs["tools"] = _dedupe_tool_names(tools, provider, model)
@@ -7330,7 +7359,7 @@ def _prepare_aux_request(
         request_provider, final_model, messages, temperature=temperature, max_tokens=max_tokens,
         tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
         reasoning_config=reasoning_config, base_url=base_info or resolved_base_url, task=task,
-        no_progress_timeout=no_progress_timeout)
+        no_progress_timeout=no_progress_timeout, api_mode=resolved_api_mode)
     if extra_headers:
         kwargs["extra_headers"] = dict(extra_headers)
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)

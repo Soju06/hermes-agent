@@ -63,9 +63,9 @@ from sqlite_support import _on_disk_journal_mode, apply_database_pragmas, apply_
 from storage_errors import is_malformed_db_error, is_sqlite_lock_error
 from storage_user_copy import set_last_init_error
 
+from ._maintenance_thread import note_committed_write, stop_maintenance_thread
 from ._schema import (
-    _enter_fts_fail_open, _fts_table_probe, _init_schema, _is_fts_write_corruption_error,
-    _try_incremental_merge_fts, declared_schema_drift,
+    _enter_fts_fail_open, _fts_table_probe, _init_schema, _is_fts_write_corruption_error, declared_schema_drift,
 )
 
 # Pre-split logger identity so log filtering/capture is unchanged.
@@ -256,7 +256,7 @@ class StoreHolder:
     _WRITE_RETRY_MIN_S, _WRITE_RETRY_MAX_S = 0.020, 0.150  # fast jitter for the first _SLOW_AFTER_S
     _WRITE_RETRY_SLOW_AFTER_S = 2.0
     _WRITE_RETRY_SLOW_MIN_S, _WRITE_RETRY_SLOW_MAX_S = 0.250, 1.000
-    # PASSIVE WAL checkpoint every N successful writes.
+    # PASSIVE WAL checkpoint every N successful writes, run by the session-db-maintenance thread.
     _CHECKPOINT_EVERY_N_WRITES = 50
     # Bounded FTS ``'merge'`` (ms of lock each) instead of ``'optimize'`` (9-18s per index on a 10GB
     # DB, longer than a writer's patience); up to _COMMANDS_PER_PASS per index, stopping on no-progress.
@@ -370,6 +370,12 @@ class StoreHolder:
         # Set True when this instance is opened via persistence.sqlite._registry.acquire(). Makes close() a no-op so the
         # registry (not individual callers) controls the connection lifecycle (#90837).
         self._shared_registry_owned = False
+        # Write-count marks of the last background checkpoint / FTS merge (see _maintenance_thread).
+        self._last_checkpoint_write_count = self._last_fts_merge_write_count = 0
+        self._maint_stop = threading.Event()
+        self._maint_start_lock = threading.Lock()
+        self._maint_thread: Optional[threading.Thread] = None  # started by the first committed write
+        self._maint_inline = False  # True only when that thread could not start
         initialization_complete = False
         try:
             if read_only:
@@ -860,12 +866,11 @@ class StoreHolder:
                         except Exception:  # health: allow BLE001 S110 -- a failed rollback must not hide the error re-raised
                             pass
                         raise
-                # Success — periodic best-effort checkpoint + FTS merge.
+                # Maintenance is driven by the dedicated DB thread (started by the
+                # first committed write); the write hot path only advances the cadence
+                # counter (and ticks inline only on a handle whose thread could not start).
                 self._write_count += 1
-                if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
-                    self._try_wal_checkpoint()
-                if self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
-                    _try_incremental_merge_fts(self)
+                note_committed_write(self)
                 return result
             except WriterMutexTimeout:
                 # No transaction began; preserve local contention attribution and never replay it.
@@ -1347,6 +1352,7 @@ class StoreHolder:
             from persistence.sqlite._registry import release
             release(self)
             return
+        stop_maintenance_thread(self)
         self._stop_token_writer()
         hook, self._token_atexit_hook = self._token_atexit_hook, None
         if hook is not None:

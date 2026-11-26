@@ -19,6 +19,7 @@ from agent.agent_runtime_helpers_placeholders import hidden_interrupt_placeholde
 from agent.message_metadata import append_message
 from agent.repetition_guard import REPETITION_LOOP_INTERRUPTED, is_runaway_repetition
 from agent.turn_failure_copy import site_copy, stamp_failure
+from agent.turn_trace_loop import tag_exit
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -277,6 +278,7 @@ def nous_rate_limit_guard(
                 # No fallback — surface the buffered rate-limit context that led here.
                 agent._flush_status_buffer()
                 agent._persist_session(messages, conversation_history)
+                tag_exit("nous_rate_limit_no_fallback")
                 # The free tier's sentence already says what to do (wait, or sign in); the
                 # fallback-provider advice is for an install that runs its own providers.
                 return _verdict("return", stamp_failure({

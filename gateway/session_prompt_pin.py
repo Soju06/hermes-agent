@@ -7,6 +7,7 @@ carries that snapshot so a gateway restart does not flip it (#125793).
 
 from __future__ import annotations
 
+import threading
 from dataclasses import replace
 from typing import Any, Dict, Optional
 
@@ -53,20 +54,36 @@ class SessionPromptPinMixin:
 
         The candidate is durable before the in-memory entry is published. The expected session id
         is the turn's launch identity: a concurrent reset or resume makes this a no-op instead of
-        writing the old conversation's system bytes onto the new one.
+        writing the old conversation's system bytes onto the new one. ``_lock`` is never held
+        across the durable write (``_save_lock`` outermost, as in ``_swap_turn_marker``); a route
+        replaced while the write was in flight is repaired from the live index and nothing is
+        published.
         """
         cleaned = sanitize_prompt_pin(pin)
         if cleaned is None:
             return False
-        with self._lock:
-            entry = self._entry_locked(session_key)
-            if entry is None or (expected_session_id is not None and entry.session_id != expected_session_id):
+        self._ensure_loaded()  # a first load may itself save; never under ``_save_lock``
+        with self._lazy("_save_lock", threading.Lock):
+            with self._lock:
+                entry = self._entry_locked(session_key)
+                if entry is None or (expected_session_id is not None and entry.session_id != expected_session_id):
+                    return False
+                if entry.prompt_pin == cleaned:
+                    return True
+                captured = self._capture_entry_save_locked(
+                    session_key, replace(entry, prompt_pin=cleaned).to_dict())
+            assert captured is not None
+            self._persist_entry_save_locked(session_key, captured)
+            repair_snapshot = None
+            with self._lock:
+                if self._entries.get(session_key) is not entry:
+                    repair_snapshot = self._snapshot_routing_locked()
+                else:
+                    entry.prompt_pin = cleaned
+            if repair_snapshot is not None:
+                self._persist_routing_data_save_locked(*repair_snapshot)
                 return False
-            if entry.prompt_pin != cleaned:
-                self._save_entry(
-                    session_key, entry_data=replace(entry, prompt_pin=cleaned).to_dict(), lock_held=True)
-                entry.prompt_pin = cleaned
-            return True
+        return True
 
     def get_prompt_pin(
         self, session_key: str, *, expected_session_id: Optional[str] = None,

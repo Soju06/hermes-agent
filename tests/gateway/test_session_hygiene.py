@@ -10,6 +10,7 @@ so CLI and messaging platforms behave identically.
 
 import asyncio
 import importlib
+import logging
 import sys
 import threading
 import time
@@ -20,6 +21,7 @@ from unittest.mock import MagicMock, AsyncMock
 
 import pytest
 
+from agent.model_metadata import estimate_messages_tokens_rough
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent
@@ -73,7 +75,7 @@ class HygieneCaptureAdapter(BasePlatformAdapter):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_session_hygiene_preserves_transcript_when_no_rotation(monkeypatch, tmp_path):
+async def test_session_hygiene_preserves_transcript_when_no_rotation(monkeypatch, tmp_path, caplog):
     """Regression for #21301: the hygiene agent is built without a session_db,
     so _compress_context cannot rotate. When it neither rotates NOR compacts
     in place, the transcript MUST be preserved — an unconditional
@@ -112,6 +114,7 @@ async def test_session_hygiene_preserves_transcript_when_no_rotation(monkeypatch
 
     gateway_run = importlib.import_module("gateway.run")
     GatewayRunner = gateway_run.GatewayRunner
+    caplog.set_level(logging.INFO, logger="gateway.run")
 
     adapter = HygieneCaptureAdapter()
     runner = object.__new__(GatewayRunner)
@@ -194,6 +197,9 @@ async def test_session_hygiene_preserves_transcript_when_no_rotation(monkeypatch
     # fallback the skill_view/read_file dedup records survive compression
     # and a re-read returns a stub pointing at pruned context.
     assert NonRotatingCompressAgent.last_instance.compress_task_id == "sess-1"
+    log_text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "trigger=token_threshold" in log_text
+    assert "#21301" in log_text
 
     # This run neither rotated nor compacted in place, so it did NOT recover
     # the session: the reset must NOT have been reached. Spying on the module
@@ -627,7 +633,7 @@ async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
 
 @pytest.mark.asyncio
 async def test_session_hygiene_honors_configurable_hard_message_limit(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, caplog
 ):
     """compression.hygiene_hard_message_limit overrides the default.
 
@@ -669,6 +675,7 @@ async def test_session_hygiene_honors_configurable_hard_message_limit(
 
     gateway_run = importlib.import_module("gateway.run")
     GatewayRunner = gateway_run.GatewayRunner
+    caplog.set_level(logging.INFO, logger="gateway.run")
 
     adapter = HygieneCaptureAdapter()
     runner = object.__new__(GatewayRunner)
@@ -740,6 +747,9 @@ async def test_session_hygiene_honors_configurable_hard_message_limit(
         "Expected hygiene compression to fire when message count (12) "
         "exceeds configured hygiene_hard_message_limit (10)"
     )
+    log_text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "trigger=hard_message_limit (10)" in log_text
+    assert "trigger=token_threshold" not in log_text
 
 
 # ---------------------------------------------------------------------------
@@ -757,10 +767,11 @@ def _close_storage_handles():
         _STORAGE_HANDLES.pop().close()
 
 
-def _make_cooldown_runner(monkeypatch, tmp_path, agent_cls, session_db, session_id):
+def _make_cooldown_runner(monkeypatch, tmp_path, agent_cls, session_db, session_id, cfg_text=None):
     """Scaffolding for the restart-persistence tests: a fresh GatewayRunner
     wired to a REAL store handle (not a MagicMock) so the hygiene
-    cooldown check/write paths exercise the actual SQLite-backed methods."""
+    cooldown check/write paths exercise the actual SQLite-backed methods.
+    ``cfg_text`` replaces the default config.yaml."""
     fake_dotenv = types.ModuleType("dotenv")
     fake_dotenv.load_dotenv = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
@@ -771,9 +782,11 @@ def _make_cooldown_runner(monkeypatch, tmp_path, agent_cls, session_db, session_
 
     cfg_path = tmp_path / "config.yaml"
     cfg_path.write_text(
-        "compression:\n"
-        "  enabled: true\n"
-        "  hygiene_failure_cooldown_seconds: 300\n",
+        cfg_text if cfg_text is not None else (
+            "compression:\n"
+            "  enabled: true\n"
+            "  hygiene_failure_cooldown_seconds: 300\n"
+        ),
         encoding="utf-8",
     )
 
@@ -844,7 +857,7 @@ def _make_cooldown_runner(monkeypatch, tmp_path, agent_cls, session_db, session_
 
 @pytest.mark.asyncio
 async def test_hygiene_compression_cooldown_survives_gateway_restart(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, caplog
 ):
     """Regression for #74136: the compression-failure cooldown must be
     persisted to the state DB, not an in-memory dict on the runner.
@@ -859,6 +872,7 @@ async def test_hygiene_compression_cooldown_survives_gateway_restart(
     db = open_persistence(profile_scope(home=tmp_path))
     try:
         seed_session(db, session_id, "telegram")
+        caplog.set_level(logging.INFO, logger="gateway.run")
 
         main_thread = threading.get_ident()
         streak_threads = []
@@ -893,7 +907,14 @@ async def test_hygiene_compression_cooldown_survives_gateway_restart(
 
             def _compress_context(self, messages, *_args, **_kwargs):
                 # Summary generation failed: compressor aborts and returns
-                # the transcript unchanged.
+                # the transcript unchanged. Mirror the per-attempt signals the
+                # real agent leaves on an abort (_begin_compression_attempt +
+                # _candidate_rejected) so the no-commit diagnosis is exercised.
+                self._last_compression_attempt_recorded = True
+                self._last_compression_attempt_in_place = None
+                self._last_compression_summary_warning = (
+                    self.context_compressor._last_summary_error
+                )
                 return (messages, None)
 
         runner1, _adapter1, event1 = _make_cooldown_runner(
@@ -903,6 +924,13 @@ async def test_hygiene_compression_cooldown_survives_gateway_restart(
         assert AbortingCompressAgent.instances == 1
         assert len(streak_threads) == 1
         assert streak_threads[0] != main_thread
+        first_run_logs = "\n".join(
+            record.getMessage() for record in caplog.records
+        )
+        # A summary abort with a bound session_db is diagnosed as the abort,
+        # never as the missing-session_db #21301 path.
+        assert "attempt aborted before commit: aux model exploded" in first_run_logs
+        assert "no session_db on the hygiene agent" not in first_run_logs
 
         # The abort must have persisted a cooldown to the DB.
         now = time.time()
@@ -1256,3 +1284,445 @@ async def test_hygiene_miss_bounds_the_model_payload(monkeypatch, tmp_path):
     finally:
         release_worker.set()
         db.close()
+
+
+@pytest.mark.asyncio
+async def test_session_hygiene_skips_active_no_progress_cooldown(
+    monkeypatch, tmp_path
+):
+    """The gateway honors the cooldown written by a no-progress attempt."""
+    session_id = "sess-no-progress-cooldown"
+    db = open_persistence(profile_scope(home=tmp_path))
+    try:
+        seed_session(db, session_id, "telegram")
+        db.messages.record_compression_cooldown(
+            session_id,
+            time.time() + 300,
+            "no_progress: protected tail spans the whole transcript",
+        )
+
+        class ShouldNotRunAgent:
+            instances = 0
+
+            def __init__(self, **_kwargs):
+                type(self).instances += 1
+
+        runner, _adapter, event = _make_cooldown_runner(
+            monkeypatch, tmp_path, ShouldNotRunAgent, db, session_id
+        )
+
+        assert await runner._handle_message(event) == "ok"
+        assert ShouldNotRunAgent.instances == 0
+        assert runner._run_agent.await_count == 1
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_session_hygiene_logs_no_progress_without_missing_db_diagnosis(
+    monkeypatch, tmp_path, caplog
+):
+    """A bound compressor no-op reports protected-tail cooldown, not #21301."""
+    session_id = "sess-no-progress-diagnostic"
+    db = open_persistence(profile_scope(home=tmp_path))
+    try:
+        seed_session(db, session_id, "telegram")
+
+        class NoProgressCompressAgent:
+            def __init__(self, **kwargs):
+                self.session_id = kwargs.get("session_id", session_id)
+                self._persistence = kwargs.get("persistence")
+                self._last_compaction_in_place = False
+                self._last_compression_no_progress = False
+                self.context_compressor = SimpleNamespace(
+                    bind_session_state=MagicMock(),
+                    _last_compress_aborted=False,
+                    _last_aux_model_failure_model=None,
+                )
+                self.shutdown_memory_provider = MagicMock()
+                self.close = MagicMock()
+
+            def _compress_context(self, messages, *_args, **_kwargs):
+                self._last_compression_no_progress = True
+                self._persistence.messages.record_compression_cooldown(
+                    self.session_id,
+                    time.time() + 300,
+                    "no_progress: protected tail spans the whole transcript",
+                )
+                return (messages, None)
+
+        caplog.set_level(logging.INFO, logger="gateway.run")
+        runner, _adapter, event = _make_cooldown_runner(
+            monkeypatch, tmp_path, NoProgressCompressAgent, db, session_id
+        )
+
+        assert await runner._handle_message(event) == "ok"
+        log_text = "\n".join(record.getMessage() for record in caplog.records)
+        assert "protected tail exceeds the compressible budget" in log_text
+        assert "compression-failure cooldown was recorded" in log_text
+        assert "no session_db on the hygiene agent" not in log_text
+        assert "#21301" not in log_text
+    finally:
+        db.close()
+
+
+def _make_progress_runner(monkeypatch, tmp_path, agent_cls, cfg_text):
+    """Hygiene runner with no seeded session row and a test-specific config.yaml (``_make_cooldown_runner`` scaffold)."""
+    return _make_cooldown_runner(monkeypatch, tmp_path, agent_cls, None, "sess-progress", cfg_text=cfg_text)
+
+
+# ---------------------------------------------------------------------------
+# Hygiene failure diagnostics: the exception REASON must survive the log line
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_session_hygiene_failure_log_preserves_exception_type(
+    monkeypatch, tmp_path, caplog
+):
+    """The auto-compress failure log must identify the exception even when
+    ``str(exc)`` is empty.
+
+    Regression: ``asyncio.TimeoutError`` has an empty ``str()``, so the old
+    ``failed: %s`` format produced ``auto-compress failed: `` — 99/99 such
+    lines in production logs carried no cause at all.
+    """
+
+    class TimeoutRaisingAgent:
+        def __init__(self, **_kwargs):
+            raise TimeoutError()
+
+    caplog.set_level(logging.INFO, logger="gateway.run")
+    runner, _adapter, event = _make_progress_runner(
+        monkeypatch,
+        tmp_path,
+        TimeoutRaisingAgent,
+        "compression:\n  enabled: true\n",
+    )
+
+    # The turn itself must still run — hygiene failures never block the user.
+    assert await runner._handle_message(event) == "ok"
+    assert runner._run_agent.await_count == 1
+
+    failure_lines = [
+        r.getMessage()
+        for r in caplog.records
+        if "auto-compress failed" in r.getMessage()
+    ]
+    assert len(failure_lines) == 1
+    # The type must be identifiable from the line alone (empty str() case).
+    assert "TimeoutError" in failure_lines[0]
+    assert not failure_lines[0].rstrip().endswith("failed:")
+
+
+# ---------------------------------------------------------------------------
+# Cancelled-lock release must not run on the event loop thread (C-b)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_session_hygiene_timeout_releases_lock_off_loop(
+    monkeypatch, tmp_path
+):
+    """The timeout path's ``release_cancelled_compression_lock()`` ends in a
+    synchronous SQLite DELETE (the coordination store's ``release_compression_lock``);
+    running it inline froze the event loop (it was the top hygiene frame in
+    loop-stall stack dumps). Contract: the release must execute on a worker
+    thread, never on the loop thread.
+    """
+    from agent.conversation_compression import CompressionCommitFence
+
+    release_threads: list = []
+
+    class RecordingFence(CompressionCommitFence):
+        def release_cancelled_compression_lock(self) -> None:
+            release_threads.append(threading.get_ident())
+            return super().release_cancelled_compression_lock()
+
+    monkeypatch.setattr(
+        "agent.conversation_compression.CompressionCommitFence",
+        RecordingFence,
+    )
+
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    cleanup_done = threading.Event()
+
+    class SlowCompressAgent:
+        def __init__(self, **kwargs):
+            self.session_id = kwargs.get("session_id", "fake-session")
+            self._session_db = kwargs.get("session_db")
+            self._last_compaction_in_place = False
+            self.context_compressor = SimpleNamespace(
+                bind_session_state=MagicMock(),
+                _last_compress_aborted=False,
+                _last_aux_model_failure_model=None,
+            )
+            self.shutdown_memory_provider = MagicMock()
+            self.close = MagicMock(side_effect=cleanup_done.set)
+
+        def _compress_context(
+            self, messages, *_args, commit_fence=None, **_kwargs
+        ):
+            worker_started.set()
+            assert release_worker.wait(timeout=2)
+            if commit_fence is not None and not commit_fence.begin_commit():
+                return (messages, None)
+            if commit_fence is not None:
+                commit_fence.finish_commit()
+            return (messages, None)
+
+    runner, _adapter, event = _make_progress_runner(
+        monkeypatch,
+        tmp_path,
+        SlowCompressAgent,
+        "compression:\n"
+        "  enabled: true\n"
+        "  hygiene_timeout_seconds: 0.01\n",
+    )
+
+    loop_thread = threading.get_ident()
+    assert await runner._handle_message(event) == "ok"
+    assert worker_started.is_set()
+    assert runner._run_agent.await_count == 1
+
+    # The timeout path released the cancelled worker's lock...
+    assert len(release_threads) >= 1
+    # ...and never on the event loop thread.
+    assert loop_thread not in release_threads
+
+    release_worker.set()
+    await asyncio.wait_for(asyncio.to_thread(cleanup_done.wait), timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_session_hygiene_cancel_during_off_loop_release_still_defers_cleanup():
+    """Awaiting the off-loop release opens a window the inline call never had.
+
+    A CancelledError delivered while ``release_cancelled_compression_lock``
+    runs on its worker thread must still hand the agent's cleanup to the
+    still-running compression future. Otherwise the detached attempt's
+    ``finally`` sees ``cleanup_deferred=False`` and tears the agent down
+    under the live executor worker.
+    """
+    from agent.conversation_compression import CompressionCommitFence
+
+    release_entered = threading.Event()
+    release_gate = threading.Event()
+
+    class BlockingReleaseFence(CompressionCommitFence):
+        def release_cancelled_compression_lock(self) -> None:
+            release_entered.set()
+            release_gate.wait(timeout=10)
+            return super().release_cancelled_compression_lock()
+
+    gateway_run = importlib.import_module("gateway.run")
+    runner = object.__new__(gateway_run.GatewayRunner)
+    deferred: list = []
+    runner._defer_agent_cleanup_until_future_done = (
+        lambda future, agent, *, context: deferred.append((future, agent, context))
+    )
+
+    worker_future = asyncio.get_running_loop().create_future()
+    agent = object()
+    attempt = gateway_run.GatewayRunner._HygieneAttempt(agent=agent, meta=None)
+    attempt.commit_fence = BlockingReleaseFence()
+    attempt.future = worker_future
+
+    task = asyncio.create_task(
+        runner._hmwa_hygiene_cancel_or_adopt(attempt, "session hygiene timeout")
+    )
+    try:
+        assert await asyncio.to_thread(release_entered.wait, 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        release_gate.set()
+
+    assert attempt.commit_fence.is_cancelled
+    assert attempt.cleanup_deferred is True
+    assert deferred == [(worker_future, agent, "session hygiene timeout")]
+    worker_future.cancel()
+
+
+# ---------------------------------------------------------------------------
+# compression.hygiene_threshold config exposure (C-c)
+# ---------------------------------------------------------------------------
+
+class _HygNoopAgent:
+    """Hygiene agent stub: compression runs but changes nothing."""
+
+    instances = 0
+
+    def __init__(self, **kwargs):
+        self.session_id = kwargs.get("session_id", "fake-session")
+        self._session_db = kwargs.get("session_db")
+        self._last_compaction_in_place = False
+        self._last_compression_no_progress = False
+        self.context_compressor = SimpleNamespace(
+            bind_session_state=MagicMock(),
+            _last_compress_aborted=False,
+            _last_aux_model_failure_model=None,
+        )
+        self.shutdown_memory_provider = MagicMock()
+        self.close = MagicMock()
+        type(self).instances += 1
+
+    def _compress_context(self, messages, *_args, **_kwargs):
+        return (messages, None)
+
+
+def _hygiene_threshold_probe_context() -> int:
+    """Context length placing the default history's token estimate BETWEEN
+    a 0.5 trigger and the default 0.85 trigger.
+
+    ``_make_progress_runner`` loads ``_make_history(6, content_size=400)``;
+    with ``estimate = ctx * 0.7``: 0.5*ctx < estimate < 0.85*ctx, so hygiene
+    fires iff the configured threshold is honored.
+    """
+    estimate = estimate_messages_tokens_rough(_make_history(6, content_size=400))
+    return int(estimate / 0.7)
+
+
+@pytest.mark.asyncio
+async def test_hygiene_threshold_config_lowers_trigger(
+    monkeypatch, tmp_path, caplog
+):
+    """compression.hygiene_threshold is read and applied at the trigger."""
+    _HygNoopAgent.instances = 0
+    caplog.set_level(logging.INFO, logger="gateway.run")
+    runner, _adapter, event = _make_progress_runner(
+        monkeypatch,
+        tmp_path,
+        _HygNoopAgent,
+        "compression:\n"
+        "  enabled: true\n"
+        "  hygiene_threshold: 0.5\n",
+    )
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda *_args, **_kwargs: _hygiene_threshold_probe_context(),
+    )
+
+    assert await runner._handle_message(event) == "ok"
+    log_text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "auto-compressing" in log_text
+    assert "threshold: 50%" in log_text
+    assert _HygNoopAgent.instances == 1
+
+
+@pytest.mark.asyncio
+async def test_hygiene_threshold_defaults_to_085_when_unset(
+    monkeypatch, tmp_path, caplog
+):
+    """Without the new key the trigger stays at the historical 0.85."""
+    _HygNoopAgent.instances = 0
+    caplog.set_level(logging.INFO, logger="gateway.run")
+    runner, _adapter, event = _make_progress_runner(
+        monkeypatch,
+        tmp_path,
+        _HygNoopAgent,
+        "compression:\n  enabled: true\n",
+    )
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda *_args, **_kwargs: _hygiene_threshold_probe_context(),
+    )
+
+    assert await runner._handle_message(event) == "ok"
+    log_text = "\n".join(r.getMessage() for r in caplog.records)
+    # Estimate sits below 85% of the probe context: no compression.
+    assert "auto-compressing" not in log_text
+    assert _HygNoopAgent.instances == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_value", ["1.5", "0", "-0.2", "abc"])
+async def test_hygiene_threshold_invalid_values_keep_default(
+    monkeypatch, tmp_path, caplog, bad_value
+):
+    """Out-of-range or unparsable hygiene_threshold values keep 0.85."""
+    _HygNoopAgent.instances = 0
+    caplog.set_level(logging.INFO, logger="gateway.run")
+    runner, _adapter, event = _make_progress_runner(
+        monkeypatch,
+        tmp_path,
+        _HygNoopAgent,
+        "compression:\n"
+        "  enabled: true\n"
+        f"  hygiene_threshold: {bad_value}\n",
+    )
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda *_args, **_kwargs: _hygiene_threshold_probe_context(),
+    )
+
+    assert await runner._handle_message(event) == "ok"
+    log_text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "auto-compressing" not in log_text
+    assert _HygNoopAgent.instances == 0
+
+
+@pytest.mark.asyncio
+async def test_hygiene_threshold_inversion_warns_once(
+    monkeypatch, tmp_path, caplog
+):
+    """compression.threshold >= hygiene_threshold logs the layering warning,
+    deduplicated across turns (config is re-read per incoming message)."""
+    hygiene_mod = importlib.import_module("gateway.run_turn_hygiene")
+    monkeypatch.setattr(hygiene_mod, "_last_hygiene_inversion_warned", None)
+
+    _HygNoopAgent.instances = 0
+    caplog.set_level(logging.INFO, logger="gateway.run")
+    runner, _adapter, event = _make_progress_runner(
+        monkeypatch,
+        tmp_path,
+        _HygNoopAgent,
+        "compression:\n"
+        "  enabled: true\n"
+        "  threshold: 0.9\n"
+        "  hygiene_threshold: 0.85\n",
+    )
+
+    assert await runner._handle_message(event) == "ok"
+    assert await runner._handle_message(event) == "ok"
+
+    warnings = [
+        r
+        for r in caplog.records
+        if "hygiene safety net will fire before" in r.getMessage()
+    ]
+    assert len(warnings) == 1
+    assert warnings[0].levelno == logging.WARNING
+
+
+@pytest.mark.asyncio
+async def test_hygiene_threshold_normal_layering_does_not_warn(
+    monkeypatch, tmp_path, caplog
+):
+    """threshold < hygiene_threshold (the intended layering) stays silent."""
+    hygiene_mod = importlib.import_module("gateway.run_turn_hygiene")
+    monkeypatch.setattr(hygiene_mod, "_last_hygiene_inversion_warned", None)
+
+    _HygNoopAgent.instances = 0
+    caplog.set_level(logging.INFO, logger="gateway.run")
+    runner, _adapter, event = _make_progress_runner(
+        monkeypatch,
+        tmp_path,
+        _HygNoopAgent,
+        "compression:\n"
+        "  enabled: true\n"
+        "  threshold: 0.8\n"
+        "  hygiene_threshold: 0.85\n",
+    )
+
+    assert await runner._handle_message(event) == "ok"
+    log_text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "hygiene safety net will fire before" not in log_text
+
+
+def test_hygiene_threshold_is_a_registered_default_config_key():
+    """compression.hygiene_threshold is registered in DEFAULT_CONFIG with the gateway's historical
+    0.85 trigger, so `hermes config` and the docs-drift ratchet know it (documented, not baselined)."""
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    assert DEFAULT_CONFIG["compression"]["hygiene_threshold"] == 0.85

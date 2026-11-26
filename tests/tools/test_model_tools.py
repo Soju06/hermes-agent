@@ -8,8 +8,85 @@ import pytest
 
 from model_tools import (
     handle_function_call,
+    get_tool_definitions,
     _AGENT_LOOP_TOOLS,
+    _apply_toolset_selection,
 )
+
+
+# =========================================================================
+# disabled_toolsets accepts individual tool names
+# =========================================================================
+
+class TestDisabledToolsetsAcceptsToolNames:
+    def _names(self, disabled=None):
+        return {
+            t["function"]["name"]
+            for t in get_tool_definitions(disabled_toolsets=disabled, quiet_mode=True)
+        }
+
+    def test_single_tool_name_is_removed(self):
+        # skill_view: always available, and a tool of the `skills` toolset, not a toolset name.
+        # (text_to_speech is only listed when its SDK is installed or lazy installs are allowed.)
+        base = self._names()
+        assert "skill_view" in base, "precondition: skill_view registered in default surface"
+        after = self._names(["skill_view"])
+        assert "skill_view" not in after
+        # Only that one tool leaves; everything else stays.
+        assert base - after == {"skill_view"}
+
+    def test_multiple_tool_names_removed(self):
+        # Two default-surface tools that are not toolset names: every listed name leaves, nothing else.
+        wanted = {"skill_view", "search_files"}
+        base = self._names()
+        assert wanted <= base, "precondition: both tools on the default surface"
+        assert base - self._names(sorted(wanted)) == wanted
+
+    def test_unknown_name_is_graceful_noop(self):
+        base = self._names()
+        after = self._names(["definitely_not_a_real_tool_or_toolset"])
+        assert after == base
+
+    @pytest.mark.parametrize("name", ["memory", "terminal"])
+    def test_toolset_name_still_takes_precedence_over_tool_name(self, name, capsys):
+        # The names model_tools cites as BOTH a toolset and a tool. The toolset match must win,
+        # removing the whole bundle (with the memory chain: memory + notes_write + notes_read + …),
+        # never just the single same-named tool. The bundle comes from the toolset, so this does
+        # not depend on which of its tools a base registers.
+        from toolsets import resolve_toolset, validate_toolset
+        from tools.registry import registry
+
+        assert validate_toolset(name) and registry.get_entry(name) is not None, (
+            f"precondition: {name} is both a toolset and a registered tool"
+        )
+        base = self._names()
+        bundle = set(resolve_toolset(name)) & base
+        assert name in bundle, f"precondition: {name} on the default surface"
+        assert not bundle & self._names([name]), "toolset subtraction should remove the bundle"
+        # Which branch took the name, even where the bundle is the one same-named tool.
+        capsys.readouterr()
+        _apply_toolset_selection(set(base), [name], False, disable=True)
+        out = capsys.readouterr().out
+        assert f"Disabled toolset '{name}'" in out
+        assert f"Disabled tool '{name}'" not in out
+
+    def test_tool_name_removes_one_tool_toolset_name_removes_bundle(self):
+        # `terminal` is both a toolset (terminal + process_manage) and a tool; `process_manage`
+        # is only a tool. Raw catalog: tool_search assembly would defer process_manage.
+        def raw(disabled=None):
+            return {
+                t["function"]["name"]
+                for t in get_tool_definitions(
+                    disabled_toolsets=disabled, quiet_mode=True, skip_tool_search_assembly=True,
+                )
+            }
+
+        base = raw()
+        assert {"terminal", "process_manage"} <= base, "precondition: terminal toolset registered"
+        assert base - raw(["process_manage"]) == {"process_manage"}
+        without_terminal = raw(["terminal"])
+        assert "terminal" not in without_terminal
+        assert "process_manage" not in without_terminal, "toolset match wins over the tool name"
 
 
 # =========================================================================

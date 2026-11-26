@@ -14,6 +14,9 @@ import pytest
 from agent.memory_manager import MemoryManager
 from agent.memory_provider import MemoryProvider
 
+# Write reason accepted by the add/patch reason gate (fork patch: memory-write-reason-gate).
+WRITE_REASON = "This is a durable environment fact that should persist across sessions."
+
 
 class _RecordingProvider(MemoryProvider):
     """Minimal external provider that records on_memory_write calls."""
@@ -151,7 +154,7 @@ def test_committed_entry_identity_comes_from_locked_store(
     monkeypatch.setattr(store, '_file_lock', checked_lock)
     monkeypatch.setattr(memory_tool_store, '_find_unique_match', checked_match)
     args = {'target': target, **({'operations': operations} if batch else operations[0])}
-    result = memory_tool(store=store, **args)
+    result = memory_tool(store=store, reason=WRITE_REASON, **args)
     assert json.loads(result)['success'] is True
     assert not locked
     assert provider.calls == []
@@ -188,7 +191,7 @@ def test_patch_mirrors_as_a_replace_of_the_whole_entry(tmp_path, monkeypatch, ba
     ops = [{'action': 'patch', 'old_text': 'port 8080', 'content': 'port 9090'},
            {'action': 'patch', 'old_text': 'nginx', 'content': 'caddy'}]
     for args in ([{'target': 'memory', 'operations': ops}] if batch else [{'target': 'memory', **op} for op in ops]):
-        result = memory_tool(store=store, **args)
+        result = memory_tool(store=store, reason=WRITE_REASON, **args)
         assert json.loads(result)['success'] is True
         manager.notify_memory_tool_write(result, args)
     assert [(c['action'], c['content'], c['metadata']['previous_content']) for c in provider.calls] == [

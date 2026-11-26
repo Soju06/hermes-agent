@@ -898,8 +898,17 @@ def _overlay_has_creds(b: _PickerBuild, pid: str, hermes_slug: str, overlay) -> 
         # consume Claude Code tokens); the picker is discovery-oriented, so read the files directly.
         try:
             from agent.anthropic_credentials import read_claude_code_credentials, read_hermes_oauth_credentials
-            hermes_creds = read_hermes_oauth_credentials()
-            cc_creds = read_claude_code_credentials()
+            from hermes_cli.auth import is_source_suppressed
+            # A file source the user suppressed (``hermes auth remove``) must not resurface
+            # built-in Anthropic in the picker.
+            hermes_creds = (
+                None if is_source_suppressed("anthropic", "hermes_pkce")
+                else read_hermes_oauth_credentials()
+            )
+            cc_creds = (
+                None if is_source_suppressed("anthropic", "claude_code")
+                else read_claude_code_credentials()
+            )
             if (hermes_creds and hermes_creds.get("accessToken")) or (cc_creds and cc_creds.get("accessToken")):
                 has_creds = True
         except Exception as exc:

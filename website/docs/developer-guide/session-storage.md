@@ -374,7 +374,9 @@ and writers of non-session tables. The SQLite backend's store holder (`StoreHold
   first 2s, then 250ms-1s): 20s for routine writes, 60s for transcript writes
   (their failure aborts the turn), 0.5s for observation-only activity writes
 - **BEGIN IMMEDIATE** transactions to surface lock contention at transaction start
-- **Periodic WAL checkpoints** every 50 successful writes (PASSIVE mode)
+- **Periodic WAL checkpoints** every 50 successful writes (PASSIVE mode), run on a per-writer
+  maintenance thread started by the first committed write (`persistence/sqlite/_maintenance_thread.py`),
+  together with the FTS incremental merge every 1000 writes, so neither runs inside a write
 
 This avoids the "convoy effect" where SQLite's deterministic internal backoff
 causes all competing writers to retry at the same intervals.

@@ -70,6 +70,9 @@ class TodoStore:
                 cur["content"] = self._cap_content(str(t["content"]).strip())
             if t.get("status") and str(t["status"]).strip().lower() in VALID_STATUSES:
                 cur["status"] = str(t["status"]).strip().lower()
+            active_form = self._read_active_form(t)
+            if active_form:
+                cur["active_form"] = active_form
             if "parent" in t:
                 parent = str(t["parent"] or "").strip()
                 if parent:
@@ -139,7 +142,8 @@ class TodoStore:
 
     @staticmethod
     def _validate(item: dict[str, Any]) -> dict[str, str]:
-        """Normalize one item to ``{id, content, status, parent?}`` (placeholders when missing)."""
+        """Normalize one item to ``{id, content, status, parent?, active_form?}`` (placeholders
+        when missing); ``active_form`` is kept only when the caller supplied one."""
         if not isinstance(item, dict):
             return {"id": "?", "content": "(invalid item)", "status": "pending"}
         item_id = str(item.get("id", "")).strip() or "?"
@@ -156,7 +160,24 @@ class TodoStore:
         parent = str(item.get("parent") or "").strip()
         if parent and parent != item_id:
             result["parent"] = parent
+        active_form = TodoStore._read_active_form(item)
+        if active_form:
+            result["active_form"] = active_form
         return result
+
+    @staticmethod
+    def _read_active_form(item: dict[str, Any]) -> str:
+        """Normalized present-continuous label for an item. Accepts both the snake_case name
+        used across this codebase and the camelCase ``activeForm`` spelling, so a model that
+        has internalized the camelCase convention from another harness is not silently
+        dropped. Empty/blank values normalize to "" (field omitted)."""
+        raw = item.get("active_form")
+        if raw is None:
+            raw = item.get("activeForm")
+        if raw is None:
+            return ""
+        text = str(raw).strip()
+        return TodoStore._cap_content(text) if text else ""
 
     @staticmethod
     def _sanitize_parents(items: list[dict[str, str]]) -> None:
@@ -215,8 +236,18 @@ def todo_tool(todos: Optional[list[dict[str, Any]]] = None, merge: bool = False,
     summary = {"total": len(items)}
     for status in ("pending", "in_progress", "completed", "cancelled"):
         summary[status] = sum(1 for i in items if i["status"] == status)
-    return json.dumps({"todos": items, "revision": store.snapshot()["revision"],
-                       "summary": summary}, ensure_ascii=False)
+    payload = {"todos": items, "revision": store.snapshot()["revision"], "summary": summary}
+    if todos is not None:
+        # The same continuation nudge Claude Code returns from TodoWrite, verbatim. CC's tool
+        # result is that sentence alone; here it rides inside the JSON payload because
+        # AIAgent._hydrate_todo_store() reconstructs session todo state by json.loads()-ing
+        # the newest todo tool result — a plain-text result would break session restoration.
+        payload["message"] = (
+            "Todos have been modified successfully. Ensure that you continue "
+            "to use the todo list to track your progress. Please proceed with "
+            "the current tasks if applicable"
+        )
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def check_todo_requirements() -> bool:
@@ -229,24 +260,99 @@ def check_todo_requirements() -> bool:
 TODO_SCHEMA = {
     "name": "todo_list",
     "description": (
-        # See #95681.
-        "Track a task list for multi-step work (3+ steps). Use for complex tasks "
-        "with 3+ steps or when the user provides multiple tasks. "
-        "For 'all N items' tasks, enumerate every instance as its own checklist "
-        "item so none are silently dropped. "
-        "Call with no parameters to read the current list.\n"
-        "List order is priority. Only ONE item in_progress at a time. "
-        "Break large phases into subtasks via parent. "
-        "Mark an item completed only after the work is verified done, never "
-        "based on intent. If something fails, cancel it and add a revised "
-        "item. Always returns the full current list."
+        # Claude Code TodoWrite's when-to-use / when-not-to-use / state-management guidance
+        # (v2.1.226), adapted to this tool's read/merge calling convention (#95681 keeps it
+        # static so the cached prompt prefix survives). The first sentence leads with the
+        # capability and fits the tool_search catalog line (CATALOG_SUMMARY_MAX_CHARS).
+        "Create and manage a structured task list for your current coding "
+        "session. This helps you track progress, organize "
+        "complex tasks, and demonstrate thoroughness to the user.\n"
+        "It also helps the user understand the progress of the task and "
+        "overall progress of their requests.\n\n"
+        "## When to Use This Tool\n"
+        "Use this tool proactively in these scenarios:\n\n"
+        "1. Complex multi-step tasks (3+ steps) - When a task requires 3 or more "
+        "distinct steps or actions\n"
+        "2. Non-trivial and complex tasks - Tasks that require careful "
+        "planning or multiple operations\n"
+        "3. User explicitly requests todo list - When the user directly asks "
+        "you to use the todo list\n"
+        "4. User provides multiple tasks - When users provide a list of "
+        "things to be done (numbered or comma-separated). For 'all N items' "
+        "tasks, enumerate every instance as its own checklist item so none "
+        "are silently dropped\n"
+        "5. After receiving new instructions - Immediately capture user "
+        "requirements as todos\n"
+        "6. When you start working on a task - Mark it as in_progress BEFORE "
+        "beginning work. Ideally you should only have one todo as "
+        "in_progress at a time\n"
+        "7. After completing a task - Mark it as completed and add any new "
+        "follow-up tasks discovered during implementation\n\n"
+        "## When NOT to Use This Tool\n"
+        "Skip using this tool when:\n"
+        "1. There is only a single, straightforward task\n"
+        "2. The task is trivial and tracking it provides no organizational "
+        "benefit\n"
+        "3. The task can be completed in less than 3 trivial steps\n"
+        "4. The task is purely conversational or informational\n\n"
+        "NOTE that you should not use this tool if there is only one trivial "
+        "task to do. In this case you are better off just doing the task "
+        "directly.\n\n"
+        "## Task States and Management\n\n"
+        "1. **Task States**: Use these states to track progress:\n"
+        "   - pending: Task not yet started\n"
+        "   - in_progress: Currently working on (limit to ONE task at a time)\n"
+        "   - completed: Task finished successfully\n"
+        "   - cancelled: Task abandoned (superseded or no longer relevant)\n\n"
+        "   **IMPORTANT**: Task descriptions must have two forms:\n"
+        "   - content: The imperative form describing what needs to be done "
+        "(e.g., \"Run tests\", \"Build the project\")\n"
+        "   - active_form: The present continuous form shown during execution "
+        "(e.g., \"Running tests\", \"Building the project\")\n\n"
+        "2. **Task Management**:\n"
+        "   - Update task status in real-time as you work\n"
+        "   - Mark tasks complete IMMEDIATELY after finishing (don't batch "
+        "completions)\n"
+        "   - Only ONE item in_progress at a time — exactly one task must be "
+        "in_progress at any time (not less, not more)\n"
+        "   - Complete current tasks before starting new ones\n"
+        "   - Remove tasks that are no longer relevant from the list "
+        "entirely, or mark them cancelled\n"
+        "   - Break large phases into subtasks via parent\n\n"
+        "3. **Task Completion Requirements**:\n"
+        "   - ONLY mark a task as completed when you have FULLY accomplished "
+        "it (verified done, never based on intent)\n"
+        "   - If you encounter errors, blockers, or cannot finish, keep the "
+        "task as in_progress\n"
+        "   - When blocked, create a new task describing what needs to be "
+        "resolved; if something fails, cancel it and add a revised item\n"
+        "   - Never mark a task as completed if:\n"
+        "     - Tests are failing\n"
+        "     - Implementation is partial\n"
+        "     - You encountered unresolved errors\n"
+        "     - You couldn't find necessary files or dependencies\n\n"
+        "4. **Task Breakdown**:\n"
+        "   - Create specific, actionable items\n"
+        "   - Break complex tasks into smaller, manageable steps\n"
+        "   - Use clear, descriptive task names\n"
+        "   - Always provide both forms:\n"
+        "     - content: \"Fix authentication bug\"\n"
+        "     - active_form: \"Fixing authentication bug\"\n\n"
+        "## Calling Convention\n"
+        "- Call with no parameters to read the current list\n"
+        "- Provide 'todos' to create/update items (the merge parameter picks "
+        "replace-the-plan vs update-by-id)\n"
+        "- List order is priority. Always returns the full current list\n\n"
+        "When in doubt, use this tool. Being proactive with task management "
+        "demonstrates attentiveness and ensures you complete all "
+        "requirements successfully."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "todos": {
                 "type": "array",
-                "description": "Task items to write.",
+                "description": "The updated todo list. Omit to read the current list.",
                 "items": {
                     "type": "object",
                     "properties": {
@@ -255,7 +361,13 @@ TODO_SCHEMA = {
                         },
                         "content": {
                             "type": "string",
-                            "description": "Task description"
+                            "description": "The task description in imperative form (e.g., \"Run tests\")"
+                        },
+                        "active_form": {
+                            "type": "string",
+                            "description": (
+                                "The present continuous form shown during execution (e.g., \"Running tests\")"
+                            )
                         },
                         "status": {
                             "type": "string",

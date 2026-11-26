@@ -334,6 +334,85 @@ model:
 #                             # (approval prompts, clarify) never count against it.
 
 # =============================================================================
+# Model Routing (ADR-003) — purpose-based route catalog
+# =============================================================================
+# Dormant unless routes are declared. Each route maps a purpose to a concrete
+# runtime plus an ordered, health-checked fallback chain. Route provider names
+# must exist under providers: above (or be a built-in provider id).
+#
+# NOTE: this root-level model_routes: catalog is unrelated to the API server's
+# per-client alias map under platforms.api_server.extra.model_routes (below) —
+# that one maps inbound API model aliases to concrete models for API clients.
+#
+# model_routes:
+#   routes:
+#     dev:
+#       description: "Backend/system/debug/PR source-code work"
+#       provider: claude-lb            # must exist under providers: (or built-in)
+#       model: claude-fable-5
+#       reasoning_effort: xhigh        # minimal|low|medium|high|xhigh|max|none, omit to leave unset
+#       accepted:                      # model ids already "in this tier" (no-op suppression);
+#         - claude-fable-5             # use dash forms: claude-opus-4-8 matches a live
+#         - gpt-5.6-sol                # claude-opus-4.8, not the other way around
+#       fallbacks:                     # ordered failover chain; an entry with a fresh unhealthy
+#                                      # verdict (from real traffic) is skipped
+#         - provider: codex-nekos
+#           model: gpt-5.6-sol
+#           reasoning_effort: xhigh    # (example) fallback effort is NOT inherited from the route
+#         - provider: glm-vooy
+#           model: grok-4.5
+#       repromote_after_turns: 3       # noop turns on a non-primary accepted member before the
+#                                      # session is re-promoted to the route primary; 0 disables,
+#                                      # omit to inherit router.repromote_after_turns
+#                                      # (a member picked with /model or the picker is never re-promoted)
+#     chat:
+#       description: "Conversation, quick Q&A"
+#       provider: glm-vooy
+#       model: grok-4.5
+#   health:                            # passive-first: real completion traffic files the verdicts
+#                                      # (outage-shaped failover = unhealthy, live success clears it);
+#                                      # no verdict = assumed healthy, no probe. The probe only
+#                                      # rechecks a stale unhealthy verdict (fail-open: auth errors
+#                                      # count healthy)
+#     enabled: true                    # kill switch; env HERMES_MODEL_ROUTES_HEALTH=0/1 overrides
+#     cache_path: ""                   # "" = <hermes home>/state/model_route_health.json
+#     ok_ttl_seconds: 300              # healthy verdicts served from cache this long (then assumed
+#                                      # healthy again, never re-probed)
+#     fail_ttl_seconds: 120            # unhealthy verdicts block the provider this long, then one
+#                                      # recovery probe rechecks it
+#     probe_timeout_seconds: 2.5       # recovery probe only
+#   static_rules:                      # matched before the LLM classifier; first match wins
+#     - name: pr-review-shorthand      # optional; shows up as `rule` in the decision log
+#       route: dev
+#       when:                          # every condition must hold (AND)
+#         text_matches_any:            # regex list, any may match
+#           - 'codex-lb\s+#?\d+'
+#       reason: "PR shorthand always routes to dev"
+#     - route: chat
+#       when:                          # supported source conditions ({eq|in|not_in}):
+#         is_owner: { eq: false }      # is_owner (per-platform *_ALLOWED_USERS envs;
+#         chat_type: { in: [dm] }      #  missing/empty allowlist counts everyone as owner),
+#                                      #  chat_id, parent_chat_id, user_id, platform, chat_type
+#       reason: "non-owner DMs stay on the chat tier"
+#   router:                            # dynamic pre-dispatch router (gateway/model_router.py)
+#     mode: off                        # off | shadow (log-only soak) | enforce;
+#                                      # env HERMES_MODEL_ROUTER_MODE wins when set
+#     model: gemini-3-flash-preview    # classifier model (bench winner — keep unless re-benched)
+#     timeout_ms: 8000                 # classifier call budget; on failure a narrow regex
+#                                      # fallback decides (never triggers chat downgrades)
+#     recent_turns: 5                  # dialogue turns shown to the classifier
+#     normal_downgrade_streak: 3       # consecutive LLM NORMALs before the chat downgrade
+#     repromote_after_turns: 3         # noop turns on a non-primary accepted member before
+#                                      # re-promotion to the route primary; 0 disables
+#                                      # (a member picked with /model or the picker is never re-promoted)
+#     chat_route: chat                 # NORMAL downgrade target; "" disables downgrades
+#     label_routes:                    # classifier label -> route; missing/"" = never switches
+#       SYSTEM_DEV: dev
+#       FRONTEND_DEV: dev
+#       DOCUMENT_WORK: ""
+#     decision_log: ""                 # "" = <hermes home>/logs/model_router_decisions.jsonl
+
+# =============================================================================
 # OpenRouter Provider Routing (only applies when using OpenRouter)
 # =============================================================================
 # Control how requests are routed across providers on OpenRouter.
@@ -1640,6 +1719,21 @@ platform_toolsets:
 #
 # CLI override: hermes chat --toolsets terminal,web,file
 
+# agent.disabled_toolsets: names subtracted from the resolved tool surface
+# regardless of which toolsets/platforms enabled them. Accepts:
+#   - a toolset name        (e.g. "browser") — removes the whole bundle
+#   - an individual tool    (e.g. "text_to_speech") — removes just that tool
+# Toolset names take precedence when a name is both (e.g. "memory"): disable
+# such a tool by its owning toolset instead. Disabling unused tools trims the
+# model-visible schema surface (fewer distractors, smaller prompt) without
+# unregistering anything — flip the list to re-enable. `hermes tools` keeps a
+# per-tool entry while its toolset stays on, and clears it when you check a
+# toolset that the entry had switched off entirely.
+# agent:
+#   disabled_toolsets:
+#     - text_to_speech        # drop voice output if unused
+#     - browser               # drop the whole browser suite if headless-only
+
 # =============================================================================
 # MCP (Model Context Protocol) Servers
 # =============================================================================
@@ -1963,6 +2057,17 @@ delegation:
   # fallback_providers:                       # Fallback chain for delegated children (same entry format as the
   #   - provider: "openrouter"                # top-level list). Pinned children use only a declared child chain;
   #     model: "deepseek/deepseek-chat"       # unpinned children inherit when unset. [] disables fallback (#65038).
+  # default_route: ""                         # model_routes route used when a delegate_task call names no
+  #                                           # route (empty/absent = delegation.model/provider above).
+  #                                           # Must name a route declared under model_routes.routes.
+  #                                           # Applies on the default backend only: a non-default
+  #                                           # delegation.backend (or the backend a session's delegate_task
+  #                                           # was built from) answers instead.
+  #                                           # When routes are declared, delegate_task also grows a 'route'
+  #                                           # enum param (top-level and per-task in tasks[]; per-task wins):
+  #                                           # the child runs on the route's health-checked provider/model,
+  #                                           # and the route's reasoning_effort beats delegation.reasoning_effort.
+  #                                           # Unknown or fully-unhealthy routes error — no silent fallback.
 
 # =============================================================================
 # Display

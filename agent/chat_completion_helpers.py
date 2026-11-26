@@ -34,6 +34,9 @@ from agent.errors import EmptyStreamError
 from agent.chat_completion_local import _streams_llamacpp, stale_giveup
 from agent.chat_completion_headers import _chat_completion_capturing_headers
 from agent.chat_completion_stream_monitor import StreamingWaitMonitor, StreamLifetimeExceeded
+from agent import passive_provider_health as _passive_health
+from agent import outage_route_fallback as _outage_route
+from agent import refusal_fallback as _refusal_fallback
 from agent.transports.chat_completions import is_router_timeout_shim, router_timeout_shim_may_follow
 from agent.fast_mode import effective_request_overrides
 from agent.turn_context import substitute_api_content
@@ -1023,6 +1026,7 @@ def direct_api_call(agent, api_kwargs: dict):
         # reset undoes the bump; the finally discards the poisoned client).
         request.mark_done()
         _reset_stale_streak(agent)
+        _passive_health.note_provider_success(agent)
         succeeded = True
         return response
     finally:
@@ -1947,11 +1951,19 @@ def _update_fallback_context_compressor(agent) -> None:
 
 
 def _reresolve_fallback_reasoning_config(agent) -> None:
-    """Per-model override > global reasoning_effort (YAML False = disabled); a config load
-    failure keeps the current reasoning_config rather than killing the swap."""
+    """Preserve the already session-resolved value (gateway /reasoning or routed effort) across
+    fallback activation. Only an absent active value falls through to fallback-model config
+    resolution (Closes #21256): per-model override > global reasoning_effort (YAML False =
+    disabled). Provider adapters still own model-specific wire adaptation such as xhigh -> max;
+    this layer must not pre-downgrade the session preference. A config load failure keeps the
+    current reasoning_config rather than killing the swap."""
+    if getattr(agent, "reasoning_config", None) is not None:
+        logger.info(
+            "Fallback %s: preserving active session reasoning_config: %s",
+            agent.model, agent.reasoning_config,
+        )
+        return
     try:
-        # Re-resolve reasoning_config for the new fallback model (Closes #21256). Wrapped in try/except
-        # because a config load failure must not kill the swap.
         from hermes_cli.config import load_config
         from hermes_constants import resolve_reasoning_config
         agent.reasoning_config = resolve_reasoning_config(load_config() or {}, agent.model)
@@ -1984,20 +1996,52 @@ def _rescope_fallback_extra_body(agent, old_model: str, old_provider: str, old_b
         logger.debug("Failed to resolve extra_body for fallback %s; keeping current: %s", agent.model, _eb_err)
 
 
-def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=None) -> bool:
+def try_activate_fallback(
+    agent, reason: FailoverReason | None = None, reset_at=None, *, retry_pending: bool = False,
+) -> bool:
     """Switch to the next fallback model/provider in the chain; False when exhausted. Swaps client,
     model slug and provider in place so the retry loop continues on the new backend; client
     construction goes through resolve_provider_client (no duplicated provider→key mappings)."""
+    if _refusal_fallback.is_content_policy_blocked(reason):
+        # Canonicalize compatible enum-like values before the established
+        # activation path stores ``reason.value``.
+        reason = FailoverReason.content_policy_blocked
+
     from agent.fallback_cooldown import _arm_rate_limit_cooldown, switch_deferred_by_reset
     from agent.fallback_notice import announce_fallback_switch, fallback_trigger_text
     if switch_deferred_by_reset(agent, reason, reset_at):
+        # Passive health: only the in-loop eager switch (retry_pending) rides the reset window
+        # out on this runtime; a deferral with no retry left ends the turn on it.
+        if not retry_pending:
+            _passive_health.note_runtime_abandoned(agent, reason)
         return False
+    # Leaving the CURRENT runtime: file the verdict before the chain advances (burst-guarded).
+    _passive_health.note_runtime_abandoned(agent, reason)
     cooldown_seconds = _arm_rate_limit_cooldown(agent, reason, reset_at=reset_at)
     while True:
-        if agent._fallback_index >= len(agent._fallback_chain):
+        # Route-aware outage fallback: an outage-shaped failure walks the CURRENT route's
+        # declared ``fallbacks:`` (healthy, non-self entries) before the global chain, so a
+        # dev-routed session degrades to another dev-tier member first. The cursor is
+        # transient (re-consulted on every skip) and falls into the global chain exactly once.
+        fb = None
+        if reason in _outage_route.OUTAGE_ROUTE_FALLBACK_REASONS:
+            fb = _outage_route.next_outage_route_fallback(agent)
+        if fb is None and agent._fallback_index >= len(agent._fallback_chain):
+            # Generic chain exhausted. For content-policy refusals only, walk the
+            # configured PERMISSIVE routes AFTER the normal fallback_providers
+            # (typically opus). Owner intent: keep fable→opus as the first hop so
+            # intelligence is preserved; PERMISSIVE (k3/grok) is the last resort
+            # when frontier models refuse the same prompt.
+            if (
+                reason == FailoverReason.content_policy_blocked
+                and _refusal_fallback.walk_refusal_routes(agent, reason)
+            ):
+                return True
+            agent._outage_route_fallback_walk_active = False
             return _fallback_chain_exhausted(agent, reason)
-        fb = agent._fallback_chain[agent._fallback_index]
-        agent._fallback_index += 1
+        if fb is None:
+            fb = agent._fallback_chain[agent._fallback_index]
+            agent._fallback_index += 1
         fb_key = _fallback_entry_key(fb)
         if getattr(agent, "_unavailable_fallback_keys", None) is None:
             agent._unavailable_fallback_keys = set()
@@ -2016,6 +2060,10 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
                 continue
             old_model, old_provider = bound
             fb_model = agent.model  # normalized by the binder
+            # Record WHY the fallback activated so plugins (e.g. capability gates) can distinguish
+            # a refusal-driven temporary swap from any other fallback state. Only set on the
+            # success path — exhaustion and skip paths must not leave a stale reason behind.
+            agent._fallback_reason = reason.value if reason is not None else None
             rewrite_prompt_model_identity(agent, fb_model, fb_provider)
 
             notice = (
@@ -2035,9 +2083,20 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
             # The stale-call streak measured the OLD provider; carrying it over would
             # short-circuit the fresh fallback before its first stream attempt.
             _reset_stale_streak(agent)
+            # Publish the mid-turn swap on the runtime_state hook so guardrail plugins (skill-gate)
+            # see the new model/provider + fallback_reason immediately. Best-effort: activation must
+            # never fail because a plugin hook failed. Local import — runtime_control is core-owned
+            # and pulling it at module scope risks an import cycle.
+            try:
+                from agent.runtime_control import _emit_runtime_state_event, get_runtime_state
+
+                _emit_runtime_state_event(agent, event="fallback", state=get_runtime_state(agent))
+            except Exception as _hook_err:
+                logger.debug("runtime_state fallback event failed: %s", _hook_err)
             from agent.native_compaction import resolve_native_compaction_capabilities
             agent.runtime_capabilities = resolve_native_compaction_capabilities(
                 model=agent.model, base_url=agent.base_url, provider=fb_provider, is_codex_backend=fb_provider == "openai-codex")
+            agent._outage_route_fallback_walk_active = False
             return True
         except Exception as e:
             if fb_provider == "nous":
@@ -2092,9 +2151,9 @@ def _iteration_summary_api_messages(agent, messages: list) -> list:
             agent._sanitize_tool_calls_for_strict_api(api_msg, model=sanitize_model)
         api_messages.append(api_msg)
 
-    effective_system = agent._cached_system_prompt or ""
-    if agent.ephemeral_system_prompt:
-        effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
+    from agent.system_prompt import compose_effective_system_prompt
+
+    effective_system = compose_effective_system_prompt(agent, agent._cached_system_prompt or "")
     if effective_system:
         api_messages = [{"role": "system", "content": effective_system}] + api_messages
     for idx, pfm in enumerate(agent.prefill_messages or ()):
@@ -2622,6 +2681,7 @@ class _BedrockStream:
         # Success clears the cross-turn breaker (#58962).
         if self.result["response"] is not None:
             _reset_stale_streak(self.agent)
+            _passive_health.note_provider_success(self.agent)
         return self.result["response"]
 
     def run(self):
@@ -2784,6 +2844,9 @@ class _StreamingCall(StreamingWaitMonitor):
     def _new_diag(self) -> dict:
         diag = self.agent._stream_diag_init()
         self.clients.diag = diag
+        # Turn trace: the loop reads first_chunk_at/started_at off this dict for the
+        # in-flight llm.call span's TTFT tag (agent/turn_trace.py).
+        self.agent._last_stream_diag = diag
         return diag
 
     def _count_chunk(self, diag, chunk) -> None:
@@ -3837,6 +3900,7 @@ class _StreamingCall(StreamingWaitMonitor):
             _cls = classify_api_error(
                 error, provider=str(getattr(self.agent, "provider", "") or ""), model=str(getattr(self.agent, "model", "") or ""))
         _reset_stale_streak(self.agent)  # deltas fired => provider responsive: clear the breaker
+        _passive_health.note_provider_success(self.agent)
         # #106260: continuing after a context-overflow error re-sends a larger request into the
         # same overflow. Return an EMPTY stub marked terminal so the loop ends the turn instead.
         # Scope is context_overflow ONLY: payload_too_large (413) has its own byte-scored recovery
@@ -3904,6 +3968,7 @@ class _StreamingCall(StreamingWaitMonitor):
             raise error
         if response is not None:
             _reset_stale_streak(self.agent)  # provider proved responsive: clear the breaker
+            _passive_health.note_provider_success(self.agent)
         # Propagate first-chunk timing for the ``post_api_request`` hook.
         if isinstance(self.clients.diag, dict) and self.clients.diag.get("first_chunk_at"):
             self.agent._last_api_first_chunk_at = float(self.clients.diag["first_chunk_at"])

@@ -37,6 +37,7 @@ from agent.turn_failure_copy import (
 from agent.route_verdicts import route_visit
 from agent.turn_retry_state import TurnRetryState
 from agent.turn_recovery_codex import _codex_soft_failure_error, _is_codex_token_expired, _recover_stale_codex_reasoning
+from agent.turn_trace_loop import tag_exit
 from hermes_constants import display_hermes_home
 from utils import base_url_host_matches
 
@@ -470,7 +471,9 @@ def _recover_format_errors(
     # Upstream mutation can invalidate a thinking signature. Native Anthropic has multiple replay
     # carriers and preserved historical blocks, so suppress the rejected opaque blocks across all
     # carriers and persist that suppression. Other transports keep their established one-request
-    # repair: drop reasoning_details only.
+    # repair, which must drop the ordered ``anthropic_content_blocks`` carrier with
+    # ``reasoning_details``: the Anthropic converter (Kimi's as-is replay) and Bedrock Converse's
+    # fallback both prefer it, so leaving it resends the same signed blocks into the same 400.
     if classified.reason == FailoverReason.thinking_signature and not _retry.thinking_sig_retry_attempted:
         _retry.thinking_sig_retry_attempted = True
         from agent.anthropic_thinking_replay import remember_rejected_thinking, tracks_rejected_thinking
@@ -481,10 +484,13 @@ def _recover_format_errors(
         else:
             removed = 0
             for message in api_messages:
-                if isinstance(message, dict) and "reasoning_details" in message:
+                if isinstance(message, dict) and (
+                    "reasoning_details" in message or "anthropic_content_blocks" in message
+                ):
                     message.pop("reasoning_details", None)
+                    message.pop("anthropic_content_blocks", None)
                     removed += 1
-            detail = "stripped reasoning_details"
+            detail = "stripped reasoning_details and anthropic_content_blocks"
         _vlines(agent, f"⚠️  Thinking block signature invalid, {detail} and retrying...")
         logger.warning(
             "%sThinking block signature recovery: %s from %d carrier/message(s) "
@@ -1883,6 +1889,7 @@ def route_classified_error(
         )
         agent._persist_session(messages, conversation_history)
         _final_response = site_copy("compression_disabled", model=agent.model)
+        tag_exit(f"context_overflow_compaction_disabled({classified.reason.value})")
         return _verdict("return", stamp_failure({
             "final_response": _final_response, "messages": messages, "completed": False,
             "api_calls": api_call_count, "error": _final_response, "partial": True, "failed": True,
@@ -1957,7 +1964,7 @@ def route_classified_error(
         if not pool_may_recover:
             agent._buffer_diagnostic_status(_eager_fallback_status(classified, _is_upstream, _is_transport_failure))
             reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
-            if agent._try_activate_fallback(reason=classified.reason, reset_at=reset_at):
+            if agent._try_activate_fallback(reason=classified.reason, reset_at=reset_at, retry_pending=True):
                 return _fallback_break()
 
     # A 401/403 surviving credential refresh means a broken credential or endpoint:

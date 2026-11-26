@@ -20,6 +20,7 @@ from pathlib import Path
 from hermes_constants import get_process_hermes_home
 from tools.environments.base import BaseEnvironment, _SHELL_ENV_NAME_RE
 from tools.environments.base_output import _pipe_stdin
+from tools.environments.local_child_nice import _nice_argv
 from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_cli.process_identity import own_process_groups, release_process_groups
 from gateway.bridged_env import BRIDGED_ENV_MARKER_PREFIX, bridged_env_digest, drop_bridge_markers
@@ -1288,7 +1289,7 @@ class LocalEnvironment(BaseEnvironment):
         # its group to the owner-death supervisor and _wait_for_process releases it.
         try:
             proc = subprocess.Popen(
-                args, text=True, env=run_env, encoding="utf-8", errors="replace",
+                _nice_argv(args), text=True, env=run_env, encoding="utf-8", errors="replace",
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
                 # detached-spawn: ok — owned via own_process_groups right below

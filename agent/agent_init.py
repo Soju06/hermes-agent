@@ -523,8 +523,7 @@ _SESSION_STATE: dict[str, Any] = {
     # False on helper agents (compression / hygiene / review forks) that hand the session to
     # a continuation row that must stay open.
     "_end_session_on_close": True,
-    # True on the background review fork: never persist or publish session lifecycle hooks,
-    # so its harness turn can't hijack or appear under the live session.
+    # Detached forks (``persist_disabled``) never persist or publish session lifecycle hooks.
     "_persist_disabled": False,
 }
 
@@ -1095,6 +1094,10 @@ def _init_session_state(agent, session_id, session_db, parent_session_id, reason
     # In-memory todo list for task planning (one per agent/session)
     from tools.todo_tool import TodoStore
     agent._todo_store = TodoStore()
+    # Todo-reminder counters (agent/turn_todo_reminder.py); the reminder gap starts at its
+    # threshold so the spacing rule cannot suppress the first eligible reminder.
+    agent._todo_loop_iterations_since_write = 0
+    agent._todo_loop_iterations_since_reminder = 10
 
 
 def _apply_display_config(agent, _agent_cfg, platform):
@@ -1186,6 +1189,12 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
 
     # External memory provider plugin (one at a time, alongside built-in): memory.provider.
     agent._memory_manager = None
+    # ADR-004 Phase 0: per-agent memory-ingest kill switch. False for every
+    # live agent (unchanged behavior). Forks that need memory READ access but
+    # zero graph-write leakage (background review, the future ingest curator)
+    # set this True at fork construction — every write-leak call site gates on
+    # agent.memory_manager.memory_ingest_allowed(agent).
+    agent._memory_ingest_disabled = False
     if memory_manager is not None and not skip_memory:
         # A caller that rebuilds the agent per turn (gateway api_server) hands back the session's
         # already-initialized manager: providers keep their prefetch/retain state across turns instead
@@ -2069,7 +2078,7 @@ def init_agent(
     platform: str | None = None, user_id: str | None = None, user_id_alt: str | None = None, user_name: str | None = None,
     chat_id: str | None = None, chat_name: str | None = None, chat_type: str | None = None, thread_id: str | None = None,
     gateway_session_key: str | None = None, skip_context_files: bool = False,
-    load_soul_identity: bool = False, skip_memory: bool = False,
+    load_soul_identity: bool = False, skip_memory: bool = False, persist_disabled: bool = False,
     skip_background_review: bool = False, session_db=None, persistence=None, parent_session_id: str | None = None,
     iteration_budget: IterationBudget = None, run_budget_seconds: Optional[float] = None,
     fallback_model: dict[str, Any] | None = None, credential_pool=None, checkpoints_enabled: bool = False,
@@ -2101,6 +2110,7 @@ def init_agent(
     agent._print_fn = None
     agent.background_review_callback = None  # Optional sync callback for gateway delivery
     agent.memory_notifications = "on"  # Memory update notifications: "off", "on", "verbose"
+    agent.runtime_update_callback = None  # Optional sync callback for session-scoped runtime switches
     # Skips the end-of-turn review fork (~30K tokens/event); one switch for both review paths.
     agent.skip_background_review = bool(skip_background_review)
     agent.log_prefix = f"{log_prefix} " if log_prefix else ""
@@ -2160,6 +2170,7 @@ def init_agent(
         agent, session_id, session_db, parent_session_id, reasoning_config, max_tokens,
         checkpoints_enabled, checkpoint_max_snapshots, checkpoint_max_total_size_mb, checkpoint_max_file_size_mb,
         persistence=persistence)
+    agent._persist_disabled = persist_disabled  # declared before the startup checks read it
 
     # Load config once for memory, skills, and compression sections
     try:

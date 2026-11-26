@@ -1,7 +1,8 @@
 """API-call exception handler for the conversation turn's retry loop: pre-/post-classification
-recovery, interpreter-shutdown abandon, classified-error routing, overflow recovery, the
-non-retryable client-error exit, max-retries exhaustion (primary transport recovery →
-fallback → terminal result) and the interruptible backoff. Nothing here imports
+recovery, interpreter-shutdown abandon, classified-error routing, the instant-transport fail-fast
+(``turn_recovery_fail_fast``), overflow recovery, the non-retryable client-error exit,
+max-retries exhaustion (primary transport recovery → fallback → terminal result) and the
+interruptible backoff. Nothing here imports
 ``agent.conversation_loop`` at module level (cycle) — loop-internal helpers resolve lazily so
 ``patch("agent.conversation_loop.X")`` sites keep intercepting.
 """
@@ -17,6 +18,7 @@ from typing import Any, Dict, Optional
 
 from agent.api_error_summary import is_provider_stream_parse_error
 from agent.error_classifier import RETRYABLE_CLIENT_REASONS, FailoverReason, classify_api_error
+from agent.refusal_history import RefusalSource, should_apply_clean_fork
 from agent.route_verdicts import route_visit
 from agent.turn_overflow import recover_from_overflow
 from agent.turn_recovery import (
@@ -25,6 +27,8 @@ from agent.turn_recovery import (
     max_retries_exhausted_result, nonretryable_client_error_result, recover_after_classification,
     recover_before_classification, route_classified_error, settle_delivered_partial,
 )
+from agent.turn_recovery_fail_fast import fast_transport_failure_result, track_instant_transport_failure
+from agent.turn_trace_loop import tag_exit
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -114,6 +118,7 @@ def handle_api_error(
             agent.log_prefix, api_call_count, api_error,
         )
         _shutdown_summary = "Turn abandoned: the process was shutting down before the model call could complete."
+        tag_exit("interpreter_shutdown")
         return _verdict("return", {
             "final_response": _shutdown_summary, "messages": messages, "api_calls": api_call_count,
             "completed": False, "failed": True, "error": _shutdown_summary,
@@ -172,12 +177,15 @@ def handle_api_error(
         if agent.clear_interrupt(preserve_redirect=True):
             _retry.restart_with_redirected_messages = True
             return _verdict("break")
+        tag_exit("interrupted_during_error_handling")
         return _verdict("return", abort_turn_on_interrupt(
             agent, messages, conversation_history, api_call_count,
             abort_message="Interrupt detected during error handling, aborting retries.",
             interrupt_text=f"Operation interrupted: handling API error ({error_type}: {agent._clean_error_message(str(api_error))}).",
         ))
 
+    # Instant deaths (refused/reset before any bytes) build a fail-fast streak; slow timeouts reset it.
+    track_instant_transport_failure(agent, _retry, classified)
     _ce = route_classified_error(
         agent, api_error, classified, _retry, error_msg=error_msg, error_context=error_context,
         recovered_with_pool=recovered_with_pool, base_url=_base, model=_model, messages=messages,
@@ -201,6 +209,15 @@ def handle_api_error(
         _provider_overflow_recovery_pending = True
     if _ce.action != "fallthrough":
         return _verdict(_ce.action, _ce.result)
+    # Past the eager fallback: an instant-failure streak with no fallback left ends the turn instead
+    # of burning the remaining retries against an endpoint that refuses connections outright.
+    _fast_fail = fast_transport_failure_result(
+        agent, api_error, classified, _retry, messages=messages, conversation_history=conversation_history,
+        api_call_count=api_call_count, current_turn_user_idx=current_turn_user_idx,
+    )
+    if _fast_fail is not None:
+        tag_exit(f"fast_transport_failure_streak({classified.reason.value})")
+        return _verdict("return", _fast_fail)
 
     _ov = recover_from_overflow(
         agent, api_error, classified, _retry, status_code=status_code, error_msg=error_msg,
@@ -322,6 +339,9 @@ def settle_unrecovered_error(
     ) and not is_context_length_error
 
     if is_client_error:
+        if classified.reason == FailoverReason.content_policy_blocked:
+            # Fallback signal only — an exception-shaped policy block never removes context.
+            should_apply_clean_fork(RefusalSource.EXCEPTION_CONTENT_POLICY)
         # A Codex ChatGPT-account entitlement 400 names the model: with nothing to rotate the
         # slug is dead for this account, so record it before the fallback walk runs (#106475).
         from agent.fallback_cooldown import _mark_entitlement_rejected_model
@@ -364,6 +384,11 @@ def settle_unrecovered_error(
                 return _verdict("break")
         # Terminal from here: collapse the continuation trail once, before the persist.
         _delivered = settle_delivered_partial(agent, messages, current_turn_user_idx)
+        tag_exit(
+            "content_policy_blocked(nonretryable)"
+            if classified.reason == FailoverReason.content_policy_blocked
+            else f"nonretryable_api_error({classified.reason.value})"
+        )
         return _verdict("return", nonretryable_client_error_result(
             agent, api_error, classified, status_code=status_code, api_kwargs=api_kwargs,
             api_messages=api_messages, messages=messages, conversation_history=conversation_history,
@@ -391,6 +416,7 @@ def settle_unrecovered_error(
             _retry.has_retried_429 = False
             agent._fallback_index = 0
             agent._fallback_activated = False
+            agent._fallback_reason = None
             return _verdict("continue")
         if agent._has_pending_fallback():
             agent._buffer_diagnostic_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
@@ -413,6 +439,7 @@ def settle_unrecovered_error(
                 retry_count = 0
             return _verdict(_ladder["action"], _ladder.get("result"))
         _delivered = settle_delivered_partial(agent, messages, current_turn_user_idx)
+        tag_exit(f"all_retries_exhausted({classified.reason.value})")
         return _verdict("return", max_retries_exhausted_result(
             agent, api_error, classified, attempts=attempts_made, is_rate_limited=is_rate_limited,
             error_msg=error_msg, api_kwargs=api_kwargs, api_messages=api_messages,
@@ -436,6 +463,7 @@ def settle_unrecovered_error(
         activity_label=f"error retry backoff ({retry_count}/{max_retries})",
     )
     if _interrupted is not None:
+        tag_exit("interrupted_during_backoff")
         return _verdict("return", _interrupted)
     if _retry.restart_with_redirected_messages:
         # Leave the retry loop — the caller rebuilds this iteration from the correction

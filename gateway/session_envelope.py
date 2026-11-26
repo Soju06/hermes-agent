@@ -316,6 +316,8 @@ def restore_native(payload, runner=None):
                         **deepcopy(envelope['event']))
     from gateway.session_moa_turn import restore_moa_turn
     restore_moa_turn(envelope, event)
+    if 'router_pre_hook_text' in envelope:  # fork model router: the text before a pre_gateway_dispatch hook
+        event._hermes_router_pre_hook_text = envelope['router_pre_hook_text']
     if 'automation' in envelope:
         event.internal = True
         if envelope['automation'].get('heartbeat'):

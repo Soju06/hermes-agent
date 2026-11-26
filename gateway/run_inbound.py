@@ -28,6 +28,7 @@ from gateway.run_busy import approval_input_words
 from gateway.run_inbound_media import rehome_inbound_media
 from gateway.run_inbound_hooks import GatewayInboundHooksMixin
 from gateway.run_inbound_moa import GatewayInboundMoaMixin
+from gateway.run_inbound_model_router import GatewayInboundModelRouterMixin, router_pre_hook_text
 from gateway.run_inbound_transcription import GatewayInboundTranscriptionMixin
 from gateway.run_plugin_injection import GatewayPluginInjectionMixin
 from gateway.run_turn_setup_guard import cancel_preagent_setup, pending_setup_busy_notice
@@ -76,6 +77,7 @@ def strip_discord_triggering_note(event: Any, message_text: Any) -> Any:
 
 class GatewayInboundMixin(
     GatewayInboundHooksMixin, GatewayInboundTranscriptionMixin, GatewayPluginInjectionMixin, GatewayInboundMoaMixin,
+    GatewayInboundModelRouterMixin,
 ):
     """Inbound message pipeline (_handle_message, text/media preparation, durable-turn markers, plugin injection) for GatewayRunner."""
 
@@ -220,10 +222,13 @@ class GatewayInboundMixin(
         # scale-to-zero: only real user-originated inbound stamps the last-inbound clock;
         # counting internal/system events would keep a genuinely idle gateway awake.
         self._scale_to_zero_note_real_inbound()
+        _pre_hook_router_text = router_pre_hook_text(event)  # fork model router: the text as sent
         event = await self._hm_pre_gateway_dispatch_hook(event, source)
         if event is None:
             return None
         source = event.source
+        with suppress(Exception):  # on the post-hook event (``rewrite`` may replace it); ``_admit_native`` commits it
+            event._hermes_router_pre_hook_text = _pre_hook_router_text
 
         if not self._is_user_authorized_for_source(source):
             if source.user_id is None:
@@ -1373,6 +1378,10 @@ class GatewayInboundMixin(
         if _paused_notice is not None:
             return _paused_notice
 
+        # Trusted pre-dispatch runtime directives apply only after auth and after the
+        # emergency-stop gate has decided this event may proceed.
+        await self._hm_apply_runtime_override_directives(event, source)
+
         _quick_key = self._session_key_for_source(source)
         _reply = None if is_internal else await self._hm_pending_reply_intercepts(event, source, _quick_key)
         if _reply is not None:
@@ -1388,6 +1397,9 @@ class GatewayInboundMixin(
             self._hm_evict_reaped_agent(_quick_key)
         if self._is_session_running(_quick_key):
             return await self._hm_handle_running_session_message(event, source, _quick_key)
+
+        # Dynamic model router (ADR-003): after the running-agent PRIORITY block, before slash dispatch.
+        await self._hm_model_router_gate(event, source, _quick_key, is_internal)
 
         _handled, _result = await self._hm_dispatch_idle_commands(event, source, _quick_key)
         if _handled:

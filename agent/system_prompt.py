@@ -22,11 +22,12 @@ from agent.prompt_cache_scope import conversation_id
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY, EXECUTION_GUIDANCE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE, HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS, KANBAN_GUIDANCE,
-    PARALLEL_TOOL_CALL_GUIDANCE, PLATFORM_HINTS, SESSION_SEARCH_GUIDANCE,
+    NOTES_GUIDANCE, PARALLEL_TOOL_CALL_GUIDANCE, PLATFORM_HINTS, SESSION_SEARCH_GUIDANCE,
     SKILLS_GUIDANCE, STEER_CHANNEL_NOTE, TASK_COMPLETION_GUIDANCE, TELEGRAM_RICH_MESSAGES_HINT,
     TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, drain_truncation_warnings,
 )
 from agent import prompt_builder as _pb
+from agent import audience_persona as _audience_persona
 from agent.runtime_cwd import resolve_agent_cwd, resolve_context_cwd
 from hermes_constants import get_default_hermes_root, get_hermes_home
 from utils import is_truthy_value
@@ -306,6 +307,7 @@ def _tool_guidance_block(agent: Any) -> Optional[str]:
         _kanban_guidance = KANBAN_GUIDANCE
     tool_guidance = [
         memory_guidance,
+        NOTES_GUIDANCE if "notes_write" in names else None,
         SESSION_SEARCH_GUIDANCE if "session_search" in names else None,
         SKILLS_GUIDANCE if "skill_manage" in names else None,
         _kanban_guidance,
@@ -540,8 +542,15 @@ def _timestamp_line(agent: Any) -> str:
                            "— trust this over the start date for what day it is now; query tools for exact time.")
     if getattr(agent, "_bot_chat_timeless_prompt", False):
         timestamp_line = f"Timezone: {', '.join(_bits)}" if _bits else ""
+    # AudienceMode is present only while the audience-personas feature is active for this session
+    # (agent/audience_persona.py).  Old stored prompts and feature-off builds carry no line, and
+    # _stored_prompt_matches_runtime treats both-absent as a match — so pre-existing sessions stay
+    # byte-stable and each session rebuilds exactly once when a persona pack appears or the resolved
+    # mode changes.  The label is distinct from Model:/Provider: so the fallback model-swap rewrite
+    # (chat_completion_helpers) can never touch it.
     trailer = (("Session ID", agent.session_id if agent.pass_session_id else None), ("Model", agent.model),
-               ("Provider", agent.provider), ("Platform", agent.platform))
+               ("Provider", agent.provider), ("Platform", agent.platform),
+               ("AudienceMode", getattr(agent, "_audience_mode", "") or None))
     return timestamp_line + "".join(f"\n{label}: {value}" for label, value in trailer if value)
 
 
@@ -780,6 +789,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     _ctx_len = _cc_len if isinstance(_cc_len, int) and _cc_len > 0 else None
     # ── Stable tier ────────────────────────────────────────────────
     stable_parts, _soul_loaded = _identity_parts(agent, _ctx_len)
+    # Audience persona: stable slot #2 (no-op without a personas/modes.yaml pack).
+    stable_parts.extend(_audience_persona.persona_prompt_part(agent, _ctx_len))
     # The skill_view() pointer dangles without skill tools OR without the
     # hermes-agent skill installed, so the variant is chosen after the skills
     # index is built; this slot holds its position.
@@ -845,6 +856,173 @@ def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str
     return "\n\n".join(p for p in (parts["stable"], parts["context"], parts["volatile"]) if p)
 
 
+def _fmt_runtime_value(value: Any, default: str = "unknown") -> str:
+    text = str(value or "").strip()
+    return text if text else default
+
+
+# Permanently static: current-turn route decisions no longer render here (they
+# would flip this line on the routed turn AND flip it back on the next turn —
+# two whole-prompt cache busts per routing event).  Routed directives are
+# delivered on the triggering turn's user message instead; see
+# ``format_routing_directive``.
+_STATIC_DESIRED_ROUTE_LINE = (
+    "DesiredRoute: label=UNCLASSIFIED target=current strictness=none "
+    "confidence=unknown reason=\"no current-turn route decision supplied\""
+)
+
+_RUNTIME_ROUTE_POLICY = (
+    "Policy: This block is authoritative for this LLM call; do not infer "
+    "current runtime from stale session headers, memory, or prior turns. "
+    "model_status is diagnostic fallback only. A current-turn routing "
+    "directive, when present, arrives on the current user message as a "
+    "[Routing directive: ...] line and is authoritative for that turn; "
+    "compare it against CurrentRuntime and, if mismatched and not "
+    "user_strict, treat as a routing anomaly before substantive work. "
+    "Routing is bidirectional and may be re-evaluated after context "
+    "discovery."
+)
+
+
+def format_routing_directive(route: Any) -> str:
+    """Render a one-shot routing directive for current-user-message delivery.
+
+    Replaces the old per-turn ``DesiredRoute`` rendering inside the system
+    prompt: the directive rides the triggering turn's user message (persisted
+    byte-exact via the api_content sidecar), so the system prompt tail stays
+    byte-stable across routing events.
+    """
+    if not isinstance(route, dict) or not route:
+        return ""
+    label = _fmt_runtime_value(route.get("label") or route.get("route_label"), "RUNTIME_OVERRIDE")
+    provider = _fmt_runtime_value(route.get("target_provider") or route.get("provider"), "current")
+    model = _fmt_runtime_value(route.get("target_model") or route.get("model"), "current")
+    effort = _fmt_runtime_value(route.get("target_reasoning_effort") or route.get("reasoning_effort"), "current")
+    strictness = _fmt_runtime_value(route.get("strictness"), "auto_reconsiderable")
+    confidence = _fmt_runtime_value(route.get("confidence"), "unknown")
+    source = _fmt_runtime_value(route.get("source"), "pre_gateway_dispatch")
+    reason = str(route.get("reason") or "runtime routing").strip().replace('"', "'")
+    return (
+        "[Routing directive: "
+        f"label={label} target={provider}/{model}/{effort} "
+        f"strictness={strictness} confidence={confidence} source={source} "
+        f"reason=\"{reason}\"]"
+    )
+
+
+def build_runtime_route_block(agent: Any) -> str:
+    """Return the API-call-time runtime/route awareness block.
+
+    The cached session system prompt is intentionally stable.  Runtime truth is
+    not: model switches, fallback activation, and reasoning overrides can all
+    happen after the prompt cache was built.  This block is appended at the API
+    boundary so the model can self-identify from authoritative live state
+    without calling ``model_status``.
+
+    Byte-stability contract (prompt-tail freeze): the rendered text is a pure
+    function of the runtime key tuple ``(provider, model, api_mode, base_url,
+    model_source, reasoning, reasoning_source)`` and is cached on the agent as
+    ``(key_tuple, text)``.  Per-API-call recompute is a tuple compare; the
+    same effective runtime always yields the exact same bytes.  Mid-turn
+    runtime mutations (fallback activation, model_switch tool) change the
+    tuple and re-render — a legitimate cache bust.
+    """
+    try:
+        from agent.runtime_control import get_runtime_state
+
+        state = get_runtime_state(agent)
+    except Exception:
+        state = {
+            "model": getattr(agent, "model", ""),
+            "provider": getattr(agent, "provider", ""),
+            "api_mode": getattr(agent, "api_mode", ""),
+            "reasoning": getattr(agent, "reasoning_config", None),
+            "model_source": getattr(agent, "_runtime_model_source", None) or "agent",
+        }
+
+    reasoning = state.get("reasoning") if isinstance(state, dict) else None
+    if isinstance(reasoning, dict):
+        effort = reasoning.get("effort")
+        if effort is None and reasoning.get("enabled") is False:
+            effort = "none"
+        reasoning_text = _fmt_runtime_value(effort)
+        reasoning_source = _fmt_runtime_value(reasoning.get("source"), "default")
+    else:
+        reasoning_text = _fmt_runtime_value(reasoning)
+        reasoning_source = "default"
+
+    key_tuple = (
+        _fmt_runtime_value(state.get("provider") if isinstance(state, dict) else ""),
+        _fmt_runtime_value(state.get("model") if isinstance(state, dict) else ""),
+        _fmt_runtime_value(state.get("api_mode") if isinstance(state, dict) else ""),
+        _fmt_runtime_value(state.get("base_url") if isinstance(state, dict) else ""),
+        _fmt_runtime_value(state.get("model_source") if isinstance(state, dict) else "agent", "agent"),
+        reasoning_text,
+        reasoning_source,
+    )
+    cached = getattr(agent, "_runtime_route_block_cache", None)
+    if (
+        isinstance(cached, tuple)
+        and len(cached) == 2
+        and cached[0] == key_tuple
+        and isinstance(cached[1], str)
+    ):
+        return cached[1]
+
+    # Route-language identity (ADR-003 Phase 3c): the model self-identifies
+    # as route + model. Raw provider/endpoint/api-mode identifiers are
+    # operator data — surfacing them in every prompt invited stale-model
+    # bias and free-form switching requests. They remain in the cache KEY
+    # above (an endpoint/api-mode change must still re-render) but not in
+    # the rendered text. Route resolution is a pure function of the key
+    # tuple given a stable config, so caching stays byte-correct.
+    route_label = ""
+    try:
+        from agent.runtime_control import _route_status_info
+
+        route_info = _route_status_info(agent)
+        if isinstance(route_info, dict):
+            route_label = str(route_info.get("current") or "") or "off-catalog"
+    except Exception:
+        route_label = ""
+
+    current = (
+        "CurrentRuntime: "
+        + (f"route={route_label} " if route_label else "")
+        + f"model={key_tuple[1]} "
+        f"reasoning={reasoning_text} "
+        f"source={key_tuple[4]} "
+        # Always emitted (default ``default``): a presence-toggling suffix
+        # shifts every byte after it and re-keys the provider prompt cache.
+        f"reasoning_source={reasoning_source}"
+    )
+
+    text = (
+        "# Runtime/Route State\n"
+        + current
+        + "\n"
+        + _STATIC_DESIRED_ROUTE_LINE
+        + "\n"
+        + _RUNTIME_ROUTE_POLICY
+    )
+    try:
+        agent._runtime_route_block_cache = (key_tuple, text)
+    except Exception:
+        pass
+    return text
+
+
+def compose_effective_system_prompt(agent: Any, base_prompt: str) -> str:
+    """Append API-call-time system prompt additions to a cached base prompt."""
+    effective_system = base_prompt or ""
+    if getattr(agent, "ephemeral_system_prompt", None):
+        effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
+    runtime_route_block = build_runtime_route_block(agent)
+    if runtime_route_block:
+        effective_system = (effective_system + "\n\n" + runtime_route_block).strip()
+    return effective_system
+
+
 def invalidate_system_prompt(agent: Any) -> None:
     """Force a rebuild on the next turn (after compression): reload memory from
     disk and clear the frozen plugin snapshot (previous bytes stashed as the
@@ -906,8 +1084,11 @@ def format_tools_for_system_message(agent: Any) -> str:
 
 
 __all__ = [
+    "build_runtime_route_block",
     "build_system_prompt",
     "build_system_prompt_parts",
+    "compose_effective_system_prompt",
+    "format_routing_directive",
     "format_tools_for_system_message",
     "invalidate_system_prompt",
     "platform_hint",

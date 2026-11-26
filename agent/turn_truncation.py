@@ -18,10 +18,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from agent.error_classifier import FailoverReason
 from agent.message_metadata import append_message
 from agent.message_sanitization import close_interrupted_tool_sequence
+from agent.refusal_history import RefusalSource, should_apply_clean_fork
 from agent.repetition_guard import is_repetition_dominated
 from agent.turn_api_call import stop_thinking_spinner
 from agent.turn_failure_copy import content_policy_copy, provider_label_for, site_copy, stamp_failure
 from agent.turn_retry_state import TurnRetryState
+from agent.turn_trace_loop import tag_exit
 from agent.usage_pricing import normalize_usage
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 
@@ -220,6 +222,7 @@ class _Trunc(TruncationVerdict):
     api_call_count: int
     effective_task_id: Any
     current_turn_user_idx: Any
+    api_messages: Any = None  # provider-shaped copy (refusal clean-fork rewrites it in place)
     action: str = "fallthrough"
     result: Optional[dict[str, Any]] = None
     window_filled: Optional[tuple[int, int]] = None  # (prompt_tokens, context_length)
@@ -232,18 +235,20 @@ class _Trunc(TruncationVerdict):
         self, final_response: str, error: Optional[str] = None, *,
         result_messages: Optional[list[dict[str, Any]]] = None, cleanup: bool = True,
         failed: bool = False, compression_exhausted: bool = False,
-        failure: tuple[str, bool] = ("truncated", True),
+        failure: tuple[str, bool] = ("truncated", True), exit_reason: str = "length_cap",
     ) -> TruncationVerdict:
         """Persist and end the turn as partial (or ``failed``).
 
         ``compression_exhausted`` forwards the #98722 typed bit so the gateway can
         move future input off a bloated session (run_turn.py consumes it). ``failure`` is
         the ``(failure_reason, retryable)`` verdict for the UI descriptor.
+        ``exit_reason`` is the waterfall-trace tag for this early exit (observation only).
         """
         agent = self.agent
         if cleanup:
             agent._cleanup_task_resources(self.effective_task_id)
         agent._persist_session(self.messages, self.conversation_history)
+        tag_exit(exit_reason)
         return self.done("return", stamp_failure(partial_result(
             self.messages if result_messages is None else result_messages, self.api_call_count,
             final_response, error, failed=failed, compression_exhausted=compression_exhausted,
@@ -284,6 +289,9 @@ def _content_filter_fallback(st: _Trunc, _retry: TurnRetryState) -> Optional[Tru
         force=True, diagnostic=True,
     )
     agent._emit_diagnostic_status("Content filter terminated stream; switching to fallback...")
+    # A stream-level output filter is a fallback signal only: it does not prove the
+    # current tool progress is contaminated, so the fallback keeps the full prompt.
+    should_apply_clean_fork(RefusalSource.STREAM_FILTER_ERROR)
     if agent._try_activate_fallback(reason=FailoverReason.content_policy_blocked):
         logger.warning("%sContent filter terminated the stream — switched to fallback", agent.log_prefix)
         # Roll partial content back to the last clean turn so the fallback gets a
@@ -371,10 +379,12 @@ def _continue_text(st: _Trunc, _retry: TurnRetryState, assistant_message: Any) -
         return st.end_turn(
             f"{partial_response}\n\n{notice}" if partial_response else notice,
             f"Prompt used {filled[0]} of {filled[1]} context tokens; no room to answer",
+            exit_reason="length_cap(window_filled)",
         )
     return st.end_turn(
         partial_response or _CEILING_NO_TEXT,
         "Response remained truncated after 4 continuation attempts",
+        exit_reason="length_cap(continuations_exhausted)",
     )
 
 
@@ -450,6 +460,7 @@ def _retry_truncated_tool_call(st: _Trunc, api_kwargs: Any) -> TruncationVerdict
     return st.end_turn(
         _final_response, cleanup=False,
         failure=(_failure, True),
+        exit_reason="length_cap(stream_stub_stall)" if st.is_stub else "length_cap(truncated_tool_call)",
     )
 
 
@@ -458,7 +469,7 @@ def recover_from_truncation(
     messages: list[dict[str, Any]], conversation_history: Any, api_kwargs: Any, api_call_count: int,
     effective_task_id: Any, current_turn_user_idx: Any, length_continue_retries: int,
     truncated_response_parts: list[tuple[str, bool]], truncated_tool_call_retries: int, retry_count: int,
-    compression_attempts: int,
+    compression_attempts: int, api_messages: Any = None,
 ) -> TruncationVerdict:
     """Recover from a truncated response. Order is load-bearing: thinking exhaustion and
     repetition abort BEFORE any continuation; a content-filter stall escalates to the
@@ -471,14 +482,14 @@ def recover_from_truncation(
         messages=messages, length_continue_retries=length_continue_retries,
         truncated_response_parts=truncated_response_parts,
         truncated_tool_call_retries=truncated_tool_call_retries, retry_count=retry_count,
-        compression_attempts=compression_attempts,
+        compression_attempts=compression_attempts, api_messages=api_messages,
     )
     if getattr(response, "_runaway_repetition", False):
         # The streaming call cut a live repetition loop: a continuation would only re-enter it,
         # whatever the partial or its tool calls look like.
         line, user_response, error = _REPETITION_STREAM_CUT
         agent._vprint(f"{agent.log_prefix}{line}", force=True, diagnostic=True)
-        return st.end_turn(user_response, error)
+        return st.end_turn(user_response, error, exit_reason="repetition_stream_cut")
     st.window_filled = _prompt_filled_window(agent, response)
     if st.is_stub and getattr(response, "_clean_eof", False):
         _banner = ("Response truncated — server ended the stream without ever sending finish_reason "
@@ -518,6 +529,7 @@ def recover_from_truncation(
             failed=True,
             compression_exhausted=True,
             failure=("context_overflow", False),
+            exit_reason="context_overflow(partial_delivery)",
         )
 
     _trunc_msg = normalize_response_for_agent(agent, response)
@@ -528,7 +540,13 @@ def recover_from_truncation(
     if abort is not None:
         line, user_response, error = abort
         agent._vprint(f"{agent.log_prefix}{line}", force=True, diagnostic=True)
-        return st.end_turn(user_response, error)
+        return st.end_turn(
+            user_response, error,
+            exit_reason=(
+                "thinking_budget_exhausted" if abort is _THINKING_EXHAUSTED
+                else "repetition_dominated_truncation"
+            ),
+        )
 
     if agent.api_mode in _CONTINUABLE_MODES:
         cf = _content_filter_fallback(st, _retry)
@@ -542,12 +560,15 @@ def recover_from_truncation(
     if len(messages) > 1:
         agent._vprint(f"{agent.log_prefix}   ⏪ Rolling back to last complete assistant turn", diagnostic=True)
         return st.end_turn(
-            _TRUNCATED_FINAL, result_messages=agent._get_messages_up_to_last_assistant(messages)
+            _TRUNCATED_FINAL, result_messages=agent._get_messages_up_to_last_assistant(messages),
+            exit_reason="length_cap(rolled_back)",
         )
     # First message was truncated - mark as failed
     agent._flush_status_buffer()
     agent._vprint(f"{agent.log_prefix}❌ First response truncated - cannot recover", force=True, diagnostic=True)
-    return st.end_turn(_FIRST_TRUNCATED_FINAL, cleanup=False, failed=True)
+    return st.end_turn(
+        _FIRST_TRUNCATED_FINAL, cleanup=False, failed=True, exit_reason="length_cap(first_response)",
+    )
 
 
 _CODEX_REPLAY_KEYS = (
@@ -748,6 +769,19 @@ def handle_content_policy_refusal(
     from agent.conversation_loop import _arm_fallback_restart, _content_policy_blocked_result
 
     _refusal_result = normalize_response_for_agent(agent, response)
+    _refusal_provider_data = getattr(_refusal_result, "provider_data", None) or {}
+    _refusal_source = (
+        RefusalSource.API_STRUCTURED_REFUSAL
+        if (
+            getattr(response, "stop_reason", None) == "refusal"
+            or bool(_refusal_provider_data.get("refusal"))
+        )
+        else RefusalSource.PROVIDER_OUTPUT_FILTER
+    )
+    # Structured API refusals and provider output filters are fallback signals only.
+    # Neither proves that current tool progress is contaminated, so clean_fork must
+    # preserve the complete prompt assembled for the fallback.
+    should_apply_clean_fork(_refusal_source)
     _refusal_text = (getattr(_refusal_result, "content", None) or "").strip()
     if not _refusal_text:
         _refusal_text = (agent._extract_reasoning(_refusal_result) or "").strip()
@@ -824,6 +858,7 @@ def handle_content_policy_refusal(
     from agent.turn_context import history_before_current_turn, refused_turn_boundary_row_id
     clean_history = history_before_current_turn(messages, current_turn_user_idx, conversation_history)
     _boundary_row_id = refused_turn_boundary_row_id(messages, current_turn_user_idx)
+    tag_exit("content_policy_blocked(refusal)")
     return RefusalVerdict("return", _content_policy_blocked_result(
         clean_history, api_call_count, final_response=_refusal_response,
         error_detail=_refusal_text or "model declined (content_filter)",
