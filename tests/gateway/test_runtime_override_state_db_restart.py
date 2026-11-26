@@ -113,3 +113,34 @@ def test_runtime_route_rehydrates_from_state_db_without_json(tmp_path, monkeypat
     assert runtime["api_mode"] == "codex_responses"
     assert reasoning == {"enabled": True, "effort": "high"}
     restarted_store.close_all_db_handles()
+
+
+def test_reasoning_reset_drops_the_persisted_level_across_a_restart(tmp_path):
+    """``/reasoning reset`` clears the durable ``runtime_reasoning_effort`` of an agent model_switch /
+    plugin runtime_override, not only the in-memory override: otherwise the next resolve, and every
+    restart, re-installs it. The runtime route itself stays."""
+    # Given: a persisted route with a level, already rehydrated into this process.
+    sessions_dir = tmp_path / "sessions"
+    config = GatewayConfig(write_sessions_json=False)
+    store = SessionStore(sessions_dir=sessions_dir, config=config)
+    session_key = store.get_or_create_session(_source()).session_key
+    assert store.update_runtime_override(
+        session_key, model="restart-model", provider="restart-provider", reasoning_effort="high",
+    )
+    runner = _runner(store)
+    assert runner._resolve_session_reasoning_config(source=_source()) == {"enabled": True, "effort": "high"}
+
+    # When
+    runner._apply_reasoning_selection(session_key, "telegram", "reset")
+
+    # Then: the configured level wins now and after a restart; the route is untouched.
+    assert runner._resolve_session_reasoning_config(source=_source()) == {"enabled": True, "effort": "medium"}
+    store.close_all_db_handles()
+    restarted_store = SessionStore(sessions_dir=sessions_dir, config=config)
+    entry = restarted_store.get_entry(session_key)
+    assert entry.runtime_reasoning_effort is None
+    assert (entry.runtime_model, entry.runtime_provider) == ("restart-model", "restart-provider")
+    assert _runner(restarted_store)._resolve_session_reasoning_config(source=_source()) == {
+        "enabled": True, "effort": "medium",
+    }
+    restarted_store.close_all_db_handles()

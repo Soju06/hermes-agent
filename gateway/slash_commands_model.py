@@ -954,6 +954,9 @@ class GatewayModelCommandsMixin:
             if persist_global:
                 return t("gateway.reasoning.reset_global_unsupported")
             self._set_session_reasoning_override(session_key, None)
+            # Fork (runtime-control): the durable level of an agent model_switch / plugin
+            # runtime_override would otherwise be re-installed by the next resolve.
+            self._clear_persisted_session_runtime_overrides(session_key, model=False)
             self._reasoning_config = self._load_reasoning_config()
             self._evict_cached_agent(session_key)
             return t("gateway.reasoning.reset_done")
