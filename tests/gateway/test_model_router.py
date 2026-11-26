@@ -1155,6 +1155,7 @@ def test_enforce_mode_applies_override_and_persists(monkeypatch, tmp_path):
         "owns_credentials": False,
         "request_overrides": {},
         "capabilities": {},
+        "router_applied": True,
     }
     assert runner._session_model_overrides["tg:c1"] == expected_override
     runner.session_store.set_model_override.assert_called_once_with(
@@ -1247,6 +1248,111 @@ def test_enforce_mode_applies_repromote_directive(monkeypatch, tmp_path):
     ]
     assert [r["applied"] for r in records] == [False, False, True]
     assert set(records[-1]) == EXPECTED_RECORD_FIELDS | {"ts", "applied", "reasoning_applied"}
+
+
+def _repromote_stage_turns(monkeypatch, tmp_path, override, *, turns):
+    """Run ``turns`` enforce-mode SYSTEM_DEV turns for a tg:c1 session parked on the dev member
+    model-alt through ``override``; returns (runner, switch mock, decision records)."""
+    from hermes_cli.model_switch import ModelSwitchResult
+
+    log_path = tmp_path / "decisions.jsonl"
+    monkeypatch.setenv("HERMES_MODEL_ROUTER_DECISION_LOG", str(log_path))
+    cfg = _member_cfg(router={"mode": "enforce"})
+    runner = _make_runner(
+        monkeypatch, cfg, runtime=("model-alt", {"provider": "p1", "base_url": "https://p1.example/v1"}),
+    )
+    runner._session_model_overrides["tg:c1"] = dict(override)
+    monkeypatch.setattr(
+        mr_mod, "_call_gemini",
+        lambda *a, **k: json.dumps({"evidence": "S5", "label": "SYSTEM_DEV", "confidence": 0.9}),
+    )
+    switch = MagicMock(return_value=ModelSwitchResult(
+        success=True, new_model="model-a", target_provider="p1", api_key="sk-test",
+        base_url="https://p1.example/v1", api_mode="chat_completions",
+    ))
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", switch)
+    for _ in range(turns):
+        asyncio.run(
+            runner._model_router_stage(_event("gateway 버그 고쳐줘"), _source(), "tg:c1", mode="enforce")
+        )
+    return runner, switch, [json.loads(line) for line in log_path.read_text().splitlines()]
+
+
+_USER_MEMBER_OVERRIDE = {
+    "model": "model-alt", "provider": "p1", "api_key": "sk-user",
+    "base_url": "https://p1.example/v1", "api_mode": "chat_completions",
+}
+
+
+def test_repromote_skips_a_user_model_pick(monkeypatch, tmp_path):
+    """O-A5: a /model override the router did not write (typed /model, picker) is the owner's
+    escape hatch. Trusted member noops past the threshold never re-promote it."""
+    runner, switch, records = _repromote_stage_turns(monkeypatch, tmp_path, _USER_MEMBER_OVERRIDE, turns=4)
+
+    switch.assert_not_called()
+    assert runner._session_model_overrides["tg:c1"] == _USER_MEMBER_OVERRIDE
+    runner.session_store.set_model_override.assert_not_called()
+    runner._evict_cached_agent.assert_not_called()
+    assert [r["outcome"] for r in records] == ["noop_satisfied"] * 4
+    assert [r["applied"] for r in records] == [False] * 4
+    assert runner._model_router_state["tg:c1"].get("repromote_streak", 0) == 0
+
+
+def test_repromote_still_fires_for_a_router_applied_override(monkeypatch, tmp_path):
+    """The exemption is only for user picks: a member the router itself switched to keeps
+    re-promoting (guards against over-blocking)."""
+    override = dict(_USER_MEMBER_OVERRIDE, api_key="sk-test", router_applied=True)
+    runner, switch, records = _repromote_stage_turns(monkeypatch, tmp_path, override, turns=3)
+
+    switch.assert_called_once()
+    assert [r["outcome"] for r in records] == [
+        "noop_satisfied_repromote_1_of_3",
+        "noop_satisfied_repromote_2_of_3",
+        "repromote_to_primary",
+    ]
+    assert [r["applied"] for r in records] == [False, False, True]
+    assert runner._session_model_overrides["tg:c1"]["model"] == "model-a"
+
+
+def test_router_applied_mark_survives_restart_and_a_user_model_drops_it(monkeypatch, tmp_path):
+    """The mark rides through the store's sanitize/persist and the restart rehydrate, so a router
+    switch keeps re-promoting after a gateway restart; a later /model write replaces the record
+    without it."""
+    import persistence_assembly
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionStore
+
+    def _no_sqlite(*args, **kwargs):
+        raise RuntimeError("SQLite disabled in test")
+
+    monkeypatch.setattr(persistence_assembly, "open_persistence", _no_sqlite)
+
+    def _store():
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        assert store.persistence is None
+        return store
+
+    store = _store()
+    key = store.get_or_create_session(_source()).session_key
+    store.set_model_override(key, {
+        "model": "model-alt", "provider": "p1", "api_key": "sk-secret", "api_mode": "chat_completions",
+        "router_applied": True,
+    })
+    restarted = _store()
+    assert restarted.get_model_override(key) == {"model": "model-alt", "provider": "p1", "router_applied": True}
+
+    runner = object.__new__(GatewayRunner)
+    runner._session_model_overrides = {}
+    runner.session_store = restarted
+    monkeypatch.setattr(
+        "gateway.run._resolve_runtime_agent_kwargs_for_provider",
+        lambda *a, **k: {"api_key": "sk-fresh", "api_mode": "chat_completions", "base_url": "https://p1.example/v1"},
+    )
+    runner._rehydrate_session_model_override(key)
+    assert runner._session_model_overrides[key]["router_applied"] is True
+
+    restarted.set_model_override(key, {"model": "model-alt", "provider": "p1", "api_key": "sk-user"})
+    assert _store().get_model_override(key) == {"model": "model-alt", "provider": "p1"}
 
 
 def test_stage_slash_command_writes_no_log(monkeypatch, tmp_path):
@@ -1501,9 +1607,14 @@ def test_enforce_apply_model_path_parity(monkeypatch, tmp_path):
     routed_write = routed.session_store.persistence.aio.sessions.update_model
     typed_write = typed.session_store.persistence.aio.sessions.update_model
     assert routed_write.await_args is not None and routed_write.await_args == typed_write.await_args
-    assert routed._session_model_overrides["tg:c1"] == typed._session_model_overrides["tg:c1"]
-    assert (routed.session_store.set_model_override.call_args
-            == typed.session_store.set_model_override.call_args)
+    # Identical except the router's own mark, which a typed /model never writes (re-promotion
+    # exempts exactly the unmarked overrides).
+    routed_override = dict(routed._session_model_overrides["tg:c1"])
+    assert routed_override.pop("router_applied") is True
+    assert "router_applied" not in typed._session_model_overrides["tg:c1"]
+    assert routed_override == typed._session_model_overrides["tg:c1"]
+    assert routed.session_store.set_model_override.call_args.args[1]["router_applied"] is True
+    assert "router_applied" not in typed.session_store.set_model_override.call_args.args[1]
     for runner in (routed, typed):
         assert not runner._peek_session_state("tg:c1").conversation.one_turn_restore
     note = routed._pending_model_notes["tg:c1"]

@@ -719,6 +719,7 @@ def _repromote_on_noop(
     trusted: bool,
     resolve: Callable[[], Optional[dict]],
     noop_outcome: str = "noop_satisfied",
+    user_pick: bool = False,
 ) -> tuple[Optional[dict], str]:
     """Advance the member→primary re-promotion streak for one no-op turn.
 
@@ -732,6 +733,9 @@ def _repromote_on_noop(
     label during a classifier outage must not walk a session toward a swap.
     ``entry`` is the per-session hysteresis dict; ``normal_streak`` and
     ``repromote_streak`` are separate counters and never interact.
+    ``user_pick`` is True when the session's /model override was not written
+    by the router (a typed /model, the picker): that member is the owner's
+    deliberate choice (ADR-003 escape hatch) and is never re-promoted.
     """
     try:
         from hermes_cli.model_routes import _lookup_route, _model_matches
@@ -750,7 +754,7 @@ def _repromote_on_noop(
     if threshold <= 0:
         return None, noop_outcome
     runtime_model = (runtime or {}).get("model")
-    if _model_matches(runtime_model, spec.model):
+    if _model_matches(runtime_model, spec.model) or user_pick:
         entry["repromote_streak"] = 0
         return None, noop_outcome
     if not trusted:
@@ -796,6 +800,7 @@ def static_rule_decision(
     router: Any,  # hermes_cli.model_routes.RouterConfig
     mode: str,
     state: dict[str, Any],
+    user_pick: bool = False,
 ) -> RoutingDecision:
     """Build the decision for an already-matched static rule.
 
@@ -804,7 +809,7 @@ def static_rule_decision(
     snapshot is only needed from this point on, so callers can defer taking
     it until a rule actually matched. ``state`` is the same per-session
     hysteresis dict the classifier path threads (re-promotion streaks are
-    shared across both paths).
+    shared across both paths). ``user_pick``: see :func:`_repromote_on_noop`.
     """
     route_name = str(rule.get("route") or "")
     entry = state.setdefault(session_key or "unknown", {"normal_streak": 0})
@@ -819,6 +824,7 @@ def static_rule_decision(
             router=router,
             trusted=True,
             resolve=lambda: _resolve_route_directive(route_name, cfg, catalog),
+            user_pick=user_pick,
         )
     else:
         directive = _resolve_route_directive(route_name, cfg, catalog)
@@ -860,6 +866,7 @@ def classifier_decision(
     mode: str,
     state: dict[str, Any],
     complete_dev: Callable[[str], str] | None = None,
+    user_pick: bool = False,
 ) -> RoutingDecision:
     """LLM classifier path (dev routing), hysteresis semantics verbatim from
     skill-gate ``_apply_dev_routing``.
@@ -901,6 +908,7 @@ def classifier_decision(
                 router=router,
                 trusted=detail.get("source") == "llm",
                 resolve=lambda: resolved,  # already resolved this turn — no extra probes
+                user_pick=user_pick,
             )
         elif directive:
             outcome = "switch"
@@ -925,6 +933,7 @@ def classifier_decision(
                 trusted=detail.get("source") == "llm",
                 resolve=lambda: chat_directive,
                 noop_outcome="noop_already_chat",
+                user_pick=user_pick,
             )
         elif not runtime:
             outcome = "normal_unknown_runtime"
@@ -972,6 +981,7 @@ def evaluate_event(
     mode: str,
     state: dict[str, Any],
     complete_dev: Callable[[str], str] | None = None,
+    user_pick: bool = False,
 ) -> Optional[RoutingDecision]:
     """Evaluate routing for one inbound message.
 
@@ -1013,6 +1023,7 @@ def evaluate_event(
             router=router,
             mode=mode,
             state=state,
+            user_pick=user_pick,
         )
     if text.startswith("/"):
         return None
@@ -1026,6 +1037,7 @@ def evaluate_event(
         mode=mode,
         state=state,
         complete_dev=complete_dev,
+        user_pick=user_pick,
     )
 
 

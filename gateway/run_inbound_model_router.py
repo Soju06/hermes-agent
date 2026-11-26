@@ -214,6 +214,10 @@ class GatewayInboundModelRouterMixin:
 
         # Runtime snapshot on the event loop — see docstring.
         runtime = self._model_router_runtime_snapshot(source, session_key)
+        # A /model override the router did not write (typed /model, picker) is the owner's pick:
+        # exempt from re-promotion (ADR-003 escape hatch). Read after the snapshot rehydrated it.
+        override = self._session_model_overrides.get(session_key) or {}
+        user_pick = bool(override) and not override.get("router_applied")
 
         if matched is not None:
             rule, rule_name = matched
@@ -224,13 +228,14 @@ class GatewayInboundModelRouterMixin:
                 rule=rule, rule_name=rule_name, text=raw_text,
                 session_key=_model_router._session_key(self.session_store, event),
                 runtime=runtime, cfg=cfg, catalog=catalog, router=catalog.router, mode=mode, state=state,
+                user_pick=user_pick,
             )
         else:
             # (4) The classifier is a blocking urllib call (up to timeout_ms) — keep the event loop free.
             decision = await asyncio.to_thread(
                 _model_router.classifier_decision,
                 event=event, session_store=self.session_store, runtime=runtime, cfg=cfg, catalog=catalog,
-                router=catalog.router, mode=mode, state=state, complete_dev=None,
+                router=catalog.router, mode=mode, state=state, complete_dev=None, user_pick=user_pick,
             )
 
         directive = decision.directive
@@ -355,6 +360,9 @@ class GatewayInboundModelRouterMixin:
             "owns_credentials": result.alias_endpoint_applied,
             "request_overrides": dict(result.request_overrides or {}),
             "capabilities": dict(result.runtime_capabilities or {}),
+            # Tells this switch from a user's /model pick (the stage's re-promotion exemption); the
+            # store persists it, and a later /model replaces the record without it.
+            "router_applied": True,
         }
         if (_otr_state := self._peek_session_state(session_key)) is not None:  # a standing switch, as a typed /model
             _otr_state.conversation.one_turn_restore = None
