@@ -102,6 +102,7 @@ def build_refusal_fallback_chain(agent: Any) -> list[dict]:
             base_url=str(getattr(agent, "base_url", "") or ""),
         )
         chain = []
+        chain_idents = []
         for route_name in route_names:
             if not str(route_name or "").strip():
                 continue
@@ -126,7 +127,18 @@ def build_refusal_fallback_chain(agent: Any) -> list[dict]:
                     route_name,
                 )
                 continue
+            if any(
+                should_skip_candidate(candidate_ident, ident)
+                for ident in chain_idents
+            ):
+                logger.info(
+                    "Refusal fallback skip: route %s resolves to a backend "
+                    "already in the chain",
+                    route_name,
+                )
+                continue
             chain.append(entry)
+            chain_idents.append(candidate_ident)
         if not chain:
             logger.warning(
                 "Refusal fallback chain empty: no usable PERMISSIVE routes "

@@ -371,6 +371,33 @@ class TestApiRefusalRouteFallback:
         for entry in chain:
             assert f"{entry['provider']}/{entry['model']}" in caplog.text
 
+    def test_refusal_chain_collapses_routes_on_the_same_backend(self):
+        agent = self._dev_agent()
+        cfg = _refusal_routes_config()
+        cfg["model_routes"]["routes"]["PERMISSIVE_CHAT"].update({
+            "provider": "openai",
+            "model": "gpt-5.6",
+        })
+        with patch("hermes_cli.config.load_config", return_value=cfg):
+            chain = build_refusal_fallback_chain(agent)
+
+        assert [(e["provider"], e["model"]) for e in chain] == [
+            ("openai", "gpt-5.6"),
+        ]
+
+    def test_refusal_chain_keeps_distinct_backends(self):
+        agent = self._dev_agent()
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value=_refusal_routes_config(),
+        ):
+            chain = build_refusal_fallback_chain(agent)
+
+        assert [(e["provider"], e["model"]) for e in chain] == [
+            ("openai", "gpt-5.6"),
+            ("zai", "glm-4.7"),
+        ]
+
     def test_empty_refusal_chain_logs_warning(self, caplog):
         agent = self._dev_agent()
         with (
