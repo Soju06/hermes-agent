@@ -272,62 +272,33 @@ def test_reset_delegated_child_context_in_does_not_touch_the_caller():
 
 
 # ---------------------------------------------------------------------------
-# Fix D — the Kanban scrub must cover the whole variable class, not a list.
+# Fix D — the Kanban scrub strips worker identity only, as upstream does.
 # ---------------------------------------------------------------------------
 
-def test_scrub_removes_every_kanban_var_the_dispatcher_injects():
-    """Class-wide invariant, not a snapshot of today's key list.
-
-    The dispatcher's worker-env builder is the growing side of this contract:
-    HERMES_KANBAN_BRANCH / _GOAL_MODE / _GOAL_MAX_TURNS were all added after
-    KANBAN_ENV_KEYS was written and escaped the scrub for that whole window.
-    This reads what the dispatcher actually assigns and requires the scrubber
-    to cover all of it — except the board *location* keys upstream deliberately
-    keeps in descendants (``KANBAN_LOCATION_ENV_KEYS``), which must survive.
+def test_scrub_keeps_non_identity_kanban_tunables():
+    """Upstream's "keep Kanban worker scope out of descendant processes" strips
+    exactly ``KANBAN_ENV_KEYS`` and keeps every other ``HERMES_KANBAN_*``. A
+    descendant's own Kanban connection reads host tunables such as
+    ``HERMES_KANBAN_BUSY_TIMEOUT_MS``, so a prefix-wide scrub must not come back.
     """
-    import re
-    from pathlib import Path
-
-    import hermes_cli.kanban_db as kdb
-    from agent.delegation_context import KANBAN_LOCATION_ENV_KEYS, scrub_kanban_env
-
-    # The worker-env builder lives in the kanban_db* module family (it moved
-    # from kanban_db.py to kanban_db_dispatch.py upstream); scan all of them.
-    src = "\n".join(
-        path.read_text()
-        for path in sorted(Path(kdb.__file__).parent.glob("kanban_db*.py"))
-    )
-    injected = sorted(set(re.findall(
-        r"""env\[["'](HERMES_KANBAN_[A-Z_]+)["']\]\s*=""", src
-    )))
-    assert injected, "could not find the dispatcher's worker env assignments"
-
-    scrubbed = scrub_kanban_env({k: "x" for k in injected} | {"PATH": "/usr/bin"})
-    leaked = sorted(k for k in injected if k in scrubbed and k not in KANBAN_LOCATION_ENV_KEYS)
-    assert not leaked, (
-        f"scrub_kanban_env left dispatcher vars in a delegated child's env: {leaked}. "
-        "Strip by the HERMES_KANBAN_ prefix so new dispatcher variables are "
-        "covered when they are introduced."
-    )
-    kept = sorted(k for k in injected if k in KANBAN_LOCATION_ENV_KEYS)
-    assert kept, "expected the dispatcher to inject at least one location key"
-    assert all(k in scrubbed for k in kept), "board location must survive the scrub"
-    assert scrubbed["PATH"] == "/usr/bin", "unrelated env must survive"
-
-
-def test_scrub_is_prefix_based_not_allowlist_based():
-    """A hypothetical future dispatcher variable must already be covered."""
     from agent.delegation_context import (
         DELEGATED_CHILD_ENV_MARKER,
+        KANBAN_ENV_KEYS,
         _fenced_kanban_root,
         scrub_kanban_env,
     )
 
-    cleaned = scrub_kanban_env({
-        "HERMES_KANBAN_SOME_FUTURE_KNOB": "1",
-        "HERMES_SESSION_KEY": "keep-me",
+    cleaned = scrub_kanban_env({k: "x" for k in KANBAN_ENV_KEYS} | {
+        "HERMES_KANBAN_BUSY_TIMEOUT_MS": "1000",
+        "HERMES_KANBAN_BOARD": "parent-board",
+        "PATH": "/usr/bin",
     })
-    assert "HERMES_KANBAN_SOME_FUTURE_KNOB" not in cleaned
-    assert cleaned["HERMES_SESSION_KEY"] == "keep-me"
+    leaked = sorted(k for k in KANBAN_ENV_KEYS if k in cleaned)
+    assert not leaked, f"worker identity reached the descendant: {leaked}"
+    assert cleaned.get("HERMES_KANBAN_BUSY_TIMEOUT_MS") == "1000", (
+        "non-identity Kanban tunables must survive the scrub"
+    )
+    assert cleaned["HERMES_KANBAN_BOARD"] == "parent-board"
+    assert cleaned["PATH"] == "/usr/bin"
     # Upstream's path-valued write fence: the marker carries the lineage's board root.
     assert cleaned[DELEGATED_CHILD_ENV_MARKER] == _fenced_kanban_root()

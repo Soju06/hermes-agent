@@ -19,32 +19,10 @@ _NON_DISPATCHER_OWNED_CONTEXT: ContextVar[bool] = ContextVar("hermes_non_dispatc
 
 DELEGATED_CHILD_ENV_MARKER = "HERMES_DELEGATED_CHILD_CONTEXT"
 
-KANBAN_ENV_PREFIX = "HERMES_KANBAN_"
-
-# Worker *identity* variables. Enumerated for documentation, tests and the
-# codex app-server scope grant only. Do NOT use this tuple to decide what to
-# strip: the dispatcher (``hermes_cli/kanban_db_dispatch.py``) grows its worker
-# env over time (HERMES_KANBAN_BRANCH, _GOAL_MODE, _GOAL_MAX_TURNS were all
-# added after the original list was written and silently escaped the scrub for
-# that whole window). ``scrub_kanban_env`` strips by prefix so a new dispatcher
-# variable is covered on the day it is introduced instead of the day someone
-# notices.
 KANBAN_ENV_KEYS: tuple[str, ...] = (
     "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_CLAIM_LOCK",
     "HERMES_KANBAN_GOAL_MODE", "HERMES_KANBAN_GOAL_MAX_TURNS",
 )
-
-# Board *location/routing* variables a descendant keeps (upstream contract since
-# "keep Kanban worker scope out of descendant processes": scrubbing removes who
-# the worker IS, not which board/workspace it works on). Everything else under
-# ``KANBAN_ENV_PREFIX`` is treated as identity and stripped. ``HERMES_KANBAN_HOME``
-# and ``HERMES_KANBAN_ATTACHMENTS_ROOT`` are operator location overrides read by
-# ``hermes_cli.kanban_db.kanban_home`` / the attachments root, not dispatcher identity.
-KANBAN_LOCATION_ENV_KEYS: frozenset[str] = frozenset({
-    "HERMES_KANBAN_BOARD", "HERMES_KANBAN_DB", "HERMES_KANBAN_WORKSPACES_ROOT",
-    "HERMES_KANBAN_WORKSPACE", "HERMES_KANBAN_BRANCH",
-    "HERMES_KANBAN_HOME", "HERMES_KANBAN_ATTACHMENTS_ROOT",
-})
 
 
 @contextmanager
@@ -212,17 +190,8 @@ def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[
     against a temp ``HERMES_HOME`` got a silently read-only board there. An inherited
     path-valued marker is kept (a grandchild that moved HERMES_HOME must not re-fence
     onto its scratch root and unfence the real one).
-
-    Strips by ``KANBAN_ENV_PREFIX`` (minus ``KANBAN_LOCATION_ENV_KEYS``) rather
-    than by the enumerated ``KANBAN_ENV_KEYS``. The dispatcher's worker-env
-    builder is the growing side of this contract; an allowlist here means every
-    identity variable it adds leaks into delegated children until someone edits
-    this file. Board routing and location overrides are kept by name.
     """
-    cleaned = {
-        k: v for k, v in env.items()
-        if not k.startswith(KANBAN_ENV_PREFIX) or k in KANBAN_LOCATION_ENV_KEYS
-    }
+    cleaned = {k: v for k, v in env.items() if k not in KANBAN_ENV_KEYS}
     # Only the gateway mints ``kanban`` sessions: a descendant ``hermes chat`` sending it is refused.
     if cleaned.get("HERMES_SESSION_SOURCE") == "kanban":
         del cleaned["HERMES_SESSION_SOURCE"]
